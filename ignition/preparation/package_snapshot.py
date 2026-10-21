@@ -273,14 +273,25 @@ class BlobStore:
         _sync_directory(self.root)
 
     @staticmethod
-    def verify(path, expected, size):
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-        with os.fdopen(fd, 'rb') as source:
-            info = os.fstat(source.fileno())
-            if not stat.S_ISREG(info.st_mode) or info.st_size != size:
-                raise ValueError('invalid cached blob')
-            digest = hashlib.file_digest(source, 'sha256').digest()
-            if BlobStore._identity(info) != BlobStore._identity(os.fstat(source.fileno())):
+    def _content_identity(info):
+        # Hardlink churn (peer ranks linking/unlinking shared content-addressed
+        # blobs) bumps ctime without touching content; mtime still changes on
+        # any real write, so content identity deliberately excludes ctime.
+        return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+
+    @staticmethod
+    def verify(path, expected, size, attempts=4):
+        for attempt in range(max(1, attempts)):
+            digest = info = None
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd, 'rb') as source:
+                info = os.fstat(source.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_size != size:
+                    raise ValueError('invalid cached blob')
+                digest = hashlib.file_digest(source, 'sha256').digest()
+                if BlobStore._content_identity(info) == BlobStore._content_identity(os.fstat(source.fileno())):
+                    break
+            if attempt + 1 == attempts:
                 raise ValueError('cached blob changed during verification')
         if digest != expected:
             raise ValueError('cached blob content does not match its hash')
