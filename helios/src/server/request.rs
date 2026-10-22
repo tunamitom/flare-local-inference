@@ -230,7 +230,9 @@ pub(super) fn prepare_inference_cached(
             echo,
         )
     } else {
-        (frontend.render_chat(&normalized, &options)?, String::new())
+        let mut rendered = frontend.render_chat(&normalized, &options)?;
+        frontend.skip_replied_message_end(&normalized, &options, &mut rendered);
+        (rendered, String::new())
     };
     let images = describe_images(&rendered.image_sources, processor, input_store)?;
     let output = if raw.is_some() {
