@@ -34,7 +34,9 @@ class MLPScratch:
 class PreparedMLP:
     """Dense or shared-expert MLP, including rank-local intermediate partitions.
 
-    Gate/up projection rows are gate first, then up. The output is a partial
+    Gate/up projection rows are gate first, then up. Block-FP8 weights run b12x's
+    block-FP8 GEMM over quantized activations, or with a ``w8a16`` workspace W8A16 GEMVs
+    over BF16 activations. The output is a partial
     hidden vector for sharded weights; the caller owns its collective reduction.
     All output and intermediate buffers must remain live through graph replay.
     """
@@ -42,7 +44,7 @@ class PreparedMLP:
     def __init__(self, source, weights: MLPWeights, gate_up, intermediate, output, *,
                  session, name, workspace, swiglu_limit=float("inf"), round_silu=True,
                  activation_mode="auto", gate_up_bias=None, down_bias=None, clamp_after_silu=False,
-                 swiglu_alpha=1., swiglu_beta=0.):
+                 swiglu_alpha=1., swiglu_beta=0., w8a16=None):
         self.gate_up, self.intermediate, self.output = gate_up, intermediate, output
         self.swiglu_limit, self.round_silu = swiglu_limit, round_silu
         if source.ndim != 2 or intermediate.ndim != 2:
@@ -61,6 +63,11 @@ class PreparedMLP:
             if isinstance(weight, BlockFP8Weight):
                 if bias is not None:
                     raise ValueError("block-FP8 MLP projections do not support bias")
+                if w8a16 is not None:
+                    from ignition.components.w8a16_gemv import W8A16Projection
+
+                    return W8A16Projection(input, weight, out, session=session, name=f"{name}.{suffix}",
+                                           workspace=w8a16)
                 return BlockFP8Projection(input, weight, out, session=session, name=f"{name}.{suffix}")
             if isinstance(weight, torch.Tensor):
                 return UnquantizedProjection(input, weight, out, session=session, name=f"{name}.{suffix}", bias=bias)
