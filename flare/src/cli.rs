@@ -691,6 +691,11 @@ pub struct ServingOptions {
         help_heading = "Advanced speculation options")]
     pub mtp_adaptive_verification_alpha: Option<f64>,
 
+    /// Token capacity from which prefill graphs captured in both activation precisions run with
+    /// quantized activations; 0 keeps them unquantized [default: package setting].
+    #[arg(long, value_name = "N", help_heading = "Advanced serving options")]
+    pub quantized_activation_min_tokens: Option<usize>,
+
     /// Host memory for prefix checkpoints and prepared inputs, e.g. 16G; 0 disables [default: disabled].
     #[arg(long, value_name = "SIZE", value_parser = parse_size, help_heading = "Prefix cache options")]
     pub prefix_cache_memory: Option<u64>,
@@ -785,6 +790,9 @@ impl ServingOptions {
         if self.mtp_adaptive_verification {
             options.push("--mtp-adaptive-verification".into());
         }
+        if let Some(n) = self.quantized_activation_min_tokens {
+            options.extend(["--quantized-activation-min-tokens".into(), n.to_string()]);
+        }
         if self.no_mtp_adaptive_verification {
             options.push("--no-mtp-adaptive-verification".into());
         }
@@ -840,6 +848,7 @@ impl ServingOptions {
             } else {
                 None
             },
+            quantized_activation_min_tokens: self.quantized_activation_min_tokens,
             device_labels: (!self.gpus.is_empty()).then(|| self.gpus.clone()),
             prefix_cache: PrefixCacheOffload {
                 memory_bytes: self.prefix_cache_memory,
