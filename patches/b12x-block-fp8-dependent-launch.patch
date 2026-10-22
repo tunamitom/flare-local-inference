@@ -1,0 +1,319 @@
+diff -ruN a/b12x/comm/pcie/_oneshot_cute.py b/b12x/comm/pcie/_oneshot_cute.py
+--- a/b12x/comm/pcie/_oneshot_cute.py
++++ b/b12x/comm/pcie/_oneshot_cute.py
+@@ -1099,6 +1099,10 @@
+         shard_packs: Int64,
+         epsilon: Float32,
+     ) -> None:
++        # Release programmatic dependents at entry. A dependent waits in-kernel for this
++        # grid to complete before it reads the normalized rows, so the release only lets
++        # it launch and fetch its weights while this grid waits on its peers.
++        cute.arch.griddepcontrol_launch_dependents()
+         tidx, _, _ = cute.arch.thread_idx()
+         bidx, _, _ = cute.arch.block_idx()
+         gdim, _, _ = cute.arch.grid_dim()
+@@ -1683,7 +1687,7 @@
+         1,
+         current_cuda_stream(),
+         compile_spec=KernelCompileSpec.from_key(
+-            "comm.pcie.oneshot_fused_rmsnorm", 2, cache_key
++            "comm.pcie.oneshot_fused_rmsnorm", 3, cache_key
+         ),
+     )
+ 
+diff -ruN a/b12x/gemm/blockscaled/_block_fp8_gemv.py b/b12x/gemm/blockscaled/_block_fp8_gemv.py
+--- a/b12x/gemm/blockscaled/_block_fp8_gemv.py
++++ b/b12x/gemm/blockscaled/_block_fp8_gemv.py
+@@ -13,6 +13,11 @@
+ Within a 128-block, K is permuted identically for both operands so that each
+ thread's fragments come from 32 contiguous bytes (two 16-byte loads); every
+ block sum still covers the same products.
++
++A dependent GEMV launches as a programmatic dependent of the preceding kernel.
++It loads all of its weight fragments and weight scales into registers, then
++waits for that kernel to complete before it reads the rows, so the weight fetch
++overlaps the producer. The arithmetic and the result are unchanged.
+ """
+ 
+ import cuda.bindings.driver as cuda
+@@ -35,6 +40,8 @@
+ # faster than the dense GEMM up to 4096 output features for K in 1536..7168;
+ # from 8192 both stream weights at the same rate and the dense GEMM keeps them.
+ MAX_OUT_FEATURES = 4096
++# A dependent GEMV keeps 16 registers of weights per 128-block a warp owns.
++MAX_PRELOADED_BLOCKS_PER_WARP = 8
+ _WARPS = 8
+ _LANES = 32
+ _UNIT_E8M0 = 0x7F7F7F7F  # four E8M0 exponents of 2^0
+@@ -55,12 +62,15 @@
+ class BlockFP8Gemv:
+     """``out[m, n] = sum_kb (lhs[m, kb] . rhs[n, kb]) * lhs_scale[m, kb] * rhs_scale[n // 128, kb]``."""
+ 
+-    def __init__(self, n: int, k: int):
++    def __init__(self, n: int, k: int, dependent: bool = False):
+         if k % 128:
+             raise ValueError("block-FP8 GEMV requires K to be a multiple of 128")
+         self.n, self.k = int(n), int(k)
+         self.blocks = self.k // 128
+         self.blocks_per_warp = (self.blocks + _WARPS - 1) // _WARPS
++        self.dependent = bool(dependent)
++        # Without room to hold every fragment, a dependent GEMV waits before loading anything.
++        self.preload = self.dependent and self.blocks_per_warp <= MAX_PRELOADED_BLOCKS_PER_WARP
+ 
+     def _shared_storage_cls(self):
+         class SharedStorage:
+@@ -95,6 +105,7 @@
+             grid=((self.n + 15) // 16, 1, 1),
+             block=(_WARPS * _LANES, 1, 1),
+             stream=stream,
++            use_pdl=self.dependent,
+         )
+ 
+     @cute.kernel
+@@ -126,6 +137,24 @@
+         # 16 features never straddle a 128-row scale block.
+         scale_row = Int64(first // 128) * self.blocks
+         unit = Uint32(_UNIT_E8M0)
++        if cutlass.const_expr(self.dependent and not self.preload):
++            cute.arch.griddepcontrol_wait()
++        preloaded = []
++        if cutlass.const_expr(self.preload):
++            for step in cutlass.range_constexpr(self.blocks_per_warp):
++                # Warps past the last block load a valid block and discard it below.
++                block_index = cutlass.min(
++                    warp * self.blocks_per_warp + step, Int32(self.blocks - 1)
++                )
++                block_offset = Int64(block_index * 128 + quad * 32)
++                first_row = rhs_base + Int64(row_a) * k + block_offset
++                second_row = rhs_base + Int64(row_b) * k + block_offset
++                preloaded.append((
++                    ld_global_nc_v4_u32(first_row) + ld_global_nc_v4_u32(first_row + Int64(16)),
++                    ld_global_nc_v4_u32(second_row) + ld_global_nc_v4_u32(second_row + Int64(16)),
++                    rhs_scale[scale_row + Int64(block_index)],
++                ))
++            cute.arch.griddepcontrol_wait()
+         acc0 = Float32(0.0)
+         acc1 = Float32(0.0)
+         acc2 = Float32(0.0)
+@@ -134,17 +163,21 @@
+             kb = warp * self.blocks_per_warp + step
+             if kb < self.blocks:
+                 offset = Int64(kb * 128 + quad * 32)
+-                pa = rhs_base + Int64(row_a) * k + offset
+-                pb = rhs_base + Int64(row_b) * k + offset
+                 px = lhs_base + Int64(token) * k + offset
+-                wa0, wa1, wa2, wa3 = ld_global_nc_v4_u32(pa)
+-                wa4, wa5, wa6, wa7 = ld_global_nc_v4_u32(pa + Int64(16))
+-                wb0, wb1, wb2, wb3 = ld_global_nc_v4_u32(pb)
+-                wb4, wb5, wb6, wb7 = ld_global_nc_v4_u32(pb + Int64(16))
++                if cutlass.const_expr(self.preload):
++                    wa, wb, weight_scale = preloaded[step]
++                else:
++                    pa = rhs_base + Int64(row_a) * k + offset
++                    pb = rhs_base + Int64(row_b) * k + offset
++                    wa0, wa1, wa2, wa3 = ld_global_nc_v4_u32(pa)
++                    wa4, wa5, wa6, wa7 = ld_global_nc_v4_u32(pa + Int64(16))
++                    wb0, wb1, wb2, wb3 = ld_global_nc_v4_u32(pb)
++                    wb4, wb5, wb6, wb7 = ld_global_nc_v4_u32(pb + Int64(16))
++                    wa = (wa0, wa1, wa2, wa3, wa4, wa5, wa6, wa7)
++                    wb = (wb0, wb1, wb2, wb3, wb4, wb5, wb6, wb7)
++                    weight_scale = rhs_scale[scale_row + Int64(kb)]
+                 x0, x1, x2, x3 = ld_global_nc_v4_u32(px)
+                 x4, x5, x6, x7 = ld_global_nc_v4_u32(px + Int64(16))
+-                wa = (wa0, wa1, wa2, wa3, wa4, wa5, wa6, wa7)
+-                wb = (wb0, wb1, wb2, wb3, wb4, wb5, wb6, wb7)
+                 xs = (x0, x1, x2, x3, x4, x5, x6, x7)
+                 d0 = Float32(0.0)
+                 d1 = Float32(0.0)
+@@ -165,7 +198,6 @@
+                         unit,
+                         unit,
+                     )
+-                weight_scale = rhs_scale[scale_row + Int64(kb)]
+                 s0 = weight_scale * lhs_scale[Int64(col0) * self.blocks + Int64(kb)]
+                 s1 = weight_scale * lhs_scale[Int64(col1) * self.blocks + Int64(kb)]
+                 acc0 = acc0 + d0 * s0
+@@ -193,19 +225,21 @@
+ 
+ 
+ @program_cache(scope="preparation")
+-def compile_block_fp8_gemv(ordinal: int, n: int, k: int):
++def compile_block_fp8_gemv(ordinal: int, n: int, k: int, dependent: bool = False):
+     fake = tuple(
+         make_ptr(dtype, 16, cute.AddressSpace.gmem, assumed_align=align)
+         for dtype, align in zip(_TYPES, _ALIGN, strict=True)
+     )
+     with torch.cuda.device(ordinal):
+         raw = b12x_compile(
+-            BlockFP8Gemv(n, k),
++            BlockFP8Gemv(n, k, dependent),
+             *fake,
+             Int32(1),
+             current_cuda_stream(),
+             compile_spec=KernelCompileSpec.from_key(
+-                "gemm.block_fp8.gemv", 2, (ordinal, n, k)
++                "gemm.block_fp8.gemv",
++                2,
++                (ordinal, n, k, "dependent") if dependent else (ordinal, n, k),
+             ),
+         )
+ 
+diff -ruN a/b12x/gemm/blockscaled/_block_fp8_row_quant.py b/b12x/gemm/blockscaled/_block_fp8_row_quant.py
+--- a/b12x/gemm/blockscaled/_block_fp8_row_quant.py
++++ b/b12x/gemm/blockscaled/_block_fp8_row_quant.py
+@@ -0,0 +1,153 @@
++"""Per-token 128-group FP8 quantization of BF16 rows for the block-FP8 GEMV.
++
++Bit-identical to ``flashinfer.quantization.per_token_group_quant_8bit(x, 128)``
++for row-major FP32 scales: each group's scale is ``max(amax, 1e-10) / 448``
++and each value is ``x * (1 / scale)``, clamped to +-448 and rounded to E4M3,
++with both divisions correctly rounded.
++
++A dependent quantization launches as a programmatic dependent of the preceding
++kernel, releases its own dependent at entry, and waits for its producer before
++reading the rows. A dependent block-FP8 GEMV behind it can then fetch its
++weights while the producer still runs.
++"""
++
++import cuda.bindings.driver as cuda
++import cutlass
++import cutlass.cute as cute
++import torch
++from cutlass import BFloat16, Float32, Int32, Int64, Uint32
++
++from b12x._lib.compile_plan import attach_programs
++from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile, run_compiled
++from b12x._lib.intrinsics.conversion import cvt_f32x4_to_e4m3x4
++from b12x._lib.intrinsics.math import div_rn_f32, fabs_f32, fmax_f32, fmin_f32
++from b12x._lib.intrinsics.memory import get_ptr_as_int64, ld_global_v4_u32, u32_as_f32
++from b12x._lib.program_cache import program_cache
++from b12x._lib.utils.device import cuda_stream_from_int_or_current, current_cuda_stream
++from b12x._lib.utils.pointers import make_ptr
++from b12x.gemm.bf16_gemv._kernel import _flat
++
++_GROUP = 128
++# Sixteen lanes own a group, eight BF16 values (16 bytes) each.
++_LANES_PER_GROUP = 16
++_THREADS = 256
++_GROUPS_PER_CTA = _THREADS // _LANES_PER_GROUP
++_E4M3_MAX = 448.0
++_EPS = 1e-10
++_TYPES = (BFloat16, Uint32, Float32)
++_ALIGN = (16, 16, 4)
++
++
++class BlockFP8RowQuant:
++    """``values[m, j], scales[m, j // 128]`` for ``rows[m, j]`` in BF16."""
++
++    def __init__(self, k: int, dependent: bool = False):
++        if k % _GROUP:
++            raise ValueError("block-FP8 row quantization requires K to be a multiple of 128")
++        self.k = int(k)
++        self.groups = self.k // _GROUP
++        self.dependent = bool(dependent)
++
++    @cute.jit
++    def __call__(
++        self,
++        rows_ptr: cute.Pointer,
++        values: cute.Pointer,
++        scales: cute.Pointer,
++        rows: Int32,
++        stream: cuda.CUstream,
++    ):
++        total = rows * self.groups
++        self.kernel(_flat(rows_ptr), _flat(values), _flat(scales), total).launch(
++            grid=((total + _GROUPS_PER_CTA - 1) // _GROUPS_PER_CTA, 1, 1),
++            block=(_THREADS, 1, 1),
++            stream=stream,
++            use_pdl=self.dependent,
++        )
++
++    @cute.kernel
++    def kernel(
++        self,
++        rows_ptr: cute.Tensor,
++        values: cute.Tensor,
++        scales: cute.Tensor,
++        total: Int32,
++    ):
++        if cutlass.const_expr(self.dependent):
++            cute.arch.griddepcontrol_launch_dependents()
++        thread, _, _ = cute.arch.thread_idx()
++        block, _, _ = cute.arch.block_idx()
++        group = Int32(block) * _GROUPS_PER_CTA + Int32(thread) // _LANES_PER_GROUP
++        lane = Int32(thread) % _LANES_PER_GROUP
++        live = group < total
++        # Spare lanes repeat the last group so every shuffle partner is active.
++        group = cutlass.min(group, total - 1)
++        if cutlass.const_expr(self.dependent):
++            cute.arch.griddepcontrol_wait()
++        # Groups are contiguous 128-value runs of the row-major input.
++        element = Int64(group) * Int64(_GROUP) + Int64(lane * 8)
++        w0, w1, w2, w3 = ld_global_v4_u32(
++            get_ptr_as_int64(rows_ptr, Int64(0)) + element * Int64(2)
++        )
++        x = []
++        for word in (w0, w1, w2, w3):
++            x.append(u32_as_f32(word << Uint32(16)))
++            x.append(u32_as_f32(word & Uint32(0xFFFF0000)))
++        amax = Float32(0.0)
++        for value in x:
++            amax = fmax_f32(amax, fabs_f32(value))
++        for offset in (1, 2, 4, 8):
++            amax = fmax_f32(amax, cute.arch.shuffle_sync_bfly(amax, offset=offset))
++        scale = div_rn_f32(fmax_f32(amax, Float32(_EPS)), Float32(_E4M3_MAX))
++        inverse = div_rn_f32(Float32(1.0), scale)
++        q = [
++            fmin_f32(fmax_f32(value * inverse, Float32(-_E4M3_MAX)), Float32(_E4M3_MAX))
++            for value in x
++        ]
++        if live:
++            word = element // Int64(4)
++            values[word] = cvt_f32x4_to_e4m3x4(q[0], q[1], q[2], q[3])
++            values[word + Int64(1)] = cvt_f32x4_to_e4m3x4(q[4], q[5], q[6], q[7])
++            if lane == Int32(0):
++                scales[Int64(group)] = scale
++
++
++@program_cache(scope="preparation")
++def compile_block_fp8_row_quant(ordinal: int, k: int, dependent: bool = False):
++    fake = tuple(
++        make_ptr(dtype, 16, cute.AddressSpace.gmem, assumed_align=align)
++        for dtype, align in zip(_TYPES, _ALIGN, strict=True)
++    )
++    with torch.cuda.device(ordinal):
++        raw = b12x_compile(
++            BlockFP8RowQuant(k, dependent),
++            *fake,
++            Int32(1),
++            current_cuda_stream(),
++            compile_spec=KernelCompileSpec.from_key(
++                "gemm.block_fp8.row_quant", 1, (ordinal, k, bool(dependent))
++            ),
++        )
++
++    def run(rows, values, scales, stream=None):
++        """Quantize BF16 ``rows`` [M, K] into E4M3 ``values`` [M, K] and FP32 ``scales`` [M, K // 128]."""
++        m = rows.shape[0]
++        if (
++            rows.dtype != torch.bfloat16
++            or values.dtype != torch.float8_e4m3fn
++            or scales.dtype != torch.float32
++            or rows.shape != (m, k)
++            or values.shape != (m, k)
++            or scales.shape != (m, k // _GROUP)
++            or not (rows.is_contiguous() and values.is_contiguous() and scales.is_contiguous())
++        ):
++            raise ValueError("block-FP8 row quantization requires contiguous [M, K] BF16 rows")
++        if m == 0:
++            return
++        pointers = tuple(
++            make_ptr(dtype, tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=align)
++            for dtype, align, tensor in zip(_TYPES, _ALIGN, (rows, values, scales), strict=True)
++        )
++        run_compiled(raw, (*pointers, Int32(m), cuda_stream_from_int_or_current(stream)))
++
++    return attach_programs(run, raw)
+Binary files a/b12x/gemm/blockscaled/__pycache__/_block_fp8_gemv.cpython-312.pyc and b/b12x/gemm/blockscaled/__pycache__/_block_fp8_gemv.cpython-312.pyc differ
+Binary files a/b12x/gemm/blockscaled/__pycache__/_block_fp8_row_quant.cpython-312.pyc and b/b12x/gemm/blockscaled/__pycache__/_block_fp8_row_quant.cpython-312.pyc differ
