@@ -3,6 +3,7 @@
 import contextlib
 import hashlib
 import json
+import os
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -64,6 +65,11 @@ from .weights import ModelWeights
 # prefill chunks below the 1024-token DMA boundary.
 TWOSHOT_MAX_TOKENS = 1024
 ONESHOT_MAX_TOKENS = 64
+# A4/A16 hybrid by default at the SM120 vLLM reference's threshold, so both engines run the same
+# expert path for each chunk size. On one TP8 MiMo expert layer MXFP4 activations measure 0.93x at
+# 512, 1.02x at 1024, 1.19x at 2048 and 1.62x at 8192 tokens; 512 is still above the 256-token
+# speculative capacity. FLARE_MIMO_A4_PREFILL_MIN_TOKENS=0 exports pure A16.
+A4_PREFILL_MIN_TOKENS = 512
 
 
 @dataclass(frozen=True)
@@ -87,6 +93,10 @@ class PreparationConfig:
     speculative_token_capacity: int | None = None
     # BF16 activations over MXFP4 experts (W4A16), as the SM120 vLLM reference serves MiMo.
     expert_activation: str = "a16"
+    # A4/A16 hybrid: A16 expert calls of at least this many tokens run dynamic MXFP4 (E8M0
+    # per-32) activations over the same packed weights. Decode and verification graphs stay
+    # below it; zero prepares pure A16 (FLARE_MIMO_A4_PREFILL_MIN_TOKENS=0 at export).
+    a4_prefill_min_tokens: int = A4_PREFILL_MIN_TOKENS
 
     def __post_init__(self):
         from ignition.components.capacity import image_capacity
@@ -153,6 +163,13 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         manifest = inspect_indexed_checkpoint(snapshot)
     transient = contextlib.ExitStack()
     transient.enter_context(package_storage.transient())
+    if config.expert_activation == "a16" and config.a4_prefill_min_tokens:
+        if config.a4_prefill_min_tokens <= config.decode_tokens:
+            raise ValueError("A4 prefill must stay above every decode and verification graph")
+        # b12x reads the threshold while planning, binding and carving expert workspaces.
+        os.environ["B12X_W4A16_MXFP4_PREFILL_MIN_TOKENS"] = str(config.a4_prefill_min_tokens)
+    else:
+        os.environ.pop("B12X_W4A16_MXFP4_PREFILL_MIN_TOKENS", None)
     weights = ModelWeights.load(manifest, device, shard=shard, progress=progress, dflash=config.dflash,
                                 expert_activation=config.expert_activation)
     release_unused()
