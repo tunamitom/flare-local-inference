@@ -513,7 +513,16 @@ impl Frontend {
                 "Cannot apply chat template to an empty conversation. Provide at least one message.",
             ))));
         }
-        self.render_jinja(messages, options, false)
+        self.render_jinja(messages, options, false, true)
+    }
+
+    /// Renders a message prefix's text for boundary placement without tokenizing it; None when the
+    /// prompt encoder or a segmented template needs the tokenized render instead.
+    pub fn render_boundary_text(&self, messages: &[Json], options: &Map<String, Json>) -> Option<Result<String>> {
+        if self.prompt_encoder != PromptEncoder::Jinja || self.ordinary_tokenizer.is_some() {
+            return None;
+        }
+        Some(self.render_jinja(messages, options, true, false).map(|rendered| rendered.text))
     }
 
     fn render_jinja(
@@ -521,6 +530,7 @@ impl Frontend {
         messages: &[Json],
         options: &Map<String, Json>,
         boundary: bool,
+        tokenize: bool,
     ) -> Result<RenderedPrompt> {
         let mut context = self.defaults.clone();
         context.extend(options.clone());
@@ -637,6 +647,9 @@ impl Frontend {
             if !preserved_space {
                 text.truncate(text.trim_end().len());
             }
+        }
+        if !tokenize {
+            return Ok(RenderedPrompt { text, token_ids: Vec::new(), image_sources });
         }
         let mut remaining = text.len();
         let mut token_ids = Vec::new();

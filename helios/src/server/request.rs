@@ -263,7 +263,7 @@ pub(super) fn prepare_inference_cached(
     let mut message_boundaries = if raw.is_some() {
         Vec::new()
     } else {
-        crate::model::message_boundaries(frontend, &rendered.token_ids, &normalized, &options)
+        crate::model::message_boundaries_with_text(frontend, &rendered.token_ids, Some(&rendered.text), &normalized, &options)
     };
     let crate::model::PreparedInput {
         tokens,
