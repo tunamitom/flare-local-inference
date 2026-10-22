@@ -22,6 +22,9 @@ class GraphSignature:
     speculation_enabled: bool | None = None
     prefill_capacity: int = 0
     packed_token_capacity: int = 0
+    # Set only on graphs captured in both activation precisions: True for the variant that quantizes
+    # activations ahead of weight-quantized projections. Loading keeps one variant per capacity.
+    quantized_activations: bool | None = None
 
     def __post_init__(self):
         if self.kind not in ("init", "restore", "snapshot", "prefill", "scored_prefill", "decode", "resume",
@@ -37,6 +40,8 @@ class GraphSignature:
             raise ValueError("graphs use the general stochastic sampling path")
         if self.speculation_enabled is not None and type(self.speculation_enabled) is not bool:
             raise TypeError("graph speculation mode must be a boolean or None")
+        if self.quantized_activations is not None and type(self.quantized_activations) is not bool:
+            raise TypeError("graph activation precision must be a boolean or None")
         if self.kind == "speculative" and self.speculation_enabled is False:
             raise ValueError("speculative graphs require speculation")
         if self.kind == "decode" and self.speculation_enabled is True:
@@ -70,6 +75,16 @@ class GraphSignature:
         if any(name in self.inputs for name in ("frame_index", "submission_sequence", "completion_records",
                                                "completion_logprobs", "logprob_requested", "readiness_timestamps")):
             raise ValueError("reserved execution buffers are bound automatically")
+
+
+def quantized_variant_selected(quantized, token_capacity, server_config):
+    """Whether loading at the package's default threshold keeps this activation precision variant."""
+    if quantized is None:
+        return True
+    if "quantized_activation_min_tokens" not in server_config:
+        raise ValueError("activation precision variants require a default quantized activation threshold")
+    threshold = server_config["quantized_activation_min_tokens"]
+    return quantized == (threshold != 0 and token_capacity >= threshold)
 
 
 class PreparedExecution(PreparedGraphBundle):
@@ -146,6 +161,8 @@ class PreparedExecution(PreparedGraphBundle):
                 graphs[-1]["speculation_enabled"] = signature.speculation_enabled
             if signature.packed_token_capacity:
                 graphs[-1]["packed_token_capacity"] = signature.packed_token_capacity
+            if signature.quantized_activations is not None:
+                graphs[-1]["quantized_activations"] = signature.quantized_activations
         abi_version = 3 if self.buffers["completion_records"].shape[-1] == 24 else 2
         return {"abi_version": abi_version, "context": context, "device": self.device,
                 "max_active": self.max_active, "input_frame_bytes": (cursor + 7) // 8 * 8,

@@ -359,6 +359,7 @@ def test_layout_selects_the_serving_variant_of_each_graph():
     class Signature:
         def __init__(self, kind, batch, tokens, enabled):
             self.kind, self.batch_capacity, self.token_capacity, self.speculation_enabled = kind, batch, tokens, enabled
+            self.quantized_activations = None
 
     class Tensor:
         def __init__(self, *shape):
