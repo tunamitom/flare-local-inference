@@ -317,7 +317,8 @@ def test_deepseek41_native_checkpoint_and_scale_compression(monkeypatch, tmp_pat
     plan = fitted(model, 4, speculation=speculation, expert_scale_compression=compression)
     assert plan.max_images == 4 and plan.image_concurrency == min(4, plan.concurrency)
     assert plan.expert_scale_compression == compression
-    assert (plan.weights_bytes < native.weights_bytes) == (compression == "csf")
+    # CSF frees each TP4 rank's measured scale bytes net of its expansion scratch.
+    assert native.weights_bytes - plan.weights_bytes == (3_443_280_216 if compression == "csf" else 0)
     monkeypatch.setattr("ignition.preparation.rank_group.prepare_group",
                         lambda snapshot, config, prepare, **options: config)
     config = model.recipe.prepare(tmp_path, plan, compile_forwards=True, kernel_cache=None, progress=None)

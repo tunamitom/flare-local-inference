@@ -45,8 +45,10 @@ RECIPE = Recipe(
     checkpoints=(Checkpoint(alias="deepseek-v4.1-flash", repository="deepseek-ai/DeepSeek-V4.1-Flash-1017",
         revision="1bae0e1088993b9b82de08f59de5be5a34e42170", architecture="DeepseekV41ForCausalLM",
         stored_bytes=510_286_023_000, device_bytes=306_557_453_640, draft_bytes=7_932_874_632,
-        # Estimate half of backbone scale bytes saved; retain the full draft budget.
-        scale_compressed_device_bytes={"csf": 298_063_988_040}),),
+        # Measured: b12x's load-time CSF encoding of this revision's 16,986,931,200 backbone E8M0
+        # expert scale bytes at TP4 keeps 686,161,920 fixed, at most 10,875,944 exception and 246,400
+        # segment bytes per rank, plus its 106,168,320-byte expansion pair. Retain the full draft budget.
+        scale_compressed_device_bytes={"csf": 306_557_453_640 - 4 * 3_443_280_216}),),
     context=1048576, page_tokens=128, concurrency=32, max_concurrency=64, prefill_chunk=4096,
     speculation=Speculation(draft_tokens=5, token_capacity=128, packed_verification=True,
                             draft_prefix_selection="gpu", graph_budget=64),
