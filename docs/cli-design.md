@@ -146,8 +146,8 @@ All launch modes use the same native distribution and serving bootstrap.
 defaulting to `~/.config/flare/orbit.toml` and
 `~/.config/flare/orbit/controller.key`. `flare orbit run` takes the serving
 flags of `flare run` and applies them to every rank; `--host`, `--port`,
-`--served-model-name`, `--scheduler-policy`, and `--api-key-file` apply to rank
-zero. `--api-key-file` names a file rank zero must be able to read; Orbit does
+`--served-model-name`, `--scheduler-policy`, `--min-checkpoint-segment`, and
+`--api-key-file` apply to rank zero. `--api-key-file` names a file rank zero must be able to read; Orbit does
 not upload it. Package inputs are Hugging Face repositories
 `ORG/NAME[@REVISION]`, controller-local files, or `NODE:/absolute/path` on a
 paired node. Orbit downloads repository packages on a candidate node and
@@ -423,6 +423,12 @@ throughput with output cadence. For throughput-oriented serving, use
 `flare run model.safetensors --gpus 0,1,2,3 --scheduler-policy throughput`.
 This preference retains token-service fairness and can produce longer gaps
 between larger output bursts. It uses the package's existing graphs.
+
+Prefill stops at every message end to publish a checkpoint that later turns
+and branches restore. `--min-checkpoint-segment N` passes over message ends
+closer than N tokens to the previous checkpoint, so a short message shares the
+next prefill pass instead of costing one of its own; a branch at such a message
+end re-prefills at most N tokens. The default, 0, stops at every message end.
 
 `flare run PACKAGE` loads an exported file without the Ignition configuration
 reader. `PACKAGE` can also be a Hugging Face repository ID with an optional
