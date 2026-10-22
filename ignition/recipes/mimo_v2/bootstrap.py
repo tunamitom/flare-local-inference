@@ -33,9 +33,11 @@ from ignition.preparation import runtime_package_pb2 as contract_proto
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 from ignition.preparation.collectives import (
     CollectivePreparation,
+    RoutedAllReduce,
     create_all_gather_runtime,
     create_all_reduce_runtime,
     create_dma_all_reduce_runtime,
+    create_twoshot_all_reduce_runtime,
 )
 from ignition.preparation.disposable import storage_ranges
 from ignition.preparation.execution import GraphSignature
@@ -57,6 +59,11 @@ from .vision import FEATURES, HIDDEN, PATCH_CAPACITIES, PreparedVision, VisionIn
 from .vision_state import PreparedVisionGeneration
 from ignition.components.vision_state import PrefillVisionInputs, VisionState
 from .weights import ModelWeights
+
+# Two-shot rows cover every reduction one-shot serves: decode, verification, draft blocks and
+# prefill chunks below the 1024-token DMA boundary.
+TWOSHOT_MAX_TOKENS = 1024
+ONESHOT_MAX_TOKENS = 64
 
 
 @dataclass(frozen=True)
@@ -184,7 +191,16 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         ipc = package_storage.peer_storage
         draft_rows = slots * weights.config.draft.block_size if config.dflash else 0
         tokens = max(config.prefill_chunk_size, config.decode_tokens, draft_rows)
-        collective = create_all_reduce_runtime(group, device, max_tokens=tokens, hidden_size=6144, ipc=ipc)
+        routed = len(config.devices) == 8
+        # Routed one-shot only serves rows below the two-shot crossover; its staging (one slot pair
+        # per peer) would otherwise be sized for a whole prefill chunk, 1.5 GiB per rank at 8192.
+        collective = create_all_reduce_runtime(group, device, max_tokens=ONESHOT_MAX_TOKENS if routed else tokens,
+                                               hidden_size=6144, ipc=ipc)
+        if routed:
+            # TP8 one-shot cost grows with rows; two-shot serves decode, verification, draft and
+            # short prefill rows above the measured crossover (three rows, 36 KiB).
+            collective = RoutedAllReduce(collective, create_twoshot_all_reduce_runtime(group, device,
+                max_tokens=TWOSHOT_MAX_TOKENS, hidden_size=6144, ipc=ipc), oneshot_max_bytes=3 * 6144 * 2)
         prefill_collective = create_dma_all_reduce_runtime(
             group, device, max_tokens=config.prefill_chunk_size, hidden_size=6144, ipc=ipc
         )
