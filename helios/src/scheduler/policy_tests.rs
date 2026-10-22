@@ -1193,6 +1193,33 @@ fn prefill_reaches_its_stop_in_one_pass_when_splitting_costs_more() {
 }
 
 #[test]
+fn short_messages_share_the_next_prefill_pass_above_the_checkpoint_segment() {
+    for (segment, stops) in [(0, vec![3000, 3020, 3050]), (256, vec![3000, 3050])] {
+        let mut s = interactive_engine(1, false);
+        s.configure_policy(PolicyConfig { min_checkpoint_segment: segment, ..s.policy }).unwrap();
+        let h = s.admit(RequestSpec {
+            prompt: vec![1; 3050],
+            message_boundaries: vec![3000, 3020],
+            conditioning: vec![],
+            max_new_tokens: 128,
+            grammar_constrained: false,
+            host_stops: false,
+            prompt_logprobs: false,
+            growable_output: false,
+        }).unwrap();
+        let mut reached = Vec::new();
+        for &stop in &stops {
+            let r = s.request(h).unwrap();
+            let work = s.prefill_work(r, 4096);
+            assert_eq!(r.consumed_tokens as usize + work, stop, "segment {segment}");
+            reached.push(stop);
+            s.request_mut(h).unwrap().consumed_tokens = stop as u64;
+        }
+        assert_eq!(reached, stops);
+    }
+}
+
+#[test]
 fn equivalent_prefill_tails_use_the_smaller_graph_despite_a_faster_padded_estimate() {
     let mut s = interactive_engine(1, false);
     set_cost(&mut s, GraphKind::Prefill, 1, 4096, MS);

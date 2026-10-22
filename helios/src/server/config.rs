@@ -304,13 +304,20 @@ impl Bootstrap {
                 .ok_or("served_names must contain strings")?,
             Some(_) => return Err("served_names must be an array".into()),
         };
+        let mut scheduling_policy = match object.get("scheduler_policy") {
+            None => crate::scheduler::PolicyConfig::default(),
+            Some(Value::String(value)) if value == "balanced" => crate::scheduler::PolicyConfig::default(),
+            Some(Value::String(value)) if value == "throughput" => crate::scheduler::PolicyConfig::throughput(),
+            Some(_) => return Err("scheduler_policy must be balanced or throughput".into()),
+        };
+        if let Some(value) = object.get("min_checkpoint_segment") {
+            scheduling_policy.min_checkpoint_segment = value
+                .as_u64()
+                .and_then(|n| usize::try_from(n).ok())
+                .ok_or("min_checkpoint_segment must be a token count")?;
+        }
         let server = ServerConfig {
-            scheduling_policy: match object.get("scheduler_policy") {
-                None => crate::scheduler::PolicyConfig::default(),
-                Some(Value::String(value)) if value == "balanced" => crate::scheduler::PolicyConfig::default(),
-                Some(Value::String(value)) if value == "throughput" => crate::scheduler::PolicyConfig::throughput(),
-                Some(_) => return Err("scheduler_policy must be balanced or throughput".into()),
-            },
+            scheduling_policy,
             api_key: Some(optional_text("api_key")?).filter(|key| !key.is_empty()),
             served_names,
             context_hint: optional_text("context_hint")?,

@@ -13,6 +13,10 @@ pub struct PolicyConfig {
     pub decode_age_price: f64,
     pub adaptation_ms: f64,
     pub estimate_ttl_ns: u64,
+    /// Prefill passes over message ends closer than this many tokens to the previous one, so a
+    /// short message shares the next pass instead of stopping for its own checkpoint. A branch
+    /// there re-prefills at most this many tokens. Zero stops at every message end.
+    pub min_checkpoint_segment: usize,
 }
 
 impl Default for PolicyConfig {
@@ -24,6 +28,7 @@ impl Default for PolicyConfig {
             decode_age_price: 0.1,
             adaptation_ms: 100.0,
             estimate_ttl_ns: 30_000_000_000,
+            min_checkpoint_segment: 0,
         }
     }
 }
@@ -287,12 +292,7 @@ impl RequestScheduler {
         };
         let segment = self.prefill_work(request, largest);
         let start = request.consumed_tokens as usize;
-        let stop = request
-            .message_boundaries
-            .iter()
-            .copied()
-            .find(|n| *n > start)
-            .unwrap_or(request.prompt_tokens);
+        let stop = self.prefill_stop(request);
         if duration_ns == 0
             || work >= segment
             || start + segment != stop
@@ -316,14 +316,30 @@ impl RequestScheduler {
             .any(|ns| ns > 0 && ns <= duration_ns.saturating_add(rest_ns))
     }
 
-    pub(super) fn prefill_work(&self, request: &LiveRequest, capacity: usize) -> usize {
+    /// The next message end prefill stops at for its checkpoint, otherwise the prompt end.
+    fn prefill_stop(&self, request: &LiveRequest) -> usize {
         let start = request.consumed_tokens as usize;
-        let mut end = request
+        let mut previous = request
             .message_boundaries
             .iter()
             .copied()
-            .find(|n| *n > start)
-            .unwrap_or(request.prompt_tokens)
+            .take_while(|n| *n <= start)
+            .last()
+            .unwrap_or(0)
+            .max(request.prefix_tokens as usize);
+        for &n in request.message_boundaries.iter().filter(|n| **n > start) {
+            if n - previous >= self.policy.min_checkpoint_segment {
+                return n;
+            }
+            previous = n;
+        }
+        request.prompt_tokens
+    }
+
+    pub(super) fn prefill_work(&self, request: &LiveRequest, capacity: usize) -> usize {
+        let start = request.consumed_tokens as usize;
+        let mut end = self
+            .prefill_stop(request)
             .min(start.saturating_add(capacity))
             .min(request.prefill_limit());
         if let Some(span) = request
