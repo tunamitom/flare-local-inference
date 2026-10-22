@@ -474,9 +474,9 @@ impl Encoder {
                 if !self.parallel_tool_calls && self.outputs[index].has_tools() {
                     return Err("parallel tool calls are disabled, but the model produced more than one tool call".into());
                 }
-                if self.tool_choice != ToolChoice::Auto && self.tool(name).is_none() {
-                    return Err(format!("model emitted undeclared tool {name}").into());
-                }
+                // A call to a tool the request did not declare passes through verbatim, as it does
+                // under auto: the client owns name routing and returns its own error result, which
+                // lets the model correct the call in the same turn.
             }
             if self.protocol == Protocol::Chat {
                 for delta in self.chats[index].apply(vec![event.clone()])? {
