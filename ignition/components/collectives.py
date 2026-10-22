@@ -20,6 +20,8 @@ from b12x.preparation import CollectiveRequirement, PreparedCall
 from ignition.preparation.tuning import declare, register_finalizer
 
 _OWNERS = weakref.WeakValueDictionary()
+# The b12x PCIe DCP channel block cap (_dcp_a2a_cute._MAX_BLOCKS).
+GATHER_BLOCK_LIMIT = 64
 _HANDLES = itertools.count()
 
 
@@ -388,7 +390,7 @@ def _gather_columns(source, output, handle):
     runtime.all_gather_heads(
         source.view(source.shape[0], runtime.heads_per_rank, runtime.query_head_dim),
         out=output.view(output.shape[0], runtime.total_heads, runtime.query_head_dim),
-        plan=owner.plan)
+        plan=owner.plan, block_limit=GATHER_BLOCK_LIMIT)
 
 
 @torch.library.custom_op("flare::pcie_all_gather", mutates_args=("output",))
@@ -580,8 +582,11 @@ class PreparedAllGather:
             raise ValueError("all-gather requires contiguous BF16 or E4M3 column partitions matching its collective "
                              "channel")
         self.runtime, self.output = runtime, output
+        # b12x launches gathers on 16 blocks unless the caller asks for more; a full-vocabulary logit
+        # gather then streams over a twelfth of the GPU, so use the channel's block cap.
         call = {"local_input": source.view(source.shape[0], runtime.heads_per_rank, runtime.query_head_dim),
-                "out": output.view(output.shape[0], runtime.total_heads, runtime.query_head_dim)}
+                "out": output.view(output.shape[0], runtime.total_heads, runtime.query_head_dim),
+                "block_limit": GATHER_BLOCK_LIMIT}
         query = pcie.query_from_runtime(runtime, surface="DcpAllToAll.all_gather_heads", call=call)
         self.plan = pcie.plan(query, runtime=runtime)
         ranks = tuple(dist.get_process_group_ranks(runtime.exchange_group))
