@@ -456,6 +456,7 @@ Help exits with status 0; usage errors go to stderr with status 2. Its options a
 | `--mtp-adaptive-verification-alpha ALPHA` | Positive finite exponent on split-proposal prefix-survival scheduling scores; below 1 favors longer verification prefixes | `1.0` |
 | `--mtp-verification-token-budget N` | Select one exact captured packed verification capacity per batch | All captured capacities |
 | `--mtp-max-verification-token-budget N` | Retain all captured packed verification capacities at or below a total-row ceiling | All captured capacities |
+| `--quantized-activation-min-tokens N` | For graphs captured in both activation precisions, serve the quantized-activation variant from token capacity `N`; `0` serves every such graph unquantized. `N` must be `0` or at least the smallest captured variant capacity, and packages without variants reject the flag | Package default |
 | `--embedding-table-storage disk\|ram` | PLE and Engram table storage; both modes deliver compact GPU rows | `disk` |
 | `--embedding-table-cache-size SIZE` | Per-host RAM budget for cached disk-backed PLE/Engram rows, including the index, usage counters and miss workspace; accepts sizes such as `1G` or `2GiB`; `0` disables | `4GiB` on discrete GPUs; `1GiB` on unified-memory GPUs such as DGX Spark |
 | `--embedding-table-resident-scales` | Keep original embedding scale bytes in host RAM while weights remain on disk; adds to the row-cache budget | Disabled |
