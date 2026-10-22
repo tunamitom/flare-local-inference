@@ -36,9 +36,10 @@ class ModelWeights:
     vision: object | None = None
 
     @classmethod
-    def load(cls, manifest, device, *, shard, progress=None, dflash=True):
+    def load(cls, manifest, device, *, shard, progress=None, dflash=True, expert_activation="a16"):
         before = torch.cuda.memory_allocated(device)
-        with MiMoWeightLoader(manifest, device, shard=shard, progress=progress) as loader:
+        with MiMoWeightLoader(manifest, device, shard=shard, progress=progress,
+                              expert_activation=expert_activation) as loader:
             config = loader.config
             embedding, norm = loader.load_tensors(("model.embed_tokens.weight", "model.norm.weight"))
             head = loader.load_tensor("lm_head.weight",
@@ -57,9 +58,12 @@ class ModelWeights:
 
 
 class MiMoWeightLoader(DirectWeightLoader):
-    def __init__(self, manifest, device, *, shard, progress=None, prefixes=None):
+    def __init__(self, manifest, device, *, shard, progress=None, prefixes=None, expert_activation="a16"):
         super().__init__(manifest, device, progress=progress, prefixes=prefixes)
+        if expert_activation not in ("a8", "a16"):
+            raise ValueError("MiMo experts use A8 or A16 activations")
         self.config, self.shard = ModelConfig.load(manifest.snapshot), shard
+        self.expert_activation = expert_activation
         self.config.qkv_chunks(0, shard)
 
     def _selected_names(self):
@@ -136,7 +140,7 @@ class MiMoWeightLoader(DirectWeightLoader):
             experts = self.load_fp4_experts(
                 [f"{prefix}.mlp.experts.{i}" for i in range(c["n_routed_experts"])],
                 hidden_size=c["hidden_size"], intermediate_size=c["moe_intermediate_size"],
-                format="mxfp4", activation_mode="a8",
+                format="mxfp4", activation_mode=self.expert_activation,
                 intermediate_range=shard.partition(c["moe_intermediate_size"], alignment=32))
             router, correction = self.load_tensors((prefix + ".mlp.gate.weight",
                                                     prefix + ".mlp.gate.e_score_correction_bias"))
