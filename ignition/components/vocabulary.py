@@ -6,6 +6,14 @@ from .collectives import PreparedAllGather
 from .linear import QuantizedProjection, UnquantizedProjection
 
 
+def vocabulary_shard_projection(source, weight, local_output, *, session, name, activation_mode="a16"):
+    """Project replicated hidden rows into this rank's contiguous vocabulary shard only."""
+    if isinstance(weight, torch.Tensor):
+        return UnquantizedProjection(source, weight, local_output, session=session, name=name)
+    return QuantizedProjection(source, weight, local_output, session=session, name=name,
+                               activation_mode=activation_mode)
+
+
 class PreparedVocabularyProjection:
     """Project replicated hidden rows with a contiguous vocabulary weight shard.
 
@@ -26,12 +34,8 @@ class PreparedVocabularyProjection:
                 or output.shape[0] < rows):
             raise ValueError("vocabulary row indices require one device int64 index per expanded output row")
         self.row_indices = row_indices
-        if isinstance(weight, torch.Tensor):
-            self.projection = UnquantizedProjection(source, weight, local_output,
-                session=session, name=f"{name}.projection")
-        else:
-            self.projection = QuantizedProjection(source, weight, local_output,
-                session=session, name=f"{name}.projection", activation_mode=activation_mode)
+        self.projection = vocabulary_shard_projection(source, weight, local_output, session=session,
+            name=f"{name}.projection", activation_mode=activation_mode)
         world = 1 if runtime is None else runtime.world_size
         columns = local_output.shape[1] * world
         if columns < output.shape[1]:
