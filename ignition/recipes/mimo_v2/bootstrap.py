@@ -79,6 +79,8 @@ class PreparationConfig:
     speculative_widths: tuple[int, ...] = tuple(range(1, 9))
     speculative_fixed_width: int | None = None
     speculative_token_capacity: int | None = None
+    # BF16 activations over MXFP4 experts (W4A16), as the SM120 vLLM reference serves MiMo.
+    expert_activation: str = "a16"
 
     def __post_init__(self):
         from ignition.components.capacity import image_capacity
@@ -146,7 +148,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         manifest = inspect_indexed_checkpoint(snapshot)
     transient = contextlib.ExitStack()
     transient.enter_context(package_storage.transient())
-    weights = ModelWeights.load(manifest, device, shard=shard, progress=progress, dflash=config.dflash)
+    weights = ModelWeights.load(manifest, device, shard=shard, progress=progress, dflash=config.dflash,
+                                expert_activation=config.expert_activation)
     release_unused()
     sequence = torch.zeros(1, dtype=torch.int64, device=device)
     with phase(progress, "Allocate model state and collectives"):
