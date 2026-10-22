@@ -305,6 +305,7 @@ impl OrbitPush {
             stage_only: false,
             api_key_file: None,
             scheduler_policy: "balanced".into(),
+            min_checkpoint_segment: 0,
             serving: self.serving.clone(),
         }
     }
@@ -389,6 +390,10 @@ pub struct OrbitRun {
         value_parser = ["balanced", "throughput"], help_heading = "Serving options")]
     pub scheduler_policy: Option<String>,
 
+    /// Prefill past message ends closer than N tokens to the previous checkpoint [default: saved group or 0].
+    #[arg(long, value_name = "N", help_heading = "Serving options")]
+    pub min_checkpoint_segment: Option<usize>,
+
     /// File on rank zero's node containing the serving API key; omit to disable authentication.
     #[arg(long, value_name = "PATH", help_heading = "Serving options")]
     pub api_key_file: Option<PathBuf>,
@@ -426,6 +431,9 @@ impl OrbitRun {
         if let Some(policy) = &self.scheduler_policy {
             options.extend(["--scheduler-policy".into(), policy.clone()]);
         }
+        if let Some(tokens) = self.min_checkpoint_segment {
+            options.extend(["--min-checkpoint-segment".into(), tokens.to_string()]);
+        }
         if let Some(path) = &self.api_key_file {
             options.extend(["--api-key-file".into(), path.display().to_string()]);
         }
@@ -453,6 +461,7 @@ impl OrbitRun {
                 .scheduler_policy
                 .clone()
                 .unwrap_or_else(|| "balanced".into()),
+            min_checkpoint_segment: self.min_checkpoint_segment.unwrap_or(0),
             serving: self.serving.clone(),
         }
     }
@@ -560,6 +569,11 @@ pub struct Run {
     #[arg(long, value_name = "MODE", default_value = "balanced",
         value_parser = ["balanced", "throughput"], help_heading = "Serving options")]
     pub scheduler_policy: String,
+
+    /// Prefill past message ends closer than N tokens to the previous checkpoint instead of
+    /// stopping to checkpoint each; a branch there re-prefills at most N tokens [default: 0, every message end].
+    #[arg(long, value_name = "N", default_value_t = 0, help_heading = "Serving options")]
+    pub min_checkpoint_segment: usize,
 
     #[command(flatten)]
     pub serving: ServingOptions,

@@ -241,6 +241,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config["mtp_adaptive_verification_alpha"] = alpha.into();
     }
     config["scheduler_policy"] = args.scheduler_policy.into();
+    config["min_checkpoint_segment"] = args.min_checkpoint_segment.into();
     if let Some(name) = args.served_model_name {
         config["served_names"] = serde_json::json!([name]);
     }
