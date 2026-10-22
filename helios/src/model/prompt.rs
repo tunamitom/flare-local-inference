@@ -189,7 +189,11 @@ pub fn message_boundaries_with_text(
     let edges = text.and_then(|text| TokenEdges::new(frontend, text, tokens));
     let mut boundaries = Vec::with_capacity(messages.len());
     let mut last_message_end = None;
-    for count in 0..=messages.len() {
+    // Every prefix renders the history before it, so long conversations checkpoint only their
+    // leading messages, which sessions share, and their recent ones, which branches revisit.
+    // Older message ends were checkpointed by the turns that first prefilled them.
+    let recent = messages.len().saturating_sub(RECENT_BOUNDARY_MESSAGES);
+    for count in (0..=messages.len()).filter(|&count| count <= LEADING_BOUNDARY_MESSAGES || count >= recent) {
         if let Some(edges) = &edges {
             if let Some(Ok(prefix)) = frontend.render_boundary_text(&messages[..count], &options) {
                 if let Some(length) = edges.split_after(&prefix) {
@@ -232,6 +236,10 @@ pub fn message_boundaries_with_text(
     }
     boundaries
 }
+
+/// Leading and most recent message counts whose ends always receive boundaries.
+const LEADING_BOUNDARY_MESSAGES: usize = 2;
+const RECENT_BOUNDARY_MESSAGES: usize = 64;
 
 /// One tokenization of the prompt text with byte spans and added-token flags.
 struct TokenEdges<'a> {
