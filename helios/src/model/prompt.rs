@@ -172,6 +172,7 @@ pub fn message_boundaries(
     options.insert("add_generation_prompt".into(), false.into());
     options.insert("continue_final_message".into(), false.into());
     let mut boundaries = Vec::with_capacity(messages.len());
+    let mut last_message_end = None;
     for count in 0..=messages.len() {
         let Ok(prefix) = frontend.render_boundary(&messages[..count], &options) else {
             continue;
@@ -179,10 +180,27 @@ pub fn message_boundaries(
         let length = prefix.token_ids.len();
         if length > 0 && length < tokens.len() && tokens.starts_with(&prefix.token_ids) {
             boundaries.push(length);
+            if count == messages.len() {
+                last_message_end = Some(length);
+            }
         }
     }
     boundaries.sort_unstable();
     boundaries.dedup();
+    // When the generation prompt begins the rendered reply, the next turn restores the prompt
+    // endpoint, so stopping at the last message end would only cost a separate prefill pass.
+    if let Some(end) = last_message_end
+        && boundaries.last() == Some(&end)
+    {
+        let mut replied = messages.to_vec();
+        replied.push(serde_json::json!({"role": "assistant", "content": "OK"}));
+        if frontend
+            .render_boundary(&replied, &options)
+            .is_ok_and(|reply| reply.token_ids.len() > tokens.len() && reply.token_ids.starts_with(tokens))
+        {
+            boundaries.pop();
+        }
+    }
     boundaries
 }
 

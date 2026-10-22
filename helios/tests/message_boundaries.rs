@@ -74,13 +74,20 @@ fn check_messages(frontend: &Frontend, messages: &[Value]) -> (Vec<u32>, Vec<usi
         messages,
         options.as_object().unwrap(),
     );
+    // The last message keeps its own checkpoint only when the generation prompt does not begin
+    // the rendered reply; otherwise the prompt endpoint serves the next turn.
+    let mut replied = messages.to_vec();
+    replied.push(json!({"role":"assistant","content":"OK"}));
+    let reply = frontend.render_boundary(&replied, &Map::new()).unwrap();
+    let prompt_begins_reply = reply.token_ids.starts_with(&rendered.token_ids);
     for count in 1..=messages.len() {
         let prefix = frontend
             .render_boundary(&messages[..count], &Map::new())
             .unwrap();
-        assert!(
+        assert_eq!(
             boundaries.contains(&prefix.token_ids.len()),
-            "message {count} has no checkpoint"
+            count < messages.len() || !prompt_begins_reply,
+            "message {count} checkpoint"
         );
         assert_eq!(
             rendered.token_ids[..prefix.token_ids.len()],
@@ -111,7 +118,8 @@ fn every_role_transition_and_empty_message_has_a_boundary() {
         {"role":"user","content":"Follow-up"}
     ]);
     let (tokens, boundaries) = check_messages(&frontend, messages.as_array().unwrap());
-    assert_eq!(boundaries.len(), 8);
+    // The generation prompt begins the rendered reply, so the last message needs no checkpoint.
+    assert_eq!(boundaries.len(), 7);
     let mut changed = tokens.clone();
     changed[boundaries[2] - 1] ^= 1;
     assert_eq!(
@@ -148,7 +156,8 @@ fn segmented_xtml_preserves_boundaries_before_seeded_assistant_and_later_turns()
         {"role":"user","content":"Follow-up"}
     ]);
     let (tokens, boundaries) = check_messages(&frontend, messages.as_array().unwrap());
-    assert_eq!(boundaries.len(), 6);
+    // The generation prompt begins the rendered reply, so the last message needs no checkpoint.
+    assert_eq!(boundaries.len(), 5);
     let mut changed = messages.as_array().unwrap().clone();
     changed[2]["content"] = "Different question".into();
     let (other, other_boundaries) = check_messages(&frontend, &changed);
