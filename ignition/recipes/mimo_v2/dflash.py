@@ -16,11 +16,34 @@ from ignition.components.vocabulary import PreparedVocabularyProjection, vocabul
 
 from .attention import partial_rotary, stage_windows
 from .decoder import PreparedDecoder, canonical_norm
+from .draft_weights import projection_rows
 
 
 # Draft blocks of up to eight rows (96 KiB) reduce through the one-shot channel with the residual add
 # and the following RMSNorm in the same launch, as the target decoder does; above that, two-shot.
 DRAFT_FUSED_REDUCE_NORM_MAX_BYTES = 96 << 10
+
+
+def within_w8a16(weights, rows):
+    """These weights with the block-FP8 draft copy when a graph's rows fit the W8A16 GEMV."""
+    from dataclasses import replace
+
+    from ignition.components.w8a16_gemv import MAX_ROWS
+
+    if getattr(weights, "draft_w8a16", None) is not None and rows <= MAX_ROWS:
+        return replace(weights, draft=weights.draft_w8a16)
+    return weights
+
+
+def projection(source, weight, output, *, session, name, w8a16=None):
+    """b12x's BF16 projection, or a W8A16 GEMV over a block-FP8 draft weight."""
+    if isinstance(weight, torch.Tensor):
+        return UnquantizedProjection(source, weight, output, session=session, name=name)
+    from ignition.components.w8a16_gemv import W8A16Projection
+
+    if w8a16 is None:
+        raise ValueError("block-FP8 draft projections require a W8A16 workspace")
+    return W8A16Projection(source, weight, output, session=session, name=name, workspace=w8a16)
 
 
 def inverse_frequencies(geometry, device):
@@ -46,7 +69,7 @@ class ContextBuffers:
         hidden = c.text["hidden_size"]
         return cls(torch.zeros((tokens, hidden // weights.shard.world_size), dtype=dtype, device=device),
                    torch.zeros((tokens, hidden), dtype=dtype, device=device),
-                   torch.zeros((tokens, weights.draft.context_kv.shape[0]), dtype=dtype, device=device),
+                   torch.zeros((tokens, projection_rows(weights.draft.context_kv)), dtype=dtype, device=device),
                    torch.zeros((tokens, kv_heads, a.key_dim), dtype=dtype, device=device),
                    torch.zeros((tokens, kv_heads, a.value_dim), dtype=dtype, device=device),
                    torch.full((tokens,), -1, dtype=torch.int64, device=device))
@@ -61,7 +84,8 @@ class PreparedContext:
     """Project accepted target features once into all draft layers' context K/V."""
 
     def __init__(self, weights, auxiliary, metadata, pool, *, session, name, workspace, runtime, coordinator,
-                 buffers=None):
+                 buffers=None, w8a16=None):
+        weights = within_w8a16(weights, auxiliary.shape[0])
         self.metadata, self.pool = metadata, pool
         c, a = weights.config.draft, weights.config.draft.attention
         self.window = a.window
@@ -70,14 +94,14 @@ class PreparedContext:
         planes = (ContextBuffers.allocate(weights, tokens, device, auxiliary.dtype) if buffers is None
                   else buffers.rows(tokens))
         self.local, self.projected = planes.local, planes.projected
-        self.project = UnquantizedProjection(auxiliary, weights.draft.projection, self.local,
-                                             session=session, name=name + ".project")
+        self.project = projection(auxiliary, weights.draft.projection, self.local,
+                                  session=session, name=name + ".project", w8a16=w8a16)
         self.gather = PreparedAllGather(self.local, self.projected, runtime=runtime, coordinator=coordinator,
                                        session=session, name=name + ".gather")
         self.norm = canonical_norm(Qwen3RMSNorm, weights.draft.hidden_norm, c.text["rms_norm_eps"])
         self.kv = planes.kv
-        self.project_kv = UnquantizedProjection(self.projected, weights.draft.context_kv, self.kv,
-                                               session=session, name=name + ".kv")
+        self.project_kv = projection(self.projected, weights.draft.context_kv, self.kv,
+                                     session=session, name=name + ".kv", w8a16=w8a16)
         self.key, self.value, self.slots = planes.key, planes.value, planes.slots
         self.inverse = inverse_frequencies(a, device)
         self.stages = []
@@ -152,12 +176,13 @@ class DraftScratch:
 
 class DraftAttention(torch.nn.Module):
     def __init__(self, index, weights, config, scratch, metadata, pool, *, runtime, coordinator, session, name, workspace,
-                 reduce_output=True):
+                 reduce_output=True, w8a16=None):
         super().__init__()
         self.scratch, self.metadata = scratch, metadata
         a = config.attention
         self.value_scale = config.text["dflash_config"].get("attention_value_scale", 1.)
-        self.qkv = UnquantizedProjection(scratch.embedding, weights.qkv, scratch.qkv, session=session, name=name + ".qkv")
+        self.qkv = projection(scratch.embedding, weights.qkv, scratch.qkv, session=session, name=name + ".qkv",
+                              w8a16=w8a16)
         self.q_norm = canonical_norm(Qwen3RMSNorm, weights.query_norm, config.text["rms_norm_eps"])
         self.k_norm = canonical_norm(Qwen3RMSNorm, weights.key_norm, config.text["rms_norm_eps"])
         self.inverse = inverse_frequencies(a, scratch.embedding.device)
@@ -171,8 +196,8 @@ class DraftAttention(torch.nn.Module):
         self.attention = PreparedPagedAttention(scratch.query, self.key, self.value, self.pages, self.lengths,
             metadata.query_start_loc, scratch.attended, sink=weights.sink, mode="verify", width=config.block_size,
             window=a.window - 1, causal=False, session=session, workspace=workspace, name=name + ".attention")
-        self.output = UnquantizedProjection(scratch.attended.flatten(1), weights.output, scratch.partial,
-                                            session=session, name=name + ".output")
+        self.output = projection(scratch.attended.flatten(1), weights.output, scratch.partial,
+                                 session=session, name=name + ".output", w8a16=w8a16)
         self.reduce = PreparedAllReduce(scratch.partial, scratch.output, runtime=runtime, coordinator=coordinator,
                                        session=session, name=name + ".reduce") if reduce_output else None
 
@@ -191,11 +216,12 @@ class DraftAttention(torch.nn.Module):
 
 
 class DraftMLP(torch.nn.Module):
-    def __init__(self, weights, scratch, *, runtime, coordinator, session, name, workspace, reduce_output=True):
+    def __init__(self, weights, scratch, *, runtime, coordinator, session, name, workspace, reduce_output=True,
+                 w8a16=None):
         super().__init__()
         s = scratch.mlp
         self.mlp = PreparedMLP(scratch.embedding, weights, s.gate_up, s.intermediate, s.output,
-                              session=session, workspace=workspace, name=name)
+                              session=session, workspace=workspace, name=name, w8a16=w8a16)
         self.reduce = PreparedAllReduce(s.output, scratch.output, runtime=runtime, coordinator=coordinator,
                                        session=session, name=name + ".reduce") if reduce_output else None
 
@@ -209,7 +235,8 @@ class PreparedDraft:
     leaves each rank's vocabulary shard in the local logits for sharded proposals."""
 
     def __init__(self, weights, scratch, metadata, pool, *, runtime, vocabulary_runtime, coordinator,
-                 session, name, workspace, gather_logits=True):
+                 session, name, workspace, gather_logits=True, w8a16=None):
+        weights = within_w8a16(weights, scratch.embedding.shape[0])
         self.weights, self.scratch, self.metadata = weights, scratch, metadata
         c = weights.config.draft
         self.embedding = PreparedEmbedding(weights.embedding, metadata.token_ids, scratch.embedding,
@@ -224,10 +251,10 @@ class PreparedDraft:
             torch.nn.Module.__init__(layer)
             layer.self_attn = DraftAttention(index, layer_weights, c, scratch, metadata, pool,
                 runtime=runtime, coordinator=coordinator, session=session, name=f"{name}.layer{index}.attention",
-                workspace=workspace, reduce_output=not self.fused)
+                workspace=workspace, reduce_output=not self.fused, w8a16=w8a16)
             layer.mlp = DraftMLP(layer_weights.mlp, scratch, runtime=runtime, coordinator=coordinator,
                                 session=session, name=f"{name}.layer{index}.mlp", workspace=workspace,
-                                reduce_output=not self.fused)
+                                reduce_output=not self.fused, w8a16=w8a16)
             layer.input_layernorm = canonical_norm(Qwen3RMSNorm, layer_weights.input_norm, c.text["rms_norm_eps"])
             layer.post_attention_layernorm = canonical_norm(Qwen3RMSNorm, layer_weights.post_attention_norm,
                                                             c.text["rms_norm_eps"])
@@ -297,9 +324,18 @@ class SpeculativePreparation:
                                 else ContextBuffers.allocate(weights, context_tokens, pool.backing.device))
         # A candidate channel proposes from each rank's draft vocabulary shard instead of gathered logits.
         self.draft_candidates = draft_candidates
+        # Block-FP8 draft weights run as W8A16 GEMVs whose split-K scratch every graph shares:
+        # all draft and context projections run in stream order on the main stream.
+        draft = weights.draft_w8a16 if getattr(weights, "draft_w8a16", None) is not None else weights.draft
+        self.w8a16_workspace = None
+        if not isinstance(draft.projection, torch.Tensor):
+            from ignition.components.w8a16_gemv import W8A16Workspace
+
+            self.w8a16_workspace = W8A16Workspace(draft.projection_shapes, pool.backing.device)
         self.forwards = DraftForwards(PreparedDecoder,
-            partial(PreparedContext, runtime=context_runtime, coordinator=coordinator, buffers=self.context_buffers),
-            partial(PreparedDraft, gather_logits=draft_candidates is None))
+            partial(PreparedContext, runtime=context_runtime, coordinator=coordinator, buffers=self.context_buffers,
+                    w8a16=self.w8a16_workspace),
+            partial(PreparedDraft, gather_logits=draft_candidates is None, w8a16=self.w8a16_workspace))
         self.rng = SpeculativeRngState.allocate(pool.backing.device, capacity=requests.capacity)
         self.generation, self.offset = torch.zeros_like(requests.generation), torch.zeros_like(requests.generation)
         self.block_size, self.logit_offset = weights.config.draft.block_size, 1
