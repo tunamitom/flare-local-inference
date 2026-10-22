@@ -53,6 +53,7 @@ from ignition.preparation.tuning import RecordedPreparationSession
 from ignition.preparation.tuning_replicas import TuningReplica
 from ignition.progress import phase
 
+from .config import ModelConfig
 from .recipe import RECIPE
 from .decoder import PreparedDecoder, Scratch
 from .dflash import SpeculativePreparation
@@ -74,6 +75,10 @@ ONESHOT_MAX_TOKENS = 64
 # `flare serve --quantized-activation-min-tokens` picks the threshold at load (0 serves pure A16).
 # FLARE_MIMO_A4_PREFILL_MIN_TOKENS=0 exports pure A16 without the A4 variants.
 A4_PREFILL_MIN_TOKENS = 512
+# With CSF expert scales, b12x's W4A16 kernels read compressed scales inline, skipping the shared
+# expansion that the MXFP4 A4 prefill kernel reads, for calls of at most 16 routed rows per expert
+# (768 MiMo tokens). A4 variants start at the first prefill capacity past that window.
+CSF_A4_PREFILL_MIN_TOKENS = 1024
 
 
 @dataclass(frozen=True)
@@ -108,8 +113,11 @@ class PreparationConfig:
     # A4/A16 hybrid: prefill graphs of at least this many tokens are captured twice, with BF16 and
     # with dynamic MXFP4 (E8M0 per-32) activations over the same packed expert weights, and the
     # package serves MXFP4 from this capacity by default. Decode and verification graphs stay
-    # below it; zero prepares pure A16 (FLARE_MIMO_A4_PREFILL_MIN_TOKENS=0 at export).
-    a4_prefill_min_tokens: int = A4_PREFILL_MIN_TOKENS
+    # below it; zero prepares pure A16 (FLARE_MIMO_A4_PREFILL_MIN_TOKENS=0 at export). None selects
+    # the default for the expert scale encoding.
+    a4_prefill_min_tokens: int | None = None
+    # "csf" keeps routed expert block scales losslessly compressed and expands them per MoE call.
+    expert_scale_compression: str | None = None
 
     @property
     def a4_prefill(self):
@@ -119,6 +127,11 @@ class PreparationConfig:
         from ignition.components.capacity import image_capacity
 
         object.__setattr__(self, "image_concurrency", image_capacity(self.max_active, self.image_concurrency))
+        if self.expert_scale_compression not in (None, "csf"):
+            raise ValueError("MiMo expert scale compression must be None or 'csf'")
+        if self.a4_prefill_min_tokens is None:
+            object.__setattr__(self, "a4_prefill_min_tokens", A4_PREFILL_MIN_TOKENS
+                               if self.expert_scale_compression is None else CSF_A4_PREFILL_MIN_TOKENS)
         if (
             len(self.devices) not in (2, 4, 8)
             or len(set(self.devices)) != len(self.devices)
@@ -185,6 +198,11 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     if config.a4_prefill:
         if config.a4_prefill_min_tokens <= config.decode_tokens:
             raise ValueError("A4 prefill must stay above every decode and verification graph")
+        if config.expert_scale_compression is not None:
+            text = ModelConfig.load(snapshot).text
+            if config.a4_prefill_min_tokens * text["num_experts_per_tok"] <= 16 * text["n_routed_experts"]:
+                raise ValueError("A4 prefill over CSF expert scales must route more than 16 rows per expert;"
+                                 f" use at least {CSF_A4_PREFILL_MIN_TOKENS} tokens")
         if importlib.util.find_spec("b12x.moe._shared.kernels.w4a16.mxfp4_a4_prefill") is None:
             raise ValueError("A4 prefill requires patches/b12x-mxfp4-a4-prefill.patch in the installed b12x")
         # b12x compiles MXFP4 launches for expert plans of at least this many tokens; each prefill
@@ -195,7 +213,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     weights = ModelWeights.load(manifest, device, shard=shard, progress=progress, dflash=config.dflash,
                                 expert_activation=config.expert_activation,
                                 draft_weight_format=config.draft_weight_format,
-                                draft_requests=config.request_capacity)
+                                draft_requests=config.request_capacity,
+                                expert_scale_compression=config.expert_scale_compression)
     release_unused()
     sequence = torch.zeros(1, dtype=torch.int64, device=device)
     with phase(progress, "Allocate model state and collectives"):
@@ -593,6 +612,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         "weights_bytes": weights.allocated_bytes,
         "mapped_host_bytes": 0,
         "offloaded_bytes": 0,
+        "expert_scale_compression": config.expert_scale_compression,
         "continuation_bytes": pool.backing.nbytes,
         "preparation_state_rows": int(pool.memory_capacity[0].item()),
         "preparation_state_bytes": int(pool.memory_capacity[0].item()) * layout.row_bytes,
