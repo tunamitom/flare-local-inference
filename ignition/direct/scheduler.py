@@ -35,6 +35,8 @@ from types import MappingProxyType
 
 import numpy as np
 
+from ignition.preparation.execution import quantized_variant_selected
+
 from .policy import Accounting, Policy
 
 INACTIVE, RUNNING, FINISHED, ERROR = 0, 1, 2, 3
@@ -91,7 +93,8 @@ class Layout:
         graphs = {}
         for name, signature in model.signatures.items():
             if (signature.kind in ("init", "restore", "snapshot", "prefill", "decode", "resume", "speculative", "packed_speculative")
-                    and signature.speculation_enabled in (None, speculative)):
+                    and signature.speculation_enabled in (None, speculative)
+                    and quantized_variant_selected(signature.quantized_activations, signature.token_capacity, config)):
                 key = (signature.kind, signature.batch_capacity, signature.token_capacity)
                 if signature.kind == "packed_speculative":
                     key += (signature.packed_token_capacity, signature.draft_tokens)
