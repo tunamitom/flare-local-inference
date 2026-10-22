@@ -88,3 +88,47 @@ def test_a4_prefill_variants_follow_the_export_threshold():
     assert PreparationConfig(dflash=True).a4_prefill
     assert not PreparationConfig(dflash=True, a4_prefill_min_tokens=0).a4_prefill
     assert not PreparationConfig(dflash=True, expert_activation="a8").a4_prefill
+
+
+def test_draft_weight_format_defaults_to_w8a16_and_keeps_bf16_above_32_rows():
+    from ignition.recipes.mimo_v2.bootstrap import PreparationConfig
+    from ignition.recipes.mimo_v2.draft_weights import DraftWeights
+
+    assert PreparationConfig(dflash=True).draft_weight_format == "w8a16"
+    with pytest.raises(ValueError, match="w8a16 or bf16"):
+        PreparationConfig(dflash=True, draft_weight_format="fp8")
+    draft = SimpleNamespace(block_size=8)
+    assert DraftWeights.serving_format("w8a16", draft, 4) == "w8a16"
+    assert DraftWeights.serving_format("w8a16", draft, 8) == "bf16"
+    assert DraftWeights.serving_format("bf16", draft, 1) == "bf16"
+
+
+def test_draft_block_fp8_conversion_keeps_shard_blocks_and_shapes():
+    from ignition.components.block_fp8 import BlockFP8Weight
+    from ignition.components.weights import MLPWeights
+    from ignition.recipes.mimo_v2.draft_weights import DraftLayerWeights, DraftWeights
+
+    generator = torch.Generator().manual_seed(3)
+
+    def matrix(n, k):
+        return torch.randn((n, k), generator=generator).to(torch.bfloat16)
+
+    layer = DraftLayerWeights(matrix(384, 256), matrix(256, 256), *(torch.ones(128),) * 2, None,
+                              *(torch.ones(256),) * 2, MLPWeights(matrix(512, 256), matrix(256, 256)))
+    weights = DraftWeights(matrix(128, 640), torch.ones(256), matrix(256, 256), torch.ones(256),
+                           torch.zeros(256, dtype=torch.bfloat16), (layer,))
+    converted = weights.block_fp8()
+    for before, after in ((weights.projection, converted.projection), (weights.context_kv, converted.context_kv),
+                          (layer.qkv, converted.layers[0].qkv), (layer.mlp.down, converted.layers[0].mlp.down)):
+        assert isinstance(after, BlockFP8Weight) and after.values.shape == before.shape
+        assert after.scales.shape == (before.shape[0] // 128, before.shape[1] // 128)
+        restored = after.values.float().view(-1, 128, before.shape[1] // 128, 128) * after.scales[:, None, :, None]
+        error = (restored.view(before.shape) - before.float()).norm() / before.float().norm()
+        assert error < 0.04
+    # Quantizing a row shard equals the matching rows of the whole matrix's quantization.
+    from ignition.components.w8a16_gemv import quantize_block_fp8
+
+    full, shard = quantize_block_fp8(layer.qkv), quantize_block_fp8(layer.qkv[128:256])
+    assert torch.equal(full.values[128:256].view(torch.uint8), shard.values.view(torch.uint8))
+    assert torch.equal(full.scales[1:2], shard.scales)
+    assert converted.projection_shapes == ((128, 640), (256, 256), (384, 256), (512, 256))
