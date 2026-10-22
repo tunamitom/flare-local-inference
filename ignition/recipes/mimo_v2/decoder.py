@@ -26,9 +26,12 @@ class Scratch:
     hidden: torch.Tensor
     local_logits: torch.Tensor
     logits: torch.Tensor
+    # Target-layer features the DFlash context projects within the same graph; graphs replay
+    # serially, so one row-sliced plane serves every capacity (zero columns without drafting).
+    auxiliary: torch.Tensor
 
     @classmethod
-    def allocate(cls, config, shard, tokens, samples, device, *, buffers=None):
+    def allocate(cls, config, shard, tokens, samples, device, *, buffers=None, auxiliary_columns=0):
         from ignition.preparation.scratch import GraphBufferPool
 
         c = config.text
@@ -46,12 +49,12 @@ class Scratch:
         buffers.join(attn, ffn)
         return cls(embedding, normalized, attention, dense, router_logits, router, reduced,
             zeros(samples, c["hidden_size"]), zeros(samples, c["vocab_size"] // shard.world_size),
-            zeros(samples, c["vocab_size"]))
+            zeros(samples, c["vocab_size"]), zeros(tokens, auxiliary_columns))
 
     def rows(self, tokens, samples):
         return type(self)(self.embedding[:tokens], self.normalized[:tokens], self.attention.rows(tokens),
             self.dense.rows(tokens), self.router_logits[:tokens], self.router.rows(tokens), self.reduced[:tokens],
-            self.hidden[:samples], self.local_logits[:samples], self.logits[:samples])
+            self.hidden[:samples], self.local_logits[:samples], self.logits[:samples], self.auxiliary[:tokens])
 
 
 class PreparedFeedForward(torch.nn.Module):
@@ -118,8 +121,11 @@ class PreparedDecoder:
             self.layers.append(layer.eval())
         self.norm = canonical_norm(norm_type, weights.norm, c["layernorm_epsilon"])
         self.target_layers = () if weights.draft is None else weights.config.draft.target_layers
-        self.auxiliary = torch.zeros((scratch.embedding.shape[0], len(self.target_layers) * c["hidden_size"]),
-                                     dtype=torch.bfloat16, device=scratch.embedding.device)
+        # Graphs prepared without drafting (the -no-mtp variants) take no auxiliary columns.
+        columns = len(self.target_layers) * c["hidden_size"]
+        if scratch.auxiliary.shape[0] != scratch.embedding.shape[0] or scratch.auxiliary.shape[1] < columns:
+            raise ValueError("decoder scratch must carry one auxiliary column block per draft target layer")
+        self.auxiliary = scratch.auxiliary[:, :columns]
         self.scoring = None if scoring is None else scoring.prepare(scratch.embedding, weights.head,
             vocabulary=weights.config.text["vocab_size"], session=session, coordinator=coordinator,
             name=name + ".prompt", copy_source=True)
