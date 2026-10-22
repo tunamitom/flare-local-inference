@@ -110,7 +110,7 @@ class PreparedRoutedExperts:
 
     def __init__(self, source, experts, ids, weights, output, *, session: PreparationSession, name: str,
                  workspace: ScratchArena | torch.Tensor | None = None, router_plan=None,
-                 a4_prefill=False, routing=None):
+                 a4_prefill=None, routing=None):
         # b12x owns the final weight/scale planes after repacking. Classify those
         # exact tensors, not opaque execution scratch or the discarded source.
         for field in ("w1_fp4", "w2_fp4", "w1_blockscale", "w2_blockscale",
@@ -136,7 +136,8 @@ class PreparedRoutedExperts:
             for plane in decoder.indexed_scales or ():
                 record_numeric_tensor(plane.storage)
         # A16 experts prepared with A4 capability run large prefill calls with quantized activations.
-        precision = {"a4_prefill": True} if a4_prefill else {}
+        # True or False selects the activation precision for every call; None leaves it to b12x.
+        precision = {} if a4_prefill is None else {"a4_prefill": a4_prefill}
         self.source = source
         self.output = output
         self.scratch = None
