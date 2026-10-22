@@ -183,3 +183,79 @@ def stages(key_history, staged_key, value_history, staged_value, keys, values):
             and staged_key.dtype == staged_value.dtype
             and all(t.is_contiguous() for t in (key_history, staged_key, value_history, staged_value, keys, values))
             and key_history.shape[1] == value_history.shape[1])
+
+
+@triton.jit
+def _commit(Backing, row_bytes, KeyOffsets, ValueOffsets, Keys, Values, key_layer_stride, value_layer_stride,
+            Positions, Starts, Requests, Counts, StateRows, window,
+            KEY: tl.constexpr, VALUE: tl.constexpr, BLOCK: tl.constexpr):
+    token, layer = tl.program_id(0), tl.program_id(1)
+    position = tl.load(Positions + token)
+    request = tl.load(Requests + token)
+    if (position >= 0) & (position - tl.load(Starts + request) < tl.load(Counts + request)):
+        base = Backing + tl.load(StateRows + request).to(tl.int64) * row_bytes
+        slot = position % window
+        lanes = tl.arange(0, BLOCK)
+        for kind in tl.static_range(2):
+            if kind == 0:
+                width = KEY
+                source = Keys + layer.to(tl.int64) * key_layer_stride + token * KEY
+                target = base + tl.load(KeyOffsets + layer) + slot * KEY
+            else:
+                width = VALUE
+                source = Values + layer.to(tl.int64) * value_layer_stride + token * VALUE
+                target = base + tl.load(ValueOffsets + layer) + slot * VALUE
+            live = lanes < width
+            # Triton's FP32 to E4M3 conversion saturates finite values and keeps NaN, as b12x's
+            # paged KV write does at unit scale.
+            values = tl.load(source + lanes, mask=live, other=0.0).to(tl.float32).to(tl.float8e4nv)
+            tl.store(target.to(tl.pointer_type(tl.float8e4nv)) + lanes, values, mask=live)
+
+
+@torch.library.custom_op("flare::mimo_commit_windows", mutates_args=("backing",))
+def _commit_windows(backing: torch.Tensor, key_offsets: torch.Tensor, value_offsets: torch.Tensor,
+                    keys: torch.Tensor, values: torch.Tensor, positions: torch.Tensor, starts: torch.Tensor,
+                    requests: torch.Tensor, counts: torch.Tensor, state_rows: torch.Tensor, window: int) -> None:
+    key, value = keys[0, 0].numel(), values[0, 0].numel()
+    _commit[(keys.shape[1], keys.shape[0])](backing, backing.stride(0), key_offsets, value_offsets, keys, values,
+        keys.stride(0), values.stride(0), positions, starts, requests, counts, state_rows, window,
+        KEY=key, VALUE=value, BLOCK=triton.next_power_of_2(max(key, value)), num_warps=1)
+
+
+@_commit_windows.register_fake
+def _fake_commit_windows(backing, key_offsets, value_offsets, keys, values, positions, starts, requests, counts,
+                         state_rows, window):
+    pass
+
+
+class WindowCommit:
+    """Every sliding layer's accepted verification rows into its circular history, in one launch.
+
+    Matches one b12x paged KV write per layer (unit scales) over the slots ``PreparedAttention.commit``
+    computes: rows of each request before its accepted count land at ``position % window`` of its state
+    row. Sliding histories are regions of one reserved backing, addressed by byte offsets.
+    """
+
+    def __init__(self, pool, layers, keys, values, metadata, window):
+        device = keys.device
+        regions = [(pool.layout.region(f"layer{i}.key"), pool.layout.region(f"layer{i}.value")) for i in layers]
+        self.backing, self.metadata, self.window = pool.reserved_backing, metadata, window
+        self.keys, self.values = keys, values
+        self.key_offsets = torch.tensor([k.offset for k, _ in regions], dtype=torch.int64, device=device)
+        self.value_offsets = torch.tensor([v.offset for _, v in regions], dtype=torch.int64, device=device)
+
+    @staticmethod
+    def serves(pool, layers, keys, values, window):
+        if not layers or getattr(pool, "reserved_backing", None) is None or pool.reserved_backing.dtype != torch.uint8:
+            return False
+        for i in layers:
+            for kind, rows in (("key", keys), ("value", values)):
+                region = pool.layout.region(f"layer{i}.{kind}")
+                if (region.dtype != torch.float8_e4m3fn or tuple(region.shape) != (window, *rows.shape[2:])):
+                    return False
+        return keys.is_contiguous() and values.is_contiguous() and keys.dtype == values.dtype == torch.bfloat16
+
+    def __call__(self, counts):
+        m = self.metadata
+        torch.ops.flare.mimo_commit_windows(self.backing, self.key_offsets, self.value_offsets, self.keys,
+            self.values, m.positions, m.starts, m.requests, counts, m.state_rows, self.window)
