@@ -493,6 +493,33 @@ impl Frontend {
         self.render_jinja(messages, options)
     }
 
+    /// Drops the last message-end boundary when the generation prompt begins the rendered reply:
+    /// the next turn then restores the prompt endpoint, which already covers the last message, so
+    /// stopping at the message end would only cost a separate prefill pass over the generation
+    /// prompt. Templates whose replies do not begin with the generation prompt, such as ones that
+    /// strip reasoning from history, keep it.
+    pub fn skip_replied_message_end(
+        &self,
+        messages: &[Json],
+        options: &Map<String, Json>,
+        rendered: &mut RenderedPrompt,
+    ) {
+        let Some(&end) = rendered.message_boundaries.last() else { return };
+        if end >= rendered.token_ids.len() {
+            return;
+        }
+        let mut replied = messages.to_vec();
+        replied.push(serde_json::json!({"role": "assistant", "content": "OK"}));
+        let mut options = options.clone();
+        options.insert("add_generation_prompt".into(), false.into());
+        options.insert("continue_final_message".into(), false.into());
+        if self.render_chat(&replied, &options).is_ok_and(|reply| {
+            reply.token_ids.len() > rendered.token_ids.len() && reply.token_ids.starts_with(&rendered.token_ids)
+        }) {
+            rendered.message_boundaries.pop();
+        }
+    }
+
     fn render_jinja(
         &self,
         messages: &[Json],
