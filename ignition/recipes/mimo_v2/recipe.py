@@ -1,5 +1,6 @@
 """MiMo V2.6 Pro MOPD text, DFlash and image preparation."""
 
+import os
 from types import MappingProxyType
 
 from ignition.planning import HEADROOM_BYTES
@@ -13,6 +14,8 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
     speculation = plan.speculation
     drafting = {} if speculation is None else {
         "speculative_widths": speculation.widths, "speculative_token_capacity": plan.speculative_token_capacity, "speculative_fixed_width": speculation.fixed_width}
+    hybrid = {} if "FLARE_MIMO_A4_PREFILL_MIN_TOKENS" not in os.environ else {
+        "a4_prefill_min_tokens": int(os.environ["FLARE_MIMO_A4_PREFILL_MIN_TOKENS"])}
     config = PreparationConfig(prompt_logprobs=plan.prompt_logprobs,
         compile_workers=plan.compile_workers, tuning_replica=plan.tuning_replica,
         devices=tuple(range(plan.world_size)), compile_decoder=compile_forwards,
@@ -20,7 +23,7 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         prefill_chunk_size=plan.prefill_chunk,
         snapshot_budget_bytes=plan.snapshots * plan.costs.state_row_bytes,
         headroom_bytes=HEADROOM_BYTES + plan.reserve_bytes, kernel_cache=kernel_cache,
-        dflash=speculation is not None, **drafting)
+        dflash=speculation is not None, **drafting, **hybrid)
     return prepare_group(snapshot, config, prepare_rank, progress=progress, package_storage=package_storage)
 
 
