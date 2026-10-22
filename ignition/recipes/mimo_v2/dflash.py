@@ -1,6 +1,6 @@
 """Captured DFlash context projections and noncausal parallel proposals."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from functools import partial
 
 import torch
@@ -23,30 +23,57 @@ def inverse_frequencies(geometry, device):
         dtype=torch.float32, device=device) / geometry.rotary_dim))
 
 
+@dataclass(frozen=True)
+class ContextBuffers:
+    """Context projection planes for the largest graph; graphs replay serially and slice rows."""
+
+    local: torch.Tensor
+    projected: torch.Tensor
+    kv: torch.Tensor
+    key: torch.Tensor
+    value: torch.Tensor
+    slots: torch.Tensor
+
+    @classmethod
+    def allocate(cls, weights, tokens, device, dtype=torch.bfloat16):
+        c, a = weights.config.draft, weights.config.draft.attention
+        _, kv_heads = a.local(weights.shard)
+        hidden = c.text["hidden_size"]
+        return cls(torch.zeros((tokens, hidden // weights.shard.world_size), dtype=dtype, device=device),
+                   torch.zeros((tokens, hidden), dtype=dtype, device=device),
+                   torch.zeros((tokens, weights.draft.context_kv.shape[0]), dtype=dtype, device=device),
+                   torch.zeros((tokens, kv_heads, a.key_dim), dtype=dtype, device=device),
+                   torch.zeros((tokens, kv_heads, a.value_dim), dtype=dtype, device=device),
+                   torch.full((tokens,), -1, dtype=torch.int64, device=device))
+
+    def rows(self, tokens):
+        if tokens > self.slots.shape[0]:
+            raise ValueError("context graph exceeds the shared context capacity")
+        return type(self)(*(getattr(self, f.name)[:tokens] for f in fields(self)))
+
+
 class PreparedContext:
     """Project accepted target features once into all draft layers' context K/V."""
 
-    def __init__(self, weights, auxiliary, metadata, pool, *, session, name, workspace, runtime, coordinator):
+    def __init__(self, weights, auxiliary, metadata, pool, *, session, name, workspace, runtime, coordinator,
+                 buffers=None):
         self.metadata, self.pool = metadata, pool
         c, a = weights.config.draft, weights.config.draft.attention
         self.window = a.window
         self.value_scale = c.text["dflash_config"].get("attention_value_scale", 1.)
         tokens, device = auxiliary.shape[0], auxiliary.device
-        heads, kv_heads = a.local(weights.shard)
-        hidden = c.text["hidden_size"]
-        self.local = torch.zeros((tokens, hidden // weights.shard.world_size), dtype=auxiliary.dtype, device=device)
-        self.projected = torch.zeros((tokens, hidden), dtype=auxiliary.dtype, device=device)
+        planes = (ContextBuffers.allocate(weights, tokens, device, auxiliary.dtype) if buffers is None
+                  else buffers.rows(tokens))
+        self.local, self.projected = planes.local, planes.projected
         self.project = UnquantizedProjection(auxiliary, weights.draft.projection, self.local,
                                              session=session, name=name + ".project")
         self.gather = PreparedAllGather(self.local, self.projected, runtime=runtime, coordinator=coordinator,
                                        session=session, name=name + ".gather")
         self.norm = canonical_norm(Qwen3RMSNorm, weights.draft.hidden_norm, c.text["rms_norm_eps"])
-        self.kv = torch.zeros((tokens, weights.draft.context_kv.shape[0]), dtype=auxiliary.dtype, device=device)
+        self.kv = planes.kv
         self.project_kv = UnquantizedProjection(self.projected, weights.draft.context_kv, self.kv,
                                                session=session, name=name + ".kv")
-        self.key = torch.zeros((tokens, kv_heads, a.key_dim), dtype=auxiliary.dtype, device=device)
-        self.value = torch.zeros((tokens, kv_heads, a.value_dim), dtype=auxiliary.dtype, device=device)
-        self.slots = torch.full((tokens,), -1, dtype=torch.int64, device=device)
+        self.key, self.value, self.slots = planes.key, planes.value, planes.slots
         self.inverse = inverse_frequencies(a, device)
         self.stages = []
         for index, layer in enumerate(weights.draft.layers):
@@ -211,7 +238,7 @@ class DraftForwards:
 
 class SpeculativePreparation:
     def __init__(self, weights, canonical, pool, requests, inputs, scratch, *, completion, frame, sequence,
-                 session, workspace, runtime, vocabulary_runtime, context_runtime, coordinator):
+                 session, workspace, runtime, vocabulary_runtime, context_runtime, coordinator, context_tokens=None):
         from .pool import PAGE_TOKENS
 
         self.page_tokens = PAGE_TOKENS
@@ -221,8 +248,11 @@ class SpeculativePreparation:
         self.session, self.workspace = session, workspace
         self.collectives = dict(runtime=runtime, vocabulary_runtime=vocabulary_runtime, coordinator=coordinator)
         self.markov_runtime = None
+        # Every prefill and verification graph projects its context through one shared set of planes.
+        self.context_buffers = (None if context_tokens is None
+                                else ContextBuffers.allocate(weights, context_tokens, pool.backing.device))
         self.forwards = DraftForwards(PreparedDecoder,
-            partial(PreparedContext, runtime=context_runtime, coordinator=coordinator))
+            partial(PreparedContext, runtime=context_runtime, coordinator=coordinator, buffers=self.context_buffers))
         self.rng = SpeculativeRngState.allocate(pool.backing.device, capacity=requests.capacity)
         self.generation, self.offset = torch.zeros_like(requests.generation), torch.zeros_like(requests.generation)
         self.block_size, self.logit_offset = weights.config.draft.block_size, 1
