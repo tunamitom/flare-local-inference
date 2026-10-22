@@ -122,11 +122,12 @@ class W8A16Gemv:
     """``out[m, n] = sum_kb (x[m, kb] . w[n, kb]) * scales[n // 128, kb]`` for a fixed shape.
 
     ``x`` is (rows, K) BF16, ``w`` is (N, K) E4M3, ``scales`` is (ceil(N/128), K/128) FP32,
-    output is (rows, N) BF16.  Owns its split-K workspace, so one instance must not be
-    launched concurrently on two streams.
+    output is (rows, N) BF16.  Owns its split-K workspace, or binds a shared W8A16Workspace,
+    so one instance must not be launched concurrently on two streams.
     """
 
-    def __init__(self, rows: int, n: int, k: int, device, config: W8A16Config | None = None):
+    def __init__(self, rows: int, n: int, k: int, device, config: W8A16Config | None = None, *,
+                 workspace=None):
         if not 1 <= rows <= MAX_ROWS or k % BLOCK or n <= 0:
             raise ValueError("W8A16 GEMV needs 1..32 rows and K a multiple of 128")
         self.rows, self.n, self.k = rows, n, k
@@ -140,9 +141,20 @@ class W8A16Gemv:
         self.split = triton.cdiv(blocks, self.blocks_per_split)
         tiles = triton.cdiv(n, self.config.block_n)
         self.grid = (tiles, self.split, 1)
-        self.partials = torch.empty((self.split, self.block_m, n) if self.split > 1 else (1,),
-                                    dtype=torch.float32, device=device)
-        self.counters = torch.zeros(tiles, dtype=torch.int32, device=device)
+        shape = (self.split, self.block_m, n) if self.split > 1 else (1,)
+        if workspace is None:
+            self.partials = torch.empty(shape, dtype=torch.float32, device=device)
+            self.counters = torch.zeros(tiles, dtype=torch.int32, device=device)
+        else:
+            self.partials, self.counters = workspace.bind(shape, tiles)
+
+    @staticmethod
+    def extent(rows: int, n: int, k: int, config: W8A16Config | None = None):
+        """FP32 partial elements and counters a launch of this shape uses."""
+        config = config or default_config(rows, n, k)
+        blocks = k // BLOCK
+        split = triton.cdiv(blocks, triton.cdiv(blocks, min(config.split, blocks)))
+        return (split * _block_m(rows) * n if split > 1 else 1), triton.cdiv(n, config.block_n)
 
     def args(self, x, w, scales, out):
         return (x, w, scales, out, self.partials, self.counters, x.shape[0])
@@ -175,3 +187,103 @@ class W8A16Gemv:
                 or out.dtype != torch.bfloat16 or out.shape != (x.shape[0], self.n)
                 or not all(t.is_contiguous() for t in (x, w, scales, out))):
             raise ValueError("W8A16 GEMV operand mismatch")
+
+
+def quantize_block_fp8(weight: torch.Tensor):
+    """E4M3 values with one FP32 scale, amax / 448, per 128x128 block of a BF16 (N, K) matrix.
+
+    The layout is BlockFP8Weight's: values (N, K), scales (ceil(N / 128), K / 128).  A ragged
+    last row block takes its scale over the rows present.
+    """
+    from ignition.components.block_fp8 import BlockFP8Weight
+
+    if weight.ndim != 2 or weight.dtype != torch.bfloat16 or weight.shape[1] % BLOCK:
+        raise ValueError("block-FP8 quantization takes BF16 matrices with K a multiple of 128")
+    n, k = weight.shape
+    row_blocks = triton.cdiv(n, BLOCK)
+    padded = torch.nn.functional.pad(weight.float(), (0, 0, 0, row_blocks * BLOCK - n))
+    blocks = padded.view(row_blocks, BLOCK, k // BLOCK, BLOCK)
+    amax = blocks.abs().amax(dim=(1, 3))
+    scales = torch.where(amax > 0, amax / 448, torch.ones_like(amax))
+    values = (blocks / scales[:, None, :, None]).clamp(-448, 448).to(torch.float8_e4m3fn)
+    return BlockFP8Weight(values.view(row_blocks * BLOCK, k)[:n].contiguous(), scales.contiguous())
+
+
+class W8A16Workspace:
+    """Split-K partials and arrival counters shared by W8A16 launches that run in stream order.
+
+    Each launch consumes its partials and re-arms its counters before the next launch on the
+    stream begins, so every projection and graph on one stream can share one workspace.  It is
+    sized for every row count up to MAX_ROWS of the given (N, K) shapes.  Counters must be zero
+    when no launch is in flight; zeroing the whole workspace, as package export does for
+    disposable storage, leaves it ready.
+    """
+
+    def __init__(self, shapes, device):
+        extents = [W8A16Gemv.extent(rows, n, k) for n, k in shapes for rows in range(1, MAX_ROWS + 1)]
+        if not extents:
+            raise ValueError("a W8A16 workspace needs at least one projection shape")
+        self.shapes = frozenset(shapes)
+        self.partials = torch.zeros(max(p for p, _ in extents), dtype=torch.float32, device=device)
+        self.counters = torch.zeros(max(t for _, t in extents), dtype=torch.int32, device=device)
+
+    def bind(self, shape, tiles):
+        count = 1
+        for size in shape:
+            count *= size
+        if count > self.partials.numel() or tiles > self.counters.numel():
+            raise ValueError("W8A16 launch exceeds its shared workspace")
+        return self.partials[:count].view(shape), self.counters[:tiles]
+
+    def scratch_tensors(self):
+        return (self.partials, self.counters)
+
+
+class W8A16Projection:
+    """``output = source @ dequantized(weight).T`` with BF16 rows and a block-FP8 weight.
+
+    Rows run as prepared W8A16 GEMV launches of at most MAX_ROWS rows each; larger sources
+    (prefill context projections) take one launch per row slice, each reading the whole weight.
+    Calls may pass any source with the prepared shape, such as a norm's fresh output.
+    """
+
+    def __init__(self, source, weight, output, *, session, name, workspace: W8A16Workspace):
+        from ignition.preparation.tensor_metadata import record_numeric_tensor
+        from ignition.preparation.tuning import register_finalizer
+
+        values, scales = weight.values, weight.scales
+        n, k = values.shape
+        rows = source.shape[0]
+        if (source.ndim != 2 or source.shape[1] != k or output.shape != (rows, n)
+                or source.dtype != torch.bfloat16 or output.dtype != torch.bfloat16
+                or not source.is_contiguous() or not output.is_contiguous() or rows == 0):
+            raise ValueError(f"W8A16 projection {name} requires contiguous BF16 rows matching its weight")
+        for tensor in (values, scales):
+            record_numeric_tensor(tensor)
+        self.weight, self.output, self.name = weight, output, name
+        self.shape = tuple(source.shape)
+        self.slices = tuple((start, min(rows, start + MAX_ROWS)) for start in range(0, rows, MAX_ROWS))
+        self.gemvs = tuple(W8A16Gemv(end - start, n, k, source.device, workspace=workspace)
+                           for start, end in self.slices)
+        self._source = source
+        self.launches = None
+        register_finalizer(session, self.prepare)
+
+    def prepare(self):
+        w, s = self.weight.values, self.weight.scales
+        self.launches = tuple(gemv.prepare(self._source[start:end], w, s, self.output[start:end])
+                              for gemv, (start, end) in zip(self.gemvs, self.slices))
+        self._source = None
+
+    def __call__(self, source):
+        from ignition.preparation.triton import launch_triton
+
+        if self.launches is None:
+            raise RuntimeError(f"W8A16 projection {self.name} must prepare before it runs")
+        if tuple(source.shape) != self.shape or not source.is_contiguous():
+            raise ValueError(f"W8A16 projection {self.name} requires contiguous {self.shape} sources")
+        w, s = self.weight.values, self.weight.scales
+        for gemv, launch, (start, end) in zip(self.gemvs, self.launches, self.slices):
+            launch_triton(launch.kernel, launch.compiled, gemv.args(source[start:end], w, s, self.output[start:end]),
+                          launch.grid, **launch.options)
+        return self.output
