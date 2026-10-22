@@ -168,11 +168,37 @@ pub fn message_boundaries(
     messages: &[Value],
     options: &Map<String, Value>,
 ) -> Vec<usize> {
+    message_boundaries_with_text(frontend, tokens, None, messages, options)
+}
+
+/// Message-end token positions of a rendered prompt. With the prompt text, each prefix is rendered as
+/// text only and placed on the prompt's single tokenization: a prefix that ends at a token edge beside
+/// an added token tokenizes to exactly those tokens, since added tokens split the text before the
+/// model's tokenizer runs. Other prefixes keep the exact re-tokenized comparison. This keeps the cost
+/// linear in prompt tokens rather than proportional to messages times tokens.
+pub fn message_boundaries_with_text(
+    frontend: &Frontend,
+    tokens: &[u32],
+    text: Option<&str>,
+    messages: &[Value],
+    options: &Map<String, Value>,
+) -> Vec<usize> {
     let mut options = options.clone();
     options.insert("add_generation_prompt".into(), false.into());
     options.insert("continue_final_message".into(), false.into());
+    let edges = text.and_then(|text| TokenEdges::new(frontend, text, tokens));
     let mut boundaries = Vec::with_capacity(messages.len());
     for count in 0..=messages.len() {
+        if let Some(edges) = &edges {
+            if let Some(Ok(prefix)) = frontend.render_boundary_text(&messages[..count], &options) {
+                if let Some(length) = edges.split_after(&prefix) {
+                    if length > 0 && length < tokens.len() {
+                        boundaries.push(length);
+                    }
+                    continue;
+                }
+            }
+        }
         let Ok(prefix) = frontend.render_boundary(&messages[..count], &options) else {
             continue;
         };
@@ -184,6 +210,45 @@ pub fn message_boundaries(
     boundaries.sort_unstable();
     boundaries.dedup();
     boundaries
+}
+
+/// One tokenization of the prompt text with byte spans and added-token flags.
+struct TokenEdges<'a> {
+    text: &'a str,
+    spans: Vec<(usize, usize)>,
+    added: Vec<bool>,
+}
+
+impl<'a> TokenEdges<'a> {
+    fn new(frontend: &Frontend, text: &'a str, tokens: &[u32]) -> Option<Self> {
+        let encoding = frontend.tokenizer().encode(text, false).ok()?;
+        if encoding.get_ids() != tokens {
+            return None;
+        }
+        let added_ids: std::collections::HashSet<u32> =
+            frontend.tokenizer().get_added_tokens_decoder().keys().copied().collect();
+        Some(Self {
+            text,
+            spans: encoding.get_offsets().to_vec(),
+            added: encoding.get_ids().iter().map(|id| added_ids.contains(id)).collect(),
+        })
+    }
+
+    /// The token count of a text prefix ending beside an added token; None when undecidable here.
+    fn split_after(&self, prefix: &str) -> Option<usize> {
+        let cut = prefix.len();
+        if !self.text.starts_with(prefix) {
+            return None;
+        }
+        if cut == 0 {
+            return Some(0);
+        }
+        let count = self.spans.partition_point(|&(_, end)| end <= cut);
+        let ends_here = count > 0 && self.spans[count - 1].1 == cut;
+        let beside_added = (count > 0 && self.added[count - 1])
+            || (count < self.spans.len() && self.added[count] && self.spans[count].0 == cut);
+        (ends_here && beside_added).then_some(count)
+    }
 }
 
 pub fn prepare_output(

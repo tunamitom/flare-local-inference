@@ -74,6 +74,17 @@ fn check_messages(frontend: &Frontend, messages: &[Value]) -> (Vec<u32>, Vec<usi
         messages,
         options.as_object().unwrap(),
     );
+    // Placing prefixes on the prompt's own tokenization finds exactly the re-tokenized boundaries.
+    assert_eq!(
+        flare_helios::model::message_boundaries_with_text(
+            frontend,
+            &rendered.token_ids,
+            Some(&rendered.text),
+            messages,
+            options.as_object().unwrap(),
+        ),
+        boundaries
+    );
     for count in 1..=messages.len() {
         let prefix = frontend
             .render_boundary(&messages[..count], &Map::new())
@@ -154,4 +165,21 @@ fn segmented_xtml_preserves_boundaries_before_seeded_assistant_and_later_turns()
     let (other, other_boundaries) = check_messages(&frontend, &changed);
     assert_eq!(boundaries[..3], other_boundaries[..3]);
     assert_eq!(tokens[..boundaries[2]], other[..other_boundaries[2]]);
+}
+
+#[test]
+fn added_token_delimited_templates_place_boundaries_on_the_prompt_tokenization() {
+    // MiMo/Qwen-style: every message closes with an added token, so each prefix ends beside one.
+    let frontend = frontend(
+        concat!(
+            "{% for m in messages %}<|open|>{{ m.role }}\n{{ m.content }}<|close|>{% endfor %}",
+            "{% if add_generation_prompt %}<|open|>assistant\n{% endif %}"
+        ),
+        TemplateEncoding::Text,
+    );
+    let messages: Vec<Value> = (0..40)
+        .map(|i| json!({"role": if i % 2 == 0 {"user"} else {"assistant"}, "content": format!("message {i} with text ").repeat(3)}))
+        .collect();
+    let (_, boundaries) = check_messages(&frontend, &messages);
+    assert_eq!(boundaries.len(), messages.len());
 }
