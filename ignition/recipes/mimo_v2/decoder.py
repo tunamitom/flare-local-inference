@@ -1,17 +1,25 @@
 """Canonical MiMo residual layers with prepared attention, experts and vocabulary shards."""
 
+import os
 from dataclasses import dataclass
 
 import torch
 
+from ignition.components.block_fp8 import BlockFP8Weight
 from ignition.components.collectives import PreparedAllReduce
 from ignition.components.embedding import PreparedEmbedding
+from ignition.components.l2_prefetch import L2Prefetcher
 from ignition.components.linear import UnquantizedProjection
 from ignition.components.mlp import MLPScratch, PreparedMLP
 from ignition.components.moe import PreparedRouter, PreparedRoutedExperts, RouterScratch
 from ignition.components.vocabulary import PreparedVocabularyProjection
 
 from .attention import AttentionScratch, PreparedAttention
+
+# Decode and verification graphs prefetch upcoming projection weights into L2 beside the
+# all-reduces, as the vLLM reference serves MiMo; FLARE_MIMO_L2_PREFETCH=0 at export disables it.
+L2_PREFETCH = os.environ.get("FLARE_MIMO_L2_PREFETCH", "1") != "0"
+L2_PREFETCH_MAX_TOKENS = 256
 
 
 @dataclass(frozen=True)
@@ -78,6 +86,8 @@ class PreparedFeedForward(torch.nn.Module):
                 router_plan=self.router.plan)
         self.reduction = PreparedAllReduce(output, scratch.reduced, runtime=runtime,
                                            coordinator=coordinator, session=session, name=name + ".reduce")
+        # (prefetcher, plan) issued after the experts, before their reduction.
+        self.prefetch = None
 
     def forward(self, hidden_states):
         self.scratch.normalized.copy_(hidden_states.reshape_as(self.scratch.normalized))
@@ -86,7 +96,45 @@ class PreparedFeedForward(torch.nn.Module):
         else:
             self.router(self.router_projection(self.scratch.normalized))
             output = self.experts()
+            if self.prefetch is not None:
+                self.prefetch[0].issue(self.prefetch[1])
         return self.reduction(output).view_as(hidden_states)
+
+
+def _projection_tensors(weight):
+    # Block-FP8 projections carry values and scales; BF16 ones are a single tensor.
+    return (weight.values, weight.scales) if isinstance(weight, BlockFP8Weight) else (weight,)
+
+
+_PREFETCH = {}
+
+
+def _shared_prefetch(weights, device):
+    """One side stream and one plan pair per layer for every decode and verification graph.
+
+    Window A (attention, after the QKV projection): this layer's output projection, router
+    and post-attention norm. Window C (after the experts, before their all-reduce): the next
+    layer's input norm and QKV projection.
+    """
+    key = (id(weights), device)
+    if key not in _PREFETCH:
+        prefetcher, layers = L2Prefetcher(device), weights.layers
+        plans = []
+        for index, layer in enumerate(layers):
+            attention = prefetcher.plan((*_projection_tensors(layer.output), layer.router, layer.post_attention_norm))
+            experts = None
+            if layer.experts is not None and index + 1 < len(layers):
+                experts = prefetcher.plan((layers[index + 1].input_norm, *_projection_tensors(layers[index + 1].qkv)))
+            plans.append((attention, experts))
+        _PREFETCH[key] = prefetcher, tuple(plans)
+    return _PREFETCH[key]
+
+
+def install_l2_windows(layers, plans, prefetcher):
+    for layer, (attention, experts) in zip(layers, plans):
+        layer.self_attn.prefetch = (prefetcher, attention)
+        if layer.mlp.experts is not None and experts is not None:
+            layer.mlp.prefetch = (prefetcher, experts)
 
 
 def canonical_norm(norm_type, weight, eps):
@@ -131,6 +179,10 @@ class PreparedDecoder:
             name=name + ".prompt", copy_source=True)
         self.head = PreparedVocabularyProjection(scratch.hidden, weights.head, scratch.local_logits, scratch.logits,
             runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head")
+        self.prefetcher = None
+        if L2_PREFETCH and mode != "prefill" and scratch.embedding.shape[0] <= L2_PREFETCH_MAX_TOKENS:
+            self.prefetcher, plans = _shared_prefetch(weights, scratch.embedding.device)
+            install_l2_windows(self.layers, plans, self.prefetcher)
 
     def __call__(self):
         hidden = self.embedding()
@@ -141,6 +193,8 @@ class PreparedDecoder:
             if index in self.target_layers:
                 column = self.target_layers.index(index) * hidden.shape[-1]
                 self.auxiliary[:, column:column + hidden.shape[-1]].copy_(hidden)
+        if self.prefetcher is not None:
+            self.prefetcher.join()
         if self.scoring is not None:
             self.scoring.source.copy_(self.norm(hidden))
             self.scoring()
