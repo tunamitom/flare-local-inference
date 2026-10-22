@@ -6,7 +6,7 @@ from types import MappingProxyType
 
 import torch
 
-from .execution import PreparedExecution
+from .execution import PreparedExecution, quantized_variant_selected
 
 
 class PreparedModel(PreparedExecution):
@@ -44,6 +44,9 @@ class PreparedModel(PreparedExecution):
         if fixed is not None and not all_variants:
             manifest["graphs"] = [graph for graph in manifest["graphs"]
                 if graph["kind"] not in ("speculative",) or graph["token_capacity"] in (1, fixed)]
+        if not all_variants:
+            manifest["graphs"] = [graph for graph in manifest["graphs"] if quantized_variant_selected(
+                graph.get("quantized_activations"), graph["token_capacity"], self.server_config)]
         if self._embedding_binding is not None and not all_variants:
             manifest["engram"] = self._embedding_binding
         return manifest

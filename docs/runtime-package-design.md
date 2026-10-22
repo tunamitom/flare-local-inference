@@ -534,6 +534,16 @@ preserve draft context. Selection removes unused variants before reading graph
 bodies; captured weights and storage remain shared. There are no standalone
 proposal or verification operations or separate packed-speculative operation.
 
+The optional `quantized_activations` field marks graphs captured in both
+activation precisions over the same weights: true for the variant that quantizes
+activations ahead of weight-quantized projections. Absent means the graph has a
+single precision. The serving contract's `quantized_activation_min_tokens` is the
+default token capacity from which loading keeps the quantized variant, and
+`--quantized-activation-min-tokens` overrides it; zero keeps every unquantized
+variant. Each marked graph requires its twin of the other precision, and loading
+keeps exactly one of the two per capacity. Older packages carry neither field and
+load unchanged.
+
 Unselected graph templates and executables are never reconstructed. Functions
 used only by omitted graphs are dropped, as are unused modules without globals.
 Modules with globals retain their persistent contents. Weights, MTP weights,

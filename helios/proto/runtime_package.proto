@@ -161,6 +161,10 @@ message ServingContract {
   // checkpoint; absent when the recipe declares none. Multiplied by steps per second it is the
   // memory bandwidth the model consumes, which integrated GPUs do not measure.
   optional uint64 decode_weight_bytes = 25;
+  // Default token capacity from which graphs captured in both activation precisions serve their
+  // quantized-activation variant; zero serves every such graph unquantized. Absent when no graph
+  // has activation precision variants.
+  optional uint64 quantized_activation_min_tokens = 26;
 }
 message ModelContract {
   uint32 version = 1;
@@ -701,6 +705,10 @@ message ExecutionGraph {
   uint64 packed_token_capacity = 13;
   // Number of confidence prefixes produced per request in the selected completion frame.
   uint32 confidence_width = 14;
+  // Present only on graphs captured in both activation precisions: true for the variant that
+  // quantizes activations ahead of weight-quantized projections. Loading keeps one variant per
+  // capacity; absent graphs have a single precision.
+  optional bool quantized_activations = 15;
 }
 enum DraftSource { NO_DRAFT = 0; MTP = 1; COPY_DRAFT = 2; }
 message InputBinding { string buffer_name = 1; uint64 host_offset = 2; uint64 nbytes = 3; }
