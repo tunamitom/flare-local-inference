@@ -137,7 +137,9 @@ class PreparedRoutedExperts:
             for plane in decoder.indexed_scales or ():
                 record_numeric_tensor(plane.storage)
         # A16 experts prepared with A4 capability run large prefill calls with quantized activations.
-        precision = {} if experts.plan.activation.outer_scale == "token" else {"a4_prefill": a4_prefill}
+        # True or False selects the activation precision for every call; None leaves it to b12x.
+        precision = ({} if experts.plan.activation.outer_scale == "token" or a4_prefill is None
+                     else {"a4_prefill": a4_prefill})
         self.source = source
         self.output = output
         self.output_source = output

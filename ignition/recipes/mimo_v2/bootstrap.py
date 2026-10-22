@@ -2,6 +2,7 @@
 
 import contextlib
 import hashlib
+import importlib.util
 import json
 import os
 from dataclasses import dataclass, replace
@@ -69,7 +70,9 @@ ONESHOT_MAX_TOKENS = 64
 # A4/A16 hybrid by default at the SM120 vLLM reference's threshold, so both engines run the same
 # expert path for each chunk size. On one TP8 MiMo expert layer MXFP4 activations measure 0.93x at
 # 512, 1.02x at 1024, 1.19x at 2048 and 1.62x at 8192 tokens; 512 is still above the 256-token
-# speculative capacity. FLARE_MIMO_A4_PREFILL_MIN_TOKENS=0 exports pure A16.
+# speculative capacity. Prefill graphs from this capacity are captured in both precisions, and
+# `flare serve --quantized-activation-min-tokens` picks the threshold at load (0 serves pure A16).
+# FLARE_MIMO_A4_PREFILL_MIN_TOKENS=0 exports pure A16 without the A4 variants.
 A4_PREFILL_MIN_TOKENS = 512
 
 
@@ -97,10 +100,15 @@ class PreparationConfig:
     speculative_graph_budget: int = 64
     # BF16 activations over MXFP4 experts (W4A16), as the SM120 vLLM reference serves MiMo.
     expert_activation: str = "a16"
-    # A4/A16 hybrid: A16 expert calls of at least this many tokens run dynamic MXFP4 (E8M0
-    # per-32) activations over the same packed weights. Decode and verification graphs stay
+    # A4/A16 hybrid: prefill graphs of at least this many tokens are captured twice, with BF16 and
+    # with dynamic MXFP4 (E8M0 per-32) activations over the same packed expert weights, and the
+    # package serves MXFP4 from this capacity by default. Decode and verification graphs stay
     # below it; zero prepares pure A16 (FLARE_MIMO_A4_PREFILL_MIN_TOKENS=0 at export).
     a4_prefill_min_tokens: int = A4_PREFILL_MIN_TOKENS
+
+    @property
+    def a4_prefill(self):
+        return self.expert_activation == "a16" and self.a4_prefill_min_tokens > 0
 
     def __post_init__(self):
         from ignition.components.capacity import image_capacity
@@ -174,10 +182,13 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         manifest = inspect_indexed_checkpoint(snapshot)
     transient = contextlib.ExitStack()
     transient.enter_context(package_storage.transient())
-    if config.expert_activation == "a16" and config.a4_prefill_min_tokens:
+    if config.a4_prefill:
         if config.a4_prefill_min_tokens <= config.decode_tokens:
             raise ValueError("A4 prefill must stay above every decode and verification graph")
-        # b12x reads the threshold while planning, binding and carving expert workspaces.
+        if importlib.util.find_spec("b12x.moe._shared.kernels.w4a16.mxfp4_a4_prefill") is None:
+            raise ValueError("A4 prefill requires patches/b12x-mxfp4-a4-prefill.patch in the installed b12x")
+        # b12x compiles MXFP4 launches for expert plans of at least this many tokens; each prefill
+        # graph's binding then selects its own activation precision.
         os.environ["B12X_W4A16_MXFP4_PREFILL_MIN_TOKENS"] = str(config.a4_prefill_min_tokens)
     else:
         os.environ.pop("B12X_W4A16_MXFP4_PREFILL_MIN_TOKENS", None)
@@ -319,21 +330,32 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         ipc=package_storage.peer_storage, runtime=collective, coordinator=coordinator)
     del manifest
     modes = (True, False) if config.dflash else (False,)
+
+    def precisions(mode, capacity):
+        # (quantized_activations, a4_prefill) per captured graph: prefill graphs from the A4 threshold
+        # are captured with both activation precisions, every other graph once with b12x's default.
+        if mode == "prefill" and config.a4_prefill and capacity >= config.a4_prefill_min_tokens:
+            return ((False, False), (True, True))
+        return ((None, None),)
+
     count = (
-        len(modes) * (prefill_graph_count(config.prefill_capacities, scoring) + 4 * len(config.batch_capacities))
+        len(modes) * sum(len(precisions(mode, capacity))
+                         for _, mode, capacities in prefill_modes(config.prefill_capacities, (), scoring)
+                         for capacity in capacities)
+        + len(modes) * 4 * len(config.batch_capacities)
         + len(config.speculative_round_shapes)
         + len(config.batch_capacities)
         + len(PATCH_CAPACITIES)
     )
     with phase(progress, "Construct graph catalog", total=count) as stage:
 
-        def add(name, forward, kind, rows, tokens, fields, *, enabled=None, packed_tokens=0):
+        def add(name, forward, kind, rows, tokens, fields, *, enabled=None, packed_tokens=0, quantized=None):
             if kind == "scored_prefill":
                 forward = PreparedScoredPrefill(forward, requests, inputs)
                 fields = (*fields, "prompt_target_tokens")
             forwards[name] = forward
             signatures[name] = GraphSignature(kind, rows, tokens, tuple(fields), speculation_enabled=enabled,
-                packed_token_capacity=packed_tokens)
+                packed_token_capacity=packed_tokens, quantized_activations=quantized)
             stage.update(advance=1)
 
         forward_inputs = (*inputs.buffers(), "sampling_grammar_mask")
@@ -343,60 +365,62 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             for kind, mode, capacities in prefill_modes(
                     config.prefill_capacities, () if enabled else config.batch_capacities, scoring):
                 for capacity in capacities:
-                    rows = 1 if mode == "prefill" else capacity
-                    name = f"{kind}{capacity}" + (suffix if mode == "prefill" else "")
-                    metadata[name] = Metadata.allocate(capacity, rows, blocks, device)
-                    storage = prefill_storage if mode == "prefill" else decoder_storage
-                    scratch[name] = storage.rows(capacity, rows)
-                    decoder = PreparedDecoder(
-                        mode_weights,
-                        environment,
-                        scratch[name],
-                        metadata[name],
-                        pool,
-                        mode=mode, scoring=scoring if kind == "scored_prefill" else None,
-                        runtime=prefill_collective if mode == "prefill" and capacity >= 1024 else collective,
-                        vocabulary_runtime=vocabulary_collective,
-                        coordinator=coordinator,
-                        session=session,
-                        name=name,
-                        workspace=arena,
-                    )
-                    batch = PreparedBatch(
-                        inputs,
-                        requests,
-                        metadata[name],
-                        mode=mode,
-                        shard=shard,
-                        pool=pool,
-                        validate_prefill=vision_state.validate_prefill if mode == "prefill" else None,
-                    )
-                    forward = PreparedGeneration(
-                        decoder,
-                        batch,
-                        completion,
-                        frame,
-                        sequence,
-                        runtime=collective,
-                        coordinator=coordinator,
-                        session=session,
-                        name=name + ".generation",
-                        workspace=arena,
-                        context_factory=None if speculation is None else speculation.forwards.context,
-                    )
-                    add(
-                        name,
-                        forward,
-                        mode,
-                        rows,
-                        capacity if mode == "prefill" else 1,
-                        (
-                            (*forward_inputs, *vision_prefill.buffers())
-                            if mode == "prefill"
-                            else forward_inputs
-                        ),
-                        enabled=enabled,
-                    )
+                    for quantized, a4_prefill in precisions(mode, capacity):
+                        rows = 1 if mode == "prefill" else capacity
+                        name = f"{kind}{capacity}" + ("-a4" if quantized else "") + (suffix if mode == "prefill" else "")
+                        metadata[name] = Metadata.allocate(capacity, rows, blocks, device)
+                        storage = prefill_storage if mode == "prefill" else decoder_storage
+                        scratch[name] = storage.rows(capacity, rows)
+                        decoder = PreparedDecoder(
+                            mode_weights,
+                            environment,
+                            scratch[name],
+                            metadata[name],
+                            pool,
+                            mode=mode, scoring=scoring if kind == "scored_prefill" else None, a4_prefill=a4_prefill,
+                            runtime=prefill_collective if mode == "prefill" and capacity >= 1024 else collective,
+                            vocabulary_runtime=vocabulary_collective,
+                            coordinator=coordinator,
+                            session=session,
+                            name=name,
+                            workspace=arena,
+                        )
+                        batch = PreparedBatch(
+                            inputs,
+                            requests,
+                            metadata[name],
+                            mode=mode,
+                            shard=shard,
+                            pool=pool,
+                            validate_prefill=vision_state.validate_prefill if mode == "prefill" else None,
+                        )
+                        forward = PreparedGeneration(
+                            decoder,
+                            batch,
+                            completion,
+                            frame,
+                            sequence,
+                            runtime=collective,
+                            coordinator=coordinator,
+                            session=session,
+                            name=name + ".generation",
+                            workspace=arena,
+                            context_factory=None if speculation is None else speculation.forwards.context,
+                        )
+                        add(
+                            name,
+                            forward,
+                            mode,
+                            rows,
+                            capacity if mode == "prefill" else 1,
+                            (
+                                (*forward_inputs, *vision_prefill.buffers())
+                                if mode == "prefill"
+                                else forward_inputs
+                            ),
+                            enabled=enabled,
+                            quantized=quantized,
+                        )
         if speculation is not None:
             from ignition.components.parallel_draft import PreparedParallelDraftRound
 
@@ -553,6 +577,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         "assets": assets,
         "model_contract": prepare_contract(signatures, buffers, pool, image_slots=config.image_concurrency, page_tokens=PAGE_TOKENS, draft_lag=0 if config.dflash else None, regions=cache_regions),
     }
+    if config.a4_prefill:
+        server_config["quantized_activation_min_tokens"] = config.a4_prefill_min_tokens
     memory = {
         "rank": rank,
         "world_size": shard.world_size,
