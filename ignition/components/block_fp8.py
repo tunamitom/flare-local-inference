@@ -43,8 +43,49 @@ def _fake_project(source, values, scales, handle):
     return source.new_empty((source.shape[0], values.shape[0]))
 
 
+# (row quantization, GEMV) program pairs of dependent projections, indexed by handle.
+_DEPENDENT_PROGRAMS = []
+
+
+@torch.library.custom_op("flare::block_fp8_dependent_projection", mutates_args=())
+def _project_dependent(source: torch.Tensor, values: torch.Tensor, scales: torch.Tensor,
+                       handle: int) -> torch.Tensor:
+    quantize, multiply = _DEPENDENT_PROGRAMS[handle]
+    rows, columns = source.shape
+    quantized = torch.empty((rows, columns), dtype=torch.float8_e4m3fn, device=source.device)
+    activation_scales = torch.empty((rows, columns // 128), dtype=torch.float32, device=source.device)
+    quantize(source, quantized, activation_scales)
+    output = source.new_empty((rows, values.shape[0]))
+    multiply(quantized, activation_scales, values, scales, output)
+    return output
+
+
+@_project_dependent.register_fake
+def _fake_project_dependent(source, values, scales, handle):
+    return source.new_empty((source.shape[0], values.shape[0]))
+
+
+def _dependent_programs(device, rows, n, k):
+    """Row quantization and GEMV that launch as programmatic dependents, or None for other shapes."""
+    from b12x.gemm.blockscaled._block_fp8_gemv import compile_block_fp8_gemv, supports
+    from b12x.gemm.blockscaled._block_fp8_row_quant import compile_block_fp8_row_quant
+
+    if not supports(rows, n, k):
+        return None
+    ordinal = device.index if device.index is not None else torch.cuda.current_device()
+    return compile_block_fp8_row_quant(ordinal, k, True), compile_block_fp8_gemv(ordinal, n, k, True)
+
+
 class BlockFP8Projection:
-    def __init__(self, source, weight, output=None, *, session, name):
+    """Block-FP8 projection of BF16 rows.
+
+    A ``dependent`` projection of at most eight rows quantizes and multiplies with
+    kernels launched as programmatic dependents: both launch while the preceding
+    kernel runs and the GEMV fetches its weights before waiting for it. They are
+    bit-identical to the default quantization and GEMV.
+    """
+
+    def __init__(self, source, weight, output=None, *, session, name, dependent=False):
         n, k = weight.values.shape
         if (source.ndim != 2 or source.shape[1] != k or source.dtype != torch.bfloat16
                 or weight.values.dtype != torch.float8_e4m3fn or weight.scales.dtype != torch.float32
@@ -61,6 +102,13 @@ class BlockFP8Projection:
             raise ValueError("block-FP8 output must match projection rows, columns, dtype and device")
         from .sm103 import is_sm103
 
+        self.dependent = None
+        if dependent and source.is_contiguous() and not is_sm103(source.device):
+            programs = _dependent_programs(source.device, source.shape[0], n, k)
+            if programs is not None:
+                self.dependent = len(_DEPENDENT_PROGRAMS)
+                _DEPENDENT_PROGRAMS.append(programs)
+                return
         if is_sm103(source.device):
             from .block_fp8_sm103 import plan
 
@@ -91,5 +139,8 @@ class BlockFP8Projection:
         declare(session, (self.plan.request(name=name, prepare_call=prepare, benchmark_call=prepare),))
 
     def __call__(self, source):
-        result = _project(source, self.weight.values, self.weight.scales, self.plan.handle)
+        if self.dependent is not None:
+            result = _project_dependent(source, self.weight.values, self.weight.scales, self.dependent)
+        else:
+            result = _project(source, self.weight.values, self.weight.scales, self.plan.handle)
         return result if self.output is None else self.output.copy_(result)

@@ -97,7 +97,10 @@ class PreparedAttention(torch.nn.Module):
             raise ValueError(f"unsupported MiMo attention mode: {mode}")
         self.mode, self.pool, self.layer = mode, pool, layer
         self.chunks = config.qkv_chunks(layer, shard)
-        self.projection = BlockFP8Projection(source, weights.qkv, session=session, name=name + ".qkv")
+        # Decode and verification rows follow the fused reduction and norm, which releases dependents
+        # at entry: the QKV GEMV then fetches its weights while that reduction waits on its peers.
+        self.projection = BlockFP8Projection(source, weights.qkv, session=session, name=name + ".qkv",
+                                             dependent=mode != "prefill")
         attended = scratch.attended.flatten(1)
         if isinstance(weights.output, BlockFP8Weight):
             self.output_projection = BlockFP8Projection(attended, weights.output, session=session, name=name + ".output")
