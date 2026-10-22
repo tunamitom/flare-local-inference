@@ -75,6 +75,11 @@ class PreparedAllReduce:
         import torch.distributed as dist
         from b12x.comm import pcie
 
+        from ignition.preparation.collectives import RoutedAllReduce
+
+        routed = runtime if isinstance(runtime, RoutedAllReduce) else None
+        if routed is not None:
+            runtime = routed.select(source)
         self.runtime, self.output = runtime, output
         # Traced forwards test this flag, never the runtime: compile workers see a runtime that
         # owns RDMA or IPC resources only as a placeholder.
@@ -83,7 +88,25 @@ class PreparedAllReduce:
             if source.shape != output.shape or source.dtype != output.dtype:
                 raise ValueError("a single-rank reduction copies its source into a matching output")
             return
-        if _roce(runtime):
+        if isinstance(runtime, pcie.PCIeTwoShotBF16):
+            # Reduce-scatter then all-gather BF16 column shards, accumulated in FP32 and rounded once.
+            from b12x.comm.pcie import _twoshot_preparation as twoshot
+
+            if (source.shape != output.shape or source.dtype != torch.bfloat16 or output.dtype != source.dtype
+                    or not source.is_contiguous() or not output.is_contiguous()):
+                raise ValueError("two-shot reductions require matching contiguous BF16 tensors")
+            self.plan = twoshot.plan(twoshot.query_from_metadata(runtime, surface="PCIeTwoShotBF16.all_reduce",
+                shape=tuple(source.shape), dtype=source.dtype), runtime=runtime)
+            group = runtime.exchange_group
+            if routed.twoshot_plan is None:
+                routed.twoshot_plan = self.plan
+
+            def prepare(state):
+                call = state.query.call
+                return PreparedCall(run=lambda: state.run(source, None, output, threads=call["threads"],
+                                                          block_limit=call["block_limit"]),
+                                    output=output, owners=(runtime, source, output))
+        elif _roce(runtime):
             if (source.shape != output.shape or source.dtype != torch.bfloat16 or output.dtype != source.dtype
                     or not source.is_contiguous() or not output.is_contiguous()
                     or not 0 < source.numel() * 2 <= max(runtime.max_size, runtime.pipe_bytes)
