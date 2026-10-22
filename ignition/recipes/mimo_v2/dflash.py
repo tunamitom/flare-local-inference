@@ -12,7 +12,7 @@ from ignition.components.linear import UnquantizedProjection
 from ignition.components.mlp import MLPScratch, PreparedMLP
 from ignition.components.paged_attention import PreparedPagedAttention, PreparedPagedKVWriter
 from ignition.components.speculation import SpeculativeRngState
-from ignition.components.vocabulary import PreparedVocabularyProjection
+from ignition.components.vocabulary import PreparedVocabularyProjection, vocabulary_shard_projection
 
 from .attention import partial_rotary, stage_windows
 from .decoder import PreparedDecoder, canonical_norm
@@ -125,7 +125,7 @@ class DraftScratch:
     logits: torch.Tensor
 
     @classmethod
-    def allocate(cls, config, shard, tokens, device):
+    def allocate(cls, config, shard, tokens, device, *, full_logits=True):
         a, c = config.attention, config.text
         heads, kv_heads = a.local(shard)
         rows = tokens // config.block_size
@@ -139,7 +139,8 @@ class DraftScratch:
             zeros(pages, 128, kv_heads, a.key_dim, dtype=torch.float8_e4m3fn),
             zeros(pages, 128, kv_heads, a.value_dim, dtype=torch.float8_e4m3fn),
             MLPScratch.allocate(tokens, hidden, c["intermediate_size"] // shard.world_size, device),
-            zeros(tokens, hidden), zeros(tokens, c["vocab_size"] // shard.world_size), zeros(tokens, c["vocab_size"]))
+            zeros(tokens, hidden), zeros(tokens, c["vocab_size"] // shard.world_size),
+            zeros(tokens, c["vocab_size"] if full_logits else 0))
 
     def rows(self, tokens, samples):
         if samples != tokens:
@@ -204,8 +205,11 @@ class DraftMLP(torch.nn.Module):
 
 
 class PreparedDraft:
+    """The draft decoder; its head gathers full-vocabulary logits, or with ``gather_logits=False``
+    leaves each rank's vocabulary shard in the local logits for sharded proposals."""
+
     def __init__(self, weights, scratch, metadata, pool, *, runtime, vocabulary_runtime, coordinator,
-                 session, name, workspace):
+                 session, name, workspace, gather_logits=True):
         self.weights, self.scratch, self.metadata = weights, scratch, metadata
         c = weights.config.draft
         self.embedding = PreparedEmbedding(weights.embedding, metadata.token_ids, scratch.embedding,
@@ -243,8 +247,10 @@ class PreparedDraft:
                         scratch.embedding, name=f"{name}.layer{index}.attention_reduce_norm", **common),
                     PreparedAllReduceRMSNorm(scratch.mlp.output, scratch.output, after, scratch.embedding,
                         name=f"{name}.layer{index}.mlp_reduce_norm", **common)))
-        self.head = PreparedVocabularyProjection(scratch.hidden, weights.head, scratch.local_logits, scratch.logits,
+        self.head = (PreparedVocabularyProjection(scratch.hidden, weights.head, scratch.local_logits, scratch.logits,
             runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head")
+            if gather_logits else vocabulary_shard_projection(scratch.hidden, weights.head, scratch.local_logits,
+                session=session, name=name + ".head.projection"))
 
     def __call__(self):
         hidden = torch.where((self.metadata.token_ids == self.weights.config.draft.noise_token)[:, None],
@@ -275,7 +281,8 @@ class DraftForwards:
 
 class SpeculativePreparation:
     def __init__(self, weights, canonical, pool, requests, inputs, scratch, *, completion, frame, sequence,
-                 session, workspace, runtime, vocabulary_runtime, context_runtime, coordinator, context_tokens=None):
+                 session, workspace, runtime, vocabulary_runtime, context_runtime, coordinator, context_tokens=None,
+                 draft_candidates=None):
         from .pool import PAGE_TOKENS
 
         self.page_tokens = PAGE_TOKENS
@@ -288,10 +295,13 @@ class SpeculativePreparation:
         # Every prefill and verification graph projects its context through one shared set of planes.
         self.context_buffers = (None if context_tokens is None
                                 else ContextBuffers.allocate(weights, context_tokens, pool.backing.device))
+        # A candidate channel proposes from each rank's draft vocabulary shard instead of gathered logits.
+        self.draft_candidates = draft_candidates
         self.forwards = DraftForwards(PreparedDecoder,
-            partial(PreparedContext, runtime=context_runtime, coordinator=coordinator, buffers=self.context_buffers))
+            partial(PreparedContext, runtime=context_runtime, coordinator=coordinator, buffers=self.context_buffers),
+            partial(PreparedDraft, gather_logits=draft_candidates is None))
         self.rng = SpeculativeRngState.allocate(pool.backing.device, capacity=requests.capacity)
         self.generation, self.offset = torch.zeros_like(requests.generation), torch.zeros_like(requests.generation)
         self.block_size, self.logit_offset = weights.config.draft.block_size, 1
         self.draft_scratch = DraftScratch.allocate(weights.config.draft, weights.shard,
-            requests.capacity * self.block_size, pool.backing.device)
+            requests.capacity * self.block_size, pool.backing.device, full_logits=draft_candidates is None)
