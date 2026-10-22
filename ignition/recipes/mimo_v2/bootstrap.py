@@ -11,6 +11,7 @@ from pathlib import Path
 import torch
 
 from ignition.components.completion import CompletionOutputs
+from ignition.components.draft_sampling import SHARD_PAYLOAD_COLUMNS
 from ignition.components.prompt_logprobs import (
     PreparedScoredPrefill, PromptScoring, prefill_graph_count, prefill_modes,
 )
@@ -95,6 +96,9 @@ class PreparationConfig:
     speculative_widths: tuple[int, ...] = tuple(range(1, 9))
     speculative_fixed_width: int | None = None
     speculative_token_capacity: int | None = None
+    # Each rank proposes drafts from its vocabulary shard of the draft head and gathers only its
+    # bounded candidates; False gathers full-vocabulary draft logits. Proposals are identical.
+    vocabulary_parallel_draft: bool = True
     # BF16 activations over MXFP4 experts (W4A16), as the SM120 vLLM reference serves MiMo.
     expert_activation: str = "a16"
     # A4/A16 hybrid: prefill graphs of at least this many tokens are captured twice, with BF16 and
@@ -232,9 +236,15 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         prefill_collective = create_dma_all_reduce_runtime(
             group, device, max_tokens=config.prefill_chunk_size, hidden_size=6144, ipc=ipc
         )
+        sharded_draft = config.dflash and config.vocabulary_parallel_draft
         vocabulary_collective = create_all_gather_runtime(
-            group, device, max_rows=max(config.decode_tokens, draft_rows), columns=152576, ipc=ipc
+            group, device, max_rows=max(config.decode_tokens, 0 if sharded_draft else draft_rows), columns=152576,
+            ipc=ipc
         )
+        # One payload row of draft candidates per proposal row and rank.
+        candidate_collective = (create_all_gather_runtime(group, device,
+            max_rows=max(batch for batch, _ in config.speculative_shapes),
+            columns=SHARD_PAYLOAD_COLUMNS * shard.world_size, ipc=ipc) if sharded_draft else None)
         context_collective = (create_all_gather_runtime(group, device,
             max_rows=tokens, columns=6144, ipc=ipc) if config.dflash else None)
         vision_collective = create_dma_all_reduce_runtime(group, device,
@@ -314,6 +324,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                 context_runtime=context_collective,
                 coordinator=coordinator,
                 context_tokens=max(config.prefill_chunk_size, config.decode_tokens),
+                draft_candidates=candidate_collective,
             )
 
     scoring = PromptScoring.allocate(config, device, buffers, frame=frame, group=group,
@@ -661,6 +672,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             collective,
             prefill_collective,
             vocabulary_collective,
+            candidate_collective,
             context_collective,
             vision_collective,
             coordinator,
@@ -668,7 +680,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         ),
         close_resources=tuple(
             c
-            for c in (scoring, context_collective, vision_collective, prefill_collective, vocabulary_collective, collective)
+            for c in (scoring, candidate_collective, context_collective, vision_collective, prefill_collective,
+                      vocabulary_collective, collective)
             if c is not None
         ),
     )
