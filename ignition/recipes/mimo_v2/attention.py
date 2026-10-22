@@ -90,7 +90,7 @@ def partial_rotary(values, positions, inverse):
 
 class PreparedAttention(torch.nn.Module):
     def __init__(self, layer, weights, config, shard, source, scratch, metadata, pool, *, mode,
-                 runtime, coordinator, session, name, workspace, reduce_output=True):
+                 runtime, coordinator, session, name, workspace, reduce_output=True, retained=None):
         super().__init__()
         self.geometry, self.scratch, self.metadata = config.attention(layer), scratch, metadata
         if mode not in ("prefill", "decode", "verify"):
@@ -126,9 +126,13 @@ class PreparedAttention(torch.nn.Module):
                     width = scratch.key.shape[0] // rows
                     pages = (geometry.window + width + PAGE_TOKENS - 1) // PAGE_TOKENS
                     key, value = key[:rows * pages], value[:rows * pages]
-                    self.retained_key, self.retained_value = torch.zeros_like(scratch.key), torch.zeros_like(scratch.value)
-                    self.commit_writer = PreparedPagedKVWriter(self.retained_key, self.retained_value,
-                        self.key_cache, self.value_cache, self.slots, session=session, name=name + ".commit")
+                    if retained is None:
+                        self.retained_key, self.retained_value = torch.zeros_like(scratch.key), torch.zeros_like(scratch.value)
+                        self.commit_writer = PreparedPagedKVWriter(self.retained_key, self.retained_value,
+                            self.key_cache, self.value_cache, self.slots, session=session, name=name + ".commit")
+                    else:
+                        # The decoder commits these rows for every sliding layer in one launch.
+                        self.retained_key, self.retained_value = retained
                 self.staged_key, self.staged_value = key, value
                 self.pages = torch.arange(key.shape[0], dtype=torch.int32, device=source.device).view(rows, -1)
                 window = geometry.window - 1
@@ -137,7 +141,7 @@ class PreparedAttention(torch.nn.Module):
                 self.pages = torch.zeros((metadata.lengths.numel(), 1), dtype=torch.int32, device=source.device)
         else:
             key, value, self.pages = self.key_cache, self.value_cache, metadata.page_table
-        retained = None if self.commit_writer is None else (self.retained_key, self.retained_value)
+        retained = (self.retained_key, self.retained_value) if mode == "verify" and geometry.window > 0 else None
         self.fused = mode != "prefill" and qkv.serves(self.chunks, scratch.query, scratch.key, scratch.value,
                                                       geometry)
         self.retained = retained if self.fused else None
@@ -233,5 +237,5 @@ class PreparedAttention(torch.nn.Module):
             self.commit_writer()
 
     def scratch_tensors(self):
-        retained = () if self.commit_writer is None else (self.retained_key, self.retained_value)
+        retained = (self.retained_key, self.retained_value) if self.mode == "verify" and self.geometry.window > 0 else ()
         return (self.slots, self.lengths, *retained)

@@ -15,6 +15,7 @@ from ignition.components.moe import PreparedRouter, PreparedRoutedExperts, Route
 from ignition.components.vocabulary import PreparedVocabularyProjection
 
 from .attention import AttentionScratch, PreparedAttention
+from .qkv import WindowCommit
 
 # Decode and verification graphs prefetch upcoming projection weights into L2 beside the
 # all-reduces, as the vLLM reference serves MiMo; FLARE_MIMO_L2_PREFETCH=0 at export disables it.
@@ -169,6 +170,18 @@ class PreparedDecoder:
                       and scratch.dense.output.dtype == partial.dtype
                       and PreparedAllReduceRMSNorm.fits(oneshot, partial))
         self.layers, self.reductions = [], []
+        # Verification keeps every sliding layer's rotated rows in one stack for a single commit launch.
+        self.window_commit, retained = None, {}
+        window = max(weights.config.attention(i).window for i in range(len(weights.layers)))
+        sliding = [i for i in range(len(weights.layers)) if weights.config.attention(i).window > 0]
+        if mode == "verify" and sliding:
+            k, v = scratch.attention.key, scratch.attention.value
+            keys = torch.zeros((len(sliding), *k.shape), dtype=k.dtype, device=k.device)
+            values = torch.zeros((len(sliding), *v.shape), dtype=v.dtype, device=v.device)
+            if (all(weights.config.attention(i).window == window for i in sliding)
+                    and WindowCommit.serves(pool, sliding, keys, values, window)):
+                self.window_commit = WindowCommit(pool, sliding, keys, values, metadata, window)
+                retained = {i: (keys[n], values[n]) for n, i in enumerate(sliding)}
         for index, layer_weights in enumerate(weights.layers):
             # Populate the canonical layer's execution modules without constructing unloaded expert tensors.
             layer = layer_type.__new__(layer_type)
@@ -176,7 +189,7 @@ class PreparedDecoder:
             layer.self_attn = PreparedAttention(index, layer_weights, weights.config, weights.shard,
                 scratch.normalized, scratch.attention, metadata, pool, mode=mode, runtime=runtime,
                 coordinator=coordinator, session=session, name=f"{name}.layer{index}.attention", workspace=workspace,
-                reduce_output=not self.fused)
+                reduce_output=not self.fused, retained=retained.get(index))
             layer.mlp = PreparedFeedForward(layer_weights, weights.config, scratch, runtime=runtime,
                 coordinator=coordinator, session=session, name=f"{name}.layer{index}.mlp", workspace=workspace,
                 reduce_output=not self.fused, a4_prefill=a4_prefill)
@@ -251,6 +264,8 @@ class PreparedDecoder:
         self.head(s.hidden)
 
     def commit(self, counts):
+        if self.window_commit is not None:
+            self.window_commit(counts)
         for layer in self.layers:
             layer.self_attn.commit(counts)
 
