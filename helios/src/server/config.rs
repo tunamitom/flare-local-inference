@@ -315,6 +315,12 @@ impl Bootstrap {
                 .filter(|v| v.is_finite() && *v > 0.0)
                 .ok_or("adaptive verification alpha must be finite and greater than zero")?;
         }
+        if let Some(value) = object.get("min_checkpoint_segment") {
+            scheduling_policy.min_checkpoint_segment = value
+                .as_u64()
+                .and_then(|n| usize::try_from(n).ok())
+                .ok_or("min_checkpoint_segment must be a token count")?;
+        }
         let server = ServerConfig {
             scheduling_policy,
             api_key: Some(optional_text("api_key")?).filter(|key| !key.is_empty()),
