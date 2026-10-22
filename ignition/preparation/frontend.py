@@ -108,8 +108,8 @@ def image_settings(config, model, profile):
     if profile not in ("qwen", "mimo"):
         raise ValueError("unsupported image preprocessing profile")
     qwen = profile == "qwen"
-    mean = [0.5] * 3 if qwen else [0.48145466, 0.4578275, 0.40821073]
-    std = [0.5] * 3 if qwen else [0.26862954, 0.26130258, 0.27577711]
+    mean = [0.5] * 3 if qwen else [0.485, 0.456, 0.406]
+    std = [0.5] * 3 if qwen else [0.229, 0.224, 0.225]
     _expected(config, {"processor_class": "Qwen3VLProcessor" if qwen else "Qwen2_5_VLProcessor",
         "image_processor_type": "Qwen2VLImageProcessorFast" if qwen else "Qwen2VLImageProcessor",
         "patch_size": 16, "temporal_patch_size": 2, "merge_size": 2,
@@ -130,9 +130,9 @@ def image_settings(config, model, profile):
                 raise ValueError(f"invalid model {name}")
             result[name] = value
     else:
-        _expected(config, {"min_pixels": 3136, "max_pixels": 12845056}, "resize area")
+        _expected(config, {"min_pixels": 8192, "max_pixels": 8388608}, "resize area")
         _expected(model, {"image_token_id": 151655}, "model configuration")
-        result = dict(min_pixels=3136, max_pixels=12845056, image_mean=mean, image_std=std)
+        result = dict(min_pixels=8192, max_pixels=8388608, image_mean=mean, image_std=std)
     return {profile: result}
 
 
