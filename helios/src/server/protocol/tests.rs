@@ -380,8 +380,9 @@ fn required_tool_choice_accepts_complete_calls_and_rejects_unknown_or_unfinished
             enc.finish(0, Termination::OutputLimit, 12, 0, None)
                 .is_err()
         );
+        // An undeclared name passes through for the client to route and reject.
         let mut enc = encoder_with_choice(protocol, ToolChoice::Required);
-        let error = enc
+        let frames = enc
             .apply(
                 0,
                 vec![Event::ToolBegin {
@@ -390,8 +391,8 @@ fn required_tool_choice_accepts_complete_calls_and_rejects_unknown_or_unfinished
                     id: None,
                 }],
             )
-            .unwrap_err();
-        assert!(error.to_string().contains("undeclared tool"));
+            .unwrap();
+        assert!(frames.iter().any(|frame| frame.data.to_string().contains("undeclared")));
     }
 }
 
@@ -579,14 +580,9 @@ fn auto_tool_choice_returns_unknown_calls_across_parsers_and_protocols() {
                     serde_json::from_str::<Value>(&streamed_arguments).unwrap(),
                     expected
                 );
+                // Required passes the unknown call through as auto does.
                 let mut required = encoder_with_choice(protocol, ToolChoice::Required);
-                assert!(
-                    required
-                        .apply(0, events)
-                        .unwrap_err()
-                        .to_string()
-                        .contains("undeclared tool")
-                );
+                assert!(required.apply(0, events).is_ok());
             }
         }
     }
