@@ -34,9 +34,13 @@ class ModelWeights:
     allocated_bytes: int
     draft: object | None = None
     vision: object | None = None
+    # Block-FP8 copy of the draft weights for graphs within the W8A16 GEMV's row limit, when larger
+    # draft graphs keep BF16 in ``draft``.
+    draft_w8a16: object | None = None
 
     @classmethod
-    def load(cls, manifest, device, *, shard, progress=None, dflash=True, expert_activation="a16"):
+    def load(cls, manifest, device, *, shard, progress=None, dflash=True, expert_activation="a16",
+             draft_weight_format="bf16", draft_requests=None):
         before = torch.cuda.memory_allocated(device)
         with MiMoWeightLoader(manifest, device, shard=shard, progress=progress,
                               expert_activation=expert_activation) as loader:
@@ -45,16 +49,19 @@ class ModelWeights:
             head = loader.load_tensor("lm_head.weight",
                 extent=slice(*shard.partition(config.text["vocab_size"], alignment=64)))
             layers = tuple(loader.load_layer(i) for i in range(config.layers))
-        draft = None
+        draft = draft_w8a16 = None
         if dflash:
             from .draft_weights import DraftWeights
 
-            draft = DraftWeights.load(manifest.snapshot / "dflash", config.draft, device, shard, progress=progress)
+            draft = DraftWeights.load(manifest.snapshot / "dflash", config.draft, device, shard, progress=progress,
+                weight_format=DraftWeights.serving_format(draft_weight_format, config.draft, draft_requests))
+            if draft_weight_format == "w8a16" and isinstance(draft.projection, torch.Tensor):
+                draft_w8a16 = draft.block_fp8()
         from .vision_weights import VisionWeights
 
         vision = VisionWeights.load(manifest, config.text, device, shard, progress=progress)
         return cls(config, shard, embedding, norm, head, layers,
-                   torch.cuda.memory_allocated(device) - before, draft, vision)
+                   torch.cuda.memory_allocated(device) - before, draft, vision, draft_w8a16)
 
 
 class MiMoWeightLoader(DirectWeightLoader):
