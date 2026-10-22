@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import torch
 
 from ignition.components.block_fp8 import BlockFP8Weight
-from ignition.components.collectives import PreparedAllReduce
+from ignition.components.collectives import PreparedAllReduce, PreparedAllReduceRMSNorm
 from ignition.components.embedding import PreparedEmbedding
 from ignition.components.l2_prefetch import L2Prefetcher
 from ignition.components.linear import UnquantizedProjection
@@ -20,6 +20,12 @@ from .attention import AttentionScratch, PreparedAttention
 # all-reduces, as the vLLM reference serves MiMo; FLARE_MIMO_L2_PREFETCH=0 at export disables it.
 L2_PREFETCH = os.environ.get("FLARE_MIMO_L2_PREFETCH", "1") != "0"
 L2_PREFETCH_MAX_TOKENS = 256
+# Decode and verification reductions up to this payload run b12x's one-shot all-reduce with the
+# residual add and RMSNorm in the same launch, the vLLM reference's 84 KiB default
+# (VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE): seven 6144-wide BF16 rows, every c1 width
+# below eight. Larger payloads keep the two-shot route and the separate add and norm;
+# FLARE_MIMO_FUSED_REDUCE_NORM_MAX_BYTES=0 at export disables the fusion.
+FUSED_REDUCE_NORM_MAX_BYTES = int(os.environ.get("FLARE_MIMO_FUSED_REDUCE_NORM_MAX_BYTES", 84 << 10))
 
 
 @dataclass(frozen=True)
@@ -66,7 +72,8 @@ class Scratch:
 
 
 class PreparedFeedForward(torch.nn.Module):
-    def __init__(self, weights, config, scratch, *, runtime, coordinator, session, name, workspace):
+    def __init__(self, weights, config, scratch, *, runtime, coordinator, session, name, workspace,
+                 reduce_output=True):
         super().__init__()
         self.scratch = scratch
         self.dense = self.router_projection = self.router = self.experts = None
@@ -84,21 +91,24 @@ class PreparedFeedForward(torch.nn.Module):
             self.experts = PreparedRoutedExperts(source, weights.experts, scratch.router.ids, scratch.router.weights,
                 output, session=session, name=name + ".experts", workspace=workspace,
                 router_plan=self.router.plan)
-        self.reduction = PreparedAllReduce(output, scratch.reduced, runtime=runtime,
-                                           coordinator=coordinator, session=session, name=name + ".reduce")
+        self.reduction = PreparedAllReduce(output, scratch.reduced, runtime=runtime, coordinator=coordinator,
+            session=session, name=name + ".reduce") if reduce_output else None
         # (prefetcher, plan) issued after the experts, before their reduction.
         self.prefetch = None
 
     def forward(self, hidden_states):
         self.scratch.normalized.copy_(hidden_states.reshape_as(self.scratch.normalized))
+        return self.reduction(self.partial()).view_as(hidden_states)
+
+    def partial(self):
+        """This rank's unreduced output from the normalized scratch rows."""
         if self.dense is not None:
-            output = self.dense(self.scratch.normalized)
-        else:
-            self.router(self.router_projection(self.scratch.normalized))
-            output = self.experts()
-            if self.prefetch is not None:
-                self.prefetch[0].issue(self.prefetch[1])
-        return self.reduction(output).view_as(hidden_states)
+            return self.dense(self.scratch.normalized)
+        self.router(self.router_projection(self.scratch.normalized))
+        output = self.experts()
+        if self.prefetch is not None:
+            self.prefetch[0].issue(self.prefetch[1])
+        return output
 
 
 def _projection_tensors(weight):
@@ -153,21 +163,42 @@ class PreparedDecoder:
         c = weights.config.text
         self.embedding = PreparedEmbedding(weights.embedding, metadata.token_ids, scratch.embedding,
             num_rows=metadata.live_counts[:1], session=session, name=name + ".embedding")
-        self.layers = []
+        oneshot = getattr(runtime, "oneshot", runtime)
+        partial = scratch.attention.partial
+        self.fused = (mode != "prefill" and partial.numel() * partial.element_size() <= FUSED_REDUCE_NORM_MAX_BYTES
+                      and scratch.dense.output.dtype == partial.dtype
+                      and PreparedAllReduceRMSNorm.fits(oneshot, partial))
+        self.layers, self.reductions = [], []
         for index, layer_weights in enumerate(weights.layers):
             # Populate the canonical layer's execution modules without constructing unloaded expert tensors.
             layer = layer_type.__new__(layer_type)
             torch.nn.Module.__init__(layer)
             layer.self_attn = PreparedAttention(index, layer_weights, weights.config, weights.shard,
                 scratch.normalized, scratch.attention, metadata, pool, mode=mode, runtime=runtime,
-                coordinator=coordinator, session=session, name=f"{name}.layer{index}.attention", workspace=workspace)
+                coordinator=coordinator, session=session, name=f"{name}.layer{index}.attention", workspace=workspace,
+                reduce_output=not self.fused)
             layer.mlp = PreparedFeedForward(layer_weights, weights.config, scratch, runtime=runtime,
-                coordinator=coordinator, session=session, name=f"{name}.layer{index}.mlp", workspace=workspace)
+                coordinator=coordinator, session=session, name=f"{name}.layer{index}.mlp", workspace=workspace,
+                reduce_output=not self.fused)
             layer.input_layernorm = canonical_norm(norm_type, layer_weights.input_norm, c["layernorm_epsilon"])
             layer.post_attention_layernorm = canonical_norm(norm_type, layer_weights.post_attention_norm,
                                                             c["layernorm_epsilon"])
             self.layers.append(layer.eval())
         self.norm = canonical_norm(norm_type, weights.norm, c["layernorm_epsilon"])
+        if self.fused:
+            # Each reduction adds into the residual stream (the embedding rows) and writes the
+            # following norm into the normalized rows both projections read: the attention
+            # partial with this layer's post-attention norm, the MLP partial with the next
+            # layer's input norm or, after the last layer, the final norm.
+            norms = [w.input_norm for w in weights.layers[1:]] + [weights.norm]
+            for index, (layer_weights, following) in enumerate(zip(weights.layers, norms)):
+                common = {"eps": c["layernorm_epsilon"], "runtime": oneshot, "coordinator": coordinator,
+                          "session": session}
+                self.reductions.append((
+                    PreparedAllReduceRMSNorm(partial, scratch.embedding, layer_weights.post_attention_norm,
+                        scratch.normalized, name=f"{name}.layer{index}.attention_reduce_norm", **common),
+                    PreparedAllReduceRMSNorm(scratch.dense.output, scratch.embedding, following,
+                        scratch.normalized, name=f"{name}.layer{index}.mlp_reduce_norm", **common)))
         self.target_layers = () if weights.draft is None else weights.config.draft.target_layers
         # Graphs prepared without drafting (the -no-mtp variants) take no auxiliary columns.
         columns = len(self.target_layers) * c["hidden_size"]
@@ -188,6 +219,8 @@ class PreparedDecoder:
         hidden = self.embedding()
         if self.vision is not None:
             self.vision.inject(self.metadata, hidden)
+        if self.fused:
+            return self._fused(hidden)
         for index, layer in enumerate(self.layers):
             hidden = layer(hidden)
             if index in self.target_layers:
@@ -202,6 +235,20 @@ class PreparedDecoder:
         else:
             self.scratch.hidden.copy_(self.norm(hidden[self.metadata.sample_indices]))
         self.head(self.scratch.hidden)
+
+    def _fused(self, residual):
+        s = self.scratch
+        s.normalized.copy_(self.layers[0].input_layernorm(residual))
+        for index, (layer, (attention, mlp)) in enumerate(zip(self.layers, self.reductions)):
+            attention(layer.self_attn(s.normalized)[0], residual)
+            mlp(layer.mlp.partial(), residual)
+            if index in self.target_layers:
+                column = self.target_layers.index(index) * residual.shape[-1]
+                self.auxiliary[:, column:column + residual.shape[-1]].copy_(residual)
+        if self.prefetcher is not None:
+            self.prefetcher.join()
+        s.hidden.copy_(s.normalized[self.metadata.sample_indices])
+        self.head(s.hidden)
 
     def commit(self, counts):
         for layer in self.layers:
