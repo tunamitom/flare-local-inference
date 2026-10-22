@@ -3,7 +3,7 @@
 import torch
 
 from .collectives import PreparedAllReduce
-from .draft_sampling import PreparedDraftDistribution
+from .draft_sampling import PreparedDraftDistribution, PreparedShardedDraftDistribution
 from .paged_batch import Metadata, PreparedBatch
 from .speculation import (
     DRAFT_RNG_DOMAIN,
@@ -14,7 +14,8 @@ from .speculation import (
 from .state import save_hidden
 
 
-def prepare_sampling_scratch(batch, width, vocab, device, *, buffers=None, proposal=True, verification=True):
+def prepare_sampling_scratch(batch, width, vocab, device, *, buffers=None, proposal=True, verification=True,
+                             proposal_layout=None):
     """Share sequential sampling stages and retain target results through verification.
 
     Proposal probabilities must be copied to retained storage before the next
@@ -25,7 +26,8 @@ def prepare_sampling_scratch(batch, width, vocab, device, *, buffers=None, propo
 
     layouts = {}
     if proposal and width > 1:
-        layouts["proposal"] = PreparedDraftDistribution.scratch_layout(batch, 1, vocab)
+        layouts["proposal"] = (PreparedDraftDistribution.scratch_layout(batch, 1, vocab) if proposal_layout is None
+                               else proposal_layout)
     if verification:
         layouts["target"] = PreparedSpeculativeDistributions.scratch_layout(batch, width, vocab)
         layouts["verify"] = PreparedStochasticVerification.scratch_layout(batch, width, vocab)
@@ -68,7 +70,10 @@ class PreparedParallelDraftRound:
     it allocates no draft decoder, Markov projection, or proposal samplers. An owner
     whose ``draft_argmax`` names a vocabulary-parallel argmax runtime proposes greedy
     drafts from the draft head's and Markov bias's vocabulary shards without gathering
-    them; each proposal distribution is then one-hot, so verification stays exact.
+    them; each proposal distribution is then one-hot, so verification stays exact. An
+    owner whose ``draft_candidates`` names a candidate channel samples each proposal from
+    the draft head's local vocabulary shards, gathering only each rank's bounded
+    candidates (PreparedShardedDraftDistribution); its draft leaves logits ungathered.
     """
 
     @staticmethod
@@ -89,8 +94,14 @@ class PreparedParallelDraftRound:
         self.proposal_only = proposal_only
         o, b, w = owner, batch, width
         device, blocks = o.pool.backing.device, o.inputs.page_tables.shape[1]
+        self.candidate_runtime = getattr(o, "draft_candidates", None) if generate_proposals and w > 1 else None
+        # Traced forwards test this flag, never the runtime, which compile workers see as a placeholder.
+        self.vocabulary_parallel = self.candidate_runtime is not None
+        proposal_layout = None if self.candidate_runtime is None else PreparedShardedDraftDistribution.scratch_layout(
+            b, o.requests.vocab_size, o.draft_scratch.local_logits.shape[1], self.candidate_runtime.world_size)
         self.sampling_scratch = prepare_sampling_scratch(b, w, o.requests.vocab_size, device, buffers=buffers,
-                                                        proposal=generate_proposals, verification=not proposal_only)
+                                                        proposal=generate_proposals, verification=not proposal_only,
+                                                        proposal_layout=proposal_layout)
         self.rows = torch.arange(b, device=device)
         self.metadata = Metadata.allocate(tokens, b, blocks, device, samples=b * w, max_query_tokens=w)
         self.validator = PreparedBatch(
@@ -171,6 +182,9 @@ class PreparedParallelDraftRound:
         self.candidates = torch.zeros((b, w), dtype=torch.int64, device=device)
         self.drafts = torch.zeros((b, w - 1), dtype=torch.int64, device=device)
         self.argmax = None
+        if self.candidate_runtime is not None and (self.markov is not None or self.selector is not None
+                                                   or getattr(o, "draft_argmax", None) is not None):
+            raise ValueError("sharded draft proposals sample the draft head's logits alone")
         if self.draft is not None and getattr(o, "draft_argmax", None) is not None:
             from .collectives import PreparedVocabularyArgmax
 
@@ -182,7 +196,7 @@ class PreparedParallelDraftRound:
         from ignition.preparation.scratch import bind_scratch
 
         layout = self.storage_layout(b, w, o.requests.vocab_size)
-        if not generate_proposals:
+        if not generate_proposals or self.candidate_runtime is not None:
             del layout["logits"]
         retained = bind_scratch(layout, device=device, workspace=buffers)
         self.logits, self.probabilities = retained.get("logits"), retained["probabilities"]
@@ -203,19 +217,43 @@ class PreparedParallelDraftRound:
             self.decoder.scratch.logits.view(b, w, -1), *args, self.drafts,
             workspace=self.sampling_scratch.get("target")
         )
-        proposals = tuple(
-            PreparedDraftDistribution(
-                self.logits,
-                *args,
-                self.drafts,
-                prefix_offset=i,
-                seed=self.seed,
-                offset=self.offset,
-                sampled=self.sampled,
-                workspace=self.sampling_scratch.get("proposal"),
+        count = w - 1 if self.generate_proposals and self.argmax is None else 0
+        if self.candidate_runtime is None:
+            proposals = tuple(
+                PreparedDraftDistribution(
+                    self.logits,
+                    *args,
+                    self.drafts,
+                    prefix_offset=i,
+                    seed=self.seed,
+                    offset=self.offset,
+                    sampled=self.sampled,
+                    workspace=self.sampling_scratch.get("proposal"),
+                )
+                for i in range(count)
             )
-            for i in range(w - 1 if self.generate_proposals and self.argmax is None else 0)
-        )
+        else:
+            # Each proposal reads its draft position's rows of this rank's local logits in place.
+            local = self.draft.scratch.local_logits.view(b, o.block_size, -1)
+            proposals = tuple(
+                PreparedShardedDraftDistribution(
+                    local[:, i + o.logit_offset],
+                    *args,
+                    self.drafts,
+                    rank=o.weights.shard.rank,
+                    world=self.candidate_runtime.world_size,
+                    runtime=self.candidate_runtime,
+                    session=o.session,
+                    coordinator=o.collectives["coordinator"],
+                    name=f"{self.name}.proposal{i}.candidates",
+                    prefix_offset=i,
+                    seed=self.seed,
+                    offset=self.offset,
+                    sampled=self.sampled,
+                    workspace=self.sampling_scratch.get("proposal"),
+                )
+                for i in range(count)
+            )
         if target is not None:
             target.prepare()
         for proposal in proposals:
@@ -305,9 +343,10 @@ class PreparedParallelDraftRound:
                 self.probabilities.zero_()
                 self.probabilities.scatter_(2, self.drafts[:, :, None], 1.0)
             for i, proposal in enumerate(proposals):
-                self.logits[:, 0].copy_(
-                    self.draft.scratch.logits.view(b, block, -1)[:, i + o.logit_offset].float()
-                )
+                if not self.vocabulary_parallel:
+                    self.logits[:, 0].copy_(
+                        self.draft.scratch.logits.view(b, block, -1)[:, i + o.logit_offset].float()
+                    )
                 if self.markov is not None:
                     self.logits[:, 0].add_(self.markov())
                 if self.selector is not None:
