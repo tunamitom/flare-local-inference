@@ -448,7 +448,7 @@ impl Frontend {
         options: &Map<String, Json>,
     ) -> Result<RenderedPrompt> {
         if self.prompt_encoder == PromptEncoder::Jinja {
-            return self.render_jinja(messages, options, true);
+            return self.render_jinja(messages, options, true, true);
         }
         let mut options = options.clone();
         options.insert("add_generation_prompt".into(), true.into());
