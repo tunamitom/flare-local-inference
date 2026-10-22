@@ -147,6 +147,37 @@ fn every_role_transition_and_empty_message_has_a_boundary() {
 }
 
 #[test]
+fn the_last_message_end_is_skipped_only_when_the_generation_prompt_begins_the_reply() {
+    let messages = json!([
+        {"role":"user","content":"Question"},
+        {"role":"assistant","content":"Answer"},
+        {"role":"user","content":"Follow-up"}
+    ]);
+    let messages = messages.as_array().unwrap();
+    let options = json!({"add_generation_prompt":true});
+    let options = options.as_object().unwrap();
+    let ends = |template: &str| {
+        let frontend = frontend(template, TemplateEncoding::Text);
+        let mut rendered = frontend.render_chat(messages, options).unwrap();
+        let before = rendered.message_boundaries.clone();
+        frontend.skip_replied_message_end(messages, options, &mut rendered);
+        (before, rendered.message_boundaries)
+    };
+    // The reply renders as <assistant>OK</assistant>, so the prompt endpoint covers the last message.
+    let (before, after) = ends(concat!(
+        "{% for m in messages %}<{{ m.role }}>{{ m.content }}</{{ m.role }}>{% mark %}{% endfor %}",
+        "{% if add_generation_prompt %}<assistant>{% endif %}"
+    ));
+    assert_eq!(after, before[..before.len() - 1]);
+    // A generation prompt that history does not repeat keeps the last message checkpoint.
+    let (before, after) = ends(concat!(
+        "{% for m in messages %}<{{ m.role }}>{{ m.content }}</{{ m.role }}>{% mark %}{% endfor %}",
+        "{% if add_generation_prompt %}<assistant><think>{% endif %}"
+    ));
+    assert_eq!(after, before);
+}
+
+#[test]
 fn segmented_xtml_preserves_boundaries_before_seeded_assistant_and_later_turns() {
     let frontend = frontend(
         include_str!("../../ignition/recipes/kimi3/assets/chat_template.jinja"),
