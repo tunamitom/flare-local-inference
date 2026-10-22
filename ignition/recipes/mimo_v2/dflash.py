@@ -6,7 +6,7 @@ from functools import partial
 import torch
 from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer, Qwen3RMSNorm
 
-from ignition.components.collectives import PreparedAllGather, PreparedAllReduce
+from ignition.components.collectives import PreparedAllGather, PreparedAllReduce, PreparedAllReduceRMSNorm
 from ignition.components.embedding import PreparedEmbedding
 from ignition.components.linear import UnquantizedProjection
 from ignition.components.mlp import MLPScratch, PreparedMLP
@@ -16,6 +16,11 @@ from ignition.components.vocabulary import PreparedVocabularyProjection
 
 from .attention import partial_rotary, stage_windows
 from .decoder import PreparedDecoder, canonical_norm
+
+
+# Draft blocks of up to eight rows (96 KiB) reduce through the one-shot channel with the residual add
+# and the following RMSNorm in the same launch, as the target decoder does; above that, two-shot.
+DRAFT_FUSED_REDUCE_NORM_MAX_BYTES = 96 << 10
 
 
 def inverse_frequencies(geometry, device):
@@ -145,7 +150,8 @@ class DraftScratch:
 
 
 class DraftAttention(torch.nn.Module):
-    def __init__(self, index, weights, config, scratch, metadata, pool, *, runtime, coordinator, session, name, workspace):
+    def __init__(self, index, weights, config, scratch, metadata, pool, *, runtime, coordinator, session, name, workspace,
+                 reduce_output=True):
         super().__init__()
         self.scratch, self.metadata = scratch, metadata
         a = config.attention
@@ -167,7 +173,7 @@ class DraftAttention(torch.nn.Module):
         self.output = UnquantizedProjection(scratch.attended.flatten(1), weights.output, scratch.partial,
                                             session=session, name=name + ".output")
         self.reduce = PreparedAllReduce(scratch.partial, scratch.output, runtime=runtime, coordinator=coordinator,
-                                       session=session, name=name + ".reduce")
+                                       session=session, name=name + ".reduce") if reduce_output else None
 
     def forward(self, hidden_states, **kwargs):
         s, m = self.scratch, self.metadata
@@ -179,20 +185,22 @@ class DraftAttention(torch.nn.Module):
         stage_windows(self.value_cache, s.value, self.value, m)
         self.lengths.copy_(m.starts.clamp(max=self.window).int() + m.lengths)
         self.attention()
-        return self.reduce(self.output(s.attended.flatten(1))), None
+        partial = self.output(s.attended.flatten(1))
+        return (partial if self.reduce is None else self.reduce(partial)), None
 
 
 class DraftMLP(torch.nn.Module):
-    def __init__(self, weights, scratch, *, runtime, coordinator, session, name, workspace):
+    def __init__(self, weights, scratch, *, runtime, coordinator, session, name, workspace, reduce_output=True):
         super().__init__()
         s = scratch.mlp
         self.mlp = PreparedMLP(scratch.embedding, weights, s.gate_up, s.intermediate, s.output,
                               session=session, workspace=workspace, name=name)
         self.reduce = PreparedAllReduce(s.output, scratch.output, runtime=runtime, coordinator=coordinator,
-                                       session=session, name=name + ".reduce")
+                                       session=session, name=name + ".reduce") if reduce_output else None
 
     def forward(self, hidden_states):
-        return self.reduce(self.mlp(hidden_states))
+        partial = self.mlp(hidden_states)
+        return partial if self.reduce is None else self.reduce(partial)
 
 
 class PreparedDraft:
@@ -202,26 +210,55 @@ class PreparedDraft:
         c = weights.config.draft
         self.embedding = PreparedEmbedding(weights.embedding, metadata.token_ids, scratch.embedding,
             num_rows=metadata.live_counts[:1], session=session, name=name + ".embedding")
-        self.layers = []
+        oneshot = getattr(runtime, "oneshot", runtime)
+        self.fused = (scratch.partial.numel() * scratch.partial.element_size() <= DRAFT_FUSED_REDUCE_NORM_MAX_BYTES
+                      and scratch.mlp.output.dtype == scratch.partial.dtype
+                      and PreparedAllReduceRMSNorm.fits(oneshot, scratch.partial))
+        self.layers, self.reductions = [], []
         for index, layer_weights in enumerate(weights.draft.layers):
             layer = Qwen3DecoderLayer.__new__(Qwen3DecoderLayer)
             torch.nn.Module.__init__(layer)
             layer.self_attn = DraftAttention(index, layer_weights, c, scratch, metadata, pool,
                 runtime=runtime, coordinator=coordinator, session=session, name=f"{name}.layer{index}.attention",
-                workspace=workspace)
+                workspace=workspace, reduce_output=not self.fused)
             layer.mlp = DraftMLP(layer_weights.mlp, scratch, runtime=runtime, coordinator=coordinator,
-                                session=session, name=f"{name}.layer{index}.mlp", workspace=workspace)
+                                session=session, name=f"{name}.layer{index}.mlp", workspace=workspace,
+                                reduce_output=not self.fused)
             layer.input_layernorm = canonical_norm(Qwen3RMSNorm, layer_weights.input_norm, c.text["rms_norm_eps"])
             layer.post_attention_layernorm = canonical_norm(Qwen3RMSNorm, layer_weights.post_attention_norm,
                                                             c.text["rms_norm_eps"])
             self.layers.append(layer.eval())
         self.norm = canonical_norm(Qwen3RMSNorm, weights.draft.norm, c.text["rms_norm_eps"])
+        if self.fused:
+            # The residual stream lives in the reduction output rows; each reduction adds into it and
+            # writes the following norm (post-attention, the next input norm, or the final norm) into
+            # the embedding rows every projection reads.
+            layers = weights.draft.layers
+            following = [w.input_norm for w in layers[1:]] + [weights.draft.norm]
+            common = {"eps": c.text["rms_norm_eps"], "runtime": oneshot, "coordinator": coordinator,
+                      "session": session}
+            for index, (layer_weights, after) in enumerate(zip(layers, following)):
+                self.reductions.append((
+                    PreparedAllReduceRMSNorm(scratch.partial, scratch.output, layer_weights.post_attention_norm,
+                        scratch.embedding, name=f"{name}.layer{index}.attention_reduce_norm", **common),
+                    PreparedAllReduceRMSNorm(scratch.mlp.output, scratch.output, after, scratch.embedding,
+                        name=f"{name}.layer{index}.mlp_reduce_norm", **common)))
         self.head = PreparedVocabularyProjection(scratch.hidden, weights.head, scratch.local_logits, scratch.logits,
             runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head")
 
     def __call__(self):
         hidden = torch.where((self.metadata.token_ids == self.weights.config.draft.noise_token)[:, None],
                              self.weights.draft.mask_embedding, self.embedding())
+        if self.fused:
+            s = self.scratch
+            s.output.copy_(hidden)
+            s.embedding.copy_(self.layers[0].input_layernorm(s.output))
+            for layer, (attention, mlp) in zip(self.layers, self.reductions):
+                attention(layer.self_attn(s.embedding)[0], s.output)
+                mlp(layer.mlp(s.embedding), s.output)
+            s.hidden.copy_(s.embedding[self.metadata.sample_indices])
+            self.head(s.hidden)
+            return
         for layer in self.layers:
             hidden = layer(hidden)
         self.scratch.hidden.copy_(self.norm(hidden[self.metadata.sample_indices]))
