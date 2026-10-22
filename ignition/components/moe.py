@@ -176,6 +176,10 @@ class PreparedRoutedExperts:
             self.scratch = planned_scratch(self.plan.scratch_specs(), workspace)
             self.binding = fused_moe.bind(self.plan, a=source, topk_ids=ids, topk_weights=weights,
                 output=output, scratch=self.scratch, input_scales_static=True, **precision)
+            # MXFP4 A4 prefill reads the expanded scale scratch, which inline CSF plans never fill.
+            if (experts.has_csf_blocks and getattr(self.binding, "mxfp4_prefill_launches", None) is not None
+                    and self.binding.execution_plan.decode_config.csf_inline_scales):
+                raise ValueError(f"{name}: MXFP4 A4 prefill cannot follow an inline CSF scale plan")
 
         register_finalizer(session, finalize, workspace=workspace)
 
