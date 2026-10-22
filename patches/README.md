@@ -14,7 +14,7 @@ done
 | Patch | Needed by | Without it |
 |---|---|---|
 | `b12x-twoshot-bf16-tp8.patch` | TP8 two-shot reductions | TP8 preparation fails while it creates the two-shot channel |
-| `b12x-mxfp4-a4-prefill.patch` | A4/A16 hybrid prefill experts | b12x ignores `B12X_W4A16_MXFP4_PREFILL_MIN_TOKENS`, so every expert call runs A16 |
+| `b12x-mxfp4-a4-prefill.patch` | A4/A16 hybrid prefill experts | MiMo preparation fails unless `FLARE_MIMO_A4_PREFILL_MIN_TOKENS=0` exports pure A16 |
 | `b12x-w4a16-topk-sum-loads.patch` | Faster W4A16 top-k sums | The top-k sum stays serialized; outputs are identical |
 
 Each patch applies cleanly to the pinned commit. These changes belong in
