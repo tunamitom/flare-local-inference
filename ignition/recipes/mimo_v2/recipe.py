@@ -24,7 +24,8 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         prefill_chunk_size=plan.prefill_chunk,
         snapshot_budget_bytes=plan.snapshots * plan.costs.state_row_bytes,
         headroom_bytes=HEADROOM_BYTES + plan.reserve_bytes, kernel_cache=kernel_cache,
-        dflash=speculation is not None, **drafting, **hybrid)
+        dflash=speculation is not None, expert_scale_compression=plan.expert_scale_compression,
+        **drafting, **hybrid)
     return prepare_group(snapshot, config, prepare_rank, progress=progress, package_storage=package_storage)
 
 
@@ -42,6 +43,10 @@ RECIPE = Recipe(
     checkpoints=(Checkpoint(alias="mimo-v2.6-pro-mopd", repository="XiaomiMiMo/MiMo-V2.6-Pro-MOPD",
         revision="adea8e2c5373181e5a973fa1ecb343cb31af214b", architecture="MiMoV2ForCausalLM",
         stored_bytes=566_027_990_784, device_bytes=568_511_624_448, draft_bytes=5_536_632_576,
+        # Lossless CSF encoding of the routed experts' E8M0 scales saves the 24,148,134,148 bytes
+        # measured by the lil-mxfp4-csf-checkpoint/1 conversion of this revision; each of eight
+        # ranks keeps 64 MiB of shared expansion scratch.
+        scale_compressed_device_bytes={"csf": 568_511_624_448 - 24_148_134_148 + 8 * (64 << 20)},
         expansion_bytes=14 << 30),),
     context=1048576, page_tokens=128, concurrency=32, max_concurrency=64, prefill_chunk=4096,
     speculation=Speculation(draft_tokens=7, token_capacity=128, packed_verification=True, graph_budget=64), max_draft_tokens=7, max_images=4, image_bytes=32 << 20,

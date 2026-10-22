@@ -40,10 +40,11 @@ class ModelWeights:
 
     @classmethod
     def load(cls, manifest, device, *, shard, progress=None, dflash=True, expert_activation="a16",
-             draft_weight_format="bf16", draft_requests=None):
+             draft_weight_format="bf16", draft_requests=None, expert_scale_compression=None):
         before = torch.cuda.memory_allocated(device)
         with MiMoWeightLoader(manifest, device, shard=shard, progress=progress,
-                              expert_activation=expert_activation) as loader:
+                              expert_activation=expert_activation,
+                              expert_scale_compression=expert_scale_compression) as loader:
             config = loader.config
             embedding, norm = loader.load_tensors(("model.embed_tokens.weight", "model.norm.weight"))
             head = loader.load_tensor("lm_head.weight",
@@ -65,13 +66,27 @@ class ModelWeights:
 
 
 class MiMoWeightLoader(DirectWeightLoader):
-    def __init__(self, manifest, device, *, shard, progress=None, prefixes=None, expert_activation="a16"):
+    def __init__(self, manifest, device, *, shard, progress=None, prefixes=None, expert_activation="a16",
+                 expert_scale_compression=None):
         super().__init__(manifest, device, progress=progress, prefixes=prefixes)
         if expert_activation not in ("a8", "a16"):
             raise ValueError("MiMo experts use A8 or A16 activations")
+        if expert_scale_compression not in (None, "csf"):
+            raise ValueError("MiMo expert scale compression must be None or 'csf'")
         self.config, self.shard = ModelConfig.load(manifest.snapshot), shard
         self.expert_activation = expert_activation
+        self.expert_scale_compression = expert_scale_compression
+        self.scale_scratch = None
         self.config.qkv_chunks(0, shard)
+
+    def expert_scale_scratch(self, hidden, intermediate, experts):
+        """Two expansion buffers shared by every routed layer, which execute serially."""
+        if self.scale_scratch is None:
+            def buffer(rows, columns):
+                return torch.empty((experts, (rows + 255) // 256 * 256, (columns + 7) // 8 * 8),
+                                   dtype=torch.uint8, device=self.device)
+            self.scale_scratch = (buffer(2 * intermediate, hidden // 32), buffer(hidden, intermediate // 32))
+        return self.scale_scratch
 
     def _selected_names(self):
         return {name for name in super()._selected_names()
@@ -144,11 +159,18 @@ class MiMoWeightLoader(DirectWeightLoader):
                                                  prefix + ".post_attention_layernorm.weight"))
         mlp = router = correction = experts = None
         if c["moe_layer_freq"][layer]:
+            interval = shard.partition(c["moe_intermediate_size"], alignment=32)
+            compression = {} if self.expert_scale_compression is None else dict(
+                # b12x keeps one compressed scale grid for A16 and A4 launches only in gate/up order.
+                projection_names=("gate_proj", "up_proj", "down_proj"), w13_layout="w31",
+                scale_compression=self.expert_scale_compression,
+                scale_scratch=self.expert_scale_scratch(c["hidden_size"], interval[1] - interval[0],
+                                                        c["n_routed_experts"]))
             experts = self.load_fp4_experts(
                 [f"{prefix}.mlp.experts.{i}" for i in range(c["n_routed_experts"])],
                 hidden_size=c["hidden_size"], intermediate_size=c["moe_intermediate_size"],
                 format="mxfp4", activation_mode=self.expert_activation,
-                intermediate_range=shard.partition(c["moe_intermediate_size"], alignment=32))
+                intermediate_range=interval, **compression)
             router, correction = self.load_tensors((prefix + ".mlp.gate.weight",
                                                     prefix + ".mlp.gate.e_score_correction_bias"))
         else:
