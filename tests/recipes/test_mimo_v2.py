@@ -79,3 +79,12 @@ def test_checkpoint_chunk_geometry_rejects_inexact_sharding():
         config().qkv_chunks(0, TensorParallelShard(0, 3))
     with pytest.raises(ValueError, match="checkpoint's fused-QKV shard count"):
         config().qkv_chunks(0, TensorParallelShard(0, 16))
+
+
+def test_a4_prefill_variants_follow_the_export_threshold():
+    from ignition.recipes.mimo_v2.bootstrap import A4_PREFILL_MIN_TOKENS, PreparationConfig
+
+    assert PreparationConfig(dflash=True).a4_prefill_min_tokens == A4_PREFILL_MIN_TOKENS == 512
+    assert PreparationConfig(dflash=True).a4_prefill
+    assert not PreparationConfig(dflash=True, a4_prefill_min_tokens=0).a4_prefill
+    assert not PreparationConfig(dflash=True, expert_activation="a8").a4_prefill
