@@ -284,6 +284,54 @@ impl RequestScheduler {
         if kind == GraphKind::ScoredPrefill { &self.scored_prefill_catalog } else { &self.prefill_catalog }
     }
 
+    /// A lone request's chunk that stops short of its next prefill stop (a message end or the
+    /// prompt end) leaves a remainder that costs another pass. True when one larger graph reaches
+    /// the stop for no more than both passes together. Requests that share the GPU keep smaller
+    /// chunks, which interleave the others' decoding.
+    fn split_costs_more(
+        &self,
+        request: &LiveRequest,
+        kind: GraphKind,
+        batch: usize,
+        capacity: usize,
+        work: usize,
+        duration_ns: u64,
+    ) -> bool {
+        let catalog = self.prefill_catalog(kind);
+        let Some(&largest) = catalog.iter().max() else {
+            return false;
+        };
+        let segment = self.prefill_work(request, largest);
+        let start = request.consumed_tokens as usize;
+        let stop = request
+            .message_boundaries
+            .iter()
+            .copied()
+            .find(|n| *n > start)
+            .unwrap_or(request.prompt_tokens);
+        if duration_ns == 0
+            || work >= segment
+            || start + segment != stop
+            || self.slots.iter().filter(|s| s.request.is_some()).count() != 1
+        {
+            return false;
+        }
+        let Some(rest_ns) = catalog
+            .iter()
+            .filter(|&&c| c >= segment - work)
+            .min()
+            .and_then(|&c| self.costs.duration(kind, batch, c))
+            .filter(|&ns| ns > 0)
+        else {
+            return false;
+        };
+        catalog
+            .iter()
+            .filter(|&&c| c > capacity && self.prefill_work(request, c) == segment)
+            .filter_map(|&c| self.costs.duration(kind, batch, c))
+            .any(|ns| ns > 0 && ns <= duration_ns.saturating_add(rest_ns))
+    }
+
     pub(super) fn prefill_work(&self, request: &LiveRequest, capacity: usize) -> usize {
         let start = request.consumed_tokens as usize;
         let mut end = request
@@ -815,6 +863,7 @@ impl RequestScheduler {
                     || (duration_ns == 0 && catalog.iter()
                         .take_while(|&&smaller| smaller < capacity)
                         .any(|&smaller| self.prefill_work(r, smaller) == work))
+                    || self.split_costs_more(r, kind, batch, capacity, work, duration_ns)
                 {
                     continue;
                 }

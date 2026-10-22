@@ -1222,6 +1222,25 @@ fn small_prefill_tails_choose_the_best_effective_value_rate() {
 }
 
 #[test]
+fn prefill_reaches_its_stop_in_one_pass_when_splitting_costs_more() {
+    // 2048 + 1024 (70 ms) costs more than one 4096 pass (60 ms) despite the better first-step rate.
+    let mut s = interactive_engine(1, false);
+    set_cost(&mut s, GraphKind::Prefill, 1, 1024, 30 * MS);
+    set_cost(&mut s, GraphKind::Prefill, 1, 2048, 40 * MS);
+    set_cost(&mut s, GraphKind::Prefill, 1, 4096, 60 * MS);
+    add(&mut s, 1, 3000, 128);
+    assert_eq!(step(&mut s, 0).kind, GraphKind::Init);
+    let plan = s.plan().unwrap();
+    assert_eq!((plan.kind, plan.token_capacity, plan.lanes[0].tokens), (GraphKind::Prefill, 4096, 3000));
+    // Cheaper two passes still split.
+    let mut s = interactive_engine(1, false);
+    add(&mut s, 1, 3000, 128);
+    step(&mut s, 0);
+    let plan = s.plan().unwrap();
+    assert_eq!((plan.token_capacity, plan.lanes[0].tokens), (2048, 2048));
+}
+
+#[test]
 fn equivalent_prefill_tails_use_the_smaller_graph_despite_a_faster_padded_estimate() {
     let mut s = interactive_engine(1, false);
     set_cost(&mut s, GraphKind::Prefill, 1, 4096, MS);
