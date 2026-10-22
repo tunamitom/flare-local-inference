@@ -73,7 +73,7 @@ class Scratch:
 
 class PreparedFeedForward(torch.nn.Module):
     def __init__(self, weights, config, scratch, *, runtime, coordinator, session, name, workspace,
-                 reduce_output=True):
+                 reduce_output=True, a4_prefill=None):
         super().__init__()
         self.scratch = scratch
         self.dense = self.router_projection = self.router = self.experts = None
@@ -90,7 +90,7 @@ class PreparedFeedForward(torch.nn.Module):
                 routed_scaling_factor=c.get("routed_scaling_factor") or 1., correction_bias=weights.correction)
             self.experts = PreparedRoutedExperts(source, weights.experts, scratch.router.ids, scratch.router.weights,
                 output, session=session, name=name + ".experts", workspace=workspace,
-                router_plan=self.router.plan)
+                router_plan=self.router.plan, a4_prefill=a4_prefill)
         self.reduction = PreparedAllReduce(output, scratch.reduced, runtime=runtime, coordinator=coordinator,
             session=session, name=name + ".reduce") if reduce_output else None
         # (prefetcher, plan) issued after the experts, before their reduction.
@@ -156,7 +156,7 @@ def canonical_norm(norm_type, weight, eps):
 
 class PreparedDecoder:
     def __init__(self, weights, environment, scratch, metadata, pool, *, mode, runtime,
-                 vocabulary_runtime, coordinator, session, name, workspace, scoring=None):
+                 vocabulary_runtime, coordinator, session, name, workspace, scoring=None, a4_prefill=None):
         layer_type, norm_type = environment.canonical
         self.weights, self.scratch, self.metadata, self.pool = weights, scratch, metadata, pool
         self.vision = environment.vision if mode == "prefill" else None
@@ -179,7 +179,7 @@ class PreparedDecoder:
                 reduce_output=not self.fused)
             layer.mlp = PreparedFeedForward(layer_weights, weights.config, scratch, runtime=runtime,
                 coordinator=coordinator, session=session, name=f"{name}.layer{index}.mlp", workspace=workspace,
-                reduce_output=not self.fused)
+                reduce_output=not self.fused, a4_prefill=a4_prefill)
             layer.input_layernorm = canonical_norm(norm_type, layer_weights.input_norm, c["layernorm_epsilon"])
             layer.post_attention_layernorm = canonical_norm(norm_type, layer_weights.post_attention_norm,
                                                             c["layernorm_epsilon"])
