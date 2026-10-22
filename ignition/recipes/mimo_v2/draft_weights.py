@@ -1,17 +1,25 @@
-"""Sharded DFlash projections and the checkpoint's learned mask embedding."""
+"""Sharded DFlash projections and the checkpoint's learned mask embedding.
 
-from dataclasses import dataclass
+With the "w8a16" weight format every projection becomes block-FP8 (E4M3 values, one FP32
+scale of amax / 448 per 128x128 block) after slicing to this rank's shard; each shard
+boundary is 128-aligned, so the blocks are those of the full matrix.  Activations stay BF16.
+"""
+
+from dataclasses import dataclass, replace
 
 import torch
 
 from ignition.components.weights import DirectWeightLoader, MLPWeights
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 
+# "w8a16": block-FP8 projections run by W8A16 GEMVs; "bf16": BF16 projections run by b12x.
+WEIGHT_FORMATS = ("w8a16", "bf16")
+
 
 @dataclass(frozen=True)
 class DraftLayerWeights:
-    qkv: torch.Tensor
-    output: torch.Tensor
+    qkv: object
+    output: object
     query_norm: torch.Tensor
     key_norm: torch.Tensor
     sink: torch.Tensor | None
@@ -22,15 +30,17 @@ class DraftLayerWeights:
 
 @dataclass(frozen=True)
 class DraftWeights:
-    projection: torch.Tensor
+    projection: object
     hidden_norm: torch.Tensor
-    context_kv: torch.Tensor
+    context_kv: object
     norm: torch.Tensor
     mask_embedding: torch.Tensor
     layers: tuple[DraftLayerWeights, ...]
 
     @classmethod
-    def load(cls, snapshot, config, device, shard, *, progress=None):
+    def load(cls, snapshot, config, device, shard, *, progress=None, weight_format="bf16"):
+        if weight_format not in WEIGHT_FORMATS:
+            raise ValueError(f"DFlash weight format must be one of {WEIGHT_FORMATS}")
         c, a = config.text, config.attention
         q_range = shard.partition(a.heads * a.key_dim, alignment=a.key_dim)
         first, last = shard.replicated_partition(a.kv_heads)
@@ -72,4 +82,44 @@ class DraftWeights:
                 or mask["embedding"].shape != (c["hidden_size"],)
                 or mask["embedding"].dtype != torch.bfloat16):
             raise ValueError("DFlash mask_embedding.pt disagrees with the draft configuration")
-        return cls(projection, hidden_norm, torch.cat(context), norm, mask["embedding"].to(device), tuple(layers))
+        weights = cls(projection, hidden_norm, torch.cat(context), norm, mask["embedding"].to(device), tuple(layers))
+        return weights if weight_format == "bf16" else weights.block_fp8()
+
+    @staticmethod
+    def serving_format(weight_format, config, requests):
+        """The weight format for drafts of ``requests`` blocks: W8A16 GEMVs serve at most 32 rows
+        per launch, so larger draft batches, which would re-read the weights per 32-row slice,
+        keep BF16; their smaller graphs then use a block-FP8 copy (ModelWeights.draft_w8a16)."""
+        from ignition.components.w8a16_gemv import MAX_ROWS
+
+        if weight_format == "w8a16" and requests is not None and requests * config.block_size > MAX_ROWS:
+            return "bf16"
+        return weight_format
+
+    def block_fp8(self):
+        """These weights with every projection quantized to block-FP8 for W8A16 GEMVs."""
+        from ignition.components.w8a16_gemv import quantize_block_fp8
+
+        layers = tuple(replace(layer, qkv=quantize_block_fp8(layer.qkv), output=quantize_block_fp8(layer.output),
+            mlp=MLPWeights(quantize_block_fp8(layer.mlp.gate_up), quantize_block_fp8(layer.mlp.down)))
+            for layer in self.layers)
+        return replace(self, projection=quantize_block_fp8(self.projection),
+                       context_kv=quantize_block_fp8(self.context_kv), layers=layers)
+
+    @property
+    def projection_shapes(self):
+        """(N, K) of every projection, for sizing shared W8A16 scratch."""
+        matrices = [self.projection, self.context_kv]
+        for layer in self.layers:
+            matrices += [layer.qkv, layer.output, layer.mlp.gate_up, layer.mlp.down]
+        return tuple(sorted({tuple(_values(m).shape) for m in matrices}))
+
+
+def _values(weight):
+    # A BF16 tensor's ``values`` is the sparse-tensor method, not a weight plane.
+    return weight if isinstance(weight, torch.Tensor) else weight.values
+
+
+def projection_rows(weight):
+    """Output features of a BF16 or block-FP8 projection."""
+    return _values(weight).shape[0]
