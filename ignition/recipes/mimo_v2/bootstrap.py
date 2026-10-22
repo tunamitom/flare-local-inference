@@ -256,10 +256,13 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         arena = ScratchArena(device, overlap=False)
         session.register_scratch(arena)
         graph_buffers = GraphBufferPool(device, chunk_bytes=2 << 20)
+        auxiliary_columns = (len(weights.config.draft.target_layers) * weights.config.text["hidden_size"]
+                             if weights.draft is not None else 0)
         prefill_storage = Scratch.allocate(weights.config, shard, config.prefill_chunk_size, 1, device,
-                                           buffers=graph_buffers.cursor())
+                                           buffers=graph_buffers.cursor(), auxiliary_columns=auxiliary_columns)
         decoder_storage = Scratch.allocate(
-            weights.config, shard, config.decode_tokens, config.decode_tokens, device, buffers=graph_buffers.cursor()
+            weights.config, shard, config.decode_tokens, config.decode_tokens, device, buffers=graph_buffers.cursor(),
+            auxiliary_columns=auxiliary_columns,
         )
         vision_inputs = VisionInputs.allocate(device)
         vision_prefill = PrefillVisionInputs.allocate(config.prefill_chunk_size, device)
@@ -299,6 +302,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                 vocabulary_runtime=vocabulary_collective,
                 context_runtime=context_collective,
                 coordinator=coordinator,
+                context_tokens=max(config.prefill_chunk_size, config.decode_tokens),
             )
 
     scoring = PromptScoring.allocate(config, device, buffers, frame=frame, group=group,
