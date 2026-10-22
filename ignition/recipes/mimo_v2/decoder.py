@@ -21,11 +21,11 @@ from .attention import AttentionScratch, PreparedAttention
 L2_PREFETCH = os.environ.get("FLARE_MIMO_L2_PREFETCH", "1") != "0"
 L2_PREFETCH_MAX_TOKENS = 256
 # Decode and verification reductions up to this payload run b12x's one-shot all-reduce with the
-# residual add and RMSNorm in the same launch, the vLLM reference's 84 KiB default
-# (VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE): seven 6144-wide BF16 rows, every c1 width
-# below eight. Larger payloads keep the two-shot route and the separate add and norm;
+# residual add and RMSNorm in the same launch: eight 6144-wide BF16 rows (96 KiB). On TP8 the
+# fused one-shot takes 17.4 µs at eight rows against 24.4 µs for the two-shot, but 69.8 µs at
+# twelve. Larger payloads keep the two-shot route and the separate add and norm;
 # FLARE_MIMO_FUSED_REDUCE_NORM_MAX_BYTES=0 at export disables the fusion.
-FUSED_REDUCE_NORM_MAX_BYTES = int(os.environ.get("FLARE_MIMO_FUSED_REDUCE_NORM_MAX_BYTES", 84 << 10))
+FUSED_REDUCE_NORM_MAX_BYTES = int(os.environ.get("FLARE_MIMO_FUSED_REDUCE_NORM_MAX_BYTES", 96 << 10))
 
 
 @dataclass(frozen=True)
