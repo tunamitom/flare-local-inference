@@ -90,7 +90,7 @@ def partial_rotary(values, positions, inverse):
 
 class PreparedAttention(torch.nn.Module):
     def __init__(self, layer, weights, config, shard, source, scratch, metadata, pool, *, mode,
-                 runtime, coordinator, session, name, workspace):
+                 runtime, coordinator, session, name, workspace, reduce_output=True):
         super().__init__()
         self.geometry, self.scratch, self.metadata = config.attention(layer), scratch, metadata
         if mode not in ("prefill", "decode", "verify"):
@@ -104,8 +104,9 @@ class PreparedAttention(torch.nn.Module):
         else:
             self.output_projection = UnquantizedProjection(attended, weights.output, scratch.partial,
                                                            session=session, name=name + ".output")
+        # Without its reduction the layer returns this rank's partial for a fused reduction and norm.
         self.reduction = PreparedAllReduce(scratch.partial, scratch.output, runtime=runtime,
-                                           coordinator=coordinator, session=session, name=name + ".reduce")
+            coordinator=coordinator, session=session, name=name + ".reduce") if reduce_output else None
         # (prefetcher, plan) issued right after the QKV projection in decode and verification.
         self.prefetch = None
         geometry = self.geometry
@@ -219,6 +220,8 @@ class PreparedAttention(torch.nn.Module):
             commit_window(self.key_cache, s.key, m.state_rows[0], m.starts[0], m.lengths[0])
             commit_window(self.value_cache, s.value, m.state_rows[0], m.starts[0], m.lengths[0])
         s.partial.copy_(self.output_projection(s.attended.flatten(1)))
+        if self.reduction is None:
+            return s.partial, None
         return self.reduction(s.partial).view_as(hidden_states), None
 
     def commit(self, counts):
