@@ -110,7 +110,7 @@ class PreparedRoutedExperts:
 
     def __init__(self, source, experts, ids, weights, output, *, session: PreparationSession, name: str,
                  workspace: ScratchArena | torch.Tensor | None = None, router_plan=None,
-                 a4_prefill=False, routing=None):
+                 a4_prefill=None, routing=None):
         # b12x owns the final weight/scale planes after repacking. Classify those
         # exact tensors, not opaque execution scratch or the discarded source.
         for field in ("w1_fp4", "w2_fp4", "w1_blockscale", "w2_blockscale",
