@@ -26,6 +26,9 @@ pub struct LoadOptions {
     /// Retain every captured packed verification capacity at or below this total-row ceiling.
     pub mtp_max_verification_token_budget: Option<usize>,
     pub adaptive_verification: Option<bool>,
+    /// Token capacity from which graphs captured in both activation precisions serve their
+    /// quantized-activation variant; zero serves them unquantized [default: package setting].
+    pub quantized_activation_min_tokens: Option<usize>,
     /// User-visible ordinals when the launcher renumbers CUDA devices.
     pub device_labels: Option<Vec<i32>>,
     pub prefix_cache: crate::offload::PrefixCacheOffload,
@@ -196,6 +199,30 @@ impl LoadOptions {
         }
         let selected_token_capacity = verification_token_limit
             .map_or(token_capacity, |budget| token_capacity.min(budget as u64));
+        let quantized_floor = execution.graphs.iter()
+            .filter(|g| g.quantized_activations == Some(true))
+            .map(|g| g.token_capacity).min();
+        let quantized_threshold = match quantized_floor {
+            None => {
+                if self.quantized_activation_min_tokens.is_some() {
+                    return Err(invalid("activation precision selection requires a package captured with quantized-activation variants"));
+                }
+                None
+            }
+            Some(floor) => {
+                let threshold = match self.quantized_activation_min_tokens {
+                    Some(value) => value as u64,
+                    None => config.get("quantized_activation_min_tokens").and_then(Value::as_u64)
+                        .ok_or_else(|| invalid("package lacks its default quantized activation threshold"))?,
+                };
+                if threshold != 0 && threshold < floor {
+                    return Err(invalid(format!(
+                        "quantized activation threshold must be 0 or at least the smallest captured variant capacity {floor}"
+                    )));
+                }
+                Some(threshold)
+            }
+        };
         let mut rank_catalog = None;
         for (rank, package) in packages.iter_mut().enumerate() {
             let execution = package
@@ -290,6 +317,7 @@ impl LoadOptions {
                         graph.draft_tokens,
                         graph.draft_source,
                         graph.speculation_enabled,
+                        graph.quantized_activations,
                     ))
                 {
                     return Err(invalid("invalid or duplicate serving graph variant"));
@@ -297,6 +325,15 @@ impl LoadOptions {
                 if !names.insert(graph.name.clone()) {
                     return Err(invalid("duplicate execution graph name"));
                 }
+            }
+            // Selection keeps one activation precision per capacity, so each variant needs its twin.
+            let twins: HashSet<_> = variants.iter().filter(|v| v.9.is_some()).cloned().collect();
+            if twins.iter().any(|v| {
+                let mut twin = v.clone();
+                twin.9 = v.9.map(|quantized| !quantized);
+                !twins.contains(&twin)
+            }) {
+                return Err(invalid("activation precision variants must be captured in both precisions"));
             }
             let resources: HashSet<_> = package
                 .graphs
@@ -313,6 +350,8 @@ impl LoadOptions {
                     && graph
                         .speculation_enabled
                         .is_none_or(|value| value == enabled)
+                    && graph.quantized_activations.is_none_or(|quantized| quantized
+                        == quantized_threshold.is_some_and(|t| t != 0 && graph.token_capacity >= t))
                     && (graph.kind != "decode" || !enabled)
                     && (graph.kind != "proposal" || (enabled
                         && graph.draft_tokens.is_some_and(|n| n as usize <= drafts
@@ -474,6 +513,9 @@ impl LoadOptions {
         if !enabled {
             object.insert("history_drafts".into(), false.into());
         }
+        if let Some(threshold) = quantized_threshold {
+            object.insert("quantized_activation_min_tokens".into(), threshold.into());
+        }
         Ok(active)
     }
 }
@@ -603,6 +645,104 @@ mod tests {
 
     fn config() -> Value {
         serde_json::json!({"speculative_token_capacity": 24, "speculative_widths": [1,2,3,4,5,6], "speculative_fixed_width": null})
+    }
+
+    fn add_graphs(package: &mut Package, graphs: Vec<wire::ExecutionGraph>) {
+        for g in graphs {
+            let id = package.functions.len();
+            package.graphs.push(Graph {
+                name: g.name.clone(), flags: 0, resource: g.name.clone(), node_count: 1, edge_count: 0,
+                functions: vec![id],
+            });
+            package.functions.push(Function {
+                id, module: g.name.clone(), symbol: "kernel".into(), parameter_sizes: vec![], attributes: vec![],
+            });
+            package.modules.push(Module { name: g.name.clone(), file: format!("{}.cubin", g.name), globals: vec![] });
+            package.execution.as_mut().unwrap().graphs.push(g);
+        }
+    }
+
+    fn prefill(capacity: u64, quantized: Option<bool>) -> wire::ExecutionGraph {
+        let suffix = match quantized { Some(true) => "-a4", Some(false) => "-a16", None => "" };
+        wire::ExecutionGraph {
+            name: format!("prefill{capacity}{suffix}"),
+            kind: "prefill".into(),
+            sampling_mode: "general".into(),
+            estimated_duration_ns: 1000,
+            batch_capacity: 1,
+            token_capacity: capacity,
+            quantized_activations: quantized,
+            ..Default::default()
+        }
+    }
+
+    fn precision_package() -> Package {
+        let mut package = package();
+        add_graphs(&mut package, vec![prefill(256, None), prefill(512, Some(false)), prefill(512, Some(true)),
+            prefill(1024, Some(false)), prefill(1024, Some(true))]);
+        package
+    }
+
+    fn precision_config() -> Value {
+        let mut config = config();
+        config["quantized_activation_min_tokens"] = 512.into();
+        config
+    }
+
+    fn selected_prefills(options: LoadOptions, config: &mut Value) -> Vec<String> {
+        let mut packages = [precision_package()];
+        options.select(&mut packages, config).unwrap();
+        let mut names: Vec<_> = packages[0].execution.as_ref().unwrap().graphs.iter()
+            .filter(|g| g.kind == "prefill").map(|g| g.name.clone()).collect();
+        let mut captured: Vec<_> = packages[0].graphs.iter()
+            .filter(|g| g.name.starts_with("prefill")).map(|g| g.name.clone()).collect();
+        names.sort();
+        captured.sort();
+        assert_eq!(names, captured);
+        names
+    }
+
+    #[test]
+    fn activation_precision_variants_follow_the_selected_threshold() {
+        let mut c = precision_config();
+        assert_eq!(selected_prefills(LoadOptions::default(), &mut c), ["prefill1024-a4", "prefill256", "prefill512-a4"]);
+        assert_eq!(c["quantized_activation_min_tokens"], 512);
+        for (threshold, expected) in [
+            (1024, ["prefill1024-a4", "prefill256", "prefill512-a16"]),
+            (700, ["prefill1024-a4", "prefill256", "prefill512-a16"]),
+            (2048, ["prefill1024-a16", "prefill256", "prefill512-a16"]),
+            (0, ["prefill1024-a16", "prefill256", "prefill512-a16"]),
+        ] {
+            let mut c = precision_config();
+            let options = LoadOptions { quantized_activation_min_tokens: Some(threshold), ..Default::default() };
+            assert_eq!(selected_prefills(options, &mut c), expected);
+            assert_eq!(c["quantized_activation_min_tokens"], threshold);
+        }
+    }
+
+    #[test]
+    fn activation_precision_selection_rejects_unsupported_requests() {
+        let error = |mut packages: [Package; 1], options: LoadOptions, mut config: Value| {
+            options.select(&mut packages, &mut config).unwrap_err().to_string()
+        };
+        let below = LoadOptions { quantized_activation_min_tokens: Some(256), ..Default::default() };
+        assert!(error([precision_package()], below, precision_config()).contains("smallest captured variant capacity 512"));
+        let requested = LoadOptions { quantized_activation_min_tokens: Some(512), ..Default::default() };
+        assert!(error([package()], requested, config()).contains("requires a package captured"));
+        assert!(error([precision_package()], LoadOptions::default(), config()).contains("lacks its default"));
+        let mut single = package();
+        add_graphs(&mut single, vec![prefill(512, Some(true))]);
+        assert!(error([single], LoadOptions::default(), precision_config()).contains("both precisions"));
+    }
+
+    #[test]
+    fn packages_without_activation_variants_select_unchanged() {
+        let mut packages = [package()];
+        let mut c = config();
+        let before = packages[0].execution.as_ref().unwrap().graphs.len();
+        LoadOptions::default().select(&mut packages, &mut c).unwrap();
+        assert!(packages[0].execution.as_ref().unwrap().graphs.len() <= before);
+        assert!(c.get("quantized_activation_min_tokens").is_none());
     }
 
     #[test]

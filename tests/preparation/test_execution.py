@@ -161,6 +161,46 @@ def test_diagnostic_manifest_selects_fixed_width_without_discarding_export_graph
     assert tuple(model.graphs) == tuple(signatures)
 
 
+@pytest.mark.parametrize("threshold,expected", [
+    (512, ["prefill256", "prefill512-a4", "prefill1024-a4"]),
+    (1024, ["prefill256", "prefill512", "prefill1024-a4"]),
+    (0, ["prefill256", "prefill512", "prefill1024"]),
+])
+def test_export_keeps_both_activation_precisions_while_diagnostics_select_the_default(
+        monkeypatch, threshold, expected):
+    from ignition.preparation.model import PreparedModel
+    from ignition.preparation.runtime_package_pb2 import ExecutionGraph, ServingContract
+
+    signatures = {"prefill256": GraphSignature("prefill", 1, 256)}
+    for capacity in (512, 1024):
+        signatures[f"prefill{capacity}"] = GraphSignature("prefill", 1, capacity, quantized_activations=False)
+        signatures[f"prefill{capacity}-a4"] = GraphSignature("prefill", 1, capacity, quantized_activations=True)
+    model = _execution(model_class=PreparedModel, graphs=dict.fromkeys(signatures, object()),
+        signatures=signatures, server_config={"quantized_activation_min_tokens": threshold},
+        memory_report={}, session=None)
+    spans = [(4096, 4), (8192, 8), (12288, 512), (16384, 128), (20480, 1)]
+    monkeypatch.setattr(model, "_validate_resources", lambda: (9, list(range(11, 16)), spans))
+    exported = model.manifest(all_variants=True)["graphs"]
+    assert {g["name"]: g.get("quantized_activations") for g in exported} == {
+        name: signature.quantized_activations for name, signature in signatures.items()}
+    encoded = ExecutionGraph(**{key: value for key, value in exported[-1].items() if key != "handle"})
+    assert ExecutionGraph.FromString(encoded.SerializeToString()).quantized_activations is True
+    assert not ExecutionGraph.FromString(ExecutionGraph(name="old").SerializeToString()).HasField(
+        "quantized_activations")
+    assert ServingContract(quantized_activation_min_tokens=threshold).HasField("quantized_activation_min_tokens")
+    assert [g["name"] for g in model.manifest()["graphs"]] == expected
+
+
+def test_activation_precision_variants_require_a_package_default():
+    from ignition.preparation.execution import quantized_variant_selected
+
+    assert quantized_variant_selected(None, 512, {})
+    with pytest.raises(ValueError, match="default quantized activation threshold"):
+        quantized_variant_selected(True, 512, {})
+    with pytest.raises(TypeError, match="activation precision"):
+        GraphSignature("prefill", 1, 512, quantized_activations=1)
+
+
 @pytest.mark.parametrize("signature", [
     lambda: GraphSignature("callback", 1, 1),
     lambda: GraphSignature("decode", True, 1),
