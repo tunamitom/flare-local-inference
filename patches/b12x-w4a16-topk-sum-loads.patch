@@ -1,0 +1,59 @@
+diff -ru a/b12x/moe/_shared/kernels/w4a16/kernel/sum.py b/b12x/moe/_shared/kernels/w4a16/kernel/sum.py
+--- a/b12x/moe/_shared/kernels/w4a16/kernel/sum.py	2026-10-22 05:45:35.766135239 +0700
++++ b/b12x/moe/_shared/kernels/w4a16/kernel/sum.py	2026-10-22 05:45:35.767285392 +0700
+@@ -485,31 +485,38 @@
+         if idx < total:
+             token = idx // Int32(self.hidden_size)
+             col = idx - token * Int32(self.hidden_size)
++            # Issue every top-k gather before any route-validity decision: the
++            # loads are independent and in bounds for all rows < active_m * topk,
++            # and a per-route branch would serialize them. Invalid routes (whose
++            # FC2 rows are never written) are dropped by select, never by
++            # multiplying possibly non-finite scratch by zero.
++            route_values = [
++                fc2_flat[
++                    Int64(token * Int32(self.topk) + Int32(route))
++                    * Int64(self.hidden_size)
++                    + Int64(col)
++                ].to(cutlass.Float32)
++                for route in range(self.topk)
++            ]
+             acc = cutlass.Float32(0.0)
+             for route in cutlass.range_constexpr(self.topk):
+                 row = token * Int32(self.topk) + Int32(route)
+-                valid_route = Int32(1)
++                term = _materialize_w4a16_topk_route_f32(route_values[route])
++                if cutlass.const_expr(self.apply_topk_weights):
++                    term = term * topk_weights_flat[row].to(cutlass.Float32)
+                 if cutlass.const_expr(self.use_expert_map):
+                     raw_expert = route_expert_ids_flat[row].to(Int32)
+                     expert = Int32(-1)
+                     if raw_expert >= Int32(0) and raw_expert < route_num_experts:
+                         expert = expert_map_flat[raw_expert].to(Int32)
+-                    if expert < Int32(0) or expert >= weight_num_experts:
+-                        valid_route = Int32(0)
+-                elif weight_num_experts > Int32(0):
+-                    expert = route_expert_ids_flat[row]
+-                    if expert < 0 or expert >= weight_num_experts:
+-                        valid_route = Int32(0)
+-                if valid_route != Int32(0):
+-                    route_value = fc2_flat[
+-                        Int64(row) * Int64(self.hidden_size) + Int64(col)
+-                    ].to(cutlass.Float32)
+-                    if cutlass.const_expr(self.apply_topk_weights):
+-                        acc += _materialize_w4a16_topk_route_f32(
+-                            route_value
+-                        ) * topk_weights_flat[row].to(cutlass.Float32)
+-                    else:
+-                        acc += _materialize_w4a16_topk_route_f32(route_value)
++                    valid = (expert >= Int32(0)) & (expert < weight_num_experts)
++                    acc += cutlass.select_(valid, term, cutlass.Float32(0.0))
++                else:
++                    expert = route_expert_ids_flat[row].to(Int32)
++                    valid = (weight_num_experts <= Int32(0)) | (
++                        (expert >= Int32(0)) & (expert < weight_num_experts)
++                    )
++                    acc += cutlass.select_(valid, term, cutlass.Float32(0.0))
+             output_flat[idx] = self._cast_elem(acc)
+ 
+     @cute.jit
