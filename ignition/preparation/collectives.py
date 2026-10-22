@@ -1,5 +1,6 @@
 """Bootstrap coordination of b12x collectives over an established Gloo group."""
 
+import contextlib
 import json
 from datetime import timedelta
 from pathlib import Path
@@ -66,6 +67,64 @@ def create_all_reduce_runtime(group, device, *, max_tokens, hidden_size, ipc=Non
         raise ValueError("all-reduce capacity must occupy complete 16-byte packs")
     return AllReduce.from_exchange_group(exchange_group=group, device=device, single_channel=True,
                                          max_size=nbytes, eager_buffer_bytes=nbytes, ipc=ipc)
+
+
+def create_twoshot_all_reduce_runtime(group, device, *, max_tokens, hidden_size, ipc=None):
+    """Allocate one b12x BF16 two-shot channel for hidden activations of up to `max_tokens` rows.
+
+    Each rank owns a `hidden_size / world_size` column shard of every row, so any token
+    count splits evenly across ranks.
+    """
+    from b12x.comm.pcie import PCIeTwoShotBF16
+
+    world_size = dist.get_world_size(group)
+    if (type(max_tokens) is not int or max_tokens <= 0 or type(hidden_size) is not int
+            or hidden_size % world_size or hidden_size // world_size % 8):
+        raise ValueError("two-shot reductions require positive rows and 8-element rank shards")
+    return PCIeTwoShotBF16.from_exchange_group(exchange_group=group, device=device,
+        max_rows=max_tokens * world_size, row_elems=hidden_size // world_size, ipc=ipc)
+
+
+class RoutedAllReduce:
+    """Route each prepared reduction by payload size between one-shot and two-shot runtimes.
+
+    One-shot reads every peer's whole payload, so its cost grows with the row count;
+    two-shot moves each rank's shard twice. On TP8 behind PCIe switches the two cross
+    near three 6144-wide BF16 rows. Payloads the two-shot channel does not accept stay
+    on one-shot. Other attributes are the one-shot runtime's.
+    """
+
+    def __init__(self, oneshot, twoshot, *, oneshot_max_bytes):
+        if type(oneshot_max_bytes) is not int or oneshot_max_bytes < 0:
+            raise ValueError("the one-shot ceiling must be a nonnegative byte count")
+        self.oneshot, self.twoshot, self.oneshot_max_bytes = oneshot, twoshot, oneshot_max_bytes
+        # Any prepared two-shot plan opens its capture context; graphs record device-selected slots.
+        self.twoshot_plan = None
+
+    def select(self, source):
+        if (source.numel() * source.element_size() > self.oneshot_max_bytes
+                and self.twoshot.accepts(source)):
+            return self.twoshot
+        return self.oneshot
+
+    @contextlib.contextmanager
+    def capture(self, stream=None):
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(self.oneshot.capture(stream=stream))
+            if self.twoshot_plan is not None:
+                stack.enter_context(self.twoshot.capture(plan=self.twoshot_plan))
+            yield self
+
+    def close(self):
+        try:
+            self.twoshot.close()
+        finally:
+            self.oneshot.close()
+
+    def __getattr__(self, name):
+        if name in ("oneshot", "twoshot"):
+            raise AttributeError(name)
+        return getattr(self.oneshot, name)
 
 
 def create_all_gather_runtime(group, device, *, max_rows, columns, ipc=None):
