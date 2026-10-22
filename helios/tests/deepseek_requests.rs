@@ -213,9 +213,19 @@ fn native_encoders_checkpoint_each_message_prefix() {
             let prefix = fixture.frontend.render_boundary(
                 &messages.as_array().unwrap()[..count], &Map::new()).unwrap();
             assert!(prepared.prompt.tokens.starts_with(&prefix.token_ids));
-            assert!(prepared.prompt.message_boundaries.contains(&prefix.token_ids.len()),
+            assert!(prepared.prompt.message_boundaries.contains(&prefix.token_ids.len())
+                    || count == messages.as_array().unwrap().len(),
                 "{encoder:?}, message {count}");
         }
+        // The generation prompt begins the rendered reply, so the prompt endpoint, not the last
+        // message end, is the next turn's checkpoint.
+        let mut replied = messages.as_array().unwrap().clone();
+        replied.push(json!({"role":"assistant","content":"OK"}));
+        let reply = fixture.frontend.render_boundary(&replied, &Map::new()).unwrap();
+        let last = fixture.frontend.render_boundary(messages.as_array().unwrap(), &Map::new()).unwrap();
+        assert_eq!(prepared.prompt.message_boundaries.contains(&last.token_ids.len()),
+            !reply.token_ids.starts_with(&fixture.frontend.render_chat(messages.as_array().unwrap(), &Map::new()).unwrap().token_ids),
+            "{encoder:?}, last message");
     }
 }
 
@@ -426,5 +436,6 @@ fn base64_images_follow_the_rendered_placeholder_order() {
         Some(&processor), &complete_message,
         vec![processor.decode_png(&green).unwrap(), processor.decode_png(&red).unwrap()]).unwrap();
     assert!(request.prompt.tokens.starts_with(&complete_message.tokens));
-    assert!(request.prompt.message_boundaries.contains(&complete_message.tokens.len()));
+    // A single message whose generation prompt begins the reply checkpoints at the prompt endpoint.
+    assert!(!request.prompt.message_boundaries.contains(&complete_message.tokens.len()));
 }
