@@ -99,6 +99,11 @@ class PreparationConfig:
     # Each rank proposes drafts from its vocabulary shard of the draft head and gathers only its
     # bounded candidates; False gathers full-vocabulary draft logits. Proposals are identical.
     vocabulary_parallel_draft: bool = True
+    # "w8a16" converts the draft's BF16 projections to block-FP8 (128x128 blocks, amax/448
+    # scales) at load and runs them as W8A16 GEMVs with BF16 activations, halving draft weight
+    # traffic; "bf16" keeps the checkpoint's BF16 projections. Draft batches above 32 rows
+    # (more than four requests of eight-token blocks) keep BF16.
+    draft_weight_format: str = "w8a16"
     # BF16 activations over MXFP4 experts (W4A16), as the SM120 vLLM reference serves MiMo.
     expert_activation: str = "a16"
     # A4/A16 hybrid: prefill graphs of at least this many tokens are captured twice, with BF16 and
@@ -126,6 +131,8 @@ class PreparationConfig:
         if not 64 <= self.prefill_chunk_size <= self.context or self.prefill_chunk_size % 64:
             raise ValueError("prefill chunk size must be 64-aligned in [64,context]")
         request_capacity(self.max_active)
+        if self.draft_weight_format not in ("w8a16", "bf16"):
+            raise ValueError("MiMo draft weights are w8a16 or bf16")
         _ = self.speculative_shapes
         if not self.speculative_widths or max(self.speculative_widths) > 8:
             raise ValueError("MiMo DFlash verification supports at most seven drafts")
@@ -188,7 +195,9 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     else:
         os.environ.pop("B12X_W4A16_MXFP4_PREFILL_MIN_TOKENS", None)
     weights = ModelWeights.load(manifest, device, shard=shard, progress=progress, dflash=config.dflash,
-                                expert_activation=config.expert_activation)
+                                expert_activation=config.expert_activation,
+                                draft_weight_format=config.draft_weight_format,
+                                draft_requests=config.request_capacity)
     release_unused()
     sequence = torch.zeros(1, dtype=torch.int64, device=device)
     with phase(progress, "Allocate model state and collectives"):
@@ -626,6 +635,9 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     ]
     if speculation is not None:
         disposable.append(speculation.draft_scratch)
+        if speculation.w8a16_workspace is not None:
+            # Zeroed counters are the workspace's idle state.
+            disposable.append(speculation.w8a16_workspace.scratch_tensors())
         disposable.append(speculation.sampling_buffers.chunks)
     for forward in forwards.values():
         if isinstance(forward, PreparedScoredPrefill):
