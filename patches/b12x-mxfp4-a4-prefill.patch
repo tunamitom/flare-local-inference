@@ -1,0 +1,2956 @@
+diff -ruN a/b12x/_lib/intrinsics/mma.py b/b12x/_lib/intrinsics/mma.py
+--- a/b12x/_lib/intrinsics/mma.py	2026-10-21 17:22:48.252812398 +0700
++++ b/b12x/_lib/intrinsics/mma.py	2026-10-21 17:22:48.255161016 +0700
+@@ -734,3 +734,98 @@
+     lo = llvm.extractvalue(T.i32(), res, [0], loc=loc, ip=ip)
+     hi = llvm.extractvalue(T.i32(), res, [1], loc=loc, ip=ip)
+     return Uint32(lo), Uint32(hi)
++
++
++@dsl_user_op
++def mxfp4_mma_m16n8k64_f32_e2m1_ue8m0(
++    d0: Float32,
++    d1: Float32,
++    d2: Float32,
++    d3: Float32,
++    a0: Uint32,
++    a1: Uint32,
++    a2: Uint32,
++    a3: Uint32,
++    b0: Uint32,
++    b1: Uint32,
++    sfa: Uint32,
++    sfb: Uint32,
++    bid_a: int = 0,
++    tid_a: int = 0,
++    bid_b: int = 0,
++    tid_b: int = 0,
++    *,
++    loc=None,
++    ip=None,
++) -> Tuple[Float32, Float32, Float32, Float32]:
++    """SM120 MXFP4 block-scaled QMMA ``m16n8k64`` (E2M1 x E2M1, UE8M0 per-32).
++
++    Emits ``mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::2X.
++    m16n8k64.row.col.f32.e2m1.e2m1.f32.ue8m0``.  The A/B/accumulator fragment
++    mapping is identical to :func:`nvfp4_mma_m16n8k64_f32_e2m1` (the 4X/UE4M3
++    variant); only the scale words differ: per-32 UE8M0 byte-pairs instead of
++    per-16 UE4M3 bytes.
++
++    Scale metadata (validated bit-exact against a float64 dequantize-and-matmul
++    oracle over multi-atom K loops and N>8 layouts -- w2-ladder R8-style
++    probes): the SFA word of lane ``L`` carries one A row's byte-pair --
++    row ``L>>2`` if ``L%4 == 0`` or row ``(L>>2)+8`` if ``L%4 == 1`` (lanes
++    ``L%4`` in {2, 3} unused), bytes 0/1 = the atom's K32 groups ``2g`` /
++    ``2g+1``.  The SFB word of lane ``L`` is valid for ``L%4 == 0`` only and
++    carries column ``L>>2``'s byte-pair (same byte order); the hardware reads
++    the word from the ``thread-id-b = 0`` lane.  ``bid_a``/``tid_a``/``bid_b``/
++    ``tid_b`` are the Table 46 defaults {0, 0} for both operands (either as
++    these i16 operands or literal ``{0, 0}`` -- both forms proven equivalent).
++    """
++    i16_ty = cutlass._mlir.ir.IntegerType.get_signless(16)
++
++    def _i16(v: int):
++        return cutlass._mlir.ir.Operation.create(
++            "llvm.mlir.constant",
++            results=[i16_ty],
++            attributes={"value": cutlass._mlir.ir.IntegerAttr.get(i16_ty, int(v))},
++        ).result
++
++    result = llvm.inline_asm(
++        llvm.StructType.get_literal([T.f32(), T.f32(), T.f32(), T.f32()]),
++        [
++            Uint32(a0).ir_value(loc=loc, ip=ip),
++            Uint32(a1).ir_value(loc=loc, ip=ip),
++            Uint32(a2).ir_value(loc=loc, ip=ip),
++            Uint32(a3).ir_value(loc=loc, ip=ip),
++            Uint32(b0).ir_value(loc=loc, ip=ip),
++            Uint32(b1).ir_value(loc=loc, ip=ip),
++            Uint32(sfa).ir_value(loc=loc, ip=ip),
++            _i16(bid_a),
++            _i16(tid_a),
++            Uint32(sfb).ir_value(loc=loc, ip=ip),
++            _i16(bid_b),
++            _i16(tid_b),
++            Float32(d0).ir_value(loc=loc, ip=ip),
++            Float32(d1).ir_value(loc=loc, ip=ip),
++            Float32(d2).ir_value(loc=loc, ip=ip),
++            Float32(d3).ir_value(loc=loc, ip=ip),
++        ],
++        """
++        mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::2X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue8m0
++        {$0, $1, $2, $3},
++        {$4, $5, $6, $7},
++        {$8, $9},
++        {$0, $1, $2, $3},
++        {$10},
++        {$11, $12},
++        {$13},
++        {$14, $15};
++        """,
++        "=f,=f,=f,=f,r,r,r,r,r,r,r,h,h,r,h,h,0,1,2,3",
++        has_side_effects=False,
++        is_align_stack=False,
++        asm_dialect=llvm.AsmDialect.AD_ATT,
++        loc=loc,
++        ip=ip,
++    )
++    r0 = llvm.extractvalue(T.f32(), result, [0], loc=loc, ip=ip)
++    r1 = llvm.extractvalue(T.f32(), result, [1], loc=loc, ip=ip)
++    r2 = llvm.extractvalue(T.f32(), result, [2], loc=loc, ip=ip)
++    r3 = llvm.extractvalue(T.f32(), result, [3], loc=loc, ip=ip)
++    return Float32(r0), Float32(r1), Float32(r2), Float32(r3)
+diff -ruN a/b12x/_lib/quant/x4t_packed_scales.py b/b12x/_lib/quant/x4t_packed_scales.py
+--- a/b12x/_lib/quant/x4t_packed_scales.py	2026-10-21 17:22:48.259812206 +0700
++++ b/b12x/_lib/quant/x4t_packed_scales.py	2026-10-21 17:22:48.261590831 +0700
+@@ -10,6 +10,7 @@
+ from __future__ import annotations
+ 
+ import functools
++import os
+ 
+ import cuda.bindings.driver as cuda
+ import cutlass
+@@ -25,6 +26,59 @@
+ from b12x._lib.utils.pointers import make_ptr
+ 
+ 
++# HOST-CALL diagnostics for decode_x4t_packed_scale(_pair) invocations (one
++# increment per host call that issues the paired/single decode grid).
++# Codex review fix: this is NOT a GPU completion count -- it increments
++# BEFORE compiled(...) is invoked (including under CUDA-graph capture) and
++# does not increment on graph replay. Nothing on the serving path reads it;
++# it exists so tests and diagnostics can prove that a consumed scale
++# prefetch removed the corresponding inline decode HOST CALL. Gated behind
++# B12X_X4T_SCALE_LAUNCH_DIAGNOSTICS=1 (cached after the first check;
++# reset_packed_scale_host_call_count() re-reads it) so production calls pay
++# only a cached boolean test, not the instrumentation.
++_packed_scale_host_calls = 0
++_launch_diagnostics: bool | None = None
++
++
++def _launch_diagnostics_enabled() -> bool:
++    global _launch_diagnostics
++    if _launch_diagnostics is None:
++        _launch_diagnostics = (
++            os.environ.get("B12X_X4T_SCALE_LAUNCH_DIAGNOSTICS", "") == "1"
++        )
++    return _launch_diagnostics
++
++
++def packed_scale_host_call_count() -> int:
++    """Number of ``decode_x4t_packed_scale(_pair)`` HOST CALLS issued so far.
++
++    Host-call instrumentation, not GPU completions: an increment happens when
++    the host issues the launch (before the compiled callable runs, including
++    during CUDA-graph capture) and graph replays do not increment it. Zero
++    unless B12X_X4T_SCALE_LAUNCH_DIAGNOSTICS=1 was set (see
++    ``reset_packed_scale_host_call_count``).
++    """
++    return _packed_scale_host_calls
++
++
++def reset_packed_scale_host_call_count() -> None:
++    """Test hook: zero the host-call record and re-read the diagnostics gate.
++
++    Never called on the serving path. Tests that assert on the record must
++    call this AFTER setting B12X_X4T_SCALE_LAUNCH_DIAGNOSTICS=1.
++    """
++    global _packed_scale_host_calls, _launch_diagnostics
++    _packed_scale_host_calls = 0
++    _launch_diagnostics = None
++
++
++def _record_packed_scale_launch() -> None:
++    global _packed_scale_host_calls
++    if not _launch_diagnostics_enabled():
++        return
++    _packed_scale_host_calls += 1
++
++
+ class _PackedScaleDecode:
+     def __init__(
+         self,
+@@ -506,6 +560,7 @@
+             expert_ids_sorted,
+         )
+     )
++    _record_packed_scale_launch()
+     compiled(
+         make_ptr(
+             cutlass.Uint8,
+@@ -635,6 +690,7 @@
+                 )
+             )
+     ids64 = expert_ids.dtype == torch.int64
++    _record_packed_scale_launch()
+     program(
+         *pointers,
+         make_ptr(
+diff -ruN a/b12x/moe/fused_moe/api.py b/b12x/moe/fused_moe/api.py
+--- a/b12x/moe/fused_moe/api.py	2026-10-21 17:22:48.300811080 +0700
++++ b/b12x/moe/fused_moe/api.py	2026-10-21 17:22:48.302709196 +0700
+@@ -259,22 +259,48 @@
+ 
+ 
+ def expand_scales(experts: PreparedExperts) -> bool:
+-    """Expand every expert's NVFP4-CSF scales into its scratch on the experts' device stream.
++    """Expand every expert's compressed scales into scratch on the current stream.
+ 
+-    A later ``bind(..., scales_expanded=True)`` for these experts skips the
+-    per-call expansion. Callers that share one scratch across layers may run
+-    this for the next layer on a side stream while other work proceeds; they
+-    order it after the previous user of the scratch and before the bound call.
+-    Micro-kernel calls still expand scales to reset their synchronization state.
+-    Returns False, doing nothing, for experts without NVFP4-CSF scales.
++    NVFP4-CSF: a later ``bind(..., scales_expanded=True)`` for these experts
++    skips the per-call expansion.  MXFP4/X4T (paired-program W4A16 payload):
++    a later ``bind(..., x4t_scales_expanded=True)`` makes the X4T runners skip
++    their inline selective decode.  Callers that share one scratch across
++    layers may run this for the next layer on a side stream while other work
++    proceeds; they order it after the previous user of the scratch and before
++    the bound call.  Micro-kernel calls still expand scales to reset their
++    synchronization state.  Returns False, doing nothing, for experts without
++    compressed scales.
+     """
+     impl = experts._impl
+     decoder = getattr(impl, "nvfp4_csf", None)
+-    if decoder is None:
+-        return False
+-    with torch.cuda.device(experts.device):
+-        decoder.decode_all(impl.w1_blockscale, impl.w2_blockscale)
+-    return True
++    if decoder is not None:
++        with torch.cuda.device(experts.device):
++            decoder.decode_all(impl.w1_blockscale, impl.w2_blockscale)
++        return True
++    capability = getattr(impl, "x4t_prefetch", None)
++    if capability is not None:
++        # Prepared full-X4T expansion using the EXISTING paired program: the
++        # retained counts program (index 1) over a persistent all-ones int32
++        # counts buffer of E entries.  Counts MUST be positive: zero counts
++        # select no experts, and zero IDs in ordinary IDs mode select only
++        # expert 0.  This expands EVERY expert into the packed w13_scale/
++        # w2_scale destinations the inline decode would write (rotation and
++        # clamping come from the compiled program, identical to the selective
++        # decode), so any later selective decode is a subset of this output.
++        from b12x._lib.quant.x4t_packed_scales import decode_x4t_packed_scale_pair
++
++        first, second = capability.planes
++        decode_x4t_packed_scale_pair(
++            first,
++            second,
++            capability.counts,
++            impl.w1_blockscale,
++            impl.w2_blockscale,
++            expert_counts=True,
++            program=capability.programs[1],
++        )
++        return True
++    return False
+ 
+ 
+ def uses_expanded_nvfp4_scales(
+diff -ruN a/b12x/moe/fused_moe/_impl.py b/b12x/moe/fused_moe/_impl.py
+--- a/b12x/moe/fused_moe/_impl.py	2026-10-21 17:22:48.285811492 +0700
++++ b/b12x/moe/fused_moe/_impl.py	2026-10-21 17:22:48.288250613 +0700
+@@ -428,6 +428,59 @@
+ 
+ 
+ @dataclass(frozen=True, kw_only=True)
++class X4TPrefetchCapability:
++    """Retained all-expert X4T scale expansion for one prepared W4A16 payload.
++
++    Built at preparation time (``prepare_b12x_x4t_weights``): the paired X4T
++    planes, the retained paired programs and the packed ``w13_scale``/
++    ``w2_scale`` scratch destinations the inline decode would write, plus the
++    persistent selector buffer the expansion needs.  ``expand_scales`` uses
++    this to expand EVERY expert into the shared scratch ahead of the call;
++    a matching ``bind(..., x4t_scales_expanded=True)`` then makes the X4T
++    runners skip their inline decode launch (see that flag's contract).
++
++    Selector legality (proven byte-equal to the selective decode): the
++    serving arm is ``counts`` -- an all-ones int32 buffer of E entries with
++    ``expert_counts=True`` and the retained counts program at index 1 of
++    ``programs``.  Counts must be POSITIVE: zero counts select no experts,
++    and zero IDs in ordinary IDs mode select only expert 0.  The documented
++    alternative arm -- a persistent int32 ``arange(E)`` with the retained
++    ordinary-IDs program at index 0 and its default flags (never set
++    ``expert_ids_unique=True`` for a program compiled for ``unique=False``)
++    -- is intentionally NOT allocated: this serving implementation only ever
++    expands through counts mode, so allocating the unused IDs buffer for
++    every paired X4T payload (even with vLLM's prefetch gate OFF) would be
++    pure waste.  Re-add it at the call site if an IDs-mode arm is ever
++    needed (Codex review: gate-OFF preparation cost must be near zero).
++
++    Destinations are NOT stored here: ``expand_scales`` writes the expert
++    package's canonical ``w1_blockscale``/``w2_blockscale`` handles (the shared
++    scratch views), so a storage-reusing weight reload cannot leave this
++    capability pointing at replaced tensors.
++    """
++
++    planes: tuple
++    programs: tuple
++    counts: torch.Tensor
++
++
++def _x4t_prefetch_capability(value: Any) -> X4TPrefetchCapability | None:
++    """The all-expert expansion capability of a prepared X4T payload, if any."""
++    programs = getattr(value, "x4t_packed_pair_programs", None)
++    first = getattr(value, "x4t_w13_scale", None)
++    second = getattr(value, "x4t_w2_scale", None)
++    if programs is None or first is None or second is None:
++        return None
++    device = value.w13_scale.device
++    experts = int(first.num_experts)
++    return X4TPrefetchCapability(
++        planes=(first, second),
++        programs=programs,
++        counts=torch.ones(experts, dtype=torch.int32, device=device),
++    )
++
++
++@dataclass(frozen=True, kw_only=True)
+ class B12XFP4ExpertWeights:
+     """The sole owner and complete runtime contract for FP4 MoE experts.
+ 
+@@ -449,6 +502,10 @@
+     representation: _PreparedWeightRepresentation | None = None
+     immutable_input_scales: bool = False
+     nvfp4_csf: object | None = None
++    # Retained all-expert X4T scale expansion for the paired-program payload
++    # (X4TPrefetchCapability).  Built at preparation; None for every payload
++    # without paired X4T planes/programs (including all NVFP4 and A8 owners).
++    x4t_prefetch: object | None = None
+     a4_prefill_scales: bool = False
+     _uniform_a1_scale: bool = field(default=False, init=False, repr=False)
+     _a1_scale_version: int | None = field(default=None, init=False, repr=False)
+@@ -567,6 +624,35 @@
+                     f"actual={actual_w2}, expected={expected_w2}"
+                 )
+ 
++        from b12x.moe._shared.kernels.w4a16.mxfp4_a4_prefill import (
++            mxfp4_prefill_min_tokens as _a4_min_tokens,
++            mxfp4_prefill_scale_format_supported as _a4_scale_ok,
++            validate_activation_globals as _a4_validate_globals,
++        )
++
++        if (
++            _a4_min_tokens() > 0
++            and not self.a1_gscale.is_meta
++            and _a4_scale_ok(self.plan.w4a16_scale_format)
++        ):
++            # W2 MXFP4 prefill: warm the unit-global admission verdict now,
++            # at weight prep, BEFORE CUDA-graph capture. Under capture with a
++            # cold cache the admission returns False and the graph bakes A16
++            # permanently (probe 2026-10-06: 95 binds/rank). validate is
++            # idempotent (fingerprint cache, cached verdict short-circuits the
++            # device sync) and capture-safe here. Gate-OFF / ineligible
++            # objects skip this entirely (no device work when disabled).
++            try:
++                _a4_validate_globals(self.a1_gscale, self.a2_gscale)
++            except Exception as exc:  # observable: never hide a warm failure
++                import sys as _sys
++
++                print(
++                    f"[a4warn] activation-globals warm failed: {exc!r}",
++                    file=_sys.stderr,
++                    flush=True,
++                )
++
+         if (
+             self.immutable_input_scales
+             and "nvfp4" in self.plan.quant_modes
+@@ -1013,6 +1099,7 @@
+         output_expert_map: torch.Tensor | None = None,
+         scales_expanded: bool = False,
+         a4_prefill: bool | None = None,
++        x4t_scales_expanded: bool = False,
+         _w4a16_launches: object | None = None,
+     ) -> "TPMoEFP4Binding":
+         """Bind live tensors to this scratch plan.
+@@ -1024,9 +1111,31 @@
+         ``a4_prefill=True`` selects prepared NVFP4 activation launches.
+         False and None keep W4A16 regardless of token count. Unsupported
+         calls and uncalibrated weights remain W4A16.
++
++        ``x4t_scales_expanded`` is the X4T twin of ``scales_expanded``: it
++        states that the prepared payload's X4T scale planes were expanded into
++        the shared packed ``w13_scale``/``w2_scale`` scratch (every expert, e.g.
++        via ``expand_scales``) after the last other reader of that scratch and
++        before this call, on this call's stream or one it waits for.  The X4T
++        runners then skip their inline ``decode_x4t_packed_scale_pair`` launch.
++        Declare it only for a call whose route ABI is covered by the prefetch
++        (a full-expansion prefetch covers every route ABI); the flag is
++        per-call and never persists.
+         """
+         if not isinstance(experts, B12XFP4ExpertWeights):
+             raise TypeError("experts must come from prepare_b12x_fp4_moe_weights")
++        if x4t_scales_expanded and (
++            self.caps.quant_mode != "w4a16" or experts.x4t_prefetch is None
++        ):
++            # Reject rather than silently assume the consumer will skip: only
++            # the W4A16 X4T runners consult the flag, and only a payload with a
++            # retained all-expert expansion (paired programs) can have been
++            # prefetched. Every other path (A8 MXFP4, NVFP4, inline, tp12-only
++            # X4T) must run its own expansion.
++            raise ValueError(
++                "x4t_scales_expanded requires a W4A16 plan whose experts "
++                "retain the paired-program X4T expansion capability"
++            )
+         weight_plan = experts.plan
+         if weight_plan != self.caps.weight_plan:
+             raise ValueError(
+@@ -1091,6 +1200,7 @@
+         topk_sum_launch = None
+         route_pack_launches = None
+         a4_prefill_launches = None
++        mxfp4_prefill_launches = None
+         if (
+             self.caps.quant_mode == "w4a16"
+             and not self._core_workspace_plan.full_rotation
+@@ -1121,6 +1231,55 @@
+                     force=a4_prefill,
+                     scales_expanded=scales_expanded,
+                 )
++            # Default-OFF MXFP4 prefill (B12X_W4A16_MXFP4_PREFILL_MIN_TOKENS):
++            # admitted only for the packed e8m0_k32 payload with unit activation
++            # globals (validated once at bind, capture-safe).  Anything else
++            # falls through to today's W4A16 path unchanged.
++            select_mxfp4 = getattr(_w4a16_launches, "select_mxfp4", None)
++            if select_mxfp4 is not None:
++                candidate = select_mxfp4(
++                    tokens=int(a.shape[0]),
++                    route_ids_dtype=topk_ids.dtype,
++                    has_route_map=(
++                        route_expert_map is not None or output_expert_map is not None
++                    ),
++                    activation_amax=activation_amax,
++                    apply_router_weight_on_input=self.caps.apply_router_weight_on_input,
++                    force=a4_prefill,
++                )
++                if candidate is not None:
++                    from b12x.moe._shared.kernels.w4a16.mxfp4_a4_prefill import (
++                        mxfp4_prefill_activation_globals_admitted,
++                        mxfp4_prefill_fits,
++                        mxfp4_prefill_supported,
++                    )
++
++                    prepared_layout = self.caps.w4a16_weight_layout or "packed"
++                    scale_format = self.caps.w4a16_scale_format or "e4m3_k16"
++                    if (
++                        mxfp4_prefill_supported(
++                            prepared_layout=prepared_layout,
++                            scale_format=scale_format,
++                            activation=experts.activation,
++                            is_gated=experts.activation in {"silu"},
++                            dtype=a.dtype,
++                            hidden_size=int(a.shape[1]),
++                            intermediate_size=experts.intermediate_size,
++                            terms=candidate.terms,
++                            swiglu_limit=self.caps.swiglu_limit,
++                        )
++                        and mxfp4_prefill_activation_globals_admitted(
++                            experts.a1_gscale,
++                            experts.a2_gscale,
++                        )
++                        and mxfp4_prefill_fits(
++                            candidate,
++                            tokens=int(a.shape[0]),
++                            intermediate_cache13=tensors["intermediate_cache13"],
++                            intermediate_cache2=tensors["intermediate_cache2"],
++                        )
++                    ):
++                        mxfp4_prefill_launches = candidate
+         elif (
+             self.caps.quant_mode == "w4a16" and self._core_workspace_plan.full_rotation
+         ):
+@@ -1191,6 +1350,8 @@
+             topk_sum_launch=topk_sum_launch,
+             route_pack_launches=route_pack_launches,
+             a4_prefill_launches=a4_prefill_launches,
++            mxfp4_prefill_launches=mxfp4_prefill_launches,
++            x4t_scales_expanded=bool(x4t_scales_expanded),
+         )
+         return replace(
+             binding,
+@@ -1294,6 +1455,15 @@
+     a4_prefill_launches: object | None = None
+     # The caller expanded every expert's NVFP4-CSF scales with expand_scales().
+     scales_expanded: bool = False
++    # Default-OFF MXFP4-activation prefill over the packed e8m0_k32 weights
++    # (B12X_W4A16_MXFP4_PREFILL_MIN_TOKENS; selected at bind, prefill only).
++    mxfp4_prefill_launches: object | None = None
++    # The caller expanded every expert's X4T scale planes into this payload's
++    # packed w13_scale/w2_scale scratch after the scratch's last reader and
++    # before this call (e.g. via expand_scales on a side stream this call waits
++    # for). The W4A16 X4T runners then skip their inline
++    # decode_x4t_packed_scale_pair launch. Per-call; never persists.
++    x4t_scales_expanded: bool = False
+     mixed_trellis_binding: object | None = None
+     mixed_trellis_buffers: object | None = None
+     compiler_scratch: torch.Tensor | None = None
+@@ -3017,9 +3187,19 @@
+     topk_sum_launch: object | None = None,
+     route_pack_launches: object | None = None,
+     a4_prefill_launches: object | None = None,
++    mxfp4_prefill_launches: object | None = None,
++    x4t_scales_expanded: bool = False,
+ ) -> TPMoEFP4Binding:
+     if not isinstance(experts, B12XFP4ExpertWeights):
+         raise TypeError("experts must come from prepare_b12x_fp4_moe_weights")
++    if x4t_scales_expanded and plan.implementation != "w4a16":
++        # Only the W4A16 runners consult the X4T scale-prefetch readiness flag.
++        # Reject every unsupported implementation (micro/dynamic/mixed) rather
++        # than silently assuming its consumer will skip its own expansion.
++        raise ValueError(
++            "x4t_scales_expanded is only supported for W4A16 bindings; got "
++            f"implementation={plan.implementation!r}"
++        )
+     if a.ndim != 2:
+         raise ValueError(
+             f"expected input activations with rank 2, got {tuple(a.shape)}"
+@@ -3222,6 +3402,8 @@
+             topk_sum_launch=topk_sum_launch,
+             route_pack_launches=route_pack_launches,
+             a4_prefill_launches=a4_prefill_launches,
++            mxfp4_prefill_launches=mxfp4_prefill_launches,
++            x4t_scales_expanded=x4t_scales_expanded,
+         )
+ 
+     if plan.implementation == "micro":
+@@ -3357,6 +3539,8 @@
+     route_num_experts: int | None = None,
+     w4a16_block_size_m: int | None = None,
+     w4a16_prefill_fused_sum: bool | None = None,
++    w4a16_a4_prefill_enabled: bool = False,
++    w4a16_a4_prefill_terms: int = 1,
+     trellis_bits: int = 3,
+     trellis_tile_config: tuple[int, int, int, int] | None = None,
+     trellis_pair_kinds: frozenset[str] | None = None,
+@@ -3734,7 +3918,135 @@
+                 align_up(direct_cache2_nbytes, _dtype_nbytes(dtype))
+                 // _dtype_nbytes(dtype),
+             )
++        # W2 MXFP4-A4 prefill workspace (Codex A2): the A4 pipeline carves
++        # quantization planes + route metadata out of cache2 and needs the
++        # per-route FC2 rows in cache13. Reserve the max of the A16 and A4
++        # requirements at plan time so mxfp4_prefill_fits cannot fail on
++        # scratch shortage at supported chunk sizes (2048/4096-token capacity).
++        # R2-fix (2026-10-06): reserve cache2 for the MXFP4-A4 prefill carve
++        # when the gate compiles it. Arithmetic replicates the kernel's
++        # _carve_layout EXACTLY (verified vs the compiled launches' own
++        # scratch_bytes at 512/1024/2048/4071/4096 live tokens, 2026-10-06:
++        # 19,091,712 @4071 matched to the byte). An earlier hand-rolled
++        # estimate ran 82KB short at capacity and all 69 layers' fits()
++        # rejected (probe: have 19,009,792 < need 19,091,712).
++        try:
++            _gate = int(os.environ.get("B12X_W4A16_MXFP4_PREFILL_MIN_TOKENS", "0") or 0)
++        except Exception:
++            _gate = 0
++        try:
++            from b12x.moe._shared.kernels.w4a16.mxfp4_a4_prefill import (
++                mxfp4_prefill_terms as _a4_terms_fn,
++            )
++
++            _a4_terms = int(_a4_terms_fn())
++        except Exception:
++            _a4_terms = 1
++        _a4_off = 0
++        _a4_routes = 0
++        if _gate > 0 and token_capacity >= _gate:
++            from b12x.moe._shared.kernels.w4a16.host import (
++                route_pack_token_capacity as _rptc,
++                max_packed_route_slots as _mprs,
++            )
++            from b12x.moe._shared.kernels.w4a16.mxfp4_a4_prefill import (
++                MXFP4_PREFILL_ROUTE_BLOCK as _RB,
++            )
++
++            _a4_t = int(token_capacity)
++            _a4_routes = _a4_t * int(num_topk)
++            _a4_numel_cap = _rptc(_a4_t, int(num_topk)) * int(num_topk)
++            _a4_pr = max(_mprs(_a4_numel_cap, _RB, int(route_E)), 1)
++            _a4_rbl = (_a4_pr + _RB - 1) // _RB
++            _a4_sizes = (
++                _a4_terms * _a4_t * int(k) // 2,
++                _a4_terms * _a4_t * (int(k) // 64) * 4,
++                _a4_terms * _a4_routes * int(n) // 2,
++                _a4_terms * _a4_routes * (int(n) // 64) * 4,
++                _a4_pr * 4,
++                _a4_rbl * 4,
++                4,
++                (int(route_E) + 1) * 4,
++                int(route_E) * 4,
++            )
++            _a4_off = 0
++            for _s in _a4_sizes:
++                _a4_off = (_a4_off + _s + 255) // 256 * 256
++            _a4_ebytes = torch.empty(0, dtype=dtype).element_size()
++            intermediate_cache2_elements = max(
++                intermediate_cache2_elements,
++                (_a4_off + _a4_ebytes - 1) // _a4_ebytes,
++            )
+         cache_dtype = torch.float16 if full_rotation else dtype
++        # NVFP4 A4 prefill workspace (B12X_W4A16_A4_PREFILL): the A4 pipeline
++        # carves quantized input/intermediate planes, their scales, and padded
++        # route metadata out of cache2 and keeps one BF16 FC2 row per route in
++        # cache13. The carve exceeds the ordinary A16 allocation at GLM's
++        # prefill chunk sizes (38,146,560 B vs 33,554,432 B at 8192 tokens,
++        # terms=1), so select_a4()/fits_buffers() silently fell back to W4A16
++        # for near-full chunks. Reserve max(A16, A4) for cache2/cache13 at plan
++        # time, gated on the plan's frozen A4 controls (never the MXFP4 env
++        # knob) and mirroring the A4 compile admission in
++        # _w4a16_primary_launches exactly (route namespace match, no
++        # router-weight-on-input, supported packed/NVFP4 geometry). Sizing goes
++        # through the kernel's own carve (a4_prefill_workspace_requirements ->
++        # W4A16A4PrefillLaunches.scratch_bytes/_carve_layout), never a second
++        # hand formula. Flag-off plans keep the stock sizes; an enabled hybrid
++        # plan reserves the enlarged buffers even when a given call binds A16
++        # (the reservation is plan-level, not per-bind).
++        _a4_cache13_elements = 0
++        if (
++            w4a16_a4_prefill_enabled
++            and route_E == int(weight_E)
++            and not apply_router_weight_on_input
++        ):
++            from b12x.moe._shared.kernels.w4a16.host import (
++                max_packed_route_slots as _a4_mprs,
++                route_pack_token_capacity as _a4_rptc,
++            )
++            from b12x.moe._shared.kernels.w4a16.prefill_a4 import (
++                A4_PREFILL_ROUTE_BLOCK as _A4_RB,
++                a4_prefill_supported as _a4_supported,
++                a4_prefill_workspace_requirements as _a4_requirements,
++            )
++
++            if _a4_supported(
++                prepared_layout=weight_layout,
++                scale_format=scale_format,
++                activation=activation,
++                is_gated=activation == "silu",
++                swiglu_limit=swiglu_limit,
++                dtype=dtype,
++                hidden_size=int(k),
++                intermediate_size=int(n),
++            ):
++                _a4_tokens = int(token_capacity)
++                _a4_numel_cap = _a4_rptc(_a4_tokens, int(num_topk)) * int(num_topk)
++                _a4_pr = max(_a4_mprs(_a4_numel_cap, _A4_RB, route_E), 1)
++                _a4_rbl = (_a4_pr + _A4_RB - 1) // _A4_RB
++                _a4_terms = (
++                    int(w4a16_a4_prefill_terms)
++                    if int(w4a16_a4_prefill_terms) in (1, 2)
++                    else 1
++                )
++                _a4_cache2_bytes, _a4_cache13_bytes = _a4_requirements(
++                    tokens=_a4_tokens,
++                    hidden_size=int(k),
++                    intermediate_size=int(n),
++                    num_experts=route_E,
++                    topk=int(num_topk),
++                    terms=_a4_terms,
++                    max_packed_routes=_a4_pr,
++                    max_route_blocks=_a4_rbl,
++                )
++                _a4_ebytes = _dtype_nbytes(cache_dtype)
++                intermediate_cache2_elements = max(
++                    intermediate_cache2_elements,
++                    (_a4_cache2_bytes + _a4_ebytes - 1) // _a4_ebytes,
++                )
++                _a4_cache13_elements = (
++                    _a4_cache13_bytes + _a4_ebytes - 1
++                ) // _a4_ebytes
+         use_prefill_fused_sum = prefill_fused_sum_eligible(
+             dtype=dtype,
+             m=token_capacity,
+@@ -3751,6 +4063,24 @@
+             if use_prefill_fused_sum
+             else routed_capacity * max(fc1_cols, int(k))
+         )
++        # W2 MXFP4-A4 prefill workspace (Codex A2): A4 stores one BF16 FC2 row
++        # per ROUTE (tokens*topk*H), far larger than the A16 fused-sum plan at
++        # 2048/4096-token capacity. Reserve the max (only when the A4 gate
++        # sized a carve above; _a4_routes is 0 otherwise).
++        if _a4_routes > 0:
++            intermediate_cache13_elements = max(
++                intermediate_cache13_elements,
++                _a4_routes * int(k),
++            )
++        # NVFP4 A4 prefill workspace: cache13 must also fit one BF16 FC2 row
++        # per route — tokens * topk * hidden_size ELEMENTS, i.e. that product
++        # times 2 bytes — for the admitted A4 pipeline (fits_buffers checks
++        # both planes together).
++        if _a4_cache13_elements > 0:
++            intermediate_cache13_elements = max(
++                intermediate_cache13_elements,
++                _a4_cache13_elements,
++            )
+         tensor_specs = [
+             _TensorAllocSpec(
+                 "intermediate_cache13",
+@@ -8255,6 +8585,8 @@
+     deterministic_output: bool | None = None,
+     w4a16_block_size_m: int | None = None,
+     w4a16_prefill_fused_sum: bool | None = None,
++    w4a16_a4_prefill_enabled: bool = False,
++    w4a16_a4_prefill_terms: int = 1,
+     decode_config: MoeDecodeConfig,
+ ) -> TPMoEArenaLayout:
+     """Compute the byte layout needed by one lane-owned MoE pool."""
+@@ -8355,6 +8687,8 @@
+             route_num_experts=route_num_experts,
+             w4a16_block_size_m=w4a16_block_size_m,
+             w4a16_prefill_fused_sum=w4a16_prefill_fused_sum,
++            w4a16_a4_prefill_enabled=w4a16_a4_prefill_enabled,
++            w4a16_a4_prefill_terms=w4a16_a4_prefill_terms,
+             trellis_bits=weight_plan.trellis_bits or 3,
+             trellis_tile_config=weight_plan.trellis_tile_config,
+             trellis_pair_kinds=weight_plan.trellis_pair_kinds,
+@@ -8984,6 +9318,8 @@
+         deterministic_output=deterministic_output,
+         w4a16_block_size_m=_resolve_trellis_route_block_size(caps),
+         w4a16_prefill_fused_sum=caps.w4a16_prefill_fused_sum,
++        w4a16_a4_prefill_enabled=bool(caps.w4a16_a4_prefill_enabled),
++        w4a16_a4_prefill_terms=int(caps.w4a16_a4_prefill_terms),
+         decode_config=caps.decode_config,
+     )
+ 
+@@ -9045,6 +9381,8 @@
+         route_num_experts=caps.route_num_experts,
+         w4a16_block_size_m=resolved_block_size_m,
+         w4a16_prefill_fused_sum=caps.w4a16_prefill_fused_sum,
++        w4a16_a4_prefill_enabled=bool(caps.w4a16_a4_prefill_enabled),
++        w4a16_a4_prefill_terms=int(caps.w4a16_a4_prefill_terms),
+         trellis_bits=caps.weight_plan.trellis_bits or 3,
+         trellis_tile_config=caps.weight_plan.trellis_tile_config,
+         trellis_pair_kinds=caps.weight_plan.trellis_pair_kinds,
+@@ -9671,6 +10009,8 @@
+             route_num_experts=caps.route_num_experts,
+             w4a16_block_size_m=resolved_block_size_m,
+             w4a16_prefill_fused_sum=caps.w4a16_prefill_fused_sum,
++            w4a16_a4_prefill_enabled=bool(caps.w4a16_a4_prefill_enabled),
++            w4a16_a4_prefill_terms=int(caps.w4a16_a4_prefill_terms),
+             trellis_bits=weight_plan.trellis_bits or 3,
+             trellis_tile_config=weight_plan.trellis_tile_config,
+             trellis_pair_kinds=weight_plan.trellis_pair_kinds,
+@@ -13635,6 +13975,39 @@
+                 output=scatter_output,
+                 launches=a4_launches,
+             )
++        mxfp4_launches = getattr(binding, "mxfp4_prefill_launches", None)
++        if mxfp4_launches is not None:
++            # Default-OFF MXFP4 prefill.  Bind admitted this call (env threshold,
++            # packed e8m0_k32 layout, unit activation globals, scratch fit,
++            # plain routing).  Prefill-only: the threshold gate keeps decode-size
++            # calls on the W4A16 path.
++            from b12x.moe._shared.kernels.w4a16.mxfp4_a4_prefill import (
++                run_w4a16_mxfp4_prefill,
++            )
++
++            if os.environ.get("B12X_W4A16_MXFP4_PREFILL_TRACE", "") == "1":
++                logger.info(
++                    "B12X MXFP4 prefill dispatch: layer=%s tokens=%d topk=%d "
++                    "hidden=%d terms=%d",
++                    layer_idx,
++                    int(a.shape[0]),
++                    int(topk_ids.shape[1]),
++                    int(a.shape[1]),
++                    int(mxfp4_launches.terms),
++                )
++            return run_w4a16_mxfp4_prefill(
++                a,
++                prepared,
++                topk_weights,
++                topk_ids,
++                a1_gscale=a1_gscale,
++                a2_gscale=a2_gscale,
++                intermediate_cache13=intermediate_cache13,
++                intermediate_cache2=intermediate_cache2,
++                output=scatter_output,
++                launches=mxfp4_launches,
++                x4t_scales_expanded=binding.x4t_scales_expanded,
++            )
+         result = run_w4a16_moe(
+             a,
+             prepared,
+@@ -13688,6 +14061,7 @@
+                 if binding.route_pack_launches is not None
+                 else plan.decode_config.w4a16_route_mode or "auto"
+             ),
++            x4t_scales_expanded=binding.x4t_scales_expanded,
+         )
+         return _finalize_trellis_output(binding, result)
+     activation_spec = _get_activation_kernel_spec(activation, quant_mode=quant_mode)
+diff -ruN a/b12x/moe/fused_moe/_preparation.py b/b12x/moe/fused_moe/_preparation.py
+--- a/b12x/moe/fused_moe/_preparation.py	2026-10-21 17:22:48.293811272 +0700
++++ b/b12x/moe/fused_moe/_preparation.py	2026-10-21 17:22:48.296283388 +0700
+@@ -386,6 +386,42 @@
+     route_pack: object | None
+     native_direct: object | None = None
+     a4_prefill: object | None = None
++    # Default-OFF MXFP4-activation prefill over the packed e8m0_k32 weights
++    # (B12X_W4A16_MXFP4_PREFILL_MIN_TOKENS > 0 compiles it; 0 = never built).
++    mxfp4_prefill: object | None = None
++
++    def select_mxfp4(
++        self,
++        *,
++        tokens: int,
++        route_ids_dtype: torch.dtype,
++        has_route_map: bool,
++        activation_amax: object | None,
++        apply_router_weight_on_input: bool,
++        force: bool | None = None,
++    ) -> object | None:
++        """The MXFP4 prefill launch set for calls at or above its threshold.
++
++        Parallel of ``select_a4``: ``force`` overrides the threshold (True takes
++        the launches for any call within their capacity, False never does).
++        ``None`` when the gate never compiled the path, the call is outside its
++        capacity/threshold, or routing is not plain top-k.  Nonunit activation
++        globals are additionally rejected at bind by the kernel module's
++        admission; this selector never inspects device values.
++        """
++        launches = self.mxfp4_prefill
++        if (
++            launches is None
++            or force is False
++            or (force is None and int(tokens) < launches.min_tokens)
++            or int(tokens) > launches.tokens
++            or route_ids_dtype not in (torch.int32, torch.int64)
++            or has_route_map
++            or activation_amax is not None
++            or apply_router_weight_on_input
++        ):
++            return None
++        return launches
+ 
+     def select_a4(
+         self,
+@@ -493,6 +529,7 @@
+                 self.native_direct,
+                 *(() if self.route_pack is None else self.route_pack.carriers()),
+                 *(() if self.a4_prefill is None else self.a4_prefill.carriers()),
++                *(() if self.mxfp4_prefill is None else self.mxfp4_prefill.carriers()),
+             )
+             if launcher is not None
+         )
+@@ -760,6 +797,47 @@
+             a4_prefill = compile_w4a16_a4_prefill(
+                 **a4_args,
+             )
++        # Default-OFF MXFP4 prefill: compiled only when the gate is set (>0) and
++        # the plan admits the packed e8m0_k32 payload.  A failed/absent compile
++        # is not fatal: the call stays on today's W4A16 path (fallback).
++        mxfp4_prefill = None
++        from b12x.moe._shared.kernels.w4a16.mxfp4_a4_prefill import (
++            compile_w4a16_mxfp4_prefill,
++            mxfp4_prefill_min_tokens,
++            mxfp4_prefill_supported,
++            mxfp4_prefill_terms,
++        )
++
++        mxfp4_min = mxfp4_prefill_min_tokens()
++        if (
++            mxfp4_min > 0
++            and tokens >= mxfp4_min
++            and core.route_E == core.weight_E
++            and not caps.apply_router_weight_on_input
++            and mxfp4_prefill_supported(
++                prepared_layout=weight_layout,
++                scale_format=scale_format,
++                activation=core.activation,
++                is_gated=core.activation in {"silu"},
++                dtype=core.dtype,
++                hidden_size=core.k,
++                intermediate_size=core.n,
++                terms=mxfp4_prefill_terms(),
++                swiglu_limit=core.swiglu_limit,
++            )
++        ):
++            mxfp4_prefill = compile_w4a16_mxfp4_prefill(
++                tokens=tokens,
++                min_tokens=mxfp4_min,
++                topk=core.num_topk,
++                hidden_size=core.k,
++                intermediate_size=core.n,
++                num_experts=core.weight_E,
++                sms=int(props.multi_processor_count),
++                ordinal=core.device.index,
++                fast_math=bool(caps.w4a16_fast_math),
++                terms=mxfp4_prefill_terms(),
++            )
+     # Direct routing requires exact M; packed routing accepts live M up to capacity.
+     return _W4A16PrimaryLaunches(
+         tokens=int(caps.max_tokens),
+@@ -773,6 +851,7 @@
+         route_pack=route_pack,
+         native_direct=native_direct,
+         a4_prefill=a4_prefill,
++        mxfp4_prefill=mxfp4_prefill,
+     )
+ 
+ 
+diff -ruN a/b12x/moe/_shared/kernels/w4a16/kernel/execution.py b/b12x/moe/_shared/kernels/w4a16/kernel/execution.py
+--- a/b12x/moe/_shared/kernels/w4a16/kernel/execution.py	2026-10-21 17:22:48.279811657 +0700
++++ b/b12x/moe/_shared/kernels/w4a16/kernel/execution.py	2026-10-21 17:22:48.281619192 +0700
+@@ -593,6 +593,7 @@
+     rotation_a_up: torch.Tensor | None = None,
+     route_mode: str = "auto",
+     route_pack_launches=None,
++    x4t_scales_expanded: bool = False,
+     stream: cuda.CUstream | None = None,
+ ) -> torch.Tensor:
+     activation = normalize_moe_activation(activation)
+diff -ruN a/b12x/moe/_shared/kernels/w4a16/mxfp4_a4_prefill.py b/b12x/moe/_shared/kernels/w4a16/mxfp4_a4_prefill.py
+--- a/b12x/moe/_shared/kernels/w4a16/mxfp4_a4_prefill.py	1970-01-01 08:00:00.000000000 +0800
++++ b/b12x/moe/_shared/kernels/w4a16/mxfp4_a4_prefill.py	2026-10-21 17:22:48.275727570 +0700
+@@ -0,0 +1,1937 @@
++"""MXFP4-activation (A4) prefill MoE GEMMs over W4A16 packed FP4 weights.
++
++Dynamic-E8M0-group-quant path (PLAN-w4a16-port.md §5): prefill contracts
++MXFP4-quantized activations with the W4A16 packed E2M1 weights through the
++SM120 block-scaled QMMA ``kind::mxf4nvf4`` ``scale_vec::2X`` m16n8k64
++(UE8M0 per-32 scales), so decode keeps the exact W4A16 path while prefill runs
++at A4 speed.  No calibrated activation scales: activations are quantized
++per-32-group on the fly (exponent-aligned, ``6 * 2**e >= max|x|``).
++
++Layout contracts (validated bit-exact vs a float64 dequantize-and-matmul
++oracle across multi-atom K loops and N>8 layouts -- see W2-fc1-ladder.md):
++
++- A/B/accumulator fragment mapping identical to the 4X variant.  Activations
++  keep the PI permutation + WORD_ORDER storage of ``prefill_a4.py``; weights
++  keep the W4A16 packed layout + PRMT B-register build.  Both operands permute
++  K identically within 16-groups, so K32 scale groups are preserved.
++- SFA: one u32 per row per K64 slice; byte 0 = UE8M0 scale of the slice's K32
++  group 0, byte 1 = group 1; loaded directly as the MMA ``sfa`` word.
++- SFB: one u32 per (atom column) holding that column's (group0, group1) UE8M0
++  byte-pair.  Weight scale bytes come from the packed e8m0_k32 grid
++  (``prepared.w13_scale``/``w2_scale``), whose stored-byte layout is
++  ``stored[e, kg, 64*blk + 4*(r//4) + inv4[r%4]] = source[e, n, kg]`` with
++  ``r = 8*(w%8) + w//8``, ``w = n%64``, ``blk = n//64``, ``inv4 = [0,2,1,3]``.
++- Requantize (FC1 epilogue -> FC2 A operand): per 32-value group, scale byte
++  = ``e + 127`` where ``e`` = smallest integer in [-127,127] with
++  ``6*2**e >= max|x|`` (``max|x|==0`` -> ``e=0``); E2M1 RNE codes, saturation
++  at 6, sign-magnitude (``-0.0`` -> ``+0``).  Byte 255 never emitted.
++
++FC1 runs the gate and up halves of a 128-column intermediate tile in one K
++sweep, applies ``silu(alpha g)*(alpha u)`` (``prefill_a4`` semantics:
++``bf16(bf16(g)*sigmoid(bf16(g))*bf16(u))``) and requantizes to MXFP4.  FC2
++stores unweighted per-route BF16 rows for the FP32 top-k sum.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++import os
++
++import cuda.bindings.driver as cuda
++import torch
++import cutlass
++import cutlass.cute as cute
++from cutlass._mlir.dialects import llvm
++from cutlass.cutlass_dsl import Float32, Int32, Int64, T, Uint32, Uint64, dsl_user_op
++
++from b12x._lib.intrinsics.atomics import (
++    ld_shared_u32,
++    st_shared_u32,
++)
++from b12x._lib.intrinsics.math import (
++    fabs_f32,
++    fmax_f32,
++)
++from b12x._lib.intrinsics.memory import (
++    cp_async4_shared_global,
++    cp_async_u32_shared_global,
++    get_ptr_as_int64,
++    ld_global_nc_v4_u32,
++    ld_shared_v2_u32,
++    ld_shared_v4_u32,
++    shared_ptr_to_u32,
++    st_global_u32,
++    st_global_v4_u32,
++    u32_as_f32,
++)
++from b12x._lib.intrinsics.mma import (
++    mxfp4_mma_m16n8k64_f32_e2m1_ue8m0,
++)
++from b12x._lib.intrinsics.packed import (
++    bfloat2_to_float2_scaled,
++    f32_to_raw_bits,
++    pack_f32x2_to_bfloat2,
++)
++
++# Position m of a 16-group holds physical K offset PI[m] (both operands permute
++# K identically, so K32 scale-group boundaries survive).
++PI = (0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15)
++WORD_ORDER = (0, 4, 1, 5, 2, 6, 3, 7)
++# Inverse of the 8x8 packed-scale column shuffle (self-inverse).
++_INV4 = (0, 2, 1, 3)
++
++BLOCK_M = 128
++TILE_K = 64
++NUM_WARPS = 8
++A_STAGE_BYTES = BLOCK_M * 32
++SFA_STAGE_BYTES = BLOCK_M * 4
++PLANE_STAGE_BYTES = A_STAGE_BYTES + SFA_STAGE_BYTES
++B_STAGE_BYTES = (TILE_K // 16) * 4 * 512
++# SFB: per K64 tile, 4 chunk slots x 64 columns x 4 B (one u32 byte-pair word
++# per column: byte 0/1 = K32 groups 2*kg0/2*kg0+1 of the tile).
++S_STAGE_BYTES = 4 * 64 * 4
++ROUTE_BYTES = BLOCK_M * 4
++EPI_ROW_BYTES = 256 * 2 + 16
++
++
++@dsl_user_op
++def prmt_b32(a: Uint32, b: Uint32, sel: Uint32, *, loc=None, ip=None) -> Uint32:
++    """``prmt.b32`` with an immediate selector."""
++    return Uint32(
++        llvm.inline_asm(
++            T.i32(),
++            [
++                Uint32(a).ir_value(loc=loc, ip=ip),
++                Uint32(b).ir_value(loc=loc, ip=ip),
++                Uint32(sel).ir_value(loc=loc, ip=ip),
++            ],
++            "prmt.b32 $0, $1, $2, $3;",
++            "=r,r,r,n",
++            has_side_effects=False,
++            is_align_stack=False,
++            asm_dialect=llvm.AsmDialect.AD_ATT,
++            loc=loc,
++            ip=ip,
++        )
++    )
++
++
++@dsl_user_op
++def prmt_b32_reg(a: Uint32, b: Uint32, sel: Uint32, *, loc=None, ip=None) -> Uint32:
++    """``prmt.b32`` with a register selector (byte LUT lookups)."""
++    return Uint32(
++        llvm.inline_asm(
++            T.i32(),
++            [
++                Uint32(a).ir_value(loc=loc, ip=ip),
++                Uint32(b).ir_value(loc=loc, ip=ip),
++                Uint32(sel).ir_value(loc=loc, ip=ip),
++            ],
++            "prmt.b32 $0, $1, $2, $3;",
++            "=r,r,r,r",
++            has_side_effects=False,
++            is_align_stack=False,
++            asm_dialect=llvm.AsmDialect.AD_ATT,
++            loc=loc,
++            ip=ip,
++        )
++    )
++
++
++@dsl_user_op
++def ld_global_nc_u8(addr: Int64, *, loc=None, ip=None) -> Uint32:
++    """Non-coherent byte load (packed scale grid bytes sit at arbitrary offsets)."""
++    return Uint32(
++        llvm.inline_asm(
++            T.i32(),
++            [Int64(addr).ir_value(loc=loc, ip=ip)],
++            "ld.global.nc.b8 $0, [$1];",
++            "=r,l",
++            has_side_effects=False,
++            is_align_stack=False,
++            asm_dialect=llvm.AsmDialect.AD_ATT,
++            loc=loc,
++            ip=ip,
++        )
++    )
++
++
++# ---------------------------------------------------------------- requantize --
++@dsl_user_op
++def _f32_exponent(x: Float32, *, loc=None, ip=None) -> Int32:
++    """IEEE-754 biased exponent of a finite, nonzero f32 (``(bits>>23)&0xFF``)."""
++    bits = f32_to_raw_bits(x)
++    return Int32((bits >> Uint32(23)) & Uint32(0xFF))
++
++
++@cute.jit
++def _ldexp2(e: Int32) -> Float32:
++    """``2**e`` for ``e`` in [-127, 127] via bit construction (exact).
++
++    ``e = -127`` is subnormal in f32 (``2**-127 = 0x00400000``); every other
++    exponent in range is normal (``biased << 23``).
++    """
++    biased = e + Int32(127)
++    result = u32_as_f32(Uint32(biased) << Uint32(23))
++    if e == Int32(-127):
++        result = u32_as_f32(Uint32(0x00400000))
++    return result
++
++
++@cute.jit
++def _mxfp4_scale_exponent(mx: Float32) -> Int32:
++    """Smallest ``e`` in [-127, 127] with ``6 * 2**e >= mx`` (``mx == 0`` -> 0).
++
++    Matches the validated CPU rule (W2 ladder): ``e0 = floor(log2 mx) - 2``
++    from the f32 exponent field, walk up with exact ``6 * 2**e`` comparisons,
++    walk down for minimality, clamp at -127 (subnormal ``mx`` -> -127).
++    """
++    e = Int32(0)
++    if mx != Float32(0.0):
++        be = _f32_exponent(mx)
++        e = Int32(-127)
++        if be != Int32(0):
++            e = (be - Int32(127)) - Int32(2)
++            for _ in cutlass.range_constexpr(8):
++                if Float32(6.0) * _ldexp2(e) < mx:
++                    e = e + Int32(1)
++            for _ in cutlass.range_constexpr(8):
++                if e > Int32(-127) and Float32(6.0) * _ldexp2(e - Int32(1)) >= mx:
++                    e = e - Int32(1)
++    return e
++
++
++@cute.jit
++def _mxfp4_pack_words(codes) -> tuple[Uint32, Uint32, Uint32, Uint32]:
++    """Pack 32 E2M1 codes (LOGICAL k order) into a row K64 slice half.
++
++    Word ``j`` nibble ``i`` holds the code of logical position
++    ``16 * (j // 2) + PI[8 * (j % 2) + i]`` (the PI permutation of the
++    tensor-core lane layout, identical to ``prefill_a4``'s 16-group packing
++    generalized to two 16-groups per K32 scale).
++    """
++    w0 = Uint32(0)
++    w1 = Uint32(0)
++    w2 = Uint32(0)
++    w3 = Uint32(0)
++    for j in cutlass.range_constexpr(4):
++        for i in cutlass.range_constexpr(8):
++            code = codes[16 * (j // 2) + PI[8 * (j % 2) + i]]
++            word = code << Uint32(4 * i)
++            if j == 0:
++                w0 = w0 | word
++            elif j == 1:
++                w1 = w1 | word
++            elif j == 2:
++                w2 = w2 | word
++            else:
++                w3 = w3 | word
++    return w0, w1, w2, w3
++
++
++@cute.jit
++def _mxfp4_quantize32(vals, codes):
++    """MXFP4-quantize 32 f32 values in LOGICAL k order (one K32 group).
++
++    ``vals[m]`` is the logical value at position ``m`` of the group (the K64
++    slice's positions ``32 g .. 32 g + 31``).  Fills ``codes[m]`` (logical
++    order) and returns the four packed payload words plus the group's UE8M0
++    scale byte (the MMA's scale-pair byte for this K32 group).
++    """
++    mx = Float32(0.0)
++    for m in cutlass.range_constexpr(32):
++        mx = fmax_f32(mx, fabs_f32(vals[m]))
++    e = _mxfp4_scale_exponent(mx)
++    two_e = _ldexp2(e)
++    for m in cutlass.range_constexpr(32):
++        av = fabs_f32(vals[m]) / two_e
++        code = Uint32(7)
++        if av <= Float32(0.25):
++            code = Uint32(0)
++        elif av < Float32(0.75):
++            code = Uint32(1)
++        elif av <= Float32(1.25):
++            code = Uint32(2)
++        elif av < Float32(1.75):
++            code = Uint32(3)
++        elif av <= Float32(2.5):
++            code = Uint32(4)
++        elif av < Float32(3.5):
++            code = Uint32(5)
++        elif av <= Float32(5.0):
++            code = Uint32(6)
++        if vals[m] < Float32(0.0):
++            code = code | Uint32(8)
++        codes[m] = code
++    w0, w1, w2, w3 = _mxfp4_pack_words(codes)
++    return w0, w1, w2, w3, (Uint32(e) + Uint32(127)) & Uint32(0xFF)
++
++
++@cute.jit
++def _mxfp4_dequant(code: Uint32, scale_byte: Uint32) -> Float32:
++    """Dequantized value of one E2M1 code under a K32 group scale byte."""
++    half = prmt_b32_reg(
++        Uint32(0x03020100), Uint32(0x0C080604), code & Uint32(7)
++    ) & Uint32(0xFF)
++    value = Float32(half) * Float32(0.5) * _ldexp2(Int32(scale_byte) - Int32(127))
++    if (code & Uint32(8)) != Uint32(0):
++        value = -value
++    return value
++
++
++@cute.jit
++def _store_slice_mxfp4(q_ptr: Int64, sf_ptr: Int64, words, scale_word: Uint32):
++    """One row K64 slice: eight payload words in WORD_ORDER + its scale word.
++
++    ``words[2g], words[2g+1]`` hold K32 group ``g`` (stored positions
++    32g..32g+31), so ``scale_word`` byte ``g`` is that group's UE8M0 byte --
++    byte 0/1 of the MMA's per-atom scale pair.
++    """
++    st_global_v4_u32(
++        q_ptr,
++        words[WORD_ORDER[0]],
++        words[WORD_ORDER[1]],
++        words[WORD_ORDER[2]],
++        words[WORD_ORDER[3]],
++    )
++    st_global_v4_u32(
++        q_ptr + Int64(16),
++        words[WORD_ORDER[4]],
++        words[WORD_ORDER[5]],
++        words[WORD_ORDER[6]],
++        words[WORD_ORDER[7]],
++    )
++    st_global_u32(sf_ptr, scale_word)
++
++
++class Mxfp4A4Quantize:
++    """BF16 ``[rows, K]`` -> permuted MXFP4 ``x_q`` + per-K64 UE8M0 scale words.
++
++    One thread per (row, K64 slice); per 32-value group (two 16-groups) the
++    scale byte is ``e + 127`` with ``6*2**e >= max|x|`` (dynamic E8M0 group
++    quant; no calibrated scales, no shared global scale).  ``terms=2`` also
++    writes the residual term (``x_q2``/``x_sf2``, same layout): ``x ~ q1 + q2``.
++    """
++
++    THREADS = 256
++
++    def __init__(self, *, size_k: int, terms: int = 1):
++        if size_k % 64:
++            raise ValueError("MXFP4 A4 quantization needs K % 64 == 0")
++        if terms not in (1, 2):
++            raise ValueError("terms must be 1 or 2")
++        self.size_k = int(size_k)
++        self.slices = self.size_k // 64
++        self.terms = int(terms)
++
++    @property
++    def __cache_key__(self) -> tuple[object, ...]:
++        return (self.size_k, self.terms)
++
++    @cute.jit
++    def __call__(
++        self,
++        x_bf16: cute.Tensor,
++        x_q: cute.Tensor,
++        x_sf: cute.Tensor,
++        x_q2: cute.Tensor,
++        x_sf2: cute.Tensor,
++        rows: cutlass.Int32,
++        stream: cuda.CUstream,
++    ):
++        items = rows * Int32(self.slices)
++        self.kernel(x_bf16, x_q, x_sf, x_q2, x_sf2, rows).launch(
++            grid=((items + Int32(self.THREADS - 1)) // Int32(self.THREADS), 1, 1),
++            block=[self.THREADS, 1, 1],
++            stream=stream,
++        )
++
++    @cute.kernel
++    def kernel(
++        self,
++        x_bf16: cute.Tensor,
++        x_q: cute.Tensor,
++        x_sf: cute.Tensor,
++        x_q2: cute.Tensor,
++        x_sf2: cute.Tensor,
++        rows: cutlass.Int32,
++    ):
++        tidx, _, _ = cute.arch.thread_idx()
++        bidx, _, _ = cute.arch.block_idx()
++        item = Int32(bidx) * Int32(self.THREADS) + Int32(tidx)
++        if item < rows * Int32(self.slices):
++            row = item // Int32(self.slices)
++            sl = item - row * Int32(self.slices)
++            src = get_ptr_as_int64(
++                x_bf16, Int64(row) * Int64(self.size_k) + Int64(sl * Int32(64))
++            )
++            words = cute.make_rmem_tensor((8,), Uint32)
++            words2 = cute.make_rmem_tensor((8,), Uint32)
++            scale_word = Uint32(0)
++            scale_word2 = Uint32(0)
++            for g in cutlass.range_constexpr(2):
++                # K32 group g = slice positions 32g..32g+31 (logical k order);
++                # four 16-byte loads per group (8 BF16 each).
++                vals = cute.make_rmem_tensor((32,), Float32)
++                codes = cute.make_rmem_tensor((32,), Uint32)
++                for v in cutlass.range_constexpr(4):
++                    raw = ld_global_nc_v4_u32(src + Int64(64 * g + 16 * v))
++                    for i in cutlass.range_constexpr(4):
++                        lo, hi = bfloat2_to_float2_scaled(raw[i], Float32(1.0))
++                        vals[8 * v + 2 * i] = lo
++                        vals[8 * v + 2 * i + 1] = hi
++                out = _mxfp4_quantize32(vals, codes)
++                words[4 * g + 0] = out[0]
++                words[4 * g + 1] = out[1]
++                words[4 * g + 2] = out[2]
++                words[4 * g + 3] = out[3]
++                scale_word = scale_word | (out[4] << Uint32(8 * g))
++                if cutlass.const_expr(self.terms == 2):
++                    # Residual of the dequantized first term: res = x - deq(q1).
++                    res = cute.make_rmem_tensor((32,), Float32)
++                    codes2 = cute.make_rmem_tensor((32,), Uint32)
++                    for m in cutlass.range_constexpr(32):
++                        res[m] = vals[m] - _mxfp4_dequant(codes[m], out[4])
++                    out2 = _mxfp4_quantize32(res, codes2)
++                    words2[4 * g + 0] = out2[0]
++                    words2[4 * g + 1] = out2[1]
++                    words2[4 * g + 2] = out2[2]
++                    words2[4 * g + 3] = out2[3]
++                    scale_word2 = scale_word2 | (out2[4] << Uint32(8 * g))
++            q_off = Int64(row) * Int64(self.size_k // 8) + Int64(sl * Int32(8))
++            sf_off = Int64(row) * Int64(self.slices) + Int64(sl)
++            _store_slice_mxfp4(
++                get_ptr_as_int64(x_q, q_off),
++                get_ptr_as_int64(x_sf, sf_off),
++                words,
++                scale_word,
++            )
++            if cutlass.const_expr(self.terms == 2):
++                _store_slice_mxfp4(
++                    get_ptr_as_int64(x_q2, q_off),
++                    get_ptr_as_int64(x_sf2, sf_off),
++                    words2,
++                    scale_word2,
++                )
++
++
++# ------------------------------------------------------- packed scale grid ---
++def _e8m0_byte_off(base: Int64, n: Int32, kg: Int32, n_padded: Int32) -> Int64:
++    """Byte address of column ``n``'s UE8M0 scale for K32 group ``kg`` in the
++    packed e8m0_k32 grid (``prepared.w13_scale``/``w2_scale``).
++
++    ``stored[kg, 64*blk + s] = source[n, kg]`` where ``q, jj = divmod(s % 64, 4)``,
++    ``p = 4*q + [0,2,1,3][jj]``, ``n = 64*blk + 8*(p % 8) + (p // 8)`` (verified
++    bit-exact against ``_pack_e8m0_k32_scales`` for multi-block N).  Inverse:
++    ``w = n % 64``, ``r = 8*(w % 8) + (w // 8)``, ``s = 4*(r // 4) + INV4[r % 4]``.
++    """
++    blk = n >> Int32(6)
++    w = n & Int32(63)
++    r = Int32(8) * (w & Int32(7)) + (w >> Int32(3))
++    rr = r & Int32(3)
++    inv4 = ((rr & Int32(1)) << Int32(1)) | (rr >> Int32(1))
++    s = Int32(4) * (r >> Int32(2)) + inv4
++    return base + Int64(kg) * Int64(n_padded) + Int64((blk << Int32(6)) + s)
++
++
++class Mxfp4A4PrefillGemm:
++    """One FC phase of the MXFP4-A4 prefill MoE over W4A16 packed FP4 weights.
++
++    Structural twin of ``prefill_a4.A4PackedPrefillGemm`` (staging, PRMT B
++    build, K-loop, epilogues, tile indexing all follow it); the differences
++    are the operand contract: ``a_q``/``a_sf`` are the dynamic-E8M0 MXFP4
++    activations from ``Mxfp4A4Quantize``, ``scales_u8`` is the packed e8m0_k32
++    weight scale grid, and the MMA is the 2X/UE8M0 m16n8k64.  ``a_sf`` holds
++    one u32 per row per K64 slice (byte 0/1 = K32 group 0/1); the SFB words
++    are staged as per-column byte-pairs from the packed grid.
++    """
++
++    def __init__(
++        self,
++        *,
++        phase: str,
++        hidden_size: int,
++        intermediate_size: int,
++        top_k: int,
++        stages: int = 4,
++        fast_math: bool = True,
++        terms: int = 1,
++        warps: int = NUM_WARPS,
++    ):
++        if phase not in ("fc1", "fc2"):
++            raise ValueError(f"unknown MXFP4 A4 prefill phase {phase!r}")
++        if hidden_size % 256 or intermediate_size % 128:
++            raise ValueError("MXFP4 A4 prefill needs H % 256 == 0 and I % 128 == 0")
++        if terms not in (1, 2):
++            raise ValueError("terms must be 1 or 2")
++        if warps not in (8, 16):
++            raise ValueError("warps must be 8 or 16")
++        self.phase = phase
++        self.fc1 = phase == "fc1"
++        self.hidden_size = int(hidden_size)
++        self.intermediate_size = int(intermediate_size)
++        self.top_k = int(top_k)
++        self.stages = int(stages)
++        self.fast_math = bool(fast_math)
++        self.terms = int(terms)
++        self.warps = int(warps)
++        self.threads = self.warps * 32
++        self.m_warps = self.warps // 4
++        self.rows_per_warp = BLOCK_M // self.m_warps
++        self.mb_per_warp = self.rows_per_warp // 16
++        self.acc_size = self.mb_per_warp * 8 * 4
++        self.size_k = self.hidden_size if self.fc1 else self.intermediate_size
++        self.size_n = 2 * self.intermediate_size if self.fc1 else self.hidden_size
++        self.n_tiles = (
++            self.intermediate_size // 128 if self.fc1 else self.hidden_size // 256
++        )
++        self.k_tiles = self.size_k // TILE_K
++        self.scales_kg = self.size_k // 32
++        self.scales_n_padded = self.size_n
++        self.b_off = self.terms * PLANE_STAGE_BYTES
++        self.s_off = self.b_off + B_STAGE_BYTES
++        self.stage_bytes = self.s_off + S_STAGE_BYTES
++        self.pipeline_bytes = self.stages * self.stage_bytes
++        self.shared_bytes = (
++            max(self.pipeline_bytes, BLOCK_M * EPI_ROW_BYTES) + ROUTE_BYTES
++        )
++
++    @property
++    def __cache_key__(self) -> tuple[object, ...]:
++        return (
++            self.phase,
++            self.hidden_size,
++            self.intermediate_size,
++            self.top_k,
++            self.stages,
++            self.fast_math,
++            self.terms,
++            BLOCK_M,
++            TILE_K,
++            self.warps,
++        )
++
++    @cute.jit
++    def __call__(
++        self,
++        a_q: cute.Tensor,
++        a_sf: cute.Tensor,
++        a_q2: cute.Tensor,
++        a_sf2: cute.Tensor,
++        weights_i32: cute.Tensor,
++        scales_u8: cute.Tensor,
++        w_global: cute.Tensor,
++        a_gscale: cute.Tensor,
++        q_gscale: cute.Tensor,
++        packed_route_indices: cute.Tensor,
++        block_expert_ids: cute.Tensor,
++        packed_route_count: cute.Tensor,
++        out_q: cute.Tensor,
++        out_sf: cute.Tensor,
++        out_q2: cute.Tensor,
++        out_sf2: cute.Tensor,
++        out_bf16: cute.Tensor,
++        live_routes: cutlass.Int32,
++        gs_stride: cutlass.Int32,
++        grid_ctas: cutlass.Int32,
++        stream: cuda.CUstream,
++    ):
++        self.kernel(
++            a_q,
++            a_sf,
++            a_q2,
++            a_sf2,
++            weights_i32,
++            scales_u8,
++            w_global,
++            a_gscale,
++            q_gscale,
++            packed_route_indices,
++            block_expert_ids,
++            packed_route_count,
++            out_q,
++            out_sf,
++            out_q2,
++            out_sf2,
++            out_bf16,
++            live_routes,
++            gs_stride,
++        ).launch(
++            grid=(grid_ctas, 1, 1),
++            block=[self.threads, 1, 1],
++            min_blocks_per_mp=1,
++            stream=stream,
++        )
++
++    @cute.jit
++    def _chunk_n64(self, n_tile: Int32, chunk: Int32) -> Int32:
++        """Packed N64 chunk index of tile ``n_tile`` slot ``chunk`` (0..3)."""
++        result = n_tile * Int32(4) + chunk
++        if cutlass.const_expr(self.fc1):
++            result = n_tile * Int32(2) + (chunk & Int32(1))
++            if chunk >= Int32(2):
++                result += Int32(self.intermediate_size // 64)
++        return result
++
++    # -- staging -------------------------------------------------------------------
++
++    @cute.jit
++    def _issue(
++        self,
++        tid: Int32,
++        stage_base: Int32,
++        k_tile: Int32,
++        a_desc,
++        sf_desc,
++        b_desc,
++        s_base: Int64,
++        n_tile: Int32,
++    ):
++        """One K64 slice: live A rows (2 x 16 B per plane) and their scale words,
++        packed B chunks (16 B vectors), and the SFB byte-pairs (64 x 4 B).
++
++        The packed e8m0_k32 grid stores each column's two K32-group scale
++        bytes at non-adjacent offsets, so the SFB words (byte-pairs) are
++        assembled here via byte loads: thread ``tid`` < 256 stages one u32
++        (byte 0 = K32 group ``2 k_tile``, byte 1 = ``2 k_tile + 1``) per
++        (chunk slot, column) of this tile.
++        """
++        for src, dst, live in a_desc:
++            if live != Int32(0):
++                cp_async4_shared_global(
++                    stage_base + dst, src + Int64(k_tile) * Int64(32)
++                )
++        for src, dst, live in sf_desc:
++            if live != Int32(0):
++                cp_async_u32_shared_global(
++                    stage_base + dst, src + Int64(k_tile) * Int64(4)
++                )
++        for src, dst in b_desc:
++            cp_async4_shared_global(
++                stage_base + dst,
++                src + Int64(k_tile) * Int64((TILE_K // 16) * (self.size_n // 64) * 512),
++            )
++        if tid < Int32(256):
++            wslot = tid >> Int32(6)
++            wcol = tid & Int32(63)
++            n_col = self._chunk_n64(n_tile, wslot) * Int32(64) + wcol
++            kg0 = Int32(2) * k_tile
++            b0 = ld_global_nc_u8(
++                _e8m0_byte_off(s_base, n_col, kg0, Int32(self.scales_n_padded))
++            )
++            b1 = ld_global_nc_u8(
++                _e8m0_byte_off(
++                    s_base, n_col, kg0 + Int32(1), Int32(self.scales_n_padded)
++                )
++            )
++            st_shared_u32(
++                stage_base
++                + Int32(self.s_off)
++                + (wslot << Int32(8))
++                + (wcol << Int32(2)),
++                b0 | (b1 << Uint32(8)),
++            )
++
++    # -- mainloop ------------------------------------------------------------------
++
++    @cute.jit
++    def _mainloop(
++        self,
++        a_q,
++        a_sf,
++        a_q2,
++        a_sf2,
++        weights_i32,
++        scales_u8,
++        smem_base: Int32,
++        tid: Int32,
++        lane: Int32,
++        m_warp: Int32,
++        slot: Int32,
++        expert: Int32,
++        n_tile: Int32,
++        live_blocks: Int32,
++        acc,
++    ):
++        route_base = smem_base + Int32(self.shared_bytes - ROUTE_BYTES)
++        k16_rows = self.size_k // 16
++        n64_chunks = self.size_n // 64
++        q = lane >> Int32(2)
++        c = lane & Int32(3)
++        h = c & Int32(1)
++        live_rows = live_blocks * Int32(16)
++        a_desc = []
++        for i in cutlass.range_constexpr(
++            (self.terms * 256 + self.threads - 1) // self.threads
++        ):
++            idx = tid + Int32(i * self.threads)
++            plane = idx >> Int32(8)
++            row = (idx & Int32(255)) >> Int32(1)
++            vec = idx & Int32(1)
++            live = Int32(0)
++            if idx < Int32(self.terms * 256) and row < live_rows:
++                live = Int32(1)
++            src_row = Int32(ld_shared_u32(route_base + (row << Int32(2))))
++            elem = Int64(src_row) * Int64(self.size_k // 8) + Int64(vec * Int32(4))
++            src = get_ptr_as_int64(a_q, elem)
++            if cutlass.const_expr(self.terms == 2) and plane != Int32(0):
++                src = get_ptr_as_int64(a_q2, elem)
++            dst = plane * Int32(PLANE_STAGE_BYTES) + row * Int32(32) + (vec << Int32(4))
++            a_desc.append((src, dst, live))
++        sf_desc = []
++        for i in cutlass.range_constexpr(
++            (self.terms * 128 + self.threads - 1) // self.threads
++        ):
++            idx = (tid + Int32(i * self.threads + 256)) & Int32(self.threads - 1)
++            if cutlass.const_expr(self.terms * 128 > self.threads):
++                idx = tid + Int32(i * self.threads)
++            plane = idx >> Int32(7)
++            row = idx & Int32(127)
++            live = Int32(0)
++            if idx < Int32(self.terms * 128) and row < live_rows:
++                live = Int32(1)
++            src_row = Int32(ld_shared_u32(route_base + (row << Int32(2))))
++            elem = Int64(src_row) * Int64(self.size_k // 64)
++            src = get_ptr_as_int64(a_sf, elem)
++            if cutlass.const_expr(self.terms == 2) and plane != Int32(0):
++                src = get_ptr_as_int64(a_sf2, elem)
++            dst = (
++                plane * Int32(PLANE_STAGE_BYTES)
++                + Int32(A_STAGE_BYTES)
++                + (row << Int32(2))
++            )
++            sf_desc.append((src, dst, live))
++        b_desc = []
++        for i in cutlass.range_constexpr(512 // self.threads):
++            idx = tid + Int32(i * self.threads)
++            b_k16 = idx >> Int32(7)
++            b_chunk = (idx >> Int32(5)) & Int32(3)
++            b_vec = idx & Int32(31)
++            src = get_ptr_as_int64(
++                weights_i32,
++                (
++                    (Int64(expert) * Int64(k16_rows) + Int64(b_k16)) * Int64(n64_chunks)
++                    + Int64(self._chunk_n64(n_tile, b_chunk))
++                )
++                * Int64(128)
++                + Int64(b_vec * Int32(4)),
++            )
++            dst = (
++                Int32(self.b_off)
++                + ((b_k16 * Int32(4) + b_chunk) << Int32(9))
++                + ((b_vec ^ (b_k16 & Int32(1))) << Int32(4))
++            )
++            b_desc.append((src, dst))
++        # SFB: one u32 byte-pair word per (chunk slot, column) is staged by
++        # _issue from the packed e8m0_k32 grid (bytes at non-adjacent offsets).
++        s_base = get_ptr_as_int64(
++            scales_u8,
++            Int64(expert) * Int64(self.scales_kg) * Int64(self.scales_n_padded),
++        )
++
++        b_frag = []
++        for j in cutlass.range_constexpr(2):
++            g = Int32(2 * j) + (c >> Int32(1))
++            row_base = Int32(self.b_off) + ((g * Int32(4) + slot) << Int32(9))
++            pair = []
++            for e in cutlass.range_constexpr(2):
++                vec = (q << Int32(2)) + (h << Int32(1)) + Int32(e)
++                pair.append(row_base + ((vec ^ (g & Int32(1))) << Int32(4)))
++            b_frag.append(pair)
++        s_frag = Int32(self.s_off) + (slot << Int32(8)) + (q << Int32(2))
++        row0 = m_warp * Int32(self.rows_per_warp) + q
++        a_frag = row0 * Int32(32) + (c << Int32(3))
++        sfa_frag = Int32(A_STAGE_BYTES) + ((row0 + (h << Int32(3))) << Int32(2))
++        warp_live = live_blocks - m_warp * Int32(self.mb_per_warp)
++
++        for p in cutlass.range_constexpr(self.stages - 1):
++            if Int32(p) < Int32(self.k_tiles):
++                self._issue(
++                    tid,
++                    smem_base + Int32(p * self.stage_bytes),
++                    Int32(p),
++                    a_desc,
++                    sf_desc,
++                    b_desc,
++                    s_base,
++                    n_tile,
++                )
++            cute.arch.cp_async_commit_group()
++        rd_base = smem_base
++        wr_base = smem_base + Int32((self.stages - 1) * self.stage_bytes)
++        stage_end = smem_base + Int32(self.stages * self.stage_bytes)
++        k_tile = Int32(0)
++        while k_tile < Int32(self.k_tiles):
++            cute.arch.cp_async_wait_group(self.stages - 2)
++            cute.arch.sync_threads()
++            nxt = k_tile + Int32(self.stages - 1)
++            if nxt < Int32(self.k_tiles):
++                self._issue(tid, wr_base, nxt, a_desc, sf_desc, b_desc, s_base, n_tile)
++            cute.arch.cp_async_commit_group()
++            if warp_live > Int32(0):
++                self._compute_stage(
++                    rd_base, b_frag, s_frag, a_frag, sfa_frag, warp_live, acc
++                )
++            rd_base += Int32(self.stage_bytes)
++            if rd_base == stage_end:
++                rd_base = smem_base
++            wr_base += Int32(self.stage_bytes)
++            if wr_base == stage_end:
++                wr_base = smem_base
++            k_tile += Int32(1)
++
++    # -- mainloop compute -----------------------------------------------------------
++
++    @cute.jit
++    def _compute_stage(
++        self,
++        rd_base: Int32,
++        b_frag,
++        s_frag: Int32,
++        a_frag: Int32,
++        sfa_frag: Int32,
++        warp_live: Int32,
++        acc,
++    ):
++        # B registers [jj][t][j]: one PRMT of the e = 0 / 1 words per register
++        # (the packed W4A16 B layout is identical to the 4X variant).
++        breg = cute.make_rmem_tensor((16,), Uint32)
++        for j in cutlass.range_constexpr(2):
++            w0 = ld_shared_v4_u32(rd_base + b_frag[j][0])
++            w1 = ld_shared_v4_u32(rd_base + b_frag[j][1])
++            for jj in cutlass.range_constexpr(4):
++                breg[(jj * 2 + 0) * 2 + j] = prmt_b32(w0[jj], w1[jj], Uint32(0x6420))
++                breg[(jj * 2 + 1) * 2 + j] = prmt_b32(w0[jj], w1[jj], Uint32(0x7531))
++        # SFB [jj][t]: the (group0, group1) byte-pair of column 16 jj + 8 t + q
++        # of this slot -- already the MMA's u32 scale word (no lift, no PRMT).
++        sfb = cute.make_rmem_tensor((8,), Uint32)
++        for jj in cutlass.range_constexpr(4):
++            for t in cutlass.range_constexpr(2):
++                sfb[jj * 2 + t] = ld_shared_u32(
++                    rd_base + s_frag + Int32((16 * jj + 8 * t) << Int32(2))
++                )
++        self._mma_block(rd_base, a_frag, sfa_frag, breg, sfb, acc, 0)
++        for mb in cutlass.range_constexpr(1, self.mb_per_warp):
++            if warp_live > Int32(mb):
++                self._mma_block(rd_base, a_frag, sfa_frag, breg, sfb, acc, mb)
++
++    @cute.jit
++    def _mma_block(
++        self,
++        rd_base: Int32,
++        a_frag: Int32,
++        sfa_frag: Int32,
++        breg,
++        sfb,
++        acc,
++        mb: cutlass.Constexpr[int],
++    ):
++        for plane in cutlass.range_constexpr(self.terms):
++            base = rd_base + a_frag + Int32(plane * PLANE_STAGE_BYTES + mb * 16 * 32)
++            a0, a2 = ld_shared_v2_u32(base)
++            a1, a3 = ld_shared_v2_u32(base + Int32(8 * 32))
++            sfa = ld_shared_u32(
++                rd_base + sfa_frag + Int32(plane * PLANE_STAGE_BYTES + mb * 16 * 4)
++            )
++            for jj in cutlass.range_constexpr(4):
++                for t in cutlass.range_constexpr(2):
++                    idx = ((mb * 4 + jj) * 2 + t) * 4
++                    d0, d1, d2, d3 = mxfp4_mma_m16n8k64_f32_e2m1_ue8m0(
++                        acc[idx],
++                        acc[idx + 1],
++                        acc[idx + 2],
++                        acc[idx + 3],
++                        a0,
++                        a1,
++                        a2,
++                        a3,
++                        breg[(jj * 2 + t) * 2 + 0],
++                        breg[(jj * 2 + t) * 2 + 1],
++                        sfa,
++                        sfb[jj * 2 + t],
++                    )
++                    acc[idx] = d0
++                    acc[idx + 1] = d1
++                    acc[idx + 2] = d2
++                    acc[idx + 3] = d3
++
++    # -- epilogues -----------------------------------------------------------------
++
++    @cute.jit
++    def _stage_epilogue(
++        self,
++        acc,
++        smem_base: Int32,
++        lane: Int32,
++        m_warp: Int32,
++        slot: Int32,
++        alpha: Float32,
++    ):
++        """[128, 256] BF16 tile of ``acc * alpha`` (columns in chunk-slot order)."""
++        q = lane >> Int32(2)
++        col0 = (slot << Int32(6)) + ((lane & Int32(3)) << Int32(1))
++        for mb in cutlass.range_constexpr(self.mb_per_warp):
++            for half_row in cutlass.range_constexpr(2):
++                row = (
++                    m_warp * Int32(self.rows_per_warp)
++                    + Int32(16 * mb + 8 * half_row)
++                    + q
++                )
++                for jj in cutlass.range_constexpr(4):
++                    for t in cutlass.range_constexpr(2):
++                        idx = ((mb * 4 + jj) * 2 + t) * 4 + 2 * half_row
++                        col = col0 + Int32(16 * jj + 8 * t)
++                        st_shared_u32(
++                            smem_base + row * Int32(EPI_ROW_BYTES) + (col << Int32(1)),
++                            pack_f32x2_to_bfloat2(
++                                acc[idx] * alpha, acc[idx + 1] * alpha
++                            ),
++                        )
++        cute.arch.sync_threads()
++
++    @cute.jit
++    def _round(self, x: Float32) -> Float32:
++        lo, _ = bfloat2_to_float2_scaled(pack_f32x2_to_bfloat2(x, x), Float32(1.0))
++        return lo
++
++    @cute.jit
++    def _activate(self, gate: Float32, up: Float32) -> Float32:
++        sigmoid = cute.arch.rcp_approx(
++            Float32(1.0) + cute.math.exp(-gate, fastmath=self.fast_math)
++        )
++        return self._round(gate * sigmoid * up)
++
++    @cute.jit
++    def _store_fc2(
++        self,
++        acc,
++        out_bf16,
++        smem_base: Int32,
++        tid: Int32,
++        lane: Int32,
++        m_warp: Int32,
++        slot: Int32,
++        n_tile: Int32,
++        live_routes: Int32,
++        alpha: Float32,
++    ):
++        self._stage_epilogue(acc, smem_base, lane, m_warp, slot, alpha)
++        route_base = smem_base + Int32(self.shared_bytes - ROUTE_BYTES)
++        for i in cutlass.range_constexpr(BLOCK_M * 32 // self.threads):
++            idx = tid + Int32(i * self.threads)
++            row = idx >> Int32(5)
++            vec = idx & Int32(31)
++            route = Int32(ld_shared_u32(route_base + (row << Int32(2))))
++            if route < live_routes:
++                v0, v1, v2, v3 = ld_shared_v4_u32(
++                    smem_base + row * Int32(EPI_ROW_BYTES) + (vec << Int32(4))
++                )
++                dst = Int64(route) * Int64(self.hidden_size) + Int64(
++                    n_tile * Int32(256) + (vec << Int32(3))
++                )
++                st_global_v4_u32(get_ptr_as_int64(out_bf16, dst), v0, v1, v2, v3)
++
++    @cute.jit
++    def _store_fc1(
++        self,
++        acc,
++        out_q,
++        out_sf,
++        out_q2,
++        out_sf2,
++        smem_base: Int32,
++        tid: Int32,
++        lane: Int32,
++        m_warp: Int32,
++        slot: Int32,
++        n_tile: Int32,
++        live_routes: Int32,
++        alpha: Float32,
++    ):
++        # Stage BF16 gate (cols 0..127) and up (128..255) after alpha.
++        self._stage_epilogue(acc, smem_base, lane, m_warp, slot, alpha)
++        route_base = smem_base + Int32(self.shared_bytes - ROUTE_BYTES)
++        # Thread -> (row, K64 half of the 128 intermediate columns).
++        if tid < Int32(2 * BLOCK_M):
++            row = tid & Int32(BLOCK_M - 1)
++            half = tid >> Int32(7)
++            route = Int32(ld_shared_u32(route_base + (row << Int32(2))))
++            if route < live_routes:
++                row_base = smem_base + row * Int32(EPI_ROW_BYTES) + (half << Int32(7))
++                words = cute.make_rmem_tensor((8,), Uint32)
++                words2 = cute.make_rmem_tensor((8,), Uint32)
++                scale_word = Uint32(0)
++                scale_word2 = Uint32(0)
++                for g in cutlass.range_constexpr(2):
++                    # K32 group g = intermediate columns 32g..32g+31 of the
++                    # 64-column half (gate and up read at the same column).
++                    vals = cute.make_rmem_tensor((32,), Float32)
++                    codes = cute.make_rmem_tensor((32,), Uint32)
++                    for v in cutlass.range_constexpr(4):
++                        gw = ld_shared_v4_u32(row_base + Int32(64 * g + 16 * v))
++                        uw = ld_shared_v4_u32(row_base + Int32(256 + 64 * g + 16 * v))
++                        for i in cutlass.range_constexpr(4):
++                            g0, g1 = bfloat2_to_float2_scaled(gw[i], Float32(1.0))
++                            u0, u1 = bfloat2_to_float2_scaled(uw[i], Float32(1.0))
++                            vals[8 * v + 2 * i] = self._activate(g0, u0)
++                            vals[8 * v + 2 * i + 1] = self._activate(g1, u1)
++                    out = _mxfp4_quantize32(vals, codes)
++                    words[4 * g + 0] = out[0]
++                    words[4 * g + 1] = out[1]
++                    words[4 * g + 2] = out[2]
++                    words[4 * g + 3] = out[3]
++                    scale_word = scale_word | (out[4] << Uint32(8 * g))
++                    if cutlass.const_expr(self.terms == 2):
++                        res = cute.make_rmem_tensor((32,), Float32)
++                        codes2 = cute.make_rmem_tensor((32,), Uint32)
++                        for m in cutlass.range_constexpr(32):
++                            res[m] = vals[m] - _mxfp4_dequant(codes[m], out[4])
++                        out2 = _mxfp4_quantize32(res, codes2)
++                        words2[4 * g + 0] = out2[0]
++                        words2[4 * g + 1] = out2[1]
++                        words2[4 * g + 2] = out2[2]
++                        words2[4 * g + 3] = out2[3]
++                        scale_word2 = scale_word2 | (out2[4] << Uint32(8 * g))
++                k64 = n_tile * Int32(2) + half
++                q_off = Int64(route) * Int64(self.intermediate_size // 8) + Int64(
++                    k64 * Int32(8)
++                )
++                sf_off = Int64(route) * Int64(self.intermediate_size // 64) + Int64(k64)
++                _store_slice_mxfp4(
++                    get_ptr_as_int64(out_q, q_off),
++                    get_ptr_as_int64(out_sf, sf_off),
++                    words,
++                    scale_word,
++                )
++                if cutlass.const_expr(self.terms == 2):
++                    _store_slice_mxfp4(
++                        get_ptr_as_int64(out_q2, q_off),
++                        get_ptr_as_int64(out_sf2, sf_off),
++                        words2,
++                        scale_word2,
++                    )
++
++    # -- kernel --------------------------------------------------------------------
++
++    @cute.kernel
++    def kernel(
++        self,
++        a_q,
++        a_sf,
++        a_q2,
++        a_sf2,
++        weights_i32,
++        scales_u8,
++        w_global,
++        a_gscale,
++        q_gscale,
++        packed_route_indices,
++        block_expert_ids,
++        packed_route_count,
++        out_q,
++        out_sf,
++        out_q2,
++        out_sf2,
++        out_bf16,
++        live_routes: cutlass.Int32,
++        gs_stride: cutlass.Int32,
++    ):
++        tidx, _, _ = cute.arch.thread_idx()
++        bidx, _, _ = cute.arch.block_idx()
++        gdimx, _, _ = cute.arch.grid_dim()
++        tid = Int32(tidx)
++        lane = tid & Int32(31)
++        warp = tid >> Int32(5)
++        m_warp = warp >> Int32(2)
++        slot = warp & Int32(3)
++
++        smem = cutlass.utils.SmemAllocator()
++
++        @cute.struct
++        class Storage:
++            words: cute.struct.Align[
++                cute.struct.MemRange[cutlass.Uint32, self.shared_bytes // 4], 1024
++            ]
++
++        storage = smem.allocate(Storage)
++        smem_base = shared_ptr_to_u32(storage.words.data_ptr())
++        route_base = smem_base + Int32(self.shared_bytes - ROUTE_BYTES)
++
++        blocks = packed_route_count[0].to(Int32) // Int32(BLOCK_M)
++        tiles = blocks * Int32(self.n_tiles)
++        tile = Int32(bidx)
++        while tile < tiles:
++            block = tile // Int32(self.n_tiles)
++            n_tile = tile - block * Int32(self.n_tiles)
++            expert = block_expert_ids[block].to(Int32)
++            if expert >= Int32(0):
++                # Gather rows (token for FC1, route for FC2); live routes form a
++                # prefix of the block.
++                if tid < Int32(BLOCK_M):
++                    route = packed_route_indices[block * Int32(BLOCK_M) + tid].to(Int32)
++                    src = Int32(0)
++                    if route < live_routes:
++                        src = route
++                        if cutlass.const_expr(self.fc1):
++                            src = route // Int32(self.top_k)
++                    st_shared_u32(route_base + (tid << Int32(2)), Uint32(src))
++                cute.arch.sync_threads()
++                live_blocks = Int32(0)
++                for probe in cutlass.range_constexpr(BLOCK_M // 16):
++                    r = packed_route_indices[
++                        block * Int32(BLOCK_M) + Int32(16 * probe)
++                    ].to(Int32)
++                    if r < live_routes:
++                        live_blocks = Int32(probe + 1)
++                # alpha: the e8m0_k32 dequant convention is
++                #   value = e2m1_code * 2^(scale_byte - 127) * global_scale
++                # with global_scale = the raw per-expert source global (the
++                # 2**119 lift belongs to the DECODE unpack path, which
++                # materializes E8M0 as BF16 halves -- not to this MMA, whose
++                # operands are native E2M1 with UE8M0 scale pairs).  The
++                # dynamic E8M0 quantizer represents activations with local
++                # per-K32 scales only and never applies activation globals,
++                # so dividing by the input global scale would be unsound
++                # compensation: weight globals alone scale the result.
++                # Activation globals must therefore be unit (enforced in
++                # run_w4a16_mxfp4_prefill).
++                alpha = w_global[expert].to(Float32)
++
++                acc = cute.make_rmem_tensor((self.acc_size,), Float32)
++                acc.fill(0.0)
++                self._mainloop(
++                    a_q,
++                    a_sf,
++                    a_q2,
++                    a_sf2,
++                    weights_i32,
++                    scales_u8,
++                    smem_base,
++                    tid,
++                    lane,
++                    m_warp,
++                    slot,
++                    expert,
++                    n_tile,
++                    live_blocks,
++                    acc,
++                )
++                cute.arch.cp_async_wait_group(0)
++                cute.arch.sync_threads()
++                # The epilogue reads route ids, not gather rows.
++                if tid < Int32(BLOCK_M):
++                    route = packed_route_indices[block * Int32(BLOCK_M) + tid].to(Int32)
++                    st_shared_u32(route_base + (tid << Int32(2)), Uint32(route))
++                cute.arch.sync_threads()
++                if cutlass.const_expr(self.fc1):
++                    self._store_fc1(
++                        acc,
++                        out_q,
++                        out_sf,
++                        out_q2,
++                        out_sf2,
++                        smem_base,
++                        tid,
++                        lane,
++                        m_warp,
++                        slot,
++                        n_tile,
++                        live_routes,
++                        alpha,
++                    )
++                else:
++                    self._store_fc2(
++                        acc,
++                        out_bf16,
++                        smem_base,
++                        tid,
++                        lane,
++                        m_warp,
++                        slot,
++                        n_tile,
++                        live_routes,
++                        alpha,
++                    )
++                cute.arch.sync_threads()
++            tile += Int32(gdimx)
++
++
++# -- host: plan-time launch set and the per-call pipeline ------------------------
++
++MXFP4_PREFILL_ROUTE_BLOCK = BLOCK_M
++_FAKE_ELEMENTS = 1 << 30
++_LAUNCH_CACHE: dict[tuple, tuple] = {}
++
++
++def mxfp4_prefill_scale_format_supported(scale_format: str | None) -> bool:
++    """Whether a prepared W4A16 scale format is the MXFP4-A4 payload.
++
++    Admission requires the e8m0_k32 (MXFP4/X4T) scales; other W4A16 formats
++    (e.g. e4m3_k16) belong to NVFP4-style weights and never dispatch A4.
++    Used as a cheap eligibility short-circuit before any device work.
++    """
++    return scale_format == "e8m0_k32"
++
++
++def mxfp4_prefill_min_tokens() -> int:
++    """Plan-time opt-in: W4A16 calls with at least this many tokens run MXFP4
++    activations over the packed weights (``B12X_W4A16_MXFP4_PREFILL_MIN_TOKENS``,
++    0 = off)."""
++    value = int(os.environ.get("B12X_W4A16_MXFP4_PREFILL_MIN_TOKENS", "0") or 0)
++    return max(value, 0)
++
++
++def _terms2_allowed() -> bool:
++    """Explicit opt-in for the unqualified terms=2 residual plane."""
++    return os.environ.get("B12X_W4A16_MXFP4_PREFILL_ALLOW_TERMS2", "") == "1"
++
++
++def mxfp4_prefill_terms() -> int:
++    """Activation planes: 1 = MXFP4, 2 = MXFP4 value + MXFP4 residual;
++    ``B12X_W4A16_MXFP4_PREFILL_TERMS``.
++
++    terms=2 is gated: the residual plane is unqualified, so it additionally
++    requires the explicit ``B12X_W4A16_MXFP4_PREFILL_ALLOW_TERMS2=1`` opt-in.
++    """
++    value = int(os.environ.get("B12X_W4A16_MXFP4_PREFILL_TERMS", "1") or 1)
++    if value not in (1, 2):
++        raise ValueError("B12X_W4A16_MXFP4_PREFILL_TERMS must be 1 or 2")
++    if value == 2 and not _terms2_allowed():
++        raise ValueError(
++            "B12X_W4A16_MXFP4_PREFILL_TERMS=2 is gated (the MXFP4 residual "
++            "plane is unqualified); set B12X_W4A16_MXFP4_PREFILL_ALLOW_TERMS2=1 "
++            "to opt in"
++        )
++    return value
++
++
++def mxfp4_prefill_warps() -> int:
++    """GEMM CTA size (``B12X_W4A16_MXFP4_PREFILL_WARPS``): 8 warps with 64-row
++    warp tiles (default) or 16 warps with 32-row tiles."""
++    value = int(os.environ.get("B12X_W4A16_MXFP4_PREFILL_WARPS", "8") or 8)
++    if value not in (8, 16):
++        raise ValueError("B12X_W4A16_MXFP4_PREFILL_WARPS must be 8 or 16")
++    return value
++
++
++def mxfp4_prefill_supported(
++    *,
++    prepared_layout: str,
++    scale_format: str,
++    activation: str,
++    is_gated: bool,
++    dtype: torch.dtype,
++    hidden_size: int,
++    intermediate_size: int,
++    terms: int = 1,
++    swiglu_limit: float | None = None,
++) -> bool:
++    """Plan-time admission.
++
++    Only the repacked K16/N64 payload (``'packed'``) is admitted: the GEMM has
++    no layout branch and always reads that payload's B addressing, while the
++    ``'modelopt'``/native preparation keeps the original weights without
++    ``_repack_weight`` (prepare.py native/X4T-native branches), so a native
++    object would produce incorrect B operands.  terms=2 is gated behind
++    ``B12X_W4A16_MXFP4_PREFILL_ALLOW_TERMS2=1`` (unqualified residual plane).
++
++    Clamped SiLU (non-null ``swiglu_limit``) is rejected: the W4A16 kernel
++    clamps gate/up to the limit before activation, while the A4 epilogue
++    computes a plain SiLU — crossing the A4 threshold would silently change
++    activation semantics.  Clamped models retain W4A16.
++    """
++    if terms not in (1, 2):
++        return False
++    if terms == 2 and not _terms2_allowed():
++        return False
++    if swiglu_limit is not None:
++        return False
++    _dt = str(dtype).removeprefix("torch.")
++    return (
++        prepared_layout == "packed"
++        and scale_format == "e8m0_k32"
++        and activation == "silu"
++        and bool(is_gated)
++        and _dt == "bfloat16"
++        and hidden_size % 256 == 0
++        and intermediate_size % 128 == 0
++    )
++
++
++@dataclass(frozen=True)
++class W4A16Mxfp4PrefillLaunches:
++    """Compiled MXFP4 prefill pipeline for one W4A16 capacity."""
++
++    tokens: int
++    min_tokens: int
++    hidden_size: int
++    intermediate_size: int
++    num_experts: int
++    topk: int
++    grid: int
++    terms: int
++    quant: object
++    fc1: object
++    fc2: object
++    topk_sum: object
++    route_pack: object
++
++    def carriers(self) -> tuple[object, ...]:
++        return (
++            self.quant,
++            self.fc1,
++            self.fc2,
++            self.topk_sum,
++            *self.route_pack.carriers(),
++        )
++
++    def scratch_bytes(self, tokens: int) -> int:
++        """Bytes of ``intermediate_cache2`` the pipeline carves for ``tokens``."""
++        return _carve_layout(self, int(tokens))[-1]
++
++
++def _fake(dtype, align=16):
++    return cute.runtime.make_fake_compact_tensor(
++        dtype, (_FAKE_ELEMENTS,), assumed_align=align
++    )
++
++
++def _compile_mxfp4_kernels(
++    *, hidden_size: int, intermediate_size: int, topk: int, fast_math: bool, terms: int
++):
++    from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile
++    from b12x._lib.utils.device import current_cuda_stream
++
++    warps = mxfp4_prefill_warps()
++    # Compile keys omit the device ordinal: one rank's plan serves every rank.
++    device = torch.cuda.current_device()
++    key = (
++        int(hidden_size),
++        int(intermediate_size),
++        int(topk),
++        bool(fast_math),
++        4,
++        int(terms),
++        warps,
++    )
++    cached = _LAUNCH_CACHE.get((int(device), *key))
++    if cached is not None:
++        return cached
++    stream = current_cuda_stream()
++    quant = b12x_compile(
++        Mxfp4A4Quantize(size_k=hidden_size, terms=terms),
++        _fake(cutlass.BFloat16),
++        _fake(cutlass.Uint32),
++        _fake(cutlass.Uint32, 4),
++        _fake(cutlass.Uint32),
++        _fake(cutlass.Uint32, 4),
++        Int32(1),
++        stream,
++        compile_spec=KernelCompileSpec.from_key(
++            "moe.w4a16.mxfp4_prefill.quant", 3, key
++        ),
++    )
++    gemms = []
++    for phase in ("fc1", "fc2"):
++        gemms.append(
++            b12x_compile(
++                Mxfp4A4PrefillGemm(
++                    phase=phase,
++                    hidden_size=hidden_size,
++                    intermediate_size=intermediate_size,
++                    top_k=topk,
++                    fast_math=fast_math,
++                    terms=terms,
++                    warps=warps,
++                ),
++                _fake(cutlass.Uint32),
++                _fake(cutlass.Uint32, 4),
++                _fake(cutlass.Uint32),
++                _fake(cutlass.Uint32, 4),
++                _fake(cutlass.Int32),
++                _fake(cutlass.Uint8),
++                _fake(cutlass.Float32, 4),
++                _fake(cutlass.Float32, 4),
++                _fake(cutlass.Float32, 4),
++                _fake(cutlass.Int32, 4),
++                _fake(cutlass.Int32, 4),
++                _fake(cutlass.Int32, 4),
++                _fake(cutlass.Uint32),
++                _fake(cutlass.Uint32, 4),
++                _fake(cutlass.Uint32),
++                _fake(cutlass.Uint32, 4),
++                _fake(cutlass.BFloat16),
++                Int32(1),
++                Int32(1),
++                Int32(1),
++                stream,
++                compile_spec=KernelCompileSpec.from_key(
++                    f"moe.w4a16.mxfp4_prefill.{phase}", 3, key
++                ),
++            )
++        )
++    result = (quant, gemms[0], gemms[1])
++    _LAUNCH_CACHE[(int(device), *key)] = result
++    return result
++
++
++def compile_w4a16_mxfp4_prefill(
++    *,
++    tokens: int,
++    min_tokens: int,
++    topk: int,
++    hidden_size: int,
++    intermediate_size: int,
++    num_experts: int,
++    sms: int,
++    ordinal: int,
++    fast_math: bool,
++    terms: int = 1,
++) -> W4A16Mxfp4PrefillLaunches:
++    from b12x.moe._shared.kernels.w4a16.kernel.sum_launch import compile_w4a16_topk_sum
++    from b12x.moe._shared.kernels.w4a16.route_pack import (
++        compile_w4a16_route_pack_launches,
++    )
++
++    if terms not in (1, 2):
++        raise ValueError("MXFP4 prefill terms must be 1 or 2")
++    if terms == 2 and not _terms2_allowed():
++        raise ValueError(
++            "MXFP4 prefill terms=2 is gated (the residual plane is "
++            "unqualified); set B12X_W4A16_MXFP4_PREFILL_ALLOW_TERMS2=1 to opt in"
++        )
++
++    quant, fc1, fc2 = _compile_mxfp4_kernels(
++        hidden_size=hidden_size,
++        intermediate_size=intermediate_size,
++        topk=topk,
++        fast_math=fast_math,
++        terms=terms,
++    )
++    topk_sum = compile_w4a16_topk_sum(
++        m=tokens,
++        topk=topk,
++        hidden_size=hidden_size,
++        element_dtype="bf16",
++        apply_topk_weights=True,
++    )
++    route_pack = compile_w4a16_route_pack_launches(
++        tokens=tokens,
++        topk=topk,
++        block_size=MXFP4_PREFILL_ROUTE_BLOCK,
++        num_experts=num_experts,
++        ordinal=ordinal,
++    )
++    return W4A16Mxfp4PrefillLaunches(
++        tokens=int(tokens),
++        min_tokens=int(min_tokens),
++        hidden_size=int(hidden_size),
++        intermediate_size=int(intermediate_size),
++        num_experts=int(num_experts),
++        topk=int(topk),
++        grid=int(sms),
++        terms=int(terms),
++        quant=quant,
++        fc1=fc1,
++        fc2=fc2,
++        topk_sum=topk_sum,
++        route_pack=route_pack,
++    )
++
++
++def _carve_layout(launches: W4A16Mxfp4PrefillLaunches, tokens: int):
++    """Byte offsets of the pipeline buffers inside ``intermediate_cache2``.
++
++    Identical to the A4 carve: x_q/x_sf are packed MXFP4 (u8 pairs of nibbles,
++    1/16 of the K dimension per row) and act_q/act_sf the per-route
++    intermediate.  ``x_sf`` holds one u32 per row per K64 slice; ``act_sf``
++    one u32 per route per K64 slice of the intermediate.
++    """
++    h, i, e = launches.hidden_size, launches.intermediate_size, launches.num_experts
++    routes = tokens * launches.topk
++    planes = launches.terms
++    sizes = (
++        planes * tokens * h // 2,  # x_q (per plane)
++        planes * tokens * (h // 64) * 4,  # x_sf (u32 per K64 slice)
++        planes * routes * i // 2,  # act_q
++        planes * routes * (i // 64) * 4,  # act_sf
++        launches.route_pack.max_packed_routes * 4,  # packed_route_indices
++        launches.route_pack.max_route_blocks * 4,  # block_expert_ids
++        4,  # packed_route_count
++        (e + 1) * 4,  # expert_offsets
++        e * 4,  # expert_counts
++    )
++    offsets = []
++    offset = 0
++    for size in sizes:
++        offsets.append(offset)
++        offset = (offset + size + 255) // 256 * 256
++    return tuple(zip(offsets, sizes)), offset
++
++
++def _planes(region: torch.Tensor, terms: int) -> tuple[torch.Tensor, torch.Tensor]:
++    """Split an activation region into its planes (plane 2 aliases plane 1 when
++    there is a single term; the kernels never touch it then)."""
++    if terms == 1:
++        return region, region
++    half = region.numel() // 2
++    return region.narrow(0, 0, half), region.narrow(0, half, half)
++
++
++def mxfp4_prefill_fits(
++    launches: W4A16Mxfp4PrefillLaunches,
++    *,
++    tokens: int,
++    intermediate_cache13: torch.Tensor,
++    intermediate_cache2: torch.Tensor,
++) -> bool:
++    routes = int(tokens) * launches.topk
++    return (
++        intermediate_cache13.numel() * intermediate_cache13.element_size()
++        >= routes * launches.hidden_size * 2
++        and intermediate_cache2.numel() * intermediate_cache2.element_size()
++        >= launches.scratch_bytes(tokens)
++    )
++
++
++# --- activation-global admission (capture-safe) -------------------------------
++# The unit-global contract (a_gscale all 1.0) is validated ONCE per scale-tensor
++# contract and the trusted host-side verdict is cached; the captured execution
++# path never inspects device values through Python.  The old per-call
++# ``bool(torch.all(...))`` check copied a CUDA reduction to the host (a device
++# sync on every eager call) and cannot run under CUDA graph capture.
++
++# fingerprint -> _ActivationGlobalAdmissionEntry (trusted verdict + STRONG
++# references to the exact validated tensors), keyed by
++# (data_ptr, _version, numel, dtype) of each scale tensor.  The fingerprint is
++# only a fast first filter: a cache HIT additionally requires the cached tensor
++# objects to BE the queried tensors (identity check).  Otherwise a freed
++# tensor whose data_ptr the CUDA caching allocator reuses for a different
++# tensor (same numel/dtype, coincident _version) could inherit a stale verdict
++# (ABA).  The strong references keep the validated tensors alive for the
++# cached lifetime, so their addresses cannot be reused while the entry is
++# live; the identity check defends whatever the allocator still does.  The
++# cache is bounded (_ACTIVATION_GLOBAL_ADMISSION_MAX entries, oldest evicted)
++# so validation cannot pin unbounded device memory.
++# 512: the serving checkpoint has 69 MoE layers; with distinct scale-tensor
++# pairs per layer a 64-entry cache evicted early layers before graph capture
++# (Codex A3). 512 covers worst-case distinct pairs with headroom.
++_ACTIVATION_GLOBAL_ADMISSION_MAX = 512
++_ACTIVATION_GLOBAL_ADMISSION: dict[tuple, "_ActivationGlobalAdmissionEntry"] = {}
++
++
++class _ActivationGlobalAdmissionEntry:
++    """Cached admission verdict plus strong refs to the validated tensors."""
++
++    __slots__ = ("a1_gscale", "a2_gscale", "verdict")
++
++    def __init__(
++        self, a1_gscale: torch.Tensor, a2_gscale: torch.Tensor, verdict: str
++    ) -> None:
++        self.a1_gscale = a1_gscale
++        self.a2_gscale = a2_gscale
++        self.verdict = verdict
++
++    def matches(self, a1_gscale: torch.Tensor, a2_gscale: torch.Tensor) -> bool:
++        """Identity check: the cached tensors must BE the queried ones."""
++        return self.a1_gscale is a1_gscale and self.a2_gscale is a2_gscale
++
++    def __eq__(self, other) -> bool:
++        # Verdict-string comparison keeps the historical
++        # ``cache.get(fingerprint) == "unit"`` assertions meaningful.
++        if isinstance(other, str):
++            return self.verdict == other
++        if isinstance(other, _ActivationGlobalAdmissionEntry):
++            return (
++                self.verdict == other.verdict
++                and self.a1_gscale is other.a1_gscale
++                and self.a2_gscale is other.a2_gscale
++            )
++        return NotImplemented
++
++
++def _cache_activation_global_verdict(
++    fingerprint: tuple, a1_gscale: torch.Tensor, a2_gscale: torch.Tensor, verdict: str
++) -> None:
++    _ACTIVATION_GLOBAL_ADMISSION[fingerprint] = _ActivationGlobalAdmissionEntry(
++        a1_gscale, a2_gscale, verdict
++    )
++    while len(_ACTIVATION_GLOBAL_ADMISSION) > _ACTIVATION_GLOBAL_ADMISSION_MAX:
++        # dict preserves insertion order: pop the oldest entry.
++        _ACTIVATION_GLOBAL_ADMISSION.pop(next(iter(_ACTIVATION_GLOBAL_ADMISSION)))
++
++
++def _activation_global_fingerprint(*tensors: torch.Tensor) -> tuple:
++    return tuple(
++        (int(t.data_ptr()), int(t._version), int(t.numel()), t.dtype) for t in tensors
++    )
++
++
++def validate_activation_globals(
++    a1_gscale: torch.Tensor, a2_gscale: torch.Tensor
++) -> bool:
++    """Validate the unit activation-global contract once (bind-time entry).
++
++    Runs the all-ones device check a single time and records the trusted
++    host-side verdict in ``_ACTIVATION_GLOBAL_ADMISSION`` keyed by a
++    fingerprint of the scale tensors ``(data_ptr, _version, numel, dtype)``.
++    Call this at bind time, before CUDA graph capture; ``run_w4a16_mxfp4_prefill``
++    consults the cache afterwards and performs no device inspection on a
++    validated contract.  Returns True when both globals are all 1.0.  Mutating
++    a scale tensor in place bumps its ``_version`` and invalidates the cached
++    verdict.
++    """
++    entry = _ACTIVATION_GLOBAL_ADMISSION.get(
++        _activation_global_fingerprint(a1_gscale, a2_gscale)
++    )
++    if (
++        entry is not None
++        and entry.a1_gscale is a1_gscale
++        and entry.a2_gscale is a2_gscale
++    ):
++        return entry.verdict == "unit"  # cached: no device sync
++    verdict = (
++        "unit"
++        if bool(torch.all(a1_gscale == 1.0)) and bool(torch.all(a2_gscale == 1.0))
++        else "nonunit"
++    )
++    _cache_activation_global_verdict(
++        _activation_global_fingerprint(a1_gscale, a2_gscale),
++        a1_gscale,
++        a2_gscale,
++        verdict,
++    )
++    return verdict == "unit"
++
++
++def _admit_activation_globals(a1_gscale: torch.Tensor, a2_gscale: torch.Tensor) -> None:
++    """Trusted admission of the unit-global contract; no device sync on hit.
++
++    - cached verdict (fingerprint match AND identity match on the exact
++      validated tensor objects): proceed with NO device inspection and NO
++      sync.  A fingerprint match with different tensor objects (address
++      reuse: freed tensors' data_ptr recycled by the CUDA caching allocator)
++      is a MISS -- the stale verdict must never be served (ABA safety);
++    - no cached verdict, not capturing: run the check once and cache it;
++    - no cached verdict, capturing (``torch.cuda.is_current_stream_capturing()``):
++      raise RuntimeError telling the caller to validate at bind time --
++      never silently bypass the contract check.
++    """
++    entry = _ACTIVATION_GLOBAL_ADMISSION.get(
++        _activation_global_fingerprint(a1_gscale, a2_gscale)
++    )
++    if entry is not None and entry.matches(a1_gscale, a2_gscale):
++        if entry.verdict == "nonunit":
++            raise ValueError(
++                "mxfp4 prefill: nonunit activation globals are unsupported on the "
++                "dynamic-E8M0 path (a_gscale must be all 1.0)"
++            )
++        return
++    if torch.cuda.is_current_stream_capturing():
++        raise RuntimeError(
++            "mxfp4 prefill: activation globals are not validated for CUDA graph "
++            "capture; call validate_activation_globals(a1_gscale, a2_gscale) at "
++            "bind time (before capture). The runner must not inspect device "
++            "values through Python under capture."
++        )
++    if not validate_activation_globals(a1_gscale, a2_gscale):
++        raise ValueError(
++            "mxfp4 prefill: nonunit activation globals are unsupported on the "
++            "dynamic-E8M0 path (a_gscale must be all 1.0)"
++        )
++
++
++def mxfp4_prefill_activation_globals_admitted(
++    a1_gscale: torch.Tensor, a2_gscale: torch.Tensor
++) -> bool:
++    """Capture-safe bind-time admission query for the unit-global contract.
++
++    Namesafe host hook for the serving dispatch (``fused_moe._impl`` bind):
++    True when the contract is admitted — a trusted cached ``"unit"`` verdict,
++    or (only when NOT capturing) a fresh validation.  Under CUDA graph capture
++    with a cold cache this returns False instead of inspecting device values,
++    so bind stays allocation-free and capture-safe and the call keeps its
++    W4A16 path; ``run_w4a16_mxfp4_prefill`` re-checks through
++    ``_admit_activation_globals`` and never launches on an unvalidated
++    contract.  No numerics, no launches: host-side admission only.
++    """
++    entry = _ACTIVATION_GLOBAL_ADMISSION.get(
++        _activation_global_fingerprint(a1_gscale, a2_gscale)
++    )
++    if entry is not None and entry.matches(a1_gscale, a2_gscale):
++        return entry.verdict == "unit"
++    if torch.cuda.is_current_stream_capturing():
++        return False
++    return validate_activation_globals(a1_gscale, a2_gscale)
++
++
++def _admit_x4t_payload(prepared):
++    """X4T payload admission, independent of the decode guard (pre-launch).
++
++    Plane presence is inspected independently of program presence: a prepared
++    object carrying X4T scale planes (``x4t_w13_scale``/``x4t_w2_scale``) MUST
++    also carry paired programs (the only supported decoder), otherwise it is
++    rejected here before any launch instead of silently falling through to
++    the GEMM.  Malformed plane metadata (exactly one plane present) is
++    rejected regardless of the program guard.  Non-X4T prepared objects (no
++    X4T attributes at all, e.g. plain ``prepare_w4a16_fp4_e8m0_k32_weights``
++    outputs) pass unchanged.  Returns
++    ``(x4t_packed_pair_programs, x4t_w13_scale, x4t_w2_scale)``.
++    """
++    x4t_programs = getattr(prepared, "x4t_packed_pair_programs", None)
++    x4t_w13_scale = getattr(prepared, "x4t_w13_scale", None)
++    x4t_w2_scale = getattr(prepared, "x4t_w2_scale", None)
++    if x4t_w13_scale is not None or x4t_w2_scale is not None:
++        if (x4t_w13_scale is None) != (x4t_w2_scale is None):
++            raise ValueError("prepared X4T weights have incomplete scale metadata")
++        if x4t_programs is None:
++            raise ValueError(
++                "mxfp4 prefill: X4T scale planes without paired programs are "
++                "not supported: the runner reconstructs routed scale scratch "
++                "only through the paired-program decoder "
++                "(decode_x4t_packed_scale_pair); the non-program "
++                "decode_x4t_tp12_w4a16_scales arm is not implemented here. "
++                "Ship x4t_packed_pair_programs (prepare_w4a16_x4t_weights "
++                "builds them for 64-row exception tasks) or use a non-X4T "
++                "prepared object."
++            )
++    return x4t_programs, x4t_w13_scale, x4t_w2_scale
++
++
++def run_w4a16_mxfp4_prefill(
++    a: torch.Tensor,
++    prepared,
++    topk_weights: torch.Tensor,
++    topk_ids: torch.Tensor,
++    *,
++    a1_gscale: torch.Tensor,
++    a2_gscale: torch.Tensor,
++    intermediate_cache13: torch.Tensor,
++    intermediate_cache2: torch.Tensor,
++    output: torch.Tensor,
++    launches: W4A16Mxfp4PrefillLaunches,
++    x4t_scales_expanded: bool = False,
++) -> torch.Tensor:
++    """Route pack (128) -> MXFP4 quant -> FC1 -> FC2 -> FP32-weighted top-k sum.
++
++    Every buffer is a view of caller scratch: ``intermediate_cache2`` holds the
++    MXFP4 activations and the route pack, ``intermediate_cache13`` the per-route
++    BF16 FC2 rows.
++
++    Only the repacked K16/N64 ``packed`` weight payload is admitted (see
++    ``mxfp4_prefill_supported``); routed X4T scale scratch is reconstructed
++    here after route packing and before FC1, matching stock ``run_w4a16_moe``.
++    """
++    from cutlass.cute.runtime import make_ptr
++
++    from b12x._lib.utils.device import current_cuda_stream
++    from b12x.moe._shared.kernels.w4a16.kernel.sum_launch import _w4a16_topk_sum_launch_flat
++    from b12x.moe._shared.kernels.w4a16.route_pack import pack_topk_routes_by_expert
++
++    weight_layout = getattr(prepared, "weight_layout", "packed")
++    if weight_layout != "packed":
++        raise ValueError(
++            "run_w4a16_mxfp4_prefill admits only the repacked K16/N64 "
++            f"'packed' weight payload; got weight_layout={weight_layout!r}. "
++            "The GEMM has no layout branch and reads only the repacked "
++            "payload's B addressing; a 'modelopt'/native payload keeps the "
++            "original weights without _repack_weight and would produce "
++            "incorrect B operands."
++        )
++    # Activation globals are unsupported on the dynamic-E8M0 path: the
++    # quantizer absorbs activation scale per K32 group and never applies a
++    # global, so nonunit globals would silently scale the output wrong.
++    # Admission is capture-safe: a trusted cached verdict (bind-time
++    # ``validate_activation_globals``) passes with no device inspection and no
++    # sync; an unvalidated contract is checked once when not capturing and
++    # rejected under capture with a bind-time RuntimeError (see
++    # ``_admit_activation_globals``).
++    _admit_activation_globals(a1_gscale, a2_gscale)
++    # X4T payload admission, pre-launch: planes require paired programs;
++    # malformed or unpaired X4T metadata is rejected before any kernel launch
++    # (no silent fallthrough to the GEMM).  Non-X4T payloads pass unchanged.
++    x4t_programs, x4t_w13_scale, x4t_w2_scale = _admit_x4t_payload(prepared)
++    tokens = int(a.shape[0])
++    routes = tokens * launches.topk
++    regions, _ = _carve_layout(launches, tokens)
++    raw = intermediate_cache2.view(-1).view(torch.uint8)
++    views = [raw.narrow(0, off, size) for off, size in regions]
++    x_q, x_sf, act_q, act_sf, pir, beid, prc, offsets, counts = (
++        v.view(torch.int32) for v in views
++    )
++    x_q, x_q2 = _planes(x_q, launches.terms)
++    x_sf, x_sf2 = _planes(x_sf, launches.terms)
++    act_q, act_q2 = _planes(act_q, launches.terms)
++    act_sf, act_sf2 = _planes(act_sf, launches.terms)
++    y = intermediate_cache13.view(-1).narrow(0, 0, routes * launches.hidden_size)
++    pack_topk_routes_by_expert(
++        topk_ids,
++        MXFP4_PREFILL_ROUTE_BLOCK,
++        launches.num_experts,
++        packed_route_indices=pir,
++        block_expert_ids=beid,
++        packed_route_count=prc,
++        expert_offsets=offsets,
++        expert_counts=counts,
++        launches=launches.route_pack,
++    )
++
++    stream = current_cuda_stream()
++    # --- X4T routed scale-scratch reconstruction ----------------------------
++    # Equivalent of stock run_w4a16_moe's pre-compute X4T scale expansion
++    # (kernel.py:13804-13847).  For X4T prepared objects the w13_scale/w2_scale
++    # grids are caller-owned reusable scratch shared by every MoE layer on one
++    # stream (prepare_w4a16.py:1349-1355 docstring: "caller-owned reusable scale
++    # grids ... shared by every MoE layer because each layer's decode and GEMM
++    # are ordered on one CUDA stream"), so each routed call must expand the
++    # current layer's scale planes after route packing and before FC1 or the
++    # GEMM reads another layer's (or uninitialized) scales.  Stock's block is
++    # inline in kernel.py, so this is a line-equivalent mirror of its packed
++    # route arm (this runner always packs routes, i.e. stock's
++    # use_direct_topk_routes=False), reusing the same decode entry points;
++    # nothing is factored out of kernel.py.  Plane/program presence was
++    # already admitted pre-launch (``_admit_x4t_payload``): planes require
++    # paired programs, so the decode below runs only for well-formed paired
++    # X4T; unpaired X4T was rejected before any launch.
++    # Skipped when the caller pre-expanded every expert's scales into this
++    # payload's scale scratch (x4t_scales_expanded=True): the all-expert
++    # expansion is a superset of this selective decode for both route arms
++    # (counts and sorted blocks), so the inline launch would be duplicate work.
++    if x4t_programs is not None and not x4t_scales_expanded:
++        # kernel.py:13804-13833 with use_direct_topk_routes=False: start
++        # from the caller-owned expert counts, or bound the sorted
++        # block_expert_ids list (retained paired programs, indices 1/3).
++        from b12x._lib.quant.x4t_packed_scales import decode_x4t_packed_scale_pair
++
++        counts_mode = True
++        active = counts
++        sorted_ids = False
++        block_bound = min(beid.numel(), topk_ids.numel())
++        if block_bound < int(getattr(prepared, "num_experts", launches.num_experts)):
++            # A nonempty packed block contains at least one routed row.
++            # Its sorted expert list therefore needs no more entries than
++            # the routed-row count; the packer fills unused entries with -1.
++            # Bounding the grid avoids scheduling all experts for decode.
++            active = beid[:block_bound]
++            counts_mode = False
++            sorted_ids = True
++        if active is None:
++            raise ValueError("Packed X4T routing requires caller-owned expert counts")
++        if sorted_ids:
++            program_index = 3
++        elif counts_mode:
++            program_index = 1
++        else:
++            program_index = 2 if active.dtype == torch.int64 else 0
++        decode_x4t_packed_scale_pair(
++            x4t_w13_scale,
++            x4t_w2_scale,
++            active,
++            prepared.w13_scale,
++            prepared.w2_scale,
++            expert_counts=counts_mode,
++            expert_ids_sorted=sorted_ids,
++            program=x4t_programs[program_index],
++            stream=stream,
++        )
++    # kernel.py's non-program arm (13834-13845, decode_x4t_tp12_
++    # w4a16_scales) is not mirrored here and is unreachable in this
++    # runner: paired programs are the only supported decoder, and an X4T
++    # payload without them is rejected pre-launch (see above) rather than
++    # decoded or silently skipped.
++
++    def ptr(dtype, tensor, align=16):
++        return make_ptr(
++            dtype, tensor.data_ptr(), cute.AddressSpace.gmem, assumed_align=align
++        )
++
++    a1 = a1_gscale.view(-1)
++    a2 = a2_gscale.view(-1)
++    gs_stride = Int32(0 if a2.numel() == 1 else 1)
++    w13 = prepared.w13.view(torch.int32)
++    w2 = prepared.w2.view(torch.int32)
++    s13 = prepared.w13_scale.view(torch.uint8)
++    s2 = prepared.w2_scale.view(torch.uint8)
++    u32 = cutlass.Uint32
++    launches.quant(
++        ptr(cutlass.BFloat16, a),
++        ptr(u32, x_q),
++        ptr(u32, x_sf, 4),
++        ptr(u32, x_q2),
++        ptr(u32, x_sf2, 4),
++        Int32(tokens),
++        stream,
++    )
++    launches.fc1(
++        ptr(u32, x_q),
++        ptr(u32, x_sf, 4),
++        ptr(u32, x_q2),
++        ptr(u32, x_sf2, 4),
++        ptr(cutlass.Int32, w13),
++        ptr(cutlass.Uint8, s13),
++        ptr(cutlass.Float32, prepared.w13_global_scale, 4),
++        ptr(cutlass.Float32, a1, 4),
++        ptr(cutlass.Float32, a2, 4),
++        ptr(cutlass.Int32, pir, 4),
++        ptr(cutlass.Int32, beid, 4),
++        ptr(cutlass.Int32, prc, 4),
++        ptr(u32, act_q),
++        ptr(u32, act_sf, 4),
++        ptr(u32, act_q2),
++        ptr(u32, act_sf2, 4),
++        ptr(cutlass.BFloat16, y),
++        Int32(routes),
++        gs_stride,
++        Int32(launches.grid),
++        stream,
++    )
++    launches.fc2(
++        ptr(u32, act_q),
++        ptr(u32, act_sf, 4),
++        ptr(u32, act_q2),
++        ptr(u32, act_sf2, 4),
++        ptr(cutlass.Int32, w2),
++        ptr(cutlass.Uint8, s2),
++        ptr(cutlass.Float32, prepared.w2_global_scale, 4),
++        ptr(cutlass.Float32, a2, 4),
++        ptr(cutlass.Float32, a2, 4),
++        ptr(cutlass.Int32, pir, 4),
++        ptr(cutlass.Int32, beid, 4),
++        ptr(cutlass.Int32, prc, 4),
++        ptr(u32, act_q),
++        ptr(u32, act_sf, 4),
++        ptr(u32, act_q2),
++        ptr(u32, act_sf2, 4),
++        ptr(cutlass.BFloat16, y),
++        Int32(routes),
++        gs_stride,
++        Int32(launches.grid),
++        stream,
++    )
++    _w4a16_topk_sum_launch_flat(
++        y,
++        output.view(-1),
++        tokens,
++        launches.topk,
++        launches.hidden_size,
++        "bf16",
++        torch.cuda.current_stream().cuda_stream,
++        topk_weights=topk_weights.view(-1),
++        launcher=launches.topk_sum,
++    )
++    return output
++
++
++__all__ = [
++    "Mxfp4A4PrefillGemm",
++    "Mxfp4A4Quantize",
++    "PI",
++    "WORD_ORDER",
++    "W4A16Mxfp4PrefillLaunches",
++    "mxfp4_prefill_fits",
++    "mxfp4_prefill_min_tokens",
++    "mxfp4_prefill_supported",
++    "compile_w4a16_mxfp4_prefill",
++    "run_w4a16_mxfp4_prefill",
++    "validate_activation_globals",
++]
+diff -ruN a/b12x/moe/_shared/kernels/w4a16/prefill_a4.py b/b12x/moe/_shared/kernels/w4a16/prefill_a4.py
+--- a/b12x/moe/_shared/kernels/w4a16/prefill_a4.py	2026-10-21 17:22:48.265812041 +0700
++++ b/b12x/moe/_shared/kernels/w4a16/prefill_a4.py	2026-10-21 17:22:48.268031271 +0700
+@@ -1208,12 +1208,15 @@
+         """Bytes of ``intermediate_cache2`` the pipeline carves for ``tokens``."""
+         return _carve_layout(self, int(tokens))[-1]
+ 
++    def cache13_bytes(self, tokens: int) -> int:
++        """Bytes of ``intermediate_cache13`` (per-route BF16 FC2 rows) the
++        pipeline needs for ``tokens``."""
++        return int(tokens) * self.topk * self.hidden_size * 2
++
+     def fits_buffers(self, tokens: int, cache13_bytes: int, cache2_bytes: int) -> bool:
+-        return cache13_bytes >= int(
+-            tokens
+-        ) * self.topk * self.hidden_size * 2 and cache2_bytes >= self.scratch_bytes(
++        return cache13_bytes >= self.cache13_bytes(
+             tokens
+-        )
++        ) and cache2_bytes >= self.scratch_bytes(tokens)
+ 
+ 
+ def _fake(dtype, align=16):
+@@ -1411,6 +1414,86 @@
+     )
+ 
+ 
++@dataclass(frozen=True)
++class _A4RoutePackCapacity:
++    """Route-pack slot/block counts baked into one planned A4 carve."""
++
++    max_packed_routes: int
++    max_route_blocks: int
++
++
++def a4_prefill_sizing_launches(
++    *,
++    tokens: int,
++    hidden_size: int,
++    intermediate_size: int,
++    num_experts: int,
++    topk: int,
++    terms: int,
++    max_packed_routes: int,
++    max_route_blocks: int,
++) -> W4A16A4PrefillLaunches:
++    """A launch-shaped sizing carrier exposing the compiled launches' own
++    ``scratch_bytes()`` / ``cache13_bytes()`` / ``fits_buffers()`` without
++    compiling kernels (kernel slots are None and must not be launched).
++
++    ``max_packed_routes`` / ``max_route_blocks`` are the route-pack capacities
++    the A4 launch set is compiled with (padded route slots and route blocks at
++    ``A4_PREFILL_ROUTE_BLOCK``); ``num_experts`` is the effective route expert
++    count. Both the planner reservation and the admission tests size through
++    this carrier, so neither can drift from the runner's ``_carve_layout``.
++    """
++    return W4A16A4PrefillLaunches(
++        tokens=int(tokens),
++        hidden_size=int(hidden_size),
++        intermediate_size=int(intermediate_size),
++        num_experts=int(num_experts),
++        topk=int(topk),
++        grid=1,
++        terms=int(terms),
++        quant=None,
++        fc1=None,
++        fc2=None,
++        topk_sum=None,
++        route_pack=_A4RoutePackCapacity(
++            max_packed_routes=int(max_packed_routes),
++            max_route_blocks=int(max_route_blocks),
++        ),
++    )
++
++
++def a4_prefill_workspace_requirements(
++    *,
++    tokens: int,
++    hidden_size: int,
++    intermediate_size: int,
++    num_experts: int,
++    topk: int,
++    terms: int,
++    max_packed_routes: int,
++    max_route_blocks: int,
++) -> tuple[int, int]:
++    """Bytes of ``intermediate_cache2`` and ``intermediate_cache13`` the A4
++    prefill pipeline carves for one planned capacity.
++
++    This reuses the compiled launches' own ``scratch_bytes()`` /
++    ``cache13_bytes()`` (and therefore ``_carve_layout``) so the planner's
++    reservation can never drift from the runner's carve: it is the same code,
++    not a second hand formula. Returns ``(cache2_bytes, cache13_bytes)``.
++    """
++    launches = a4_prefill_sizing_launches(
++        tokens=tokens,
++        hidden_size=hidden_size,
++        intermediate_size=intermediate_size,
++        num_experts=num_experts,
++        topk=topk,
++        terms=terms,
++        max_packed_routes=max_packed_routes,
++        max_route_blocks=max_route_blocks,
++    )
++    return launches.scratch_bytes(tokens), launches.cache13_bytes(tokens)
++
++
+ def run_w4a16_a4_prefill(
+     a: torch.Tensor,
+     prepared,
