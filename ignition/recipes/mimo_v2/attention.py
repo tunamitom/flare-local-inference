@@ -10,6 +10,7 @@ from ignition.components.linear import UnquantizedProjection
 from ignition.components.paged_attention import PreparedPagedAttention, PreparedPagedKVWriter
 from ignition.components.window_attention import stage_windows
 
+from . import qkv
 from .pool import PAGE_TOKENS
 
 
@@ -135,6 +136,13 @@ class PreparedAttention(torch.nn.Module):
                 self.pages = torch.zeros((metadata.lengths.numel(), 1), dtype=torch.int32, device=source.device)
         else:
             key, value, self.pages = self.key_cache, self.value_cache, metadata.page_table
+        retained = None if self.commit_writer is None else (self.retained_key, self.retained_value)
+        self.fused = mode != "prefill" and qkv.serves(self.chunks, scratch.query, scratch.key, scratch.value,
+                                                      geometry)
+        self.retained = retained if self.fused else None
+        self.staged = (mode == "verify" and geometry.window > 0 and self.key_cache.shape[1] == geometry.window
+                       and qkv.stages(self.key_cache, self.staged_key, self.value_cache, self.staged_value,
+                                      scratch.key, scratch.value))
         self.writer = None
         if geometry.window < 0 or mode == "decode":
             self.writer = PreparedPagedKVWriter(scratch.key, scratch.value, key, value, self.slots,
@@ -155,22 +163,27 @@ class PreparedAttention(torch.nn.Module):
         projected = self.projection(hidden_states.reshape(-1, hidden_states.shape[-1]))
         if self.prefetch is not None:
             self.prefetch[0].issue(self.prefetch[1])
-        query, key, value, offset = [], [], [], 0
-        for chunk in self.chunks:
-            q_end, k_end = offset + chunk.query_rows, offset + chunk.query_rows + chunk.key_rows
-            query.append(projected[:, offset:q_end])
-            key.append(projected[:, q_end:k_end])
-            value.append(projected[:, k_end:k_end + chunk.value_rows])
-            offset += chunk.padded_rows
-        q = torch.cat(query, -1).view_as(s.query)
-        k = torch.cat(key, -1).view_as(s.key)
-        v = torch.cat(value, -1).view_as(s.value)
-        frequencies = m.positions.clamp_min(0).float()[:, None] * self.inverse[None]
-        angles = torch.cat((frequencies, frequencies), -1)
-        cos, sin = angles.cos().bfloat16(), angles.sin().bfloat16()
-        s.query.copy_(self._rotary(q, cos, sin))
-        s.key.copy_(self._rotary(k, cos, sin))
-        s.value.copy_(v if self.value_scale is None else v * self.value_scale)
+        if self.fused:
+            # Split, partial RoPE, value scale and retained verification rows in one launch.
+            qkv.rotate(projected, m.positions, self.inverse, s.query, s.key, s.value, self.value_scale,
+                       retained=self.retained)
+        else:
+            query, key, value, offset = [], [], [], 0
+            for chunk in self.chunks:
+                q_end, k_end = offset + chunk.query_rows, offset + chunk.query_rows + chunk.key_rows
+                query.append(projected[:, offset:q_end])
+                key.append(projected[:, q_end:k_end])
+                value.append(projected[:, k_end:k_end + chunk.value_rows])
+                offset += chunk.padded_rows
+            q = torch.cat(query, -1).view_as(s.query)
+            k = torch.cat(key, -1).view_as(s.key)
+            v = torch.cat(value, -1).view_as(s.value)
+            frequencies = m.positions.clamp_min(0).float()[:, None] * self.inverse[None]
+            angles = torch.cat((frequencies, frequencies), -1)
+            cos, sin = angles.cos().bfloat16(), angles.sin().bfloat16()
+            s.query.copy_(self._rotary(q, cos, sin))
+            s.key.copy_(self._rotary(k, cos, sin))
+            s.value.copy_(v if self.value_scale is None else v * self.value_scale)
         if a.window < 0:
             columns = (m.positions.clamp_min(0) // PAGE_TOKENS).clamp(max=m.token_page_table.shape[1] - 1)
             rows = torch.arange(m.positions.numel(), device=m.positions.device)
@@ -189,11 +202,16 @@ class PreparedAttention(torch.nn.Module):
             stage_window(self.value_cache, s.value, s.window_value, row, start, length)
             self.lengths.copy_(m.starts.clamp(max=a.window).int() + m.lengths)
         else:
-            self.retained_key.copy_(s.key)
-            self.retained_value.copy_(s.value)
-            stage_windows(self.key_cache, s.key, self.staged_key, m)
-            stage_windows(self.value_cache, s.value, self.staged_value, m)
-            self.lengths.copy_(m.starts.clamp(max=a.window).int() + m.lengths)
+            if self.retained is None:
+                self.retained_key.copy_(s.key)
+                self.retained_value.copy_(s.value)
+            if self.staged:
+                qkv.stage(self.key_cache, s.key, self.staged_key, self.value_cache, s.value, self.staged_value,
+                          m, self.lengths)
+            else:
+                stage_windows(self.key_cache, s.key, self.staged_key, m)
+                stage_windows(self.value_cache, s.value, self.staged_value, m)
+                self.lengths.copy_(m.starts.clamp(max=a.window).int() + m.lengths)
         if self.writer is not None:
             self.writer()
         self.attention()
