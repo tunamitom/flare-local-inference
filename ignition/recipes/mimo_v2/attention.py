@@ -105,6 +105,8 @@ class PreparedAttention(torch.nn.Module):
                                                            session=session, name=name + ".output")
         self.reduction = PreparedAllReduce(scratch.partial, scratch.output, runtime=runtime,
                                            coordinator=coordinator, session=session, name=name + ".reduce")
+        # (prefetcher, plan) issued right after the QKV projection in decode and verification.
+        self.prefetch = None
         geometry = self.geometry
         self.inverse = 1.0 / (geometry.theta ** (torch.arange(0, geometry.rotary_dim, 2,
                                    dtype=torch.float32, device=source.device) / geometry.rotary_dim))
@@ -151,6 +153,8 @@ class PreparedAttention(torch.nn.Module):
     def forward(self, hidden_states, **kwargs):
         s, m, a = self.scratch, self.metadata, self.geometry
         projected = self.projection(hidden_states.reshape(-1, hidden_states.shape[-1]))
+        if self.prefetch is not None:
+            self.prefetch[0].issue(self.prefetch[1])
         query, key, value, offset = [], [], [], 0
         for chunk in self.chunks:
             q_end, k_end = offset + chunk.query_rows, offset + chunk.query_rows + chunk.key_rows
