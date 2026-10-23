@@ -169,7 +169,9 @@ class PreparedTwoPhaseVerification:
         state, out, b, w = self.state, self.verifier.output, self.batch, self.width
         safe, live = _live(state, self.slots, self.generations, self.live_rows, self.request_rows)
         self._kernels[2]()
-        self.compact_draft.copy_(self.draft_probs.gather(-1, self.union[:, None, :].expand_as(self.compact_draft)))
+        # Padding past the union's live entries is never written; keep its indices in range.
+        union = self.union.clamp(0, self.draft_probs.shape[-1] - 1)
+        self.compact_draft.copy_(self.draft_probs.gather(-1, union[:, None, :].expand_as(self.compact_draft)))
         self.seed_bits.copy_(state.seed.view(torch.int64)[safe] ^ TARGET_RNG_DOMAIN)
         self.offset.copy_(torch.where(self.rng.generation[safe] == self.generations, self.rng.target_offset[safe], 0))
         self.accepted.zero_()
@@ -177,7 +179,7 @@ class PreparedTwoPhaseVerification:
         tokens, _, _ = self._sampling.chain_speculative_sampling(self.compact_draft, self.draft_columns, self.target,
             self.accepted, self.emitted, deterministic=True, seed=self.seed_bits, offset=self.offset,
             row_independent_rng=True)
-        tokens = torch.where(tokens >= 0, self.union.gather(-1, tokens.clamp_min(0).long()), -1)
+        tokens = torch.where(tokens >= 0, self.union.gather(-1, tokens.clamp(0, self.union.shape[-1] - 1).long()), -1)
         valid = live & self.draft_valid.all(-1) & ((self.drafts >= 0) & (self.drafts < state.vocab_size)).all(-1)
         offered = (self.token_limits - 1).clamp(0, w - 1)
         accepted = torch.minimum(self.emitted, offered)
