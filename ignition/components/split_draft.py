@@ -121,6 +121,25 @@ class PreparedDraftConfidence:
         self.output.copy_(self.logits.sigmoid())
 
 
+class PreparedDistributionConfidence:
+    """Confidence from each draft position's own distribution, for drafters without a confidence head.
+
+    A block drafter predicts every position from the shared context and the proposals before
+    it, so the largest probability of position i's distribution never depends on the token
+    sampled at i. That keeps the causal admission rule of ``causal_prefix`` unbiased.
+    """
+
+    def __init__(self, source, output):
+        self.probabilities = source.probabilities[:, :source.width - 1]
+        self.output = output
+
+    def record_embedding(self, position, embedding):
+        pass
+
+    def __call__(self):
+        self.output.copy_(self.probabilities.amax(-1).clamp(0., 1.))
+
+
 class PreparedProposalStorage:
     """One retained block per physical request slot across all graph shapes."""
 
@@ -149,12 +168,18 @@ class PreparedDraftProposal:
     """Publish independently owned blocks and consume their RNG reservation once."""
 
     def __init__(self, source, confidence_output, storage):
-        if source.width <= 1 or source.markov is None or source.width > storage.depth + 1:
-            raise ValueError("split proposals require compatible retained storage and a confidence head")
+        if source.width <= 1 or source.width > storage.depth + 1:
+            raise ValueError("split proposals require compatible retained storage")
         self.source, self.storage = source, storage
         o, b = source.owner, source.batch
-        self.confidence = PreparedDraftConfidence(source, o.weights.draft.confidence_head,
-            confidence_output[:b, :source.width - 1], name=f"split.proposal{b}x{source.width}.confidence")
+        head = getattr(o.weights.draft, "confidence_head", None)
+        if source.markov is not None and head is not None:
+            self.confidence = PreparedDraftConfidence(source, head,
+                confidence_output[:b, :source.width - 1], name=f"split.proposal{b}x{source.width}.confidence")
+        elif source.markov is None:
+            self.confidence = PreparedDistributionConfidence(source, confidence_output[:b, :source.width - 1])
+        else:
+            raise ValueError("split proposals with a Markov head require a confidence head")
         self.allowed = torch.zeros_like(source.active)
         self.depth = torch.full_like(source.before, source.width - 1)
         self.completion = PreparedCompletion(o.requests, o.inputs.row_slot_ids[:b],
@@ -166,7 +191,7 @@ class PreparedDraftProposal:
         slots = o.inputs.row_slot_ids[:s.batch]
         safe = slots.long().clamp(0, o.requests.capacity - 1)
         self.allowed.copy_(~p.ready[safe] | (p.generations[safe] != o.requests.generation[safe]))
-        s.propose(True, self.confidence, self.allowed)
+        s.propose(True, self.confidence if s.markov is not None else None, self.allowed)
         self.confidence()
         for source, destination in (
             (o.requests.generation[safe], p.generations),
