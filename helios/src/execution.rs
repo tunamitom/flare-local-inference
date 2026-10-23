@@ -28,7 +28,7 @@ mod tests;
 
 pub use manifest::{
     ABI_VERSION, BATCH_CAPACITIES, BufferDescriptor, CollectiveHealth, Dtype, ExecutionManifest,
-    GraphDescriptor, GraphKind, InputBinding, LOGPROB_FIELDS, LOGPROB_PAIR_FIELDS,
+    GraphBranch, GraphDescriptor, GraphKind, InputBinding, LOGPROB_FIELDS, LOGPROB_PAIR_FIELDS,
     MAX_OUTPUT_TOKENS, MAX_TOP_LOGPROBS, PROMPT_FIELDS, RECORD_FIELDS, REQUEST_LANES,
     SPECULATIVE_ABI_VERSION, SamplingMode, VECTOR_RECORD_FIELDS,
 };

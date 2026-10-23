@@ -75,6 +75,10 @@ impl TensorParallelExecutor {
         usize::from(self.pending.is_some())
     }
 
+    pub fn branch_counts(&self) -> (u64, u64) {
+        self.local.branch_counts()
+    }
+
     pub fn manifest(&self) -> &ExecutionManifest {
         self.local.manifest()
     }

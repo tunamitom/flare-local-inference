@@ -648,6 +648,16 @@ message Execution {
   uint64 input_frame_bytes = 3;
   repeated Buffer buffers = 4;
   repeated ExecutionGraph graphs = 5;
+  // Two-phase rounds: after the named graph completes, the host reads a one-byte flag from
+  // flag_buffer and launches taken (nonzero) or fallback (zero). The continuations are captured
+  // graphs outside the selectable catalog. Absent in packages without two-phase rounds.
+  repeated ExecutionBranch branches = 6;
+}
+message ExecutionBranch {
+  string graph = 1;
+  string flag_buffer = 2;
+  string taken = 3;
+  string fallback = 4;
 }
 message Buffer {
   string name = 1;

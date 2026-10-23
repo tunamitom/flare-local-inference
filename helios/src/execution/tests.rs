@@ -158,6 +158,7 @@ pub(super) fn manifest() -> ExecutionManifest {
         ],
     };
     ExecutionManifest {
+        branches: Vec::new(),
         engram: None,
         collectives: None,
         cache: None,

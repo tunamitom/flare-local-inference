@@ -256,6 +256,9 @@ pub(super) struct Metrics {
     host_inbound_rate: AtomicU64,
     host_inbound_waiting: AtomicU64,
     learned_draft_steps: AtomicU64,
+    /// Two-phase rounds by continuation, mirrored from the local rank's executor.
+    pub two_phase_taken: AtomicU64,
+    pub two_phase_fallback: AtomicU64,
 }
 
 impl Metrics {
@@ -763,6 +766,11 @@ impl Metrics {
                 count.load(Ordering::Relaxed)
             );
         }
+        text.push_str("# HELP flare_two_phase_rounds_total Two-phase rounds by the continuation the host launched.\n# TYPE flare_two_phase_rounds_total counter\n");
+        let _ = writeln!(text, "flare_two_phase_rounds_total{{continuation=\"taken\"}} {}",
+            self.two_phase_taken.load(Ordering::Relaxed));
+        let _ = writeln!(text, "flare_two_phase_rounds_total{{continuation=\"fallback\"}} {}",
+            self.two_phase_fallback.load(Ordering::Relaxed));
         for (name, help, value) in [
             (
                 "constrained_max_inflight",

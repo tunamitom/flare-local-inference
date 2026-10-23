@@ -169,6 +169,10 @@ impl ThreadedExecutor {
         }
         Ok(result)
     }
+    pub fn branch_counts(&self) -> (u64, u64) {
+        self.local.branch_counts()
+    }
+
     pub fn manifest(&self) -> &ExecutionManifest {
         self.local.manifest()
     }

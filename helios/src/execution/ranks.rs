@@ -59,6 +59,15 @@ impl RankExecutor {
         }
     }
 
+    /// Two-phase rounds that took their (taken, fallback) continuation on the local rank.
+    pub(crate) fn branch_counts(&self) -> (u64, u64) {
+        match self {
+            Self::Local(executor) => executor.branch_counts(),
+            Self::Parallel(executor) => executor.branch_counts(),
+            Self::Threaded(executor) => executor.branch_counts(),
+        }
+    }
+
     pub(crate) fn outstanding(&self) -> usize {
         match self {
             Self::Local(executor) => executor.outstanding(),
