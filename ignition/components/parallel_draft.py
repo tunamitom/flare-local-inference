@@ -335,19 +335,28 @@ class PreparedParallelDraftRound:
         verify()
         self.verify_finish()
 
-    def propose(self, advance_rng=True, observer=None, allowed=None):
+    def propose(self, advance_rng=True, observer=None, allowed=None, validated=True):
+        """Draft each active row's block.
+
+        ``validated=False`` drafts after a verification in the same graph: the uploaded batch
+        describes the verified rows, so ``allowed`` alone selects rows and every row drafts the
+        full block from its committed position.
+        """
         if not self.generate_proposals:
             raise RuntimeError("verification-only preparation cannot generate proposals")
         o, b, w = self.owner, self.batch, self.width
         target, proposals, verify, commit = self.operations
-        self.validator.begin(self.validation(self.validator.validate()))
         slots = o.inputs.row_slot_ids[:b].long()
         safe = slots.clamp(0, o.requests.capacity - 1)
-        self.active.copy_(self.validator.token_state.active.bool())
-        if allowed is not None:
-            self.active.logical_and_(allowed)
+        if validated:
+            self.validator.begin(self.validation(self.validator.validate()))
+            self.active.copy_(self.validator.token_state.active.bool())
+            if allowed is not None:
+                self.active.logical_and_(allowed)
+        else:
+            self.active.copy_(allowed)
         self.before.copy_(o.requests.consumed_tokens[safe])
-        limits = torch.where(self.active, o.inputs.query_lengths[:b], 0)
+        limits = torch.where(self.active, o.inputs.query_lengths[:b] if validated else w, 0)
         states = o.inputs.request_state_rows[safe, 0]
         self.candidates[:, 0].copy_(o.requests.pending_token[safe])
         self.base_offset.copy_(

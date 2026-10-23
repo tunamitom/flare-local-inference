@@ -111,6 +111,10 @@ class PreparationConfig:
     # confidence from the drafter's own distributions, and verification graphs check the prefix
     # the runtime chooses per step. Joined graphs keep one width per request history.
     split_speculation: bool = field(default_factory=lambda: os.environ.get("FLARE_MIMO_SPLIT_SPECULATION", "0") == "1")
+    # With split speculation, verification graphs also draft each surviving row's next full block
+    # after their commit, so a request needs a separate proposal graph only for its first block.
+    fused_split_proposals: bool = field(
+        default_factory=lambda: os.environ.get("FLARE_MIMO_FUSED_SPLIT_PROPOSALS", "1") == "1")
     # "w8a16" converts the draft's BF16 projections to block-FP8 (128x128 blocks, amax/448
     # scales) at load and runs them as W8A16 GEMVs with BF16 activations, halving draft weight
     # traffic; "bf16" keeps the checkpoint's BF16 projections. Draft batches above 32 rows
@@ -467,13 +471,18 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             if config.split_speculation:
                 from ignition.components.capacity import proposal_shapes
                 from ignition.components.split_draft import (
-                    PreparedDraftProposal, PreparedDraftVerification, PreparedProposalStorage)
+                    PreparedDraftProposal, PreparedDraftVerification, PreparedFusedVerificationProposal,
+                    PreparedProposalStorage)
 
                 confidence = package_storage.host_allocate(
                     "proposal_confidence", (config.request_capacity, config.draft_tokens), torch.float32)
                 buffers["proposal_confidence"] = confidence.device_view
                 split = PreparedProposalStorage(speculation, config.draft_tokens)
                 buffers.update(split.buffers())
+                if config.fused_split_proposals:
+                    # The runtime downloads confidence with every verification while this marker exists.
+                    buffers["fused_verification_proposals"] = torch.ones(1, dtype=torch.uint8, device=device)
+                full_blocks = {}
                 # The DFlash drafter always predicts its full block; a proposal keeps the first depth drafts.
                 for batch, depth in sorted(proposal_shapes(config.max_active, config.draft_tokens), reverse=True):
                     name = f"proposal{batch}x{depth + 1}"
@@ -482,14 +491,19 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                     source.prepare()
                     add(name, PreparedDraftProposal(source, confidence.device_view, split), "proposal",
                         batch, depth + 1, forward_inputs, enabled=True)
+                    if depth == config.draft_tokens:
+                        full_blocks[batch] = source
                 for batch, width in sorted(config.speculative_shapes, key=lambda shape: shape[0] * shape[1],
                                            reverse=True):
                     name = f"verification{batch}x{width}"
                     target = PreparedParallelDraftRound(speculation, batch, width, name, generate_proposals=False,
                         buffers=speculation.sampling_buffers.cursor())
                     target.prepare()
-                    add(name, PreparedDraftVerification(split, target), "verification", batch, width,
-                        forward_inputs, enabled=True)
+                    verification = PreparedDraftVerification(split, target)
+                    if config.fused_split_proposals:
+                        verification = PreparedFusedVerificationProposal(
+                            verification, full_blocks[batch], confidence.device_view, split)
+                    add(name, verification, "verification", batch, width, forward_inputs, enabled=True)
                     if width == 1:
                         # Decoding without a proposal still retains the draft context.
                         decode = PreparedParallelDraftRound(speculation, batch, 1, f"speculative{batch}x1",

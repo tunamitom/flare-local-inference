@@ -212,3 +212,68 @@ def test_retained_proposals_regroup_prefixes_and_reject_stale_ownership(target_c
         assert observed.tolist() == [-1] * 4
         assert retained.ready.all()
     graph.reset()
+
+
+@torch.no_grad()
+def test_fused_verification_retains_each_surviving_rows_next_block_from_its_commit():
+    from types import SimpleNamespace
+    from ignition.components.split_draft import PreparedFusedVerificationProposal, PreparedProposalStorage
+
+    def tensor(values, dtype=torch.int64):
+        return torch.tensor(values, dtype=dtype, device="cuda")
+
+    vocab = 13
+    requests = SimpleNamespace(capacity=4, vocab_size=vocab, generation=tensor([11, 12, 13, 14]),
+        consumed_tokens=tensor([10, 20, 30, 40]), generated_tokens=tensor([1, 1, 1, 1]),
+        pending_token=tensor([4, 5, 6, 7]), status=tensor([1, 1, 1, 1]))
+    inputs = SimpleNamespace(row_slot_ids=tensor([3, 0, 2], torch.int32), row_generations=tensor([14, 11, 13]),
+        live_rows=tensor([3], torch.int32), request_state_rows=tensor([[1], [2], [3], [4]]),
+        query_lengths=tensor([2, 2, 2], torch.int32))
+    owner = SimpleNamespace(requests=requests, inputs=inputs, sequence=tensor([6]))
+    storage = PreparedProposalStorage(owner, 7)
+    admitted = torch.zeros(3, dtype=torch.bool, device="cuda")
+    emitted = tensor([2, 1, 2])
+
+    def verify():
+        # Rows 0 and 1 verify and commit; row 2 is rejected as stale.
+        admitted.copy_(tensor([1, 1, 0], torch.bool))
+        slots = inputs.row_slot_ids.long()
+        requests.consumed_tokens[slots[:2]] += emitted[:2]
+        requests.pending_token[slots[:2]] += 100
+
+    verification = type("Verification", (), {"__call__": lambda self: verify(), "target": SimpleNamespace(batch=3),
+                                              "admitted": admitted})()
+    probabilities = torch.softmax(torch.arange(3 * 8 * vocab, device="cuda", dtype=torch.float32)
+                                  .view(3, 8, vocab).remainder(5.0), -1)
+    source = SimpleNamespace(owner=owner, batch=3, width=8, markov=None,
+        active=torch.zeros(3, dtype=torch.bool, device="cuda"), before=torch.zeros(3, dtype=torch.int64, device="cuda"),
+        base_offset=tensor([100, 200, 300]), candidates=torch.zeros((3, 8), dtype=torch.int64, device="cuda"),
+        drafts=torch.zeros((3, 7), dtype=torch.int64, device="cuda"), probabilities=probabilities,
+        valid=torch.zeros((3, 7), dtype=torch.bool, device="cuda"))
+    seen = {}
+
+    def propose(advance_rng, observer, allowed, validated=True):
+        seen["validated"] = validated
+        safe = inputs.row_slot_ids.long().clamp(0, requests.capacity - 1)
+        source.active.copy_(allowed)
+        source.before.copy_(requests.consumed_tokens[safe])
+        source.candidates[:, 0].copy_(requests.pending_token[safe])
+        source.drafts.copy_(source.before[:, None] + torch.arange(1, 8, device="cuda"))
+        source.candidates[:, 1:].copy_(source.drafts)
+        source.valid.copy_(allowed[:, None].expand(-1, 7))
+
+    source.propose = propose
+    confidence = torch.zeros((4, 7), device="cuda")
+    fused = PreparedFusedVerificationProposal(verification, source, confidence, storage)
+    requests.status[2] = 2  # slot 2 (row 2) finished as well; neither may be retained
+    fused()
+    torch.cuda.synchronize()
+    assert seen["validated"] is False
+    assert source.active.tolist() == [True, True, False]
+    assert storage.ready.tolist() == [True, False, False, True]
+    assert storage.before[[3, 0]].tolist() == [42, 11]
+    assert storage.candidates[3, 0].item() == 107 and storage.candidates[0, 0].item() == 104
+    assert storage.drafts[3].tolist() == list(range(43, 50))
+    assert storage.depths[[3, 0]].tolist() == [7, 7]
+    assert storage.sequence[[3, 0]].tolist() == [6, 6]
+    torch.testing.assert_close(confidence[:3], probabilities[:, :7].amax(-1))

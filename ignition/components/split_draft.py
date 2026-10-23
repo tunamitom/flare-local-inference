@@ -260,6 +260,49 @@ class PreparedDraftVerification:
             r.consumed_tokens.stride(0), r.capacity)
 
 
+class PreparedFusedVerificationProposal:
+    """Verify retained prefixes, then retain each surviving row's next full block in the same graph.
+
+    The proposal follows the commit, so it drafts from each row's committed position and the
+    draft context the verification just extended. Confidence leaves with the completion, and the
+    host chooses the next verification width from it without a separate proposal graph. The
+    verification alone writes completion records.
+    """
+
+    def __init__(self, verification, source, confidence_output, storage):
+        if source.width != storage.depth + 1 or source.batch < verification.target.batch:
+            raise ValueError("fused proposals draft a full retained block for every verified row")
+        if source.markov is not None:
+            raise ValueError("fused proposals need distribution confidence, which a Markov head would bias")
+        self.verification, self.source, self.storage = verification, source, storage
+        self.batch = verification.target.batch
+        self.confidence = PreparedDistributionConfidence(source, confidence_output[:source.batch])
+        self.allowed = torch.zeros_like(source.active)
+        self.depth = torch.full_like(source.before, storage.depth)
+
+    def __call__(self):
+        v, s, p = self.verification, self.source, self.storage
+        o, b = s.owner, self.batch
+        v()
+        slots = o.inputs.row_slot_ids[:s.batch]
+        safe = slots.long().clamp(0, o.requests.capacity - 1)
+        rows = torch.arange(s.batch, device=slots.device)
+        self.allowed.copy_((rows < b) & (rows < o.inputs.live_rows) & (slots >= 0) & (slots < o.requests.capacity)
+                           & (o.requests.status[safe] == 1))
+        self.allowed[:b].logical_and_(v.admitted)
+        s.propose(True, None, self.allowed, validated=False)
+        self.confidence()
+        for source, destination in (
+            (o.requests.generation[safe], p.generations),
+            (o.inputs.request_state_rows[safe, 0], p.state_rows),
+            (o.sequence.expand(s.batch), p.sequence),
+            (self.depth, p.depths), (s.before, p.before), (s.base_offset, p.base_offset),
+            (s.candidates, p.candidates), (s.drafts, p.drafts),
+            (s.probabilities, p.probabilities), (s.valid, p.valid), (s.active, p.ready),
+        ):
+            scatter_rows(source, slots, destination, s.active)
+
+
 class PreparedCombinedDraftRound:
     """One-graph reference for the retained full-block proposal RNG contract."""
 
