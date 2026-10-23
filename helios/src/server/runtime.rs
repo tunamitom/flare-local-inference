@@ -1369,10 +1369,14 @@ impl<'a> Worker<'a> {
                 .max()
                 .unwrap_or(0);
             let step = &measured_step;
+            let realized = self.scheduler.realized_width(step, &completion.records);
+            if self.scheduler.is_switched(step) {
+                self.metrics.switched_completed(realized);
+            }
             self.metrics.speculative_completed(
                 kind,
                 step.batch_capacity,
-                self.scheduler.realized_width(step, &completion.records),
+                realized,
                 nanos,
                 &completion.records,
             );

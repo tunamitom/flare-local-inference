@@ -215,6 +215,8 @@ pub(super) struct Metrics {
     sampling_launches: [AtomicU64; 5],
     speculative: [[RoundMetrics; 8]; 7],
     proposals: [[ProposalMetrics; 7]; 7],
+    /// Rounds of a graph that chose its verification width on device, by realized width.
+    switched: [AtomicU64; 8],
     draft_sources: [[[AtomicU64; 2]; 2]; 7],
     mixed_grammar_decode_steps: AtomicU64,
     constrained_max_inflight: AtomicU64,
@@ -391,6 +393,12 @@ impl Metrics {
                     self.draft_sources[depth][source][1].fetch_add(1, Ordering::Relaxed);
                 }
             }
+        }
+    }
+
+    pub fn switched_completed(&self, width: usize) {
+        if let Some(counter) = width.checked_sub(1).and_then(|index| self.switched.get(index)) {
+            counter.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -577,6 +585,10 @@ impl Metrics {
                     let _ = writeln!(text, "flare_proposal_{metric}{{batch=\"{batch}\",depth=\"{depth}\"}} {value}");
                 }
             }
+        }
+        text.push_str("# HELP flare_switched_rounds_total Rounds of the graph that chose its verification width on device, by realized width.\n# TYPE flare_switched_rounds_total counter\n");
+        for (width, count) in (1..).zip(&self.switched) {
+            let _ = writeln!(text, "flare_switched_rounds_total{{width=\"{width}\"}} {}", count.load(Ordering::Relaxed));
         }
         text.push_str("# HELP flare_speculative_drafts_total Draft outcomes by one-based depth and actual proposal source; accepted counts are clipped at EOS/output budget.\n# TYPE flare_speculative_drafts_total counter\n");
         for (index, sources) in self.draft_sources.iter().enumerate() {

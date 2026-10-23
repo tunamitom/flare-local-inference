@@ -221,6 +221,10 @@ mod scheduler_tests {
     #[test]
     fn a_switched_round_commits_the_width_the_device_chose() {
         let (mut s, _) = engine();
+        // The switched graph replaces the batch's host-width graphs; other batches keep theirs.
+        assert_eq!(s.speculative_catalog[0], vec![8]);
+        s.enable_speculation(&(1..=8).collect::<Vec<_>>()).unwrap();
+        assert_eq!(s.speculative_catalog[0], vec![8]);
         let h = ready(&mut s);
         let rounds = s.request(h).unwrap().acceptance.rounds();
         let output = round(&mut s, h, 8, 3, 3).unwrap();
