@@ -106,11 +106,16 @@ class PreparationConfig:
     # Speculative rounds of at most this many requests verify in two phases: shard summaries decide
     # on device whether the round's nuclei fit a compact verifier, and the host then launches the
     # compact or the dense continuation. Zero captures every round in one phase.
-    two_phase_max_batch: int = 4
+    two_phase_max_batch: int = field(default_factory=lambda: int(os.environ.get("FLARE_MIMO_TWO_PHASE_MAX_BATCH", "4")))
     # Split speculation: proposal graphs retain each request's drafts with per-position
     # confidence from the drafter's own distributions, and verification graphs check the prefix
     # the runtime chooses per step. Joined graphs keep one width per request history.
     split_speculation: bool = field(default_factory=lambda: os.environ.get("FLARE_MIMO_SPLIT_SPECULATION", "0") == "1")
+    # Device-selected width for one-request rounds: a prefix proposes the full draft block and
+    # picks the verification width from the drafts' survival against host-supplied width costs;
+    # the runtime composes it with a conditional switch over one verification body per width.
+    # Larger batches keep joined graphs. Exclusive with split speculation.
+    switch_speculation: bool = field(default_factory=lambda: os.environ.get("FLARE_MIMO_SWITCH_SPECULATION", "0") == "1")
     # "w8a16" converts the draft's BF16 projections to block-FP8 (128x128 blocks, amax/448
     # scales) at load and runs them as W8A16 GEMVs with BF16 activations, halving draft weight
     # traffic; "bf16" keeps the checkpoint's BF16 projections. Draft batches above 32 rows
@@ -388,13 +393,13 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     )
     with phase(progress, "Construct graph catalog", total=count) as stage:
 
-        def add(name, forward, kind, rows, tokens, fields, *, enabled=None, quantized=None, branch=None):
+        def add(name, forward, kind, rows, tokens, fields, *, enabled=None, quantized=None, branch=None, switch=None):
             if kind == "scored_prefill":
                 forward = PreparedScoredPrefill(forward, requests, inputs)
                 fields = (*fields, "prompt_target_tokens")
             forwards[name] = forward
             signatures[name] = GraphSignature(kind, rows, tokens, tuple(fields), speculation_enabled=enabled,
-                                              quantized_activations=quantized, branch=branch)
+                                              quantized_activations=quantized, branch=branch, switch=switch)
             stage.update(advance=1)
 
         forward_inputs = (*inputs.buffers(), "sampling_grammar_mask")
@@ -464,6 +469,40 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             from ignition.components.parallel_draft import PreparedParallelDraftRound
 
             speculation.sampling_buffers = GraphBufferPool(device, chunk_bytes=2 << 20)
+            if config.switch_speculation:
+                if config.split_speculation or 1 not in config.batch_capacities:
+                    raise ValueError("switch speculation needs one-request rounds and excludes split speculation")
+                from ignition.components.split_draft import (
+                    PreparedDraftProposal, PreparedDraftVerification, PreparedProposalStorage)
+                from ignition.components.width_selection import (
+                    PreparedSelectedVerification, PreparedSelectionPrefix, PreparedWidthSelection)
+
+                widths = config.draft_tokens + 1
+                switch_storage = PreparedProposalStorage(speculation, config.draft_tokens)
+                buffers.update(switch_storage.buffers())
+                switch_confidence = torch.zeros((config.request_capacity, config.draft_tokens),
+                                                dtype=torch.float32, device=device)
+                switch_costs = torch.zeros((config.request_capacity, widths), dtype=torch.float32, device=device)
+                switch_selected = torch.ones(1, dtype=torch.int32, device=device)
+                buffers.update(proposal_confidence=switch_confidence, speculative_width_costs=switch_costs,
+                               switch_selected_width=switch_selected)
+                prefix_name = f"selection1x{widths}"
+                source = PreparedParallelDraftRound(speculation, 1, widths, f"{prefix_name}.proposal",
+                    buffers=speculation.sampling_buffers.cursor(), proposal_only=True)
+                source.prepare()
+                bodies = tuple(f"{prefix_name}.w{width}" for width in range(1, widths + 1))
+                for width, body in zip(range(1, widths + 1), bodies):
+                    target = PreparedParallelDraftRound(speculation, 1, width, body, generate_proposals=False,
+                        buffers=speculation.sampling_buffers.cursor())
+                    target.prepare()
+                    add(body, PreparedSelectedVerification(PreparedDraftVerification(switch_storage, target)),
+                        "continuation", 1, width, ())
+                selection = PreparedWidthSelection(switch_confidence, switch_costs,
+                    inputs.query_lengths, switch_selected, widths)
+                add(prefix_name, PreparedSelectionPrefix(
+                        PreparedDraftProposal(source, switch_confidence, switch_storage), selection),
+                    "speculative", 1, widths, (*forward_inputs, "speculative_width_costs"), enabled=True,
+                    switch=("switch_selected_width", bodies))
             if config.split_speculation:
                 from ignition.components.capacity import proposal_shapes
                 from ignition.components.split_draft import (
@@ -498,6 +537,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                         add(f"speculative{batch}x1", decode, "speculative", batch, 1, forward_inputs, enabled=True)
             for batch, width in (() if config.split_speculation else
                                  sorted(config.speculative_shapes, key=lambda shape: shape[0] * shape[1], reverse=True)):
+                if config.switch_speculation and (batch, width) == (1, config.draft_tokens + 1):
+                    continue  # the selection graph owns the widest one-request shape
                 name = f"speculative{batch}x{width}"
                 two_phase = (width > 1 and batch <= config.two_phase_max_batch
                              and speculation.draft_candidates is not None)

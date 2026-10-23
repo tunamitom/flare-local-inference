@@ -326,3 +326,44 @@ def test_packages_without_two_phase_rounds_export_no_branches(monkeypatch):
     monkeypatch.setattr(execution, "_validate_resources",
                         lambda: (9, [11, 12], [(4096, 4), (8192, 8), (12288, 512), (16384, 128), (20480, 1)]))
     assert "branches" not in execution.manifest()
+
+
+def test_switched_rounds_export_switches_and_hide_their_bodies(monkeypatch):
+    selector = _tensor("int32", (1,))
+    selector.numel = lambda: 1
+    bodies = ("selection1x3.w1", "selection1x3.w2", "selection1x3.w3")
+    signatures = {
+        "selection1x3": GraphSignature("speculative", 1, 3, ("tokens",), speculation_enabled=True,
+                                       switch=("switch_selected_width", bodies)),
+        **{body: GraphSignature("continuation", 1, width) for width, body in enumerate(bodies, 1)},
+    }
+    base = _execution().buffers
+    execution = _execution(graphs={name: object() for name in signatures}, signatures=signatures,
+                           buffers={**base, "switch_selected_width": selector})
+    spans = [(4096, 4), (8192, 8), (12288, 512), (16384, 128), (20480, 1), (24576, 4)]
+    monkeypatch.setattr(execution, "_validate_resources", lambda: (9, [11, 12, 13, 14], spans))
+    manifest = execution.manifest(all_variants=True)
+    assert [graph["name"] for graph in manifest["graphs"]] == ["selection1x3"]
+    assert manifest["switches"] == [{"graph": "selection1x3", "selector_buffer": "switch_selected_width",
+                                     "bodies": list(bodies)}]
+    assert "branches" not in manifest
+    from google.protobuf import json_format
+
+    from ignition.preparation.runtime_package_pb2 import Execution
+
+    encoded = json_format.ParseDict({"switches": manifest["switches"]}, Execution())
+    assert list(encoded.switches[0].bodies) == list(bodies)
+    with pytest.raises(ValueError, match="exactly one branch"):
+        _execution(graphs={name: object() for name in signatures},
+                   signatures={**signatures, "selection1x3": GraphSignature("speculative", 1, 3, ("tokens",),
+                               speculation_enabled=True)}, buffers={**base, "switch_selected_width": selector})
+    wrong = _tensor("int64", (1,))
+    wrong.numel = lambda: 1
+    with pytest.raises(ValueError, match="int32 selector"):
+        _execution(graphs={name: object() for name in signatures}, signatures=signatures,
+                   buffers={**base, "switch_selected_width": wrong})
+    for switch in (("switch_selected_width", ()), ("switch_selected_width", ("a", "a")), ("", ("a",))):
+        with pytest.raises(ValueError, match="distinct named continuations"):
+            GraphSignature("speculative", 1, 3, switch=switch)
+    with pytest.raises(ValueError, match="distinct named continuations"):
+        GraphSignature("decode", 1, 1, switch=("switch_selected_width", ("a",)))
