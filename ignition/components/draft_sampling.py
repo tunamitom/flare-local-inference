@@ -214,15 +214,16 @@ def _selected_row(Slots, Generations, Generation, live_rows, row, CAPACITY: tl.c
 @triton.jit
 def _proposal_valid(maximum, Candidates, Slots, Generations, LiveRows, Generation, Status, row, candidate_stride,
                     CAPACITY: tl.constexpr, BATCH: tl.constexpr, V: tl.constexpr, PREFIX: tl.constexpr,
-                    RUNNING: tl.constexpr):
-    # The row's liveness (as speculation's _live), its draft prefix and a finite maximum.
+                    RUNNING: tl.constexpr, POSITIONS: tl.constexpr):
+    # The row's liveness (as speculation's _live), its draft prefix and a finite maximum. A row block
+    # of POSITIONS draft positions of one request legitimately repeats its slot POSITIONS times.
     live_rows = tl.load(LiveRows)
     selected, slot, safe = _selected_row(Slots, Generations, Generation, live_rows, row, CAPACITY, BATCH)
     sharing = 0
     for other in tl.static_range(BATCH):
         other_selected, other_slot, _ = _selected_row(Slots, Generations, Generation, live_rows, other, CAPACITY, BATCH)
         sharing += (other_selected & (other_slot == slot)).to(tl.int32)
-    live = selected & (sharing <= 1) & (tl.load(Status + safe) == RUNNING)
+    live = selected & (sharing <= POSITIONS) & (tl.load(Status + safe) == RUNNING)
     prefix_valid = True
     for index in tl.static_range(PREFIX):
         draft = tl.load(Candidates + row * candidate_stride + index)
@@ -243,7 +244,7 @@ def _draft_scores_finish(BlockMax, Candidates, Slots, Generations, LiveRows, Gen
     maxima = tl.load(BlockMax + row * BLOCKS + block, mask=present, other=-float("inf"))
     maximum = tl.max(maxima, 0)
     valid, safe = _proposal_valid(maximum, Candidates, Slots, Generations, LiveRows, Generation, Status, row,
-                                  candidate_stride, CAPACITY, BATCH, V, PREFIX, RUNNING)
+                                  candidate_stride, CAPACITY, BATCH, V, PREFIX, RUNNING, 1)
     tl.store(Maximum + row, maximum)
     tl.store(Valid + row, valid)
     top_k = tl.load(TopK + safe)
@@ -299,7 +300,8 @@ def _shard_pool(BlockCandidates, BlockMax, Slots, TopK, Payload, CAPACITY: tl.co
 def _pooled_sample(Received, Candidates, Slots, Generations, LiveRows, Generation, Status, TopK, Params, Seed,
                    Offset, Selected, Probabilities, Maximum, Valid, Sampled, candidate_stride,
                    CAPACITY: tl.constexpr, BATCH: tl.constexpr, V: tl.constexpr, PREFIX: tl.constexpr,
-                   WORLD: tl.constexpr, PAYLOAD: tl.constexpr, K: tl.constexpr, RUNNING: tl.constexpr):
+                   WORLD: tl.constexpr, PAYLOAD: tl.constexpr, K: tl.constexpr, RUNNING: tl.constexpr,
+                   POSITIONS: tl.constexpr):
     # _draft_scores_finish and _select_and_sample over the gathered shard payloads in rank order.
     row = tl.program_id(0)
     base = Received + row * WORLD * PAYLOAD
@@ -309,7 +311,7 @@ def _pooled_sample(Received, Candidates, Slots, Generations, LiveRows, Generatio
     maxima = tl.load(base + shard * PAYLOAD + K).to(tl.int32).to(tl.float32, bitcast=True)
     maximum = tl.max(maxima, 0)
     valid, safe = _proposal_valid(maximum, Candidates, Slots, Generations, LiveRows, Generation, Status, row,
-                                  candidate_stride, CAPACITY, BATCH, V, PREFIX, RUNNING)
+                                  candidate_stride, CAPACITY, BATCH, V, PREFIX, RUNNING, POSITIONS)
     tl.store(Maximum + row, maximum)
     top_k = tl.load(TopK + safe)
     k = tl.minimum(tl.maximum(tl.where(top_k > 0, top_k, V), 1), K)
@@ -498,7 +500,8 @@ class PreparedShardedDraftDistribution(_SupportBroadcast):
             gathered_payload=((batch, world * SHARD_PAYLOAD), torch.int64))
 
     def __init__(self, local_logits, requests, slots, generations, live_rows, candidate_prefix_ids, *, rank, world,
-                 runtime, session, coordinator, name, seed, offset, sampled, prefix_offset=0, workspace=None):
+                 runtime, session, coordinator, name, seed, offset, sampled, prefix_offset=0, workspace=None,
+                 positions=1):
         from ignition.preparation.scratch import bind_scratch
 
         from .collectives import PreparedAllGather
@@ -528,6 +531,9 @@ class PreparedShardedDraftDistribution(_SupportBroadcast):
         # forwards do not guard, so every rank binds the same compiled kernel.
         self.token_offset = torch.full((1,), rank * local_vocab, dtype=torch.int64, device=local_logits.device)
         self.rank, self.world = rank, world
+        if type(positions) is not int or positions < 1 or batch % positions or (positions > 1 and prefix_offset):
+            raise ValueError("a draft position block holds whole requests and conditions on no earlier draft")
+        self.positions = positions
         for key, tensor in bind_scratch(self.scratch_layout(batch, vocab, local_vocab, world),
                                         device=device, workspace=workspace).items():
             setattr(self, key, tensor)
@@ -564,7 +570,7 @@ class PreparedShardedDraftDistribution(_SupportBroadcast):
             self.seed, self.offset, self.proposal_selected, self.probabilities, self.maximum, self.valid,
             self.sampled, self.candidates.stride(0)), (batch, 1, 1), CAPACITY=state.capacity, BATCH=batch, V=vocab,
             PREFIX=self.prefix_offset, WORLD=self.world, PAYLOAD=SHARD_PAYLOAD, K=DRAFT_CANDIDATES,
-            RUNNING=RUNNING, num_warps=4)
+            RUNNING=RUNNING, POSITIONS=self.positions, num_warps=4)
         self._kernels = local, pooled
         self.shard_candidates()
         if self.gather is not None:
@@ -588,3 +594,54 @@ class PreparedShardedDraftDistribution(_SupportBroadcast):
         self.pooled_sample()
         self._synchronize()
         return self.probabilities
+
+
+class PreparedShardedDraftBlock:
+    """Every draft position of one request in one sharded proposal: one gather and one broadcast.
+
+    A block drafter without a Markov head or selector scores each position from the shared context
+    alone, so the positions are independent rows: row i reads position i's local logits, the request's
+    slot, generation and seed, and the Philox offset ``base + 4 * i`` that the position-by-position
+    loop would use. Penalties count the committed histogram but not the block's own earlier drafts;
+    verification receives exactly the distribution each draft was drawn from, so outputs keep the
+    target policy and only acceptance can differ, for requests with repetition penalties.
+    """
+
+    def __init__(self, local_logits, requests, slots, generations, live_rows, *, rank, world, runtime,
+                 session, coordinator, name, seed, base_offset, workspace=None):
+        positions = local_logits.shape[0]
+        if slots.numel() != 1 or positions < 2 or local_logits.dim() != 2:
+            raise ValueError("a draft position block serves one request's [positions, vocabulary/world] logits")
+        device = local_logits.device
+        self.positions, self.request_slots, self.request_generations = positions, slots, generations
+        self.request_live, self.request_seed, self.base_offset = live_rows, seed, base_offset
+        self.slots = torch.zeros(positions, dtype=slots.dtype, device=device)
+        self.generations = torch.zeros(positions, dtype=generations.dtype, device=device)
+        self.live_rows = torch.zeros_like(live_rows)
+        self.seed = torch.zeros(positions, dtype=torch.int64, device=device)
+        self.offset = torch.zeros(positions, dtype=torch.int64, device=device)
+        self.sampled = torch.zeros(positions, dtype=torch.int64, device=device)
+        self.steps = 4 * torch.arange(positions, dtype=torch.int64, device=device)
+        self.prefix = torch.zeros((positions, 1), dtype=torch.int64, device=device)
+        self.distribution = PreparedShardedDraftDistribution(
+            local_logits, requests, self.slots, self.generations, self.live_rows, self.prefix, rank=rank,
+            world=world, runtime=runtime, session=session, coordinator=coordinator, name=name, seed=self.seed,
+            offset=self.offset, sampled=self.sampled, workspace=workspace, positions=positions)
+
+    def prepare(self):
+        self.distribution.prepare()
+
+    def expand(self):
+        """Repeat the request's row metadata per position, with each position's Philox offset."""
+        self.slots.copy_(self.request_slots.expand(self.positions))
+        self.generations.copy_(self.request_generations.expand(self.positions))
+        self.live_rows.copy_(self.request_live * self.positions)
+        self.seed.copy_(self.request_seed.expand(self.positions))
+        self.offset.copy_(self.base_offset + self.steps)
+
+    def __call__(self):
+        """Sample every position; returns (drafts [P], dense probabilities [P, 1, V], valid [P, 1])."""
+        self.expand()
+        probabilities = self.distribution()
+        return self.sampled, probabilities, self.distribution.valid
+
