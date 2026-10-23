@@ -48,6 +48,10 @@ use crate::{
 struct RoundMetrics {
     rounds: AtomicU64,
     gpu_ns: AtomicU64,
+    /// Fastest rank's CUDA duration: the slowest-minus-fastest gap is cross-rank waiting.
+    gpu_min_ns: AtomicU64,
+    /// Host interval from dispatch through every rank's observed completion.
+    wall_ns: AtomicU64,
     emitted: AtomicU64,
     offered: AtomicU64,
     accepted: AtomicU64,
@@ -366,6 +370,8 @@ impl Metrics {
         width: usize,
         elapsed_ns: u64,
         records: &[CompletionRecord],
+        fastest_ns: u64,
+        wall_ns: u64,
     ) {
         if kind == GraphKind::Speculative {
             self.learned_draft_steps.fetch_add(width.saturating_sub(1) as u64, Ordering::Relaxed);
@@ -373,6 +379,8 @@ impl Metrics {
         let counters = &self.speculative[batch.trailing_zeros() as usize][width - 1];
         counters.rounds.fetch_add(1, Ordering::Relaxed);
         counters.gpu_ns.fetch_add(elapsed_ns, Ordering::Relaxed);
+        counters.gpu_min_ns.fetch_add(fastest_ns, Ordering::Relaxed);
+        counters.wall_ns.fetch_add(wall_ns, Ordering::Relaxed);
         for record in records.iter().filter(|r| r.status != 0) {
             let Some(v) = record.vector else {
                 continue;
@@ -538,6 +546,14 @@ impl Metrics {
                 "CUDA event duration of combined speculative or verification graphs; excludes separate proposal graphs and transport.",
             ),
             (
+                "gpu_min_rank_nanoseconds_total",
+                "Fastest rank's CUDA duration of completed speculative graphs.",
+            ),
+            (
+                "wall_nanoseconds_total",
+                "Host dispatch-to-completion interval of completed speculative graphs.",
+            ),
+            (
                 "emitted_tokens_total",
                 "Raw emitted tokens in completed speculative records, including lanes cancelled after submission.",
             ),
@@ -562,6 +578,8 @@ impl Metrics {
                     let value = match metric {
                         "rounds_total" => &counts.rounds,
                         "gpu_nanoseconds_total" => &counts.gpu_ns,
+                        "gpu_min_rank_nanoseconds_total" => &counts.gpu_min_ns,
+                        "wall_nanoseconds_total" => &counts.wall_ns,
                         "emitted_tokens_total" => &counts.emitted,
                         "offered_drafts_total" => &counts.offered,
                         _ => &counts.accepted,
@@ -997,7 +1015,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        metrics.speculative_completed(GraphKind::Speculative, 1, 8, 1000, &records);
+        metrics.speculative_completed(GraphKind::Speculative, 1, 8, 1000, &records, 900, 1100);
         for learned in [false, true] {
             let snapshot = metrics.snapshot(learned);
             assert_eq!(snapshot.verify_steps, 1);
@@ -1022,8 +1040,8 @@ mod tests {
     fn separate_proposals_keep_their_shape_and_cost_after_narrow_verification() {
         let metrics = Metrics::default();
         metrics.proposal_completed(4, 8, 700);
-        metrics.speculative_completed(GraphKind::Verification, 2, 3, 300, &[]);
-        metrics.speculative_completed(GraphKind::Verification, 2, 1, 100, &[]);
+        metrics.speculative_completed(GraphKind::Verification, 2, 3, 300, &[], 250, 320);
+        metrics.speculative_completed(GraphKind::Verification, 2, 1, 100, &[], 90, 110);
         let snapshot = metrics.snapshot(true);
         assert_eq!(snapshot.draft_steps, 7);
         assert_eq!(snapshot.verify_steps, 2);
