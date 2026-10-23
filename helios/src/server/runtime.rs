@@ -1336,6 +1336,14 @@ impl<'a> Worker<'a> {
                 completion.timing,
                 &confidence[..measured_step.batch_capacity],
             )?
+        } else if kind == GraphKind::Verification && completion.proposal_confidence.is_some() {
+            let confidence = completion.proposal_confidence.as_ref().unwrap();
+            self.scheduler.complete_fused_verification(
+                completion.fence,
+                &completion.records,
+                completion.timing,
+                &confidence[..measured_step.batch_capacity],
+            )?
         } else {
             self.scheduler
                 .complete(completion.fence, &completion.records, completion.timing)?

@@ -316,6 +316,16 @@ impl ExecutionManifest {
         }
     }
 
+    /// Whether verification graphs also retain each row's next proposal and its confidence.
+    pub fn fused_verification_proposals(&self) -> bool {
+        self.buffers.iter().any(|buffer| buffer.name == "fused_verification_proposals")
+    }
+
+    /// Whether a graph's completion downloads per-row proposal confidence.
+    pub fn graph_reports_confidence(&self, kind: GraphKind) -> bool {
+        kind == GraphKind::Proposal || (kind == GraphKind::Verification && self.fused_verification_proposals())
+    }
+
     pub fn buffer(&self, name: &str) -> Result<&BufferDescriptor> {
         self.buffers
             .iter()
@@ -448,6 +458,15 @@ impl ExecutionManifest {
                 || graph.packed_token_capacity < graph.batch_capacity
                 || graph.packed_token_capacity > graph.batch_capacity.saturating_mul(graph.token_capacity)) {
                 return Err("packed verification rows exceed declared request-prefix bounds".into());
+            }
+            if graph.kind == GraphKind::Verification && self.fused_verification_proposals() {
+                let confidence = self.buffer("proposal_confidence")?;
+                if confidence.dtype != Dtype::Float32 || confidence.shape.len() != 2
+                    || confidence.shape[0] != self.request_capacity() || confidence.shape[1] != 7
+                    || confidence.strides != [7, 1]
+                {
+                    return Err("fused verification proposals require seven FP32 confidences per request row".into());
+                }
             }
             if graph.kind == GraphKind::Proposal {
                 let confidence = self.buffer("proposal_confidence")?;

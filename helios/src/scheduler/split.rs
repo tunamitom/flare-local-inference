@@ -644,6 +644,43 @@ impl RequestScheduler {
         }
     }
 
+    /// Completes a verification whose graph also proposed each surviving row's next block.
+    /// Rows still decoding retain that proposal at their committed position, so their next
+    /// round verifies a width chosen from fresh confidence without a separate proposal graph.
+    pub fn complete_fused_verification(&mut self, fence: Fence, records: &[CompletionRecord],
+        timing: crate::execution::ExecutionTiming, confidence: &[[f32; 7]]) -> Result<Vec<GeneratedToken>> {
+        let split = self.split.as_ref().ok_or("fused verification without a split catalog")?;
+        let depth = split.width;
+        let step = self.submitted_step(fence)?.clone();
+        if step.kind != GraphKind::Verification || confidence.len() < step.batch_capacity {
+            return Err("fused verification does not match its batch and confidence extent".into());
+        }
+        for row in confidence.iter().take(step.lanes.len()) {
+            if row[..depth - 1].iter().any(|p| !p.is_finite() || !(0.0..=1.0).contains(p)) {
+                return Err("fused proposal confidence must be finite and in [0, 1]".into());
+            }
+        }
+        let generated = self.complete(fence, records, timing)?;
+        let mut fresh = 0;
+        for (lane, &raw) in step.lanes.iter().zip(confidence) {
+            let Ok(request) = self.request(lane.request) else { continue };
+            if request.phase != RequestPhase::Decode || request.error_code.is_some() {
+                continue;
+            }
+            let consumed = request.consumed_tokens;
+            let split = self.split.as_mut().unwrap();
+            split.retained[lane.request.slot as usize] = Some(RetainedProposal {
+                request: lane.request, fence, consumed, width: 1, limit: depth,
+                confidence: calibrated(&raw, &split.calibration), raw_survival: survival(&raw),
+            });
+            fresh |= 1 << lane.request.slot;
+        }
+        if fresh != 0 {
+            self.finalize_proposals(fresh, None)?;
+        }
+        Ok(generated)
+    }
+
     pub fn complete_proposal(&mut self, fence: Fence, records: &[CompletionRecord],
         timing: crate::execution::ExecutionTiming, confidence: &[[f32; 7]]) -> Result<Vec<GeneratedToken>> {
         let split = self.split.as_ref().ok_or("proposal completion without a split catalog")?;
@@ -897,6 +934,49 @@ mod tests {
         }
         assert!(neutral >= 5, "the uncalibrated drafter buys deep verification: {neutral}");
         assert!(rescaled <= 3, "realized acceptance shortens verification: {rescaled}");
+    }
+
+    /// Verifies a retained width-two proposal through a graph that also proposes the next block.
+    fn fused_round(confidence: [f32; 7]) -> (usize, u64) {
+        let mut s = measured_split_engine(1);
+        costs(&mut s, 1, &[9.0, 9.4, 10.13, 10.86, 11.9, 12.9].map(|x| (x * 1e6) as u64));
+        let h = ready(&mut s);
+        let request = s.request_mut(h).unwrap();
+        request.accounting.service.tokens = Some(utility::ServicePrice::initial(0.09));
+        request.accounting.service.deliveries = Some(utility::ServicePrice::initial(0.065));
+        retain(&mut s, h, [0.9; 7]);
+        s.split.as_mut().unwrap().retained[h.slot as usize].as_mut().unwrap().width = 2;
+        let fence = Fence(s.submitted.0 + 1);
+        let step = ScheduledStep { packed_token_capacity: 0, kind: GraphKind::Verification, batch_capacity: 1,
+            token_capacity: 2, mixed: None, requires_feedback: true,
+            lanes: vec![ScheduledLane { request: h, start_position: 65, tokens: 2 }] };
+        let plan = ScheduledPlan { origin: PlanOrigin::Ordinary, selected_cost: Default::default(),
+            owner: s.plan_owner.clone(), epochs: vec![s.request(h).unwrap().epoch],
+            estimated_duration_ns: 1000, selection_value_rate: 0.0, selection_log_scale: 0.0, verification_budget: None, step };
+        s.commit(&plan, fence).unwrap();
+        let mut vector = TokenVector { emitted_count: 2, offered_drafts: 1, accepted_drafts: 1,
+            verification_width: 2, ..Default::default() };
+        vector.tokens[..2].copy_from_slice(&[11, 12]);
+        let mut records = vec![CompletionRecord::default(); s.limits.request_capacity()];
+        records[h.slot as usize] = CompletionRecord { generation: h.generation as i64, submission_sequence: fence.0 as i64,
+            consumed_tokens: 67, generated_tokens: 3, token_id: 12, status: 1, vector: Some(vector), ..Default::default() };
+        s.complete_fused_verification(fence, &records, Default::default(), &[confidence]).unwrap();
+        let retained = s.retained_proposal(s.request(h).unwrap()).expect("the fused proposal is retained");
+        (retained.width, retained.consumed)
+    }
+
+    #[test]
+    fn fused_verification_retains_the_next_proposal_at_its_committed_position() {
+        let (_, consumed) = fused_round([0.9; 7]);
+        assert_eq!(consumed, 67);
+    }
+
+    #[test]
+    fn fused_verification_widens_with_confident_drafts_and_narrows_with_doubtful_ones() {
+        let (confident, _) = fused_round([0.97; 7]);
+        let (doubtful, _) = fused_round([0.2; 7]);
+        assert!(confident >= 5, "confident drafts buy deep verification: {confident}");
+        assert!(doubtful <= 2, "doubtful drafts verify shallow: {doubtful}");
     }
 
     #[test]

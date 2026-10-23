@@ -382,7 +382,7 @@ impl GraphExecutor {
                 confidence: manifest
                     .graphs
                     .iter()
-                    .any(|g| g.kind == GraphKind::Proposal)
+                    .any(|g| manifest.graph_reports_confidence(g.kind))
                     .then(|| {
                         let buffer = manifest.buffer("proposal_confidence")?;
                         Readback::new(&model, buffer.address, buffer.nbytes)
@@ -817,8 +817,8 @@ impl GraphExecutor {
             records,
             logprobs,
             prompt_logprobs,
-            proposal_confidence: if self.manifest.graphs[pending.graph_index].kind
-                == GraphKind::Proposal
+            proposal_confidence: if self.manifest.graph_reports_confidence(
+                self.manifest.graphs[pending.graph_index].kind)
             {
                 let mut confidence = [[0.0; MAX_OUTPUT_TOKENS - 1]; REQUEST_LANES];
                 let graph = &self.manifest.graphs[pending.graph_index];
@@ -830,7 +830,9 @@ impl GraphExecutor {
                     .zip(unsafe { frame.confidence.as_ref().unwrap().bytes() }
                         .chunks_exact(4 * self.manifest.buffer("proposal_confidence")?.shape[1]))
                 {
-                    for (value, bytes) in row.iter_mut().take(graph.token_capacity - 1).zip(bytes.chunks_exact(4)) {
+                    // A fused verification retains a full-depth proposal whatever its own width.
+                    let drafts = if graph.kind == GraphKind::Proposal { graph.token_capacity - 1 } else { 7 };
+                    for (value, bytes) in row.iter_mut().take(drafts).zip(bytes.chunks_exact(4)) {
                         *value = f32::from_ne_bytes(bytes.try_into().unwrap());
                     }
                 }
@@ -1228,7 +1230,7 @@ fn enqueue_completion(
             frame.prompt_logprobs.as_ref().unwrap().enqueue_copy(copy,
                 b.address + index * b.nbytes / 2, prompt_rows * super::PROMPT_FIELDS * 4)?;
         }
-        if kind == GraphKind::Proposal {
+        if manifest.graph_reports_confidence(kind) {
             let confidence = manifest.buffer("proposal_confidence")?;
             frame.confidence.as_ref().unwrap().enqueue_copy(copy, confidence.address, confidence.nbytes)?;
         }
