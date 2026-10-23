@@ -162,3 +162,107 @@ mod tests {
         assert!(costs[..4].iter().all(|c| *c > 0.0) && costs[4..].iter().all(|c| *c == 0.0));
     }
 }
+
+#[cfg(test)]
+mod scheduler_tests {
+    use super::super::refresh::PlanOrigin;
+    use super::super::*;
+    use crate::execution::{CompletionRecord, ExecutionTiming, TokenVector};
+
+    fn engine() -> (RequestScheduler, Vec<crate::execution::GraphDescriptor>) {
+        let mut s = super::super::tests::scheduler(1, 512, 64);
+        s.enable_speculation(&(1..=8).collect::<Vec<_>>()).unwrap();
+        let graphs = super::super::tests::duration_graphs(1);
+        s.measured_graph_durations(&graphs).unwrap();
+        let switched = graphs.iter().position(|g| g.kind == GraphKind::Speculative && g.token_capacity == 8).unwrap();
+        s.device_widths(&graphs, &[switched]).unwrap();
+        (s, graphs)
+    }
+
+    fn ready(s: &mut RequestScheduler) -> RequestHandle {
+        let handle = s.admit(super::super::tests::spec(65, 64)).unwrap();
+        let r = s.request_mut(handle).unwrap();
+        r.phase = RequestPhase::Decode;
+        r.consumed_tokens = 65;
+        r.scheduled_consumed = 65;
+        r.generated_tokens = 1;
+        handle
+    }
+
+    /// Commit and complete one speculative round of `capacity` that verified `width` and emitted `emitted`.
+    fn round(s: &mut RequestScheduler, h: RequestHandle, capacity: usize, width: i64, emitted: i64) -> Result<Vec<GeneratedToken>> {
+        let fence = Fence(s.submitted.0 + 1);
+        let step = ScheduledStep { packed_token_capacity: 0, kind: GraphKind::Speculative, batch_capacity: 1,
+            token_capacity: capacity, mixed: None, requires_feedback: true,
+            lanes: vec![ScheduledLane { request: h, start_position: 65, tokens: capacity }] };
+        let plan = ScheduledPlan { origin: PlanOrigin::Ordinary, selected_cost: Default::default(),
+            owner: s.plan_owner.clone(), epochs: vec![s.request(h).unwrap().epoch],
+            estimated_duration_ns: 1000, selection_value_rate: 0.0, selection_log_scale: 0.0, verification_budget: None, step };
+        s.commit(&plan, fence).unwrap();
+        let mut records = vec![CompletionRecord::default(); s.limits.request_capacity()];
+        let mut vector = TokenVector { emitted_count: emitted, offered_drafts: width - 1, accepted_drafts: emitted - 1,
+            verification_width: width, ..Default::default() };
+        for i in 0..emitted as usize { vector.tokens[i] = 100 + i as i64; }
+        records[h.slot as usize] = CompletionRecord {
+            generation: h.generation as i64, submission_sequence: fence.0 as i64,
+            consumed_tokens: 65 + emitted, generated_tokens: 1 + emitted, token_id: 100 + emitted - 1, status: 1,
+            vector: Some(vector), ..Default::default()
+        };
+        let mut timing = ExecutionTiming::default();
+        timing.gpu_ns[0] = Some(9_000_000);
+        let realized = s.realized_width(&plan.step, &records);
+        let result = s.complete(fence, &records, timing);
+        if result.is_ok() {
+            assert_eq!(realized as i64, width.clamp(1, capacity as i64));
+        }
+        result
+    }
+
+    #[test]
+    fn a_switched_round_commits_the_width_the_device_chose() {
+        let (mut s, _) = engine();
+        let h = ready(&mut s);
+        let rounds = s.request(h).unwrap().acceptance.rounds();
+        let output = round(&mut s, h, 8, 3, 3).unwrap();
+        assert_eq!(output.len(), 3);
+        let r = s.request(h).unwrap();
+        assert_eq!((r.generated_tokens, r.consumed_tokens), (4, 68));
+        // Device-chosen widths do not train the per-depth acceptance estimates.
+        assert_eq!(r.acceptance.rounds(), rounds);
+        let lane = ScheduledLane { request: h, start_position: 68, tokens: 8 };
+        let costs = s.width_costs(&lane);
+        assert_eq!(costs[2], 9.0);
+        assert!(costs[..8].iter().all(|c| *c > 0.0));
+        assert!((s.round_tokens(s.request(h).unwrap(), GraphKind::Speculative, 1, 8, 8) - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn widths_beyond_the_switched_capacity_or_on_host_width_graphs_are_rejected() {
+        let (mut s, _) = engine();
+        let h = ready(&mut s);
+        assert!(round(&mut s, h, 8, 9, 3).is_err());
+        let (mut s, _) = engine();
+        let h = ready(&mut s);
+        assert!(round(&mut s, h, 4, 3, 3).is_err());
+        let (mut s, _) = engine();
+        let h = ready(&mut s);
+        assert!(round(&mut s, h, 4, 4, 3).is_ok());
+    }
+
+    #[test]
+    fn only_a_one_request_speculative_graph_may_switch() {
+        let mut s = super::super::tests::scheduler(2, 512, 64);
+        s.enable_speculation(&(1..=8).collect::<Vec<_>>()).unwrap();
+        let graphs = super::super::tests::duration_graphs(2);
+        s.measured_graph_durations(&graphs).unwrap();
+        let two = graphs.iter().position(|g| g.kind == GraphKind::Speculative && g.batch_capacity == 2).unwrap();
+        let decode = graphs.iter().position(|g| g.kind == GraphKind::Decode).unwrap();
+        let one = graphs.iter().position(|g| g.kind == GraphKind::Speculative && g.batch_capacity == 1 && g.token_capacity == 8).unwrap();
+        assert!(s.device_widths(&graphs, &[two]).is_err());
+        assert!(s.device_widths(&graphs, &[decode]).is_err());
+        assert!(s.device_widths(&graphs, &[one, one]).is_err());
+        assert!(s.device_widths(&graphs, &[99]).is_err());
+        assert!(s.device_widths(&graphs, &[one]).is_ok());
+        assert!(s.device_widths(&graphs, &[]).is_ok() && s.device_width.is_none());
+    }
+}
