@@ -48,7 +48,9 @@ def _l2_prefetch(Segments, segments, CHUNK: tl.constexpr, BLOCK: tl.constexpr):
 
 
 @torch.library.custom_op("flare::l2_prefetch", mutates_args=("token",))
-def _issue(segments: torch.Tensor, token: torch.Tensor, stream: int) -> None:
+def _issue(segments: torch.Tensor, token: torch.Tensor, stream: int, after: torch.Tensor | None = None) -> None:
+    # ``after`` is read only for ordering: traced forwards cannot hoist the window above the
+    # kernel that produces it, so the side stream forks once that kernel is on the main stream.
     main = torch.cuda.current_stream(segments.device)
     side = torch.cuda.ExternalStream(stream, device=segments.device)
     side.wait_stream(main)
@@ -57,7 +59,7 @@ def _issue(segments: torch.Tensor, token: torch.Tensor, stream: int) -> None:
 
 
 @_issue.register_fake
-def _fake_issue(segments, token, stream):
+def _fake_issue(segments, token, stream, after=None):
     pass
 
 
@@ -121,9 +123,10 @@ class L2Prefetcher:
         return torch.tensor([value for segment in taken for value in segment], dtype=torch.int64,
                             device=self.device)
 
-    def issue(self, plan):
+    def issue(self, plan, after=None):
+        """Fork a window; with ``after``, it starts only once the kernel producing that tensor ends."""
         if plan is not None:
-            torch.ops.flare.l2_prefetch(plan, self.token, self.stream_handle)
+            torch.ops.flare.l2_prefetch(plan, self.token, self.stream_handle, after)
             self.issued = True
 
     def join(self):
