@@ -218,6 +218,8 @@ pub struct ExecutionManifest {
     pub graphs: Vec<GraphDescriptor>,
     /// Two-phase rounds, at most one per graph index.
     pub branches: Vec<GraphBranch>,
+    /// Graph indices that choose their verification width on device, up to their token capacity.
+    pub switched: Vec<usize>,
 }
 
 /// After graph `graph` completes, the host reads the one-byte flag at device `flag`

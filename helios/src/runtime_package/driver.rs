@@ -56,6 +56,32 @@ pub struct CopyParams {
 #[repr(C, align(64))]
 pub struct TensorMap(pub [u8; 128]);
 
+/// `CUDA_CONDITIONAL_NODE_PARAMS`.
+#[repr(C)]
+pub struct ConditionalParams {
+    pub handle: u64,
+    pub kind: c_int,
+    pub size: c_uint,
+    pub graphs_out: *mut Handle,
+    pub context: Handle,
+}
+
+/// `CUgraphNodeParams` holding a conditional node; the union is 29 `long long`s.
+#[repr(C)]
+pub struct NodeParams {
+    pub kind: c_int,
+    pub reserved0: [c_int; 3],
+    pub conditional: ConditionalParams,
+    pub padding: [u8; 29 * 8 - size_of::<ConditionalParams>()],
+    pub reserved2: i64,
+}
+
+const _: () = assert!(size_of::<NodeParams>() == 256 && size_of::<ConditionalParams>() == 32);
+
+pub const NODE_TYPE_CONDITIONAL: c_int = 13;
+pub const CONDITIONAL_SWITCH: c_int = 2;
+pub const CONDITIONAL_ASSIGN_DEFAULT: c_uint = 1;
+
 #[repr(C)]
 pub struct Location {
     pub kind: c_int,
@@ -159,6 +185,9 @@ driver! {
     graph_attribute: "cuGraphKernelNodeSetAttribute"(Handle, c_int, *const c_void);
     graph_edges: "cuGraphAddDependencies_v2"(Handle, *const Handle, *const Handle, *const [u8; 8], usize);
     graph_instantiate: "cuGraphInstantiateWithFlags"(*mut Handle, Handle, u64);
+    graph_conditional_handle: "cuGraphConditionalHandleCreate"(*mut u64, Handle, Handle, c_uint, c_uint);
+    graph_node: "cuGraphAddNode_v2"(*mut Handle, Handle, *const Handle, *const c_void, usize, *mut NodeParams);
+    graph_child: "cuGraphAddChildGraphNode"(*mut Handle, Handle, *const Handle, usize, Handle);
     executable_destroy: "cuGraphExecDestroy"(Handle);
     tensor_map_replace: "cuTensorMapReplaceAddress"(*mut TensorMap, *mut c_void);
     error_name: "cuGetErrorName"(c_int, *mut *const c_char);

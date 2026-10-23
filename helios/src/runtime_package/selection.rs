@@ -361,6 +361,27 @@ impl LoadOptions {
             {
                 return Err(invalid("graph declares more than one execution branch"));
             }
+            // Device-selected widths: a catalogued prefix and its uncatalogued bodies.
+            for switch in &execution.switches {
+                let selector = execution.buffers.iter().find(|b| b.name == switch.selector_buffer);
+                if !names.contains(&switch.graph)
+                    || switch.bodies.is_empty()
+                    || selector.is_none_or(|b| b.nbytes < 4 || b.dtype != "int32")
+                    || execution.branches.iter().any(|b| b.graph == switch.graph)
+                {
+                    return Err(invalid("invalid execution switch"));
+                }
+                for body in &switch.bodies {
+                    if names.contains(body) || !branch_graphs.insert(body.clone()) {
+                        return Err(invalid("execution switch bodies must be distinct uncatalogued graphs"));
+                    }
+                }
+            }
+            if execution.switches.iter().map(|s| &s.graph).collect::<HashSet<_>>().len()
+                != execution.switches.len()
+            {
+                return Err(invalid("graph declares more than one execution switch"));
+            }
             names.extend(branch_graphs);
             if names != resources {
                 return Err(invalid(
@@ -520,6 +541,10 @@ impl LoadOptions {
             let mut selected: HashSet<_> = execution.graphs.iter().map(|g| g.name.clone()).collect();
             // A selected two-phase graph keeps both continuations; unselected ones keep none.
             execution.branches.retain(|branch| selected.contains(&branch.graph));
+            execution.switches.retain(|switch| selected.contains(&switch.graph));
+            for switch in &execution.switches {
+                selected.extend(switch.bodies.iter().cloned());
+            }
             for branch in &execution.branches {
                 selected.insert(branch.taken.clone());
                 selected.insert(branch.fallback.clone());

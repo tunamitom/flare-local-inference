@@ -396,6 +396,7 @@ impl ModelRuntime {
                 };
                 if let Err(error) = scheduler
                     .graph_durations(&executor.manifest().graphs)
+                    .and_then(|()| scheduler.device_widths(&executor.manifest().graphs, &executor.manifest().switched))
                     .and_then(|()| scheduler.configure_policy(policy))
                     .and_then(|()| match &executor.manifest().cache {
                         Some(cache) if !cache.snapshot_pages.is_empty() => {
@@ -1371,7 +1372,7 @@ impl<'a> Worker<'a> {
             self.metrics.speculative_completed(
                 kind,
                 step.batch_capacity,
-                step.token_capacity,
+                self.scheduler.realized_width(step, &completion.records),
                 nanos,
                 &completion.records,
             );

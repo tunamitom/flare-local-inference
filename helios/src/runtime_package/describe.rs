@@ -591,6 +591,7 @@ mod tests {
             reservations: vec![],
             execution: Some(wire::Execution {
                 branches: Vec::new(),
+        switches: Vec::new(),
                 abi_version: 9,
                 max_active: 32,
                 input_frame_bytes: 0,

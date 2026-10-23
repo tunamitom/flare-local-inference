@@ -9,6 +9,9 @@ pub use policy::{PolicyConfig, RequestAccounting};
 use refresh::PlanOrigin;
 pub mod speculation;
 pub mod split;
+mod switch;
+/// Per-row width costs a switched graph reads: one per verification width 1..=8.
+pub const DEVICE_WIDTHS: usize = switch::MAX_WIDTH;
 #[cfg(test)]
 mod valuation;
 
@@ -600,6 +603,8 @@ pub struct RequestScheduler {
     mixed_catalog: Vec<(usize, usize, usize)>,
     proposal_source: speculation::ProposalSource,
     split: Option<split::SplitSpeculation>,
+    /// The one-request graph that chooses its verification width on device, if the package has one.
+    device_width: Option<switch::DeviceWidth>,
     /// Conditional acceptance observed across all requests. New requests start from it
     /// rather than the uninformed prior, so a request that begins at width one is not
     /// held there by a prior that never sees a draft.
@@ -677,6 +682,7 @@ impl RequestScheduler {
             mixed_catalog: Vec::new(),
             proposal_source: speculation::ProposalSource::Mtp,
             split: None,
+            device_width: None,
             costs: cost::ActionCosts::default(),
             refresh: refresh::RefreshState::default(),
             tickets: HashMap::new(),
@@ -895,6 +901,67 @@ impl RequestScheduler {
         // Each graph contributes at most one candidate per request slot.
         self.candidates = std::cell::RefCell::new(Vec::with_capacity(graphs.len() * REQUEST_LANES));
         Ok(())
+    }
+
+    /// Graphs that choose their verification width on device (the manifest's switched indices).
+    /// Only a one-request speculative graph whose width drafts may switch.
+    pub fn device_widths(
+        &mut self,
+        graphs: &[crate::execution::GraphDescriptor],
+        switched: &[usize],
+    ) -> Result<()> {
+        self.device_width = None;
+        for &index in switched {
+            let graph = graphs.get(index).ok_or("switched graph index is out of range")?;
+            let device = switch::DeviceWidth::new(graph.batch_capacity, graph.token_capacity)
+                .filter(|_| graph.kind == GraphKind::Speculative && self.device_width.is_none())
+                .ok_or("only one one-request speculative graph may choose its width on device")?;
+            self.device_width = Some(device);
+        }
+        Ok(())
+    }
+
+    fn switched(&self, kind: GraphKind, batch: usize, capacity: usize) -> bool {
+        self.device_width.as_ref().is_some_and(|d| d.matches(kind, batch, capacity))
+    }
+
+    /// Expected tokens of a round of this shape carrying `request` with `tokens` lanes.
+    fn round_tokens(&self, request: &LiveRequest, kind: GraphKind, batch: usize, capacity: usize,
+                    tokens: usize) -> f64 {
+        let prior = self.expected_speculative_tokens(request, tokens);
+        match &self.device_width {
+            Some(device) if device.matches(kind, batch, capacity) => {
+                device.expected_tokens(request.consumed_tokens, prior)
+            }
+            _ => prior,
+        }
+    }
+
+    /// Per-width round milliseconds the switched graph reads for this lane; zero excludes a width.
+    pub fn width_costs(&self, lane: &ScheduledLane) -> [f32; switch::MAX_WIDTH] {
+        let Some(device) = &self.device_width else {
+            return [0.0; switch::MAX_WIDTH];
+        };
+        // Until switched rounds are observed, a host-width round of the same width prices it.
+        device.width_costs(lane.start_position, |width| {
+            self.costs
+                .duration(GraphKind::Speculative, device.batch, width)
+                .filter(|ns| *ns > 0)
+                .map(|ns| ns as f64 / 1e6)
+        })
+    }
+
+    /// The verification width a completed round realized: the device's choice for a switched
+    /// graph, else the graph's width.
+    pub fn realized_width(&self, step: &ScheduledStep, records: &[CompletionRecord]) -> usize {
+        if !self.switched(step.kind, step.batch_capacity, step.token_capacity) {
+            return step.token_capacity;
+        }
+        step.lanes
+            .first()
+            .and_then(|lane| records.get(lane.request.slot as usize))
+            .and_then(|record| record.vector)
+            .map_or(step.token_capacity, |vector| vector.verification_width.clamp(1, step.token_capacity as i64) as usize)
     }
 
     pub fn estimated_duration_ns(&self, step: &ScheduledStep) -> Option<u64> {
@@ -2150,6 +2217,8 @@ impl RequestScheduler {
                 "completion contains an active physical slot outside the submitted lanes".into(),
             );
         }
+        // A switched graph verifies the width it chose, at most its capacity.
+        let switched = self.switched(step.kind, step.batch_capacity, step.token_capacity);
         // Validate every live lane before committing any completion state.
         for (row, lane) in step.lanes.iter().enumerate() {
             let kind = step.lane_kind(row);
@@ -2191,7 +2260,11 @@ impl RequestScheduler {
             if let Some(vector) = record.vector {
                 if vector.emitted_count != emitted
                     || (matches!(kind, GraphKind::Speculative | GraphKind::Verification)
-                        && (vector.verification_width != width
+                        && ((if switched {
+                            !(1..=width).contains(&vector.verification_width)
+                        } else {
+                            vector.verification_width != width
+                        })
                             || record.consumed_tokens - request.consumed_tokens as i64 != emitted))
                 {
                     return Err("token vector does not match committed request progress".into());
@@ -2245,6 +2318,7 @@ impl RequestScheduler {
         let mut window_snapshots = Vec::new();
         let mut acceptance_observations = Vec::new();
         let mut verified = Vec::new();
+        let mut device_rounds = Vec::new();
         for (row, lane) in step.lanes.iter().enumerate() {
             let kind = step.lane_kind(row);
             let Ok(request) = self.request_mut(lane.request) else {
@@ -2304,8 +2378,15 @@ impl RequestScheduler {
                     vector.emitted_count > vector.accepted_drafts,
                     vector.copy_offered_mask as u8,
                 );
-                request.acceptance.observe(observation.0, observation.1, observation.2, observation.3);
-                acceptance_observations.push(observation);
+                if switched {
+                    // Device-chosen widths verify deeper when the drafts look likely to survive,
+                    // so their outcomes would bias the per-depth acceptance estimates.
+                    device_rounds.push((lane.start_position, vector.verification_width.max(0) as usize,
+                        vector.emitted_count.max(0) as usize));
+                } else {
+                    request.acceptance.observe(observation.0, observation.1, observation.2, observation.3);
+                    acceptance_observations.push(observation);
+                }
                 if kind == GraphKind::Verification {
                     verified.push((lane.request, offered, (vector.accepted_drafts as usize).min(offered)));
                 }
@@ -2402,6 +2483,13 @@ impl RequestScheduler {
             }
             if request.pending == 0 {
                 request.scheduled_consumed = request.consumed_tokens;
+            }
+        }
+        if let Some(device) = self.device_width.as_mut() {
+            let gpu = timing.gpu_ns.into_iter().flatten().max().unwrap_or(0);
+            let nanos = gpu.saturating_sub(timing.readiness.map_or(0, |intervals| intervals.wait_ns()));
+            for (position, width, tokens) in device_rounds {
+                device.observe(position, width, tokens, nanos);
             }
         }
         for (offered, accepted, rejected, copy_mask) in acceptance_observations {
