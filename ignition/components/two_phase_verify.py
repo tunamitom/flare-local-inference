@@ -20,6 +20,7 @@ nucleus in global ID order; only floating-point summation order differs.
 import torch
 import triton
 
+from .flashinfer_sampling import verify_chain
 from .speculation import TARGET_RNG_DOMAIN, _live, _metadata, _tensor
 from .vocab_parallel_verify import (NUCLEUS_SLOTS, SUMMARY_CANDIDATES, _merge_kernel, _summary_chunk_kernel,
                                     _summary_merge_kernel, _union_kernel, compact_eligible)
@@ -176,9 +177,8 @@ class PreparedTwoPhaseVerification:
         self.offset.copy_(torch.where(self.rng.generation[safe] == self.generations, self.rng.target_offset[safe], 0))
         self.accepted.zero_()
         self.emitted.zero_()
-        tokens, _, _ = self._sampling.chain_speculative_sampling(self.compact_draft, self.draft_columns, self.target,
-            self.accepted, self.emitted, deterministic=True, seed=self.seed_bits, offset=self.offset,
-            row_independent_rng=True)
+        tokens, _, _ = verify_chain(self.compact_draft, self.draft_columns, self.target, self.accepted,
+            self.emitted, self.seed_bits, self.offset)
         tokens = torch.where(tokens >= 0, self.union.gather(-1, tokens.clamp(0, self.union.shape[-1] - 1).long()), -1)
         valid = live & self.draft_valid.all(-1) & ((self.drafts >= 0) & (self.drafts < state.vocab_size)).all(-1)
         offered = (self.token_limits - 1).clamp(0, w - 1)
