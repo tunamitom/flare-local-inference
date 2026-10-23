@@ -173,3 +173,73 @@ pub fn copy_proposal(history: &[u32], maximum: usize) -> ([i64; 7], usize) {
     }
     (output, 0)
 }
+
+/// How many tokens host-width speculative rounds of each batch and width emitted per lane against
+/// what the acceptance profiles predicted at completion. Profiles learn per request from offered
+/// drafts and miss what a shape does to them (seeded or stale profiles, a batch whose requests
+/// accept less), so the policy scales a shape's predictions by its realized ratio.
+#[derive(Clone, Copy)]
+pub struct RealizedTokens {
+    sums: [[(f64, f64); 8]; BATCH_CAPACITIES.len()],
+}
+
+impl Default for RealizedTokens {
+    fn default() -> Self {
+        Self { sums: [[(0.0, 0.0); 8]; BATCH_CAPACITIES.len()] }
+    }
+}
+
+impl RealizedTokens {
+    /// Pseudo-tokens at ratio one, the decay per observed lane, and the ratio's bounds.
+    const PRIOR: f64 = 16.0;
+    const DECAY: f64 = 0.995;
+    const BOUNDS: (f64, f64) = (0.5, 1.25);
+
+    fn index(batch: usize, width: usize) -> Option<(usize, usize)> {
+        let b = BATCH_CAPACITIES.iter().position(|&capacity| capacity == batch)?;
+        (1..=8).contains(&width).then_some((b, width - 1))
+    }
+
+    pub fn observe(&mut self, batch: usize, width: usize, predicted: f64, emitted: f64) {
+        let Some((b, w)) = Self::index(batch, width) else { return };
+        if !(predicted.is_finite() && emitted.is_finite()) || predicted <= 0.0 {
+            return;
+        }
+        let (realized, expected) = &mut self.sums[b][w];
+        *realized = *realized * Self::DECAY + emitted;
+        *expected = *expected * Self::DECAY + predicted;
+    }
+
+    pub fn ratio(&self, batch: usize, width: usize) -> f64 {
+        let Some((b, w)) = Self::index(batch, width) else { return 1.0 };
+        let (realized, expected) = self.sums[b][w];
+        ((realized + Self::PRIOR) / (expected + Self::PRIOR)).clamp(Self::BOUNDS.0, Self::BOUNDS.1)
+    }
+}
+
+#[cfg(test)]
+mod realized_tests {
+    use super::RealizedTokens;
+
+    #[test]
+    fn a_shape_that_over_promises_is_discounted_and_unseen_shapes_stay_neutral() {
+        let mut realized = RealizedTokens::default();
+        assert_eq!(realized.ratio(8, 3), 1.0);
+        for _ in 0..400 {
+            realized.observe(8, 3, 2.8, 2.2);
+        }
+        let ratio = realized.ratio(8, 3);
+        assert!((ratio - 2.2 / 2.8).abs() < 0.02, "{ratio}");
+        assert_eq!(realized.ratio(8, 1), 1.0);
+        assert_eq!(realized.ratio(4, 3), 1.0);
+        for _ in 0..2000 {
+            realized.observe(4, 2, 1.0, 5.0);
+        }
+        assert_eq!(realized.ratio(4, 2), 1.25);
+        realized.observe(3, 2, 1.0, 1.0);
+        realized.observe(8, 9, 1.0, 1.0);
+        realized.observe(8, 2, f64::NAN, 1.0);
+        assert_eq!(realized.ratio(8, 2), 1.0);
+    }
+}
+
