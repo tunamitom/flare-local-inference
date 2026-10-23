@@ -600,6 +600,10 @@ pub struct RequestScheduler {
     mixed_catalog: Vec<(usize, usize, usize)>,
     proposal_source: speculation::ProposalSource,
     split: Option<split::SplitSpeculation>,
+    /// Conditional acceptance observed across all requests. New requests start from it
+    /// rather than the uninformed prior, so a request that begins at width one is not
+    /// held there by a prior that never sees a draft.
+    acceptance_population: speculation::AcceptanceProfile,
     costs: cost::ActionCosts,
     refresh: refresh::RefreshState,
     tickets: HashMap<PrefixKey, Ticket>,
@@ -679,6 +683,7 @@ impl RequestScheduler {
             track_publications: false,
             publications: Vec::new(),
             admissions: 0,
+            acceptance_population: speculation::AcceptanceProfile::default(),
         })
     }
 
@@ -1429,7 +1434,7 @@ impl RequestScheduler {
             window_snapshot_ready: false,
             window_restore: false,
             epoch: 0,
-            acceptance: speculation::AcceptanceProfile::default(),
+            acceptance: self.acceptance_population.seeded(),
             accounting: self.accounting(),
             handle,
             state_slot: StateSlotId((1 + slot * execution_rows) as u32),
@@ -2228,6 +2233,7 @@ impl RequestScheduler {
         let mut boundaries = Vec::new();
         let mut captures = Vec::new();
         let mut window_snapshots = Vec::new();
+        let mut acceptance_observations = Vec::new();
         for (row, lane) in step.lanes.iter().enumerate() {
             let kind = step.lane_kind(row);
             let Ok(request) = self.request_mut(lane.request) else {
@@ -2281,12 +2287,14 @@ impl RequestScheduler {
                 // ABI3 may count padded proposals in the physical capture. Only
                 // the lane's logical draft extent supplies acceptance observations.
                 let offered = (vector.offered_drafts as usize).min(lane.tokens.saturating_sub(1));
-                request.acceptance.observe(
+                let observation = (
                     offered,
                     (vector.accepted_drafts as usize).min(offered),
                     vector.emitted_count > vector.accepted_drafts,
                     vector.copy_offered_mask as u8,
                 );
+                request.acceptance.observe(observation.0, observation.1, observation.2, observation.3);
+                acceptance_observations.push(observation);
             }
             if record.status == 3 {
                 request.error_code = Some(record.error_code);
@@ -2381,6 +2389,9 @@ impl RequestScheduler {
             if request.pending == 0 {
                 request.scheduled_consumed = request.consumed_tokens;
             }
+        }
+        for (offered, accepted, rejected, copy_mask) in acceptance_observations {
+            self.acceptance_population.observe(offered, accepted, rejected, copy_mask);
         }
         self.advance_retirement(fence)?;
         for snapshot in window_snapshots {
