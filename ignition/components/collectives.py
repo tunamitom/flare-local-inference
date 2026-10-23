@@ -512,6 +512,9 @@ class PreparedBroadcast:
     def prepare(self):
         from ignition.preparation.triton import prepare_triton
 
+        # A caller may run the broadcast while preparing, before the session finalizer.
+        if hasattr(self, "_pack"):
+            return
         options = dict(OFFSETS=self._offsets, SIZES=self._sizes, BOOLS=self._bools, BLOCK=256, num_warps=4)
         grid = (triton.cdiv(max(self._sizes), 256), 1, 1)
         self._pack = prepare_triton(_broadcast_pack, (self._byte_views, self.send), grid, **options)
@@ -527,6 +530,7 @@ class PreparedBroadcast:
     def __call__(self):
         if self.single:
             return
+        self.prepare()
         _broadcast_pack_call(list(self._tensors), self.send, self.handle)
         self.gather(self.send.view(torch.bfloat16))
         # Aliased destinations keep their field order across separate stream-ordered launches.
