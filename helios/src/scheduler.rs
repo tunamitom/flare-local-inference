@@ -814,6 +814,7 @@ impl RequestScheduler {
             self.speculative_fixed_width,
             self.limits.max_active.next_power_of_two(),
         );
+        self.restrict_switched_catalog();
     }
     /// Restricts scheduling to graph shapes present in the loaded execution manifest.
     pub fn speculative_graphs(&mut self, shapes: &[(usize, usize)]) -> Result<()> {
@@ -849,7 +850,19 @@ impl RequestScheduler {
             }
         }
         self.speculative_catalog = catalog;
+        self.restrict_switched_catalog();
         Ok(())
+    }
+
+    /// A one-request switched graph chooses any width up to its capacity each round with the
+    /// round's own draft confidences, so it replaces that batch's host-width speculative graphs.
+    fn restrict_switched_catalog(&mut self) {
+        if let Some(device) = &self.device_width {
+            let widths = &mut self.speculative_catalog[device.batch.trailing_zeros() as usize];
+            if widths.contains(&device.capacity) {
+                widths.retain(|w| *w == device.capacity);
+            }
+        }
     }
     pub fn proposal_source(&mut self, source: speculation::ProposalSource) -> Result<()> {
         if self.submitted != Fence(0) || self.slots.iter().any(|s| s.request.is_some()) {
@@ -918,7 +931,12 @@ impl RequestScheduler {
                 .ok_or("only one one-request speculative graph may choose its width on device")?;
             self.device_width = Some(device);
         }
+        self.restrict_switched_catalog();
         Ok(())
+    }
+
+    pub fn is_switched(&self, step: &ScheduledStep) -> bool {
+        self.switched(step.kind, step.batch_capacity, step.token_capacity)
     }
 
     fn switched(&self, kind: GraphKind, batch: usize, capacity: usize) -> bool {
