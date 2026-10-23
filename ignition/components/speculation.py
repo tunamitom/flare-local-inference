@@ -8,6 +8,7 @@ returned counts; these operations never reconstruct model state.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import torch
@@ -439,11 +440,20 @@ class PreparedSpeculativeCommit:
         self.idle_record[[4, 12, *range(16, 24)]] = -1
         if draft_context_lag is None:
             self.idle_record[13] = -1
+        self.fused = None
 
     def prepare(self):
         self.logprobs.prepare()
+        from ignition.components.speculative_commit_fused import fusable, prepare_fused_commit
+        # One program replaces the ~40 compiled kernels when the request state carries no token history.
+        if self.fused is None and os.environ.get("FLARE_FUSED_COMMIT", "1") != "0" and fusable(self):
+            self.fused = prepare_fused_commit(self)
 
     def __call__(self):
+        if self.fused is not None:
+            self.fused()
+            self.logprobs()
+            return self
         state, acceptance, columns = self.state, self.acceptance, self.columns
         width = columns.numel()
         safe = self.slots.long().clamp(0, state.capacity - 1)
