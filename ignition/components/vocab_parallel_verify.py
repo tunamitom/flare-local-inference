@@ -335,3 +335,40 @@ def fused_compact_chain_verify(merged, batch, width, draft_ids, draft_token_prob
         deterministic=True, seed=seed, offset=offset, row_independent_rng=True)
     tokens = torch.where(tokens >= 0, union.gather(-1, tokens.clamp_min(0).long()), -1)
     return tokens, accepted, emitted
+
+
+def compact_eligible(parameters, top_k, grammar_enabled, logprob_requested, slots, live,
+                     candidates=SUMMARY_CANDIDATES):
+    """[R] rows whose sampling policy the compact path reproduces exactly.
+
+    ``parameters`` is the request state's [S, 6] temperature, top-p, min-p,
+    repetition, presence and frequency columns; ``top_k``, ``grammar_enabled``
+    and ``logprob_requested`` are per-slot; ``slots`` maps rows to slots and
+    ``live`` marks live rows. Penalties count prior tokens across the full
+    vocabulary and grammar masks do too, so either forces the dense path;
+    min-p filters relative to the global maximum, which the summaries carry,
+    but stays dense until verified; logprob records read full-vocabulary
+    logits. Top-k above the published candidates may need unpublished tokens.
+    Dead rows are eligible so they never force a fallback.
+    """
+    safe = slots.long().clamp(0, parameters.shape[0] - 1)
+    p = parameters[safe]
+    bits = p.view(torch.int32)
+    neutral = (p[:, 3] == 1.) & (bits[:, 4] == 0) & (bits[:, 5] == 0) & (bits[:, 2] == 0)
+    k = top_k[safe]
+    bounded = (k <= 0) | (k <= candidates)
+    plain = (grammar_enabled[safe] == 0) & (logprob_requested[safe] == 0)
+    return (neutral & bounded & plain) | ~live
+
+
+def compact_round(eligible, complete, fallbacks=None):
+    """Rank-uniform [1] bool: every row is eligible and its gathered nucleus complete.
+
+    ``complete`` comes from gathered summaries, so every rank computes the same
+    flag without communication. ``fallbacks``, an int64 [1] debug tensor, counts
+    rounds that fall back to the dense path; it accumulates on device only.
+    """
+    take = (eligible & complete).all().reshape(1)
+    if fallbacks is not None:
+        fallbacks.add_((~take).long())
+    return take
