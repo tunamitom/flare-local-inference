@@ -340,6 +340,28 @@ impl LoadOptions {
                 .iter()
                 .map(|graph| graph.name.clone())
                 .collect();
+            // Two-phase continuations are captured graphs outside the selectable catalog.
+            let mut branch_graphs = HashSet::new();
+            for branch in &execution.branches {
+                if !names.contains(&branch.graph)
+                    || branch.taken == branch.fallback
+                    || branch.flag_buffer.is_empty()
+                    || !execution.buffers.iter().any(|b| b.name == branch.flag_buffer)
+                {
+                    return Err(invalid("invalid execution branch"));
+                }
+                for continuation in [&branch.taken, &branch.fallback] {
+                    if names.contains(continuation) || !branch_graphs.insert(continuation.clone()) {
+                        return Err(invalid("execution branch continuations must be distinct uncatalogued graphs"));
+                    }
+                }
+            }
+            if execution.branches.iter().map(|b| &b.graph).collect::<HashSet<_>>().len()
+                != execution.branches.len()
+            {
+                return Err(invalid("graph declares more than one execution branch"));
+            }
+            names.extend(branch_graphs);
             if names != resources {
                 return Err(invalid(
                     "execution catalog must describe every captured graph exactly once",
@@ -495,10 +517,16 @@ impl LoadOptions {
                 return Err(invalid("selected graph catalogs differ between ranks"));
             }
             rank_catalog = Some(catalog);
-            let selected: HashSet<_> = execution.graphs.iter().map(|g| g.name.as_str()).collect();
+            let mut selected: HashSet<_> = execution.graphs.iter().map(|g| g.name.clone()).collect();
+            // A selected two-phase graph keeps both continuations; unselected ones keep none.
+            execution.branches.retain(|branch| selected.contains(&branch.graph));
+            for branch in &execution.branches {
+                selected.insert(branch.taken.clone());
+                selected.insert(branch.fallback.clone());
+            }
             package
                 .graphs
-                .retain(|graph| selected.contains(graph.name.as_str()));
+                .retain(|graph| selected.contains(&graph.name));
             prune_kernels(package)?;
         }
         let object = config
@@ -1022,6 +1050,64 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn branched_package() -> Package {
+        let mut package = package();
+        for name in ["speculative2x3.taken", "speculative2x3.fallback"] {
+            let id = package.functions.len();
+            package.graphs.push(Graph {
+                name: name.into(), flags: 0, resource: name.into(), node_count: 1, edge_count: 0,
+                functions: vec![id],
+            });
+            package.functions.push(Function {
+                id, module: name.into(), symbol: "kernel".into(), parameter_sizes: vec![], attributes: vec![],
+            });
+            package.modules.push(Module { name: name.into(), file: format!("{name}.cubin"), globals: vec![] });
+        }
+        let execution = package.execution.as_mut().unwrap();
+        execution.buffers.push(wire::Buffer { name: "two_phase_flag".into(), nbytes: 1, ..Default::default() });
+        execution.branches.push(wire::ExecutionBranch {
+            graph: "speculative2x3".into(),
+            flag_buffer: "two_phase_flag".into(),
+            taken: "speculative2x3.taken".into(),
+            fallback: "speculative2x3.fallback".into(),
+        });
+        package
+    }
+
+    #[test]
+    fn two_phase_continuations_follow_their_selected_graph() {
+        let select = |drafts| {
+            let mut packages = vec![branched_package()];
+            let options = LoadOptions { mtp_draft_tokens: Some(drafts), adaptive_verification: Some(true), ..Default::default() };
+            options.select(&mut packages, &mut config()).unwrap();
+            packages.remove(0)
+        };
+        let kept = select(2);
+        let names: HashSet<_> = kept.graphs.iter().map(|g| g.name.as_str()).collect();
+        assert!(names.contains("speculative2x3") && names.contains("speculative2x3.taken")
+            && names.contains("speculative2x3.fallback"));
+        assert_eq!(kept.execution.as_ref().unwrap().branches.len(), 1);
+        // Without width 3 the two-phase graph and both continuations are dropped.
+        let dropped = select(1);
+        assert!(dropped.graphs.iter().all(|g| !g.name.starts_with("speculative2x3")));
+        assert!(dropped.execution.as_ref().unwrap().branches.is_empty());
+    }
+
+    #[test]
+    fn invalid_two_phase_declarations_fail_selection() {
+        let reject = |edit: &dyn Fn(&mut wire::Execution)| {
+            let mut package = branched_package();
+            edit(package.execution.as_mut().unwrap());
+            let mut packages = vec![package];
+            assert!(LoadOptions::default().select(&mut packages, &mut config()).is_err());
+        };
+        reject(&|e| e.branches[0].flag_buffer = "missing".into());
+        reject(&|e| e.branches[0].fallback = e.branches[0].taken.clone());
+        reject(&|e| e.branches[0].graph = "speculative9x9".into());
+        reject(&|e| e.branches[0].taken = "speculative2x2".into());
+        reject(&|e| { let duplicate = e.branches[0].clone(); e.branches.push(duplicate); });
     }
 
     #[test]

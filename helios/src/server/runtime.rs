@@ -882,6 +882,11 @@ impl<'a> Worker<'a> {
                 self.complete(kind, completion)?;
                 progress = true;
             }
+            if !executor.manifest().branches.is_empty() {
+                let (taken, fallback) = executor.branch_counts();
+                self.metrics.two_phase_taken.store(taken, Ordering::Relaxed);
+                self.metrics.two_phase_fallback.store(fallback, Ordering::Relaxed);
+            }
             progress |= self.publish()?;
             progress |= self.service_store()?;
             let (step, planned) = self.plan(executor.outstanding())?;

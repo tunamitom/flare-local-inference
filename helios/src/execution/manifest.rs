@@ -216,9 +216,26 @@ pub struct ExecutionManifest {
     pub input_frame_bytes: usize,
     pub buffers: Vec<BufferDescriptor>,
     pub graphs: Vec<GraphDescriptor>,
+    /// Two-phase rounds, at most one per graph index.
+    pub branches: Vec<GraphBranch>,
+}
+
+/// After graph `graph` completes, the host reads the one-byte flag at device `flag`
+/// and launches `taken` (nonzero) or `fallback` (zero) before the round's completion.
+/// Every rank computes the same flag, so all ranks take the same continuation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GraphBranch {
+    pub graph: usize,
+    pub flag: usize,
+    pub taken: usize,
+    pub fallback: usize,
 }
 
 impl ExecutionManifest {
+    pub fn branch(&self, graph: usize) -> Option<GraphBranch> {
+        self.branches.iter().copied().find(|branch| branch.graph == graph)
+    }
+
     pub fn completion_fields(&self) -> usize {
         if self.abi_version == SPECULATIVE_ABI_VERSION {
             VECTOR_RECORD_FIELDS

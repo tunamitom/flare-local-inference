@@ -1,7 +1,7 @@
 use super::{NativeResources, format::invalid, protobuf::size};
 use crate::{
     Result,
-    execution::{BufferDescriptor, ExecutionManifest, GraphDescriptor, InputBinding},
+    execution::{BufferDescriptor, ExecutionManifest, GraphBranch, GraphDescriptor, InputBinding},
 };
 
 impl NativeResources {
@@ -70,7 +70,36 @@ impl NativeResources {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
+        let executable = |name: &str| {
+            self.names
+                .iter()
+                .position(|candidate| candidate == name)
+                .map(|index| self.executables[index] as usize)
+                .ok_or_else(|| invalid("execution branch references an unknown graph"))
+        };
+        let mut branches = Vec::new();
+        for branch in &execution.branches {
+            // Selection may drop a two-phase graph; its continuations are then unused.
+            let Some(graph) = graphs.iter().position(|g| g.name == branch.graph) else {
+                continue;
+            };
+            let flag = buffers
+                .iter()
+                .find(|b| b.name == branch.flag_buffer)
+                .filter(|b| b.nbytes >= 1)
+                .ok_or_else(|| invalid("execution branch flag buffer is missing or empty"))?;
+            if branches.iter().any(|b: &GraphBranch| b.graph == graph) {
+                return Err(invalid("graph declares more than one execution branch"));
+            }
+            branches.push(GraphBranch {
+                graph,
+                flag: flag.address,
+                taken: executable(&branch.taken)?,
+                fallback: executable(&branch.fallback)?,
+            });
+        }
         let manifest = ExecutionManifest {
+            branches,
             collectives: None,
             engram: None,
             cache: self.cache.clone(),

@@ -202,6 +202,8 @@ struct Pending {
     grammar: bool,
     dispatched: Instant,
     queued: bool,
+    /// A two-phase round whose continuation awaits the host's flag read.
+    branch: Option<super::GraphBranch>,
 }
 
 struct Frame {
@@ -215,6 +217,11 @@ struct Frame {
     started: Event,
     transferred: Event,
     pending: Option<Pending>,
+    /// Two-phase rounds: the first graph's completion on the model stream, the flag's
+    /// arrival in pinned memory, and the flag byte itself.
+    phased: Event,
+    decided: Event,
+    branch_flag: PinnedHost,
 }
 
 enum Readback {
@@ -326,6 +333,9 @@ pub struct GraphExecutor {
     completed: Fence,
     poison: Option<Error>,
     shutdown: Option<Shutdown>,
+    /// Two-phase rounds that launched their taken and fallback continuations.
+    pub branches_taken: u64,
+    pub branches_fallback: u64,
     _thread_bound: PhantomData<Rc<()>>,
 }
 
@@ -385,6 +395,9 @@ impl GraphExecutor {
                 started: model.event_with_timing(true)?,
                 transferred: copy.event()?,
                 pending: None,
+                phased: model.event()?,
+                decided: copy.event()?,
+                branch_flag: model.host_buffer(64)?,
             })
         };
         let frames = [frame()?, frame()?];
@@ -407,9 +420,15 @@ impl GraphExecutor {
             next_sequence: 1,
             completed: Fence(0),
             poison: None,
+            branches_taken: 0,
+            branches_fallback: 0,
             shutdown: None,
             _thread_bound: PhantomData,
         })
+    }
+
+    pub fn branch_counts(&self) -> (u64, u64) {
+        (self.branches_taken, self.branches_fallback)
     }
 
     pub fn manifest(&self) -> &ExecutionManifest {
@@ -453,7 +472,7 @@ impl GraphExecutor {
                 .frames
                 .iter()
                 .filter_map(|frame| frame.pending)
-                .any(|pending| pending.grammar)
+                .any(|pending| pending.grammar || pending.branch.is_some())
             && (!grammar_constrained
                 || resources.frames.iter().all(|frame| frame.pending.is_none()))
     }
@@ -543,6 +562,10 @@ impl GraphExecutor {
         {
             return Ok(None);
         }
+        // A two-phase round's continuation must reach the model stream before any later graph.
+        if resources.frames.iter().any(|frame| frame.pending.is_some_and(|p| p.branch.is_some())) {
+            return Ok(None);
+        }
         let Some(index) = resources
             .frames
             .iter()
@@ -587,8 +610,12 @@ impl GraphExecutor {
             grammar: grammar_constrained,
             dispatched,
             queued,
+            branch: None,
         });
         self.next_sequence += 1;
+        let branch = self.manifest.branch(graph_index);
+        frame.pending.as_mut().unwrap().branch = branch;
+        let manifest = &self.manifest;
         let mut operation = || -> Result<()> {
             // Validated destinations are disjoint, so copies within a batch do
             // not depend on each other. Omitted input ranges remain untouched.
@@ -606,46 +633,17 @@ impl GraphExecutor {
                 }
             }
             resources.model.launch(graph.handle)?;
-            resources.model.record(&frame.produced)?;
-            resources.copy.wait(&frame.produced)?;
-            let address = self.manifest.buffer("completion_records")?.address
-                + index * self.manifest.completion_bytes();
-            // SAFETY: The manifest bounds both completion rows; index selects one
-            // row in that retained allocation. The copy stream waits for the model
-            // event, and the pinned output is not read or reused before transferred
-            // completes. Shutdown drains both streams before releasing either owner.
-            unsafe {
-                resources.copy.download(
-                    &frame.output,
-                    address,
-                    self.manifest.completion_bytes(),
-                )?;
-                if logprobs != 0 {
-                    let b = self.manifest.buffer("completion_logprobs")?;
-                    frame.logprobs.as_ref().unwrap().enqueue_copy(
-                        &resources.copy, b.address + index * b.nbytes / 2, b.nbytes / 2,
-                    )?;
-                }
-                if prompt_rows != 0 {
-                    let b = self.manifest.buffer("prompt_logprobs")?;
-                    frame.prompt_logprobs.as_ref().unwrap().enqueue_copy(&resources.copy,
-                        b.address + index * b.nbytes / 2, prompt_rows * super::PROMPT_FIELDS * 4)?;
-                }
-                if graph.kind == GraphKind::Proposal {
-                    let confidence = self.manifest.buffer("proposal_confidence")?;
-                    frame.confidence.as_ref().unwrap().enqueue_copy(
-                        &resources.copy, confidence.address, confidence.nbytes,
-                    )?;
-                }
-                if crate::engram::consumes(graph.kind) {
-                    if let Some(readback) = &frame.readiness {
-                        let buffer = self.manifest.buffer("readiness_timestamps")?;
-                        readback.enqueue_copy(&resources.copy, buffer.address + index * buffer.nbytes / 2,
-                                              buffer.nbytes / 2)?;
-                    }
-                }
+            if let Some(branch) = branch {
+                // The host chooses the continuation once the flag reaches pinned memory.
+                resources.model.record(&frame.phased)?;
+                resources.copy.wait(&frame.phased)?;
+                // SAFETY: The manifest bounds the one-byte flag in a retained buffer;
+                // the pinned destination is read only after `decided` completes.
+                unsafe { resources.copy.download(&frame.branch_flag, branch.flag, 1)? };
+                return resources.copy.record(&frame.decided);
             }
-            resources.copy.record(&frame.transferred)
+            enqueue_completion(manifest, &resources.model, &resources.copy, frame, index, graph.kind,
+                               logprobs, prompt_rows)
         };
         if let Err(error) = operation() {
             self.poison = Some(error.clone());
@@ -666,6 +664,38 @@ impl GraphExecutor {
             .resources
             .as_mut()
             .ok_or_else(|| Error::execution(ExecutionError::Closed, "executor is closed"))?;
+        for (index, frame) in resources.frames.iter_mut().enumerate() {
+            let Some(branch) = frame.pending.and_then(|p| p.branch) else {
+                continue;
+            };
+            let decided = match frame.decided.completed() {
+                Ok(decided) => decided,
+                Err(error) => {
+                    self.poison = Some(error.clone());
+                    return Err(error);
+                }
+            };
+            if !decided {
+                return Ok(None);
+            }
+            let taken = frame.branch_flag.bytes()[0] != 0;
+            let pending = frame.pending.as_mut().unwrap();
+            pending.branch = None;
+            let (kind, logprobs, prompt_rows) = (
+                self.manifest.graphs[pending.graph_index].kind, pending.logprobs, pending.prompt_rows);
+            let continuation = if taken { branch.taken } else { branch.fallback };
+            let launched = resources.model.launch(continuation).and_then(|()| enqueue_completion(
+                &self.manifest, &resources.model, &resources.copy, frame, index, kind, logprobs, prompt_rows));
+            if let Err(error) = launched {
+                self.poison = Some(error.clone());
+                return Err(error);
+            }
+            if taken {
+                self.branches_taken += 1;
+            } else {
+                self.branches_fallback += 1;
+            }
+        }
         let frame = resources
             .frames
             .iter_mut()
@@ -1166,6 +1196,50 @@ pub(super) fn decode_prompt_logprobs(bytes: &[u8], rows: usize) -> Result<Vec<Op
         }
         Ok(Some(PromptLogprobs { value, rank: int(2) as u32 }))
     }).collect()
+}
+
+/// Records the produced event and queues the completion and sidecar downloads of one frame.
+#[allow(clippy::too_many_arguments)]
+fn enqueue_completion(
+    manifest: &ExecutionManifest,
+    model: &Stream,
+    copy: &Stream,
+    frame: &Frame,
+    index: usize,
+    kind: GraphKind,
+    logprobs: u64,
+    prompt_rows: usize,
+) -> Result<()> {
+    model.record(&frame.produced)?;
+    copy.wait(&frame.produced)?;
+    let address = manifest.buffer("completion_records")?.address + index * manifest.completion_bytes();
+    // SAFETY: The manifest bounds both completion rows; index selects one
+    // row in that retained allocation. The copy stream waits for the model
+    // event, and the pinned output is not read or reused before transferred
+    // completes. Shutdown drains both streams before releasing either owner.
+    unsafe {
+        copy.download(&frame.output, address, manifest.completion_bytes())?;
+        if logprobs != 0 {
+            let b = manifest.buffer("completion_logprobs")?;
+            frame.logprobs.as_ref().unwrap().enqueue_copy(copy, b.address + index * b.nbytes / 2, b.nbytes / 2)?;
+        }
+        if prompt_rows != 0 {
+            let b = manifest.buffer("prompt_logprobs")?;
+            frame.prompt_logprobs.as_ref().unwrap().enqueue_copy(copy,
+                b.address + index * b.nbytes / 2, prompt_rows * super::PROMPT_FIELDS * 4)?;
+        }
+        if kind == GraphKind::Proposal {
+            let confidence = manifest.buffer("proposal_confidence")?;
+            frame.confidence.as_ref().unwrap().enqueue_copy(copy, confidence.address, confidence.nbytes)?;
+        }
+        if crate::engram::consumes(kind) {
+            if let Some(readback) = &frame.readiness {
+                let buffer = manifest.buffer("readiness_timestamps")?;
+                readback.enqueue_copy(copy, buffer.address + index * buffer.nbytes / 2, buffer.nbytes / 2)?;
+            }
+        }
+    }
+    copy.record(&frame.transferred)
 }
 
 #[cfg(test)]
