@@ -241,6 +241,8 @@ enum ValueSource {
   IMAGE_TENSOR = 37;
   IMAGE_FEATURE_SLOT = 38;
   PROMPT_TARGET_TOKEN = 39;
+  // Estimated round milliseconds of each verification width 1..=8 at the row's context.
+  WIDTH_COSTS = 40;
 }
 enum InputIndexing {
   INDEXING_UNSPECIFIED = 0;
@@ -652,6 +654,15 @@ message Execution {
   // flag_buffer and launches taken (nonzero) or fallback (zero). The continuations are captured
   // graphs outside the selectable catalog. Absent in packages without two-phase rounds.
   repeated ExecutionBranch branches = 6;
+  // Device-selected widths: the named graph is a prefix that writes a verification width into
+  // selector_buffer (int32, 1-based); the runtime composes prefix, a conditional SWITCH over the
+  // bodies (ordered by width 1..=N, captured as continuations), into one executable graph.
+  repeated ExecutionSwitch switches = 7;
+}
+message ExecutionSwitch {
+  string graph = 1;
+  string selector_buffer = 2;
+  repeated string bodies = 3;
 }
 message ExecutionBranch {
   string graph = 1;

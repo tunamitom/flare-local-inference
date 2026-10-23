@@ -28,6 +28,10 @@ class GraphSignature:
     # A two-phase round: (flag buffer, taken graph, fallback graph). After this graph completes the
     # host reads the one-byte flag and launches one of the two continuation graphs.
     branch: tuple[str, str, str] | None = None
+    # A device-selected width: (selector buffer, bodies ordered by width 1..=N). This graph writes a
+    # 1-based width into the int32 selector; the runtime composes it with a conditional SWITCH over
+    # the continuation bodies into one executable graph.
+    switch: tuple[str, tuple[str, ...]] | None = None
 
     def __post_init__(self):
         if self.kind not in ("init", "restore", "snapshot", "prefill", "scored_prefill", "decode", "resume",
@@ -37,6 +41,11 @@ class GraphSignature:
                 or any(type(name) is not str or not name for name in self.branch)
                 or self.branch[1] == self.branch[2]):
             raise ValueError("only speculative graphs branch, to two distinct named continuations")
+        if self.switch is not None and (self.kind != "speculative" or self.branch is not None
+                or len(self.switch) != 2 or type(self.switch[0]) is not str or not self.switch[0]
+                or not self.switch[1] or len(set(self.switch[1])) != len(self.switch[1])
+                or any(type(name) is not str or not name for name in self.switch[1])):
+            raise ValueError("only unbranched speculative graphs switch, over distinct named continuations")
         if self.kind == "continuation" and self.inputs:
             raise ValueError("continuations read the inputs their first phase uploaded")
         if self.kind == "scored_prefill" and (self.batch_capacity != 1
@@ -123,10 +132,15 @@ class PreparedExecution(PreparedGraphBundle):
                 raise ValueError("graph signature references an unregistered input buffer")
         continuations = [name for name, s in signatures.items() if s.kind == "continuation"]
         branched = [s.branch for s in signatures.values() if s.branch is not None]
-        targets = [name for branch in branched for name in branch[1:]]
+        switched = [s.switch for s in signatures.values() if s.switch is not None]
+        targets = [name for branch in branched for name in branch[1:]] + [
+            name for switch in switched for name in switch[1]]
         if sorted(targets) != sorted(continuations) or any(
                 branch[0] not in self.buffers or self.buffers[branch[0]].numel() < 1 for branch in branched):
             raise ValueError("every continuation belongs to exactly one branch over a registered flag buffer")
+        if any(switch[0] not in self.buffers or str(self.buffers[switch[0]].dtype) != "torch.int32"
+               or self.buffers[switch[0]].numel() < 1 for switch in switched):
+            raise ValueError("every switch selects through a registered int32 selector buffer")
         from ignition.components.completion import validate_completion_buffers
         validate_completion_buffers(self.buffers, request_capacity(max_active))
         self.signatures = MappingProxyType(dict(signatures))
@@ -160,6 +174,7 @@ class PreparedExecution(PreparedGraphBundle):
                 cursor += nbytes
         graphs = []
         branches = []
+        switches = []
         speculative = any(signature.kind in ("speculative", "proposal", "verification") for signature in self.signatures.values())
         for (name, _), handle in zip(self.graphs.items(), handles, strict=True):
             signature = self.signatures[name]
@@ -170,6 +185,9 @@ class PreparedExecution(PreparedGraphBundle):
             if signature.branch is not None:
                 flag, taken, fallback = signature.branch
                 branches.append({"graph": name, "flag_buffer": flag, "taken": taken, "fallback": fallback})
+            if signature.switch is not None:
+                switches.append({"graph": name, "selector_buffer": signature.switch[0],
+                                 "bodies": list(signature.switch[1])})
             inputs = (*reserved, *signature.inputs)
             graphs.append({"name": name, "kind": signature.kind, "handle": handle,
                 "sampling_mode": signature.sampling_mode,
@@ -190,6 +208,8 @@ class PreparedExecution(PreparedGraphBundle):
                     "buffers": descriptors, "graphs": graphs}
         if branches:
             manifest["branches"] = branches
+        if switches:
+            manifest["switches"] = switches
         return manifest
 
     def start_executor(self, *, peers=None):

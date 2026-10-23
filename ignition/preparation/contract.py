@@ -39,6 +39,8 @@ def text_inputs(kind):
         values += [b("token_ids", p.PENDING_TOKEN)]
     if kind == "mixed":
         values += [b("prefill_row", p.PREFILL_ROW, p.SCALAR)]
+    if kind == "speculative":
+        values.append(b("speculative_width_costs", p.WIDTH_COSTS))
     if kind in ("speculative", "mixed"):
         for name, source in (("copy_token_ids", p.COPY_TOKEN_IDS), ("copy_token_count", p.COPY_TOKEN_COUNT),
                              ("copy_expected_consumed", p.COPY_CONSUMED_TOKENS), ("copy_generation", p.COPY_GENERATION),
