@@ -16,6 +16,23 @@ pub(super) fn observed_duration_ns(timing: ExecutionTiming) -> Option<u64> {
         .map(|ns| if timing.queued { ns } else { ns.max(timing.wall_ns) })
 }
 
+/// Context buckets for decode and joined speculative costs: a round's attention and KV traffic
+/// grow with the batch's longest context, so a width measured at 8k is not its cost at 128k.
+const CONTEXT_BUCKETS: usize = 4;
+
+pub(super) fn context_bucket(position: u64) -> usize {
+    match position {
+        ..=8192 => 0,
+        ..=32768 => 1,
+        ..=131072 => 2,
+        _ => 3,
+    }
+}
+
+fn context_aware(kind: GraphKind) -> bool {
+    matches!(kind, GraphKind::Decode | GraphKind::Speculative)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Key {
     pub kind: GraphKind,
@@ -46,6 +63,31 @@ struct Estimate {
     handoff_ns: u64,
     observed_at_ns: u64,
     last_attempt_ns: u64,
+    /// Per-context replay medians; zero is unmeasured. The context-blind median above keeps
+    /// driving freshness and refresh.
+    contexts: [ContextCost; CONTEXT_BUCKETS],
+}
+
+#[derive(Default)]
+struct ContextCost {
+    nanos: u64,
+    replays: ReplayTimes,
+    observed_at_ns: u64,
+}
+
+impl Estimate {
+    /// The cost at `context`: its own bucket, else the nearest freshly measured bucket, else
+    /// the context-blind median.
+    fn nanos_at(&self, kind: GraphKind, context: usize, now_ns: u64, ttl_ns: u64) -> u64 {
+        if self.nanos == 0 || !context_aware(kind) {
+            return self.nanos;
+        }
+        (0..CONTEXT_BUCKETS)
+            .filter(|&bucket| self.contexts[bucket].nanos != 0
+                && now_ns.saturating_sub(self.contexts[bucket].observed_at_ns) < ttl_ns)
+            .min_by_key(|&bucket| (bucket.abs_diff(context), std::cmp::Reverse(bucket)))
+            .map_or(self.nanos, |bucket| self.contexts[bucket].nanos)
+    }
 }
 
 #[derive(Default)]
@@ -85,6 +127,7 @@ pub(super) struct ActionCosts {
     entries: Vec<(Key, Estimate)>,
     now_ns: u64,
     ttl_ns: u64,
+    context: usize,
 }
 
 impl ActionCosts {
@@ -102,6 +145,23 @@ impl ActionCosts {
         estimate.replays.observe(nanos, false);
         estimate.handoff_ns = 0;
         estimate.observed_at_ns = self.now_ns;
+        estimate.contexts = Default::default();
+    }
+
+    #[cfg(test)]
+    pub fn set_measured_at(&mut self, step: &ScheduledStep, bucket: usize, nanos: u64) {
+        let key = Key::from_step(step);
+        let now = self.now_ns;
+        let estimate = &mut self.entries.iter_mut().find(|(k, _)| *k == key).unwrap().1;
+        if estimate.nanos == 0 {
+            estimate.nanos = nanos;
+            estimate.replays.observe(nanos, false);
+            estimate.observed_at_ns = now;
+        }
+        let cost = &mut estimate.contexts[bucket];
+        cost.nanos = nanos;
+        cost.replays.observe(nanos, false);
+        cost.observed_at_ns = now;
     }
 
     pub fn prepared(graphs: &[GraphDescriptor]) -> Result<Self> {
@@ -125,6 +185,7 @@ impl ActionCosts {
                     handoff_ns: 0,
                     observed_at_ns: 0,
                     last_attempt_ns: 0,
+                    contexts: Default::default(),
                 },
             ));
         }
@@ -132,7 +193,13 @@ impl ActionCosts {
             entries,
             now_ns: 0,
             ttl_ns: super::PolicyConfig::default().estimate_ttl_ns,
+            context: 0,
         })
+    }
+
+    /// Estimates for decode and joined speculation answer for this context bucket.
+    pub fn set_context(&mut self, bucket: usize) {
+        self.context = bucket.min(CONTEXT_BUCKETS - 1);
     }
 
     pub fn advance_to(&mut self, now_ns: u64, ttl_ns: u64) {
@@ -172,11 +239,11 @@ impl ActionCosts {
             prefill,
             packed,
         })
-        .map(|estimate| estimate.nanos.saturating_add(estimate.handoff_ns))
+        .map(|estimate| estimate.nanos_at(kind, self.context, self.now_ns, self.ttl_ns).saturating_add(estimate.handoff_ns))
     }
 
     pub fn duration_key(&self, key: Key) -> Option<u64> {
-        self.entry(key).map(|estimate| estimate.nanos.saturating_add(estimate.handoff_ns))
+        self.entry(key).map(|estimate| estimate.nanos_at(key.kind, self.context, self.now_ns, self.ttl_ns).saturating_add(estimate.handoff_ns))
     }
 
     pub fn is_fresh(&self, key: Key) -> bool {
@@ -199,7 +266,7 @@ impl ActionCosts {
     }
 
     pub fn observation(&self, key: Key) -> Option<(u64, Option<u64>, bool)> {
-        self.entry(key).map(|estimate| (estimate.nanos.saturating_add(estimate.handoff_ns),
+        self.entry(key).map(|estimate| (estimate.nanos_at(key.kind, self.context, self.now_ns, self.ttl_ns).saturating_add(estimate.handoff_ns),
             (estimate.nanos != 0).then_some(estimate.observed_at_ns),
             estimate.fresh(self.now_ns, self.ttl_ns)))
     }
@@ -248,6 +315,13 @@ impl ActionCosts {
             }
             estimate.nanos = estimate.replays.observe(sample, fresh);
             estimate.observed_at_ns = self.now_ns;
+            if context_aware(step.kind) {
+                let position = step.lanes.iter().map(|lane| lane.start_position).max().unwrap_or(0);
+                let bucket = &mut estimate.contexts[context_bucket(position)];
+                let fresh = bucket.nanos != 0 && self.now_ns.saturating_sub(bucket.observed_at_ns) < self.ttl_ns;
+                bucket.nanos = bucket.replays.observe(sample, fresh);
+                bucket.observed_at_ns = self.now_ns;
+            }
         }
     }
 }

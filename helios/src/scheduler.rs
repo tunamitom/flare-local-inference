@@ -907,6 +907,18 @@ impl RequestScheduler {
         timing: crate::execution::ExecutionTiming,
     ) {
         self.costs.observe(step, timing);
+        self.refresh_cost_context();
+    }
+
+    /// Decode and speculative costs are read at the longest live decode context.
+    fn refresh_cost_context(&mut self) {
+        let position = self.slots.iter()
+            .filter_map(|slot| slot.request.as_ref())
+            .filter(|request| request.phase == RequestPhase::Decode)
+            .map(|request| request.consumed_tokens)
+            .max()
+            .unwrap_or(0);
+        self.costs.set_context(cost::context_bucket(position));
     }
 
     pub fn submitted_timing(&self, fence: Fence) -> Result<SubmittedTiming> {

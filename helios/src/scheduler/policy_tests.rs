@@ -2653,3 +2653,37 @@ fn verified_rounds_feed_the_acceptance_population() {
     s.acceptance_population.observe(1, 1, false, 0);
     assert!(s.acceptance_population.expected_tokens(ProposalSource::Mtp, 2) > 1.5);
 }
+
+#[test]
+fn speculative_costs_are_read_at_the_live_context() {
+    use crate::scheduler::cost::context_bucket;
+    let mut s = interactive_engine(1, true);
+    let step = |width| ScheduledStep {
+        kind: GraphKind::Speculative,
+        batch_capacity: 1,
+        token_capacity: width,
+        packed_token_capacity: 0,
+        mixed: None,
+        lanes: vec![],
+        requires_feedback: false,
+    };
+    // Width eight is cheap at short context but its attention grows faster at long context.
+    s.costs.set_measured_at(&step(3), context_bucket(4096), 10 * MS);
+    s.costs.set_measured_at(&step(3), context_bucket(100_000), 11 * MS);
+    s.costs.set_measured_at(&step(8), context_bucket(4096), 12 * MS);
+    s.costs.set_measured_at(&step(8), context_bucket(100_000), 20 * MS);
+    let (three, eight) = (2.2, 3.0);
+    let rate = |s: &RequestScheduler, width: usize, tokens: f64| {
+        tokens / s.costs.duration(GraphKind::Speculative, 1, width).unwrap() as f64
+    };
+    s.costs.set_context(context_bucket(4096));
+    assert!(rate(&s, 8, eight) > rate(&s, 3, three));
+    s.costs.set_context(context_bucket(100_000));
+    assert_eq!(s.costs.duration(GraphKind::Speculative, 1, 8), Some(20 * MS));
+    assert!(rate(&s, 8, eight) < rate(&s, 3, three));
+    // An unmeasured bucket borrows its nearest measured neighbour, preferring the longer one.
+    s.costs.set_context(context_bucket(20_000));
+    assert_eq!(s.costs.duration(GraphKind::Speculative, 1, 8), Some(20 * MS));
+    s.costs.set_context(context_bucket(500_000));
+    assert_eq!(s.costs.duration(GraphKind::Speculative, 1, 8), Some(20 * MS));
+}
