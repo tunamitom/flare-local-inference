@@ -52,8 +52,9 @@ use driver::{
     NODE_TYPE_CONDITIONAL, NodeParams, TensorMap,
 };
 
-/// Selects a conditional SWITCH body from a device-written 1-based width (native/select_conditional.cu).
-const SELECT_CONDITIONAL_PTX: &str = include_str!("../../native/select_conditional.ptx");
+/// Selects a conditional SWITCH body from a device-written 1-based width (native/select_conditional.cu,
+/// SASS for sm_80+ families plus compute_80 PTX); serving images disable PTX JIT, so SASS is required.
+const SELECT_CONDITIONAL_FATBIN: &[u8] = include_bytes!("../../native/select_conditional.fatbin");
 use format::{Blob, Memory, Node, Package, Reference, Relocation, RelocationKind, invalid};
 
 struct Storage {
@@ -941,10 +942,16 @@ impl NativeResources {
         }
     }
 
-    /// The SWITCH selector kernel, JIT-compiled from PTX once per context.
+    /// The SWITCH selector kernel, loaded once per context.
     unsafe fn select_conditional_function(&mut self) -> Result<Handle> {
         let driver = self.driver.clone();
-        let image = CString::new(SELECT_CONDITIONAL_PTX).map_err(|_| invalid("selector PTX contains NUL"))?;
+        // cuModuleLoadData reads the fat binary in place; give it 8-byte alignment.
+        let mut image = vec![0u64; SELECT_CONDITIONAL_FATBIN.len().div_ceil(8)];
+        // SAFETY: the destination holds at least as many bytes as the source.
+        unsafe {
+            std::ptr::copy_nonoverlapping(SELECT_CONDITIONAL_FATBIN.as_ptr(), image.as_mut_ptr().cast::<u8>(),
+                SELECT_CONDITIONAL_FATBIN.len());
+        }
         let symbol = c"flare_select_conditional";
         unsafe {
             let mut module = null_mut();
