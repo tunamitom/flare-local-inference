@@ -177,6 +177,7 @@ impl RequestScheduler {
         }
         self.now_ns = now_ns;
         self.costs.advance_to(now_ns, self.policy.estimate_ttl_ns);
+        self.refresh_cost_context();
         Ok(())
     }
 
