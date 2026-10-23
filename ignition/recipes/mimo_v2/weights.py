@@ -57,7 +57,9 @@ class ModelWeights:
             draft = DraftWeights.load(manifest.snapshot / "dflash", config.draft, device, shard, progress=progress,
                 weight_format=DraftWeights.serving_format(draft_weight_format, config.draft, draft_requests))
             if draft_weight_format == "w8a16" and isinstance(draft.projection, torch.Tensor):
-                draft_w8a16 = draft.block_fp8()
+                draft_w8a16 = draft.block_fp8(head)
+            elif draft_weight_format == "w8a16":
+                draft = draft.with_head(head)
         from .vision_weights import VisionWeights
 
         vision = VisionWeights.load(manifest, config.text, device, shard, progress=progress)
