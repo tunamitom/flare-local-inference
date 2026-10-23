@@ -373,6 +373,7 @@ pub fn manifest(config: &ModelConfig) -> ExecutionManifest {
         .collect();
     ExecutionManifest {
         branches: Vec::new(),
+        switched: Vec::new(),
         abi_version: 3,
         context: 1,
         device: 0,

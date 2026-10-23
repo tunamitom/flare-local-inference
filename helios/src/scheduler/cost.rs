@@ -18,7 +18,7 @@ pub(super) fn observed_duration_ns(timing: ExecutionTiming) -> Option<u64> {
 
 /// Context buckets for decode and joined speculative costs: a round's attention and KV traffic
 /// grow with the batch's longest context, so a width measured at 8k is not its cost at 128k.
-const CONTEXT_BUCKETS: usize = 4;
+pub(super) const CONTEXT_BUCKETS: usize = 4;
 
 pub(super) fn context_bucket(position: u64) -> usize {
     match position {

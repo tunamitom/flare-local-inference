@@ -1,0 +1,53 @@
+// Generated from select_conditional.cu by nvcc 13.1: nvcc -arch=compute_80 -ptx
+
+.version 9.1
+.target sm_80
+.address_size 64
+
+	// .globl	flare_select_conditional
+.extern .func cudaGraphSetConditional
+(
+	.param .b64 cudaGraphSetConditional_param_0,
+	.param .b32 cudaGraphSetConditional_param_1
+)
+;
+
+.visible .entry flare_select_conditional(
+	.param .u64 flare_select_conditional_param_0,
+	.param .u64 flare_select_conditional_param_1,
+	.param .u32 flare_select_conditional_param_2
+)
+{
+	.reg .pred 	%p<3>;
+	.reg .b32 	%r<7>;
+	.reg .b64 	%rd<4>;
+
+
+	ld.param.u64 	%rd1, [flare_select_conditional_param_0];
+	ld.param.u64 	%rd2, [flare_select_conditional_param_1];
+	ld.param.u32 	%r1, [flare_select_conditional_param_2];
+	cvta.to.global.u64 	%rd3, %rd2;
+	ld.global.u32 	%r2, [%rd3];
+	setp.lt.s32 	%p1, %r2, 1;
+	add.s32 	%r3, %r2, -1;
+	selp.b32 	%r4, 0, %r3, %p1;
+	setp.lt.u32 	%p2, %r4, %r1;
+	add.s32 	%r5, %r1, -1;
+	selp.b32 	%r6, %r4, %r5, %p2;
+	{ // callseq 0, 0
+	.reg .b32 temp_param_reg;
+	.param .b64 param0;
+	st.param.b64 	[param0+0], %rd1;
+	.param .b32 param1;
+	st.param.b32 	[param1+0], %r6;
+	call.uni 
+	cudaGraphSetConditional, 
+	(
+	param0, 
+	param1
+	);
+	} // callseq 0
+	ret;
+
+}
+

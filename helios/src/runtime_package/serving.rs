@@ -98,8 +98,15 @@ impl NativeResources {
                 fallback: executable(&branch.fallback)?,
             });
         }
+        // A switched prefix's executable is the composed conditional graph.
+        let switched = execution
+            .switches
+            .iter()
+            .filter_map(|switch| graphs.iter().position(|g| g.name == switch.graph))
+            .collect();
         let manifest = ExecutionManifest {
             branches,
+            switched,
             collectives: None,
             engram: None,
             cache: self.cache.clone(),

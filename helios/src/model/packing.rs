@@ -109,6 +109,7 @@ impl Inputs {
                             | ImageLeftContext
                             | ImageRightContext => binding.indexing == PackedToken,
                             PendingToken => matches!(binding.indexing, SubmissionRow | PackedToken),
+                            WidthCosts => binding.indexing == SubmissionRow && graph.kind == GraphKind::Speculative,
                             Constant => binding.indexing != PackedToken,
                             RequestSlot | RequestGeneration if graph.kind == GraphKind::Vision => {
                                 binding.indexing == Scalar
@@ -125,7 +126,7 @@ impl Inputs {
                         {
                             return Err("row input cannot cover the prepared request slots".into());
                         }
-                        if matches!(binding.source, SamplingParameters | ImageTensor | PageTable)
+                        if matches!(binding.source, SamplingParameters | WidthCosts | ImageTensor | PageTable)
                             && binding.value_offset != 0
                         {
                             return Err("value offset requires an integer value source".into());
@@ -154,6 +155,7 @@ impl Inputs {
                         }
                         let expected_width = match binding.source {
                             ValueSource::SamplingParameters => 6,
+                            ValueSource::WidthCosts => crate::scheduler::DEVICE_WIDTHS,
                             ValueSource::EosTokenIds | ValueSource::LiveStateRows => 8,
                             ValueSource::PromptHistogram => config.contract.vocabulary,
                             ValueSource::GrammarMask => config.contract.vocabulary.div_ceil(32),
@@ -177,9 +179,9 @@ impl Inputs {
                                     | ValueSource::RequestGeneration
                                     | ValueSource::CopyGeneration
                             ) && buffer.dtype != Dtype::Int64)
-                            || (binding.source == ValueSource::SamplingParameters
+                            || (matches!(binding.source, ValueSource::SamplingParameters | ValueSource::WidthCosts)
                                 && buffer.dtype != Dtype::Float32)
-                            || (binding.source != ValueSource::SamplingParameters
+                            || (!matches!(binding.source, ValueSource::SamplingParameters | ValueSource::WidthCosts)
                                 && binding.source != ValueSource::ImageTensor
                                 && !matches!(buffer.dtype, Dtype::Int32 | Dtype::Int64))
                             || (binding.indexing != InputIndexing::Scalar
@@ -408,6 +410,14 @@ impl Inputs {
                     InputIndexing::Scalar => unreachable!(),
                 };
                 token_offset += lane.tokens;
+                if binding.source == ValueSource::WidthCosts {
+                    self.staging.put(
+                        &binding.buffer,
+                        destination * 4,
+                        frame.scheduler.width_costs(lane).into_iter().flat_map(f32::to_le_bytes),
+                    );
+                    continue;
+                }
                 if binding.source == ValueSource::SamplingParameters {
                     self.staging.put(
                         &binding.buffer,

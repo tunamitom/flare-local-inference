@@ -499,7 +499,8 @@ impl RequestScheduler {
                     for &width in &self.speculative_catalog[batch.ilog2() as usize] {
                         if let Some(ns) = self.speculative_duration(r, batch, width)
                         {
-                            let expected = self.expected_speculative_tokens(r, self.speculative_tokens(r, width));
+                            let expected = self.round_tokens(r, GraphKind::Speculative, batch, width,
+                                self.speculative_tokens(r, width));
                             consider(ns, value.decode(expected, ns as f64 / 1e6));
                         }
                     }
@@ -713,7 +714,7 @@ impl RequestScheduler {
                 }
                 let offer = (
                     slot,
-                    self.lane_value(request, role, extent, horizon, values[slot]),
+                    self.lane_value(request, role, batch, extent, horizon, values[slot]),
                 );
                 if mixed && role == GraphKind::Prefill {
                     let best = &mut prompts[usize::from(promoted)];
@@ -820,6 +821,7 @@ impl RequestScheduler {
         &self,
         r: &LiveRequest,
         kind: GraphKind,
+        batch: usize,
         capacity: usize,
         duration_ns: u64,
         value: LaneValue,
@@ -834,7 +836,7 @@ impl RequestScheduler {
             | GraphKind::Speculative
             | GraphKind::Proposal
             | GraphKind::Verification => value.decode(
-                self.expected_speculative_tokens(r, tokens),
+                self.round_tokens(r, kind, batch, capacity, tokens),
                 duration_ns as f64 / 1e6,
             ),
             GraphKind::Resume => value.decode(1.0, duration_ns as f64 / 1e6),
@@ -882,7 +884,7 @@ impl RequestScheduler {
             }
             offers[count] = (
                 slot,
-                self.lane_value(r, kind, capacity, duration_ns, values[slot]),
+                self.lane_value(r, kind, batch, capacity, duration_ns, values[slot]),
             );
             count += 1;
         }
@@ -1050,6 +1052,7 @@ impl RequestScheduler {
                         let value = self.lane_value(
                             r,
                             GraphKind::Prefill,
+                            batch,
                             prefill,
                             duration_ns,
                             values[slot],
@@ -1061,7 +1064,7 @@ impl RequestScheduler {
                     Some(kind) if kind == decode => {
                         decoders[count] = (
                             slot,
-                            self.lane_value(r, decode, width, duration_ns, values[slot]),
+                            self.lane_value(r, decode, batch, width, duration_ns, values[slot]),
                         );
                         count += 1;
                     }
