@@ -475,7 +475,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                 from ignition.components.split_draft import (
                     PreparedDraftProposal, PreparedDraftVerification, PreparedProposalStorage)
                 from ignition.components.width_selection import (
-                    PreparedSelectedVerification, PreparedSelectionPrefix, PreparedWidthSelection)
+                    PreparedSelectedVerification, PreparedSelectionPrefix, PreparedWidthCalibration,
+                    PreparedWidthSelection)
 
                 widths = config.draft_tokens + 1
                 switch_storage = PreparedProposalStorage(speculation, config.draft_tokens)
@@ -484,8 +485,10 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                                                 dtype=torch.float32, device=device)
                 switch_costs = torch.zeros((config.request_capacity, widths), dtype=torch.float32, device=device)
                 switch_selected = torch.ones(1, dtype=torch.int32, device=device)
+                switch_sums = torch.zeros((config.draft_tokens, 2), dtype=torch.float32, device=device)
                 buffers.update(proposal_confidence=switch_confidence, speculative_width_costs=switch_costs,
-                               switch_selected_width=switch_selected)
+                               switch_selected_width=switch_selected, switch_calibration=switch_sums)
+                calibration = PreparedWidthCalibration(switch_sums, switch_confidence, config.draft_tokens)
                 prefix_name = f"selection1x{widths}"
                 source = PreparedParallelDraftRound(speculation, 1, widths, f"{prefix_name}.proposal",
                     buffers=speculation.sampling_buffers.cursor(), proposal_only=True)
@@ -495,10 +498,10 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                     target = PreparedParallelDraftRound(speculation, 1, width, body, generate_proposals=False,
                         buffers=speculation.sampling_buffers.cursor())
                     target.prepare()
-                    add(body, PreparedSelectedVerification(PreparedDraftVerification(switch_storage, target)),
-                        "continuation", 1, width, ())
+                    add(body, PreparedSelectedVerification(PreparedDraftVerification(switch_storage, target),
+                            calibration, target.operations[3]), "continuation", 1, width, ())
                 selection = PreparedWidthSelection(switch_confidence, switch_costs,
-                    inputs.query_lengths, switch_selected, widths)
+                    inputs.query_lengths, switch_selected, widths, calibration)
                 add(prefix_name, PreparedSelectionPrefix(
                         PreparedDraftProposal(source, switch_confidence, switch_storage), selection),
                     "speculative", 1, widths, (*forward_inputs, "speculative_width_costs"), enabled=True,
