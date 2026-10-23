@@ -101,6 +101,8 @@ _TUNED = {
     (4096, 6144): ((16, W8A16Config(128, 3, 8, 3)), (32, W8A16Config(64, 4, 2, 3))),
     (768, 30720): ((16, W8A16Config(32, 30, 4, 2)), (32, W8A16Config(64, 12, 8, 4))),
     (1280, 6144): ((16, W8A16Config(32, 12, 4, 4)), (32, W8A16Config(64, 6, 8, 4))),
+    # The draft head's vocabulary shard; rows 17-32 reuse the 16-row config.
+    (19072, 6144): ((8, W8A16Config(128, 3, 4, 2)), (32, W8A16Config(64, 1, 4, 4))),
 }
 
 
