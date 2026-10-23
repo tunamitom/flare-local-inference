@@ -11,6 +11,10 @@ pub(super) struct SplitSpeculation {
     // between the conditional probabilities in each observed draft block.
     forecast: [Option<Forecast>; REQUEST_LANES],
     population: [f32; 7],
+    // Drafter confidences are not calibrated against the target, and every split width decision
+    // reads them; each depth rescales them by the realized acceptance of verified proposals.
+    calibration: [Calibration; 7],
+    verifying: [Option<(RequestHandle, [f32; 7])>; REQUEST_LANES],
     pub(super) pending_budget: Option<(Fence, usize)>,
 }
 
@@ -39,6 +43,49 @@ pub(super) struct RetainedProposal {
     pub width: usize,
     limit: usize,
     confidence: [f32; 7],
+    raw_survival: [f32; 7],
+}
+
+/// Decayed sums of the drafter's predicted prefix survival and the realized acceptance at one depth.
+#[derive(Clone, Copy)]
+struct Calibration {
+    predicted: f64,
+    realized: f64,
+}
+
+const CALIBRATION_DECAY: f64 = 1.0 / 1024.0;
+// Equal starting sums hold the ratio near one through the first hundred or so verifications and
+// decay with every observation, so the steady-state ratio is unbiased.
+const CALIBRATION_PRIOR: f64 = 64.0;
+
+impl Default for Calibration {
+    fn default() -> Self {
+        Self { predicted: CALIBRATION_PRIOR, realized: CALIBRATION_PRIOR }
+    }
+}
+
+impl Calibration {
+    fn observe(&mut self, predicted: f64, realized: f64) {
+        self.predicted = self.predicted * (1.0 - CALIBRATION_DECAY) + predicted;
+        self.realized = self.realized * (1.0 - CALIBRATION_DECAY) + realized;
+    }
+
+    fn ratio(&self) -> f64 {
+        if self.predicted > 0.0 { self.realized / self.predicted } else { 1.0 }
+    }
+}
+
+/// Conditional confidences whose prefix survival is the drafter's, rescaled per depth and kept
+/// non-increasing.
+fn calibrated(confidence: &[f32; 7], calibration: &[Calibration; 7]) -> [f32; 7] {
+    let (mut raw, mut previous) = (1.0f64, 1.0f64);
+    std::array::from_fn(|depth| {
+        raw *= f64::from(confidence[depth]);
+        let survival = (raw * calibration[depth].ratio()).min(previous);
+        let conditional = if previous > 0.0 { survival / previous } else { 0.0 };
+        previous = survival;
+        conditional as f32
+    })
 }
 
 #[derive(Clone, Copy, Default)]
@@ -141,6 +188,8 @@ impl RequestScheduler {
             retained: [None; REQUEST_LANES],
             forecast: [None; REQUEST_LANES],
             population: survival(&[FORECAST_PRIOR; 7]),
+            calibration: [Calibration::default(); 7],
+            verifying: [None; REQUEST_LANES],
             pending_budget: None,
         });
         Ok(())
@@ -574,6 +623,27 @@ impl RequestScheduler {
         }
     }
 
+    /// Keeps the drafter's own survival of each submitted verification for its acceptance outcome.
+    pub(super) fn begin_verification(&mut self, lanes: &[ScheduledLane]) {
+        let split = self.split.as_mut().unwrap();
+        for lane in lanes {
+            let slot = lane.request.slot as usize;
+            split.verifying[slot] = split.retained[slot].take()
+                .filter(|p| p.request == lane.request).map(|p| (lane.request, p.raw_survival));
+        }
+    }
+
+    /// Rescales later confidences by how often verified drafts survived against the drafter's survival.
+    pub(super) fn observe_verification(&mut self, request: RequestHandle, offered: usize, accepted: usize) {
+        let Some(split) = self.split.as_mut() else { return };
+        let slot = request.slot as usize;
+        let Some((owner, predicted)) = split.verifying[slot].take() else { return };
+        if owner != request { return; }
+        for depth in 0..offered.min(7) {
+            split.calibration[depth].observe(f64::from(predicted[depth]), f64::from(u8::from(depth < accepted)));
+        }
+    }
+
     pub fn complete_proposal(&mut self, fence: Fence, records: &[CompletionRecord],
         timing: crate::execution::ExecutionTiming, confidence: &[[f32; 7]]) -> Result<Vec<GeneratedToken>> {
         let split = self.split.as_ref().ok_or("proposal completion without a split catalog")?;
@@ -587,9 +657,11 @@ impl RequestScheduler {
                 return Err("proposal confidence must be finite and in [0, 1]".into());
             }
         }
-        for (lane, &confidence) in step.lanes.iter().zip(confidence) {
-            self.split.as_mut().unwrap().retained[lane.request.slot as usize] = Some(RetainedProposal {
-                request: lane.request, fence, consumed: lane.start_position, width: 1, limit: lane.tokens, confidence,
+        for (lane, &raw) in step.lanes.iter().zip(confidence) {
+            let split = self.split.as_mut().unwrap();
+            split.retained[lane.request.slot as usize] = Some(RetainedProposal {
+                request: lane.request, fence, consumed: lane.start_position, width: 1, limit: lane.tokens,
+                confidence: calibrated(&raw, &split.calibration), raw_survival: survival(&raw),
             });
         }
         let generated = match self.complete(fence, records, timing) {
@@ -786,6 +858,58 @@ mod tests {
     }
 
     #[test]
+    fn neutral_calibration_keeps_drafter_confidence() {
+        let confidence = [0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3];
+        let neutral = calibrated(&confidence, &[Calibration::default(); 7]);
+        for (a, b) in neutral.iter().zip(confidence) { assert!((a - b).abs() < 1e-6); }
+    }
+
+    #[test]
+    fn realized_acceptance_rescales_an_overconfident_drafter_and_shortens_verification() {
+        let raw = [0.9; 7];
+        // Realized prefix survival per depth, far below the drafter's 0.9, 0.81, 0.73, ...
+        let realized = [0.6, 0.3, 0.1, 0.05, 0.0, 0.0];
+        let widths = |calibrate: bool| {
+            let mut s = measured_split_engine(1);
+            costs(&mut s, 1, &[9.0, 9.4, 10.13, 10.86, 11.9, 12.9].map(|x| (x * 1e6) as u64));
+            let h = ready(&mut s);
+            let request = s.request_mut(h).unwrap();
+            request.accounting.service.tokens = Some(utility::ServicePrice::initial(0.09));
+            request.accounting.service.deliveries = Some(utility::ServicePrice::initial(0.065));
+            if calibrate {
+                for i in 0..6000 {
+                    s.split.as_mut().unwrap().verifying[h.slot as usize] = Some((h, survival(&raw)));
+                    let accepted = realized.iter().take_while(|&&r| ((i % 100) as f64) < r * 100.0).count();
+                    s.observe_verification(h, 5, accepted);
+                }
+            }
+            let confidence = calibrated(&raw, &s.split.as_ref().unwrap().calibration);
+            retain(&mut s, h, confidence);
+            s.split.as_mut().unwrap().retained[h.slot as usize].as_mut().unwrap().limit = 6;
+            s.finalize_proposals(1 << h.slot, None).unwrap();
+            (s.split.as_ref().unwrap().retained[h.slot as usize].unwrap().width, confidence)
+        };
+        let (neutral, _) = widths(false);
+        let (rescaled, confidence) = widths(true);
+        let survival = survival(&confidence);
+        for (depth, r) in realized.iter().enumerate().take(4) {
+            assert!((f64::from(survival[depth]) - r).abs() < 0.03, "depth {depth}: {} vs {r}", survival[depth]);
+        }
+        assert!(neutral >= 5, "the uncalibrated drafter buys deep verification: {neutral}");
+        assert!(rescaled <= 3, "realized acceptance shortens verification: {rescaled}");
+    }
+
+    #[test]
+    fn verification_outcomes_of_other_requests_do_not_calibrate() {
+        let mut s = measured_split_engine(2);
+        let (a, b) = (ready(&mut s), ready(&mut s));
+        s.split.as_mut().unwrap().verifying[a.slot as usize] = Some((b, [0.9; 7]));
+        s.observe_verification(a, 5, 0);
+        assert!(s.split.as_ref().unwrap().calibration.iter().all(|c| c.predicted == CALIBRATION_PRIOR));
+        assert!(s.split.as_ref().unwrap().verifying[a.slot as usize].is_none());
+    }
+
+    #[test]
     fn throughput_preference_can_choose_more_tokens_in_a_longer_burst() {
         for (policy, wanted) in [(PolicyConfig::default(), 2), (PolicyConfig::throughput(), 3)] {
             let mut s = measured_split_engine(8);
@@ -865,7 +989,7 @@ mod tests {
 
     fn retain(s: &mut RequestScheduler, handle: RequestHandle, confidence: [f32; 7]) {
         s.split.as_mut().unwrap().retained[handle.slot as usize] = Some(RetainedProposal {
-            request: handle, fence: s.completed, consumed: 65, width: 1, limit: 8, confidence,
+            request: handle, fence: s.completed, consumed: 65, width: 1, limit: 8, confidence, raw_survival: survival(&confidence),
         });
     }
 
