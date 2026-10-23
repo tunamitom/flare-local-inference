@@ -3,7 +3,7 @@
 import torch
 
 from .collectives import PreparedAllReduce
-from .draft_sampling import PreparedDraftDistribution, PreparedShardedDraftDistribution
+from .draft_sampling import PreparedDraftDistribution, PreparedShardedDraftBlock, PreparedShardedDraftDistribution
 from .paged_batch import Metadata, PreparedBatch
 from .speculation import (
     DRAFT_RNG_DOMAIN,
@@ -103,8 +103,13 @@ class PreparedParallelDraftRound:
         self.candidate_runtime = getattr(o, "draft_candidates", None) if generate_proposals and w > 1 else None
         # Traced forwards test this flag, never the runtime, which compile workers see as a placeholder.
         self.vocabulary_parallel = self.candidate_runtime is not None
+        # One request's draft positions sample as one row block (one gather, one broadcast) when the
+        # owner allows it; otherwise each position is its own sharded proposal.
+        self.block_positions = (self.candidate_runtime is not None and b == 1 and w > 2
+                                and getattr(o, "draft_position_blocks", False))
         proposal_layout = None if self.candidate_runtime is None else PreparedShardedDraftDistribution.scratch_layout(
-            b, o.requests.vocab_size, o.draft_scratch.local_logits.shape[1], self.candidate_runtime.world_size)
+            w - 1 if self.block_positions else b, o.requests.vocab_size, o.draft_scratch.local_logits.shape[1],
+            self.candidate_runtime.world_size)
         self.sampling_scratch = prepare_sampling_scratch(b, w, o.requests.vocab_size, device, buffers=buffers,
                                                         proposal=generate_proposals, verification=not proposal_only,
                                                         proposal_layout=proposal_layout)
@@ -214,6 +219,7 @@ class PreparedParallelDraftRound:
             torch.zeros_like(self.before) for _ in range(4)
         )
         self.operations = None
+        self.block = None
 
     def prepare(self):
         if self.operations is not None:
@@ -239,6 +245,15 @@ class PreparedParallelDraftRound:
                 )
                 for i in range(count)
             )
+        elif self.block_positions:
+            local = self.draft.scratch.local_logits.view(b, o.block_size, -1)
+            self.block = PreparedShardedDraftBlock(
+                local[0, o.logit_offset:o.logit_offset + count], o.requests, o.inputs.row_slot_ids[:b],
+                o.inputs.row_generations[:b], o.inputs.live_rows, rank=o.weights.shard.rank,
+                world=self.candidate_runtime.world_size, runtime=self.candidate_runtime, session=o.session,
+                coordinator=o.collectives["coordinator"], name=f"{self.name}.proposals.candidates",
+                seed=self.seed, base_offset=self.base_offset, workspace=self.sampling_scratch.get("proposal"))
+            proposals = (self.block.distribution,)
         else:
             # Each proposal reads its draft position's rows of this rank's local logits in place.
             local = self.draft.scratch.local_logits.view(b, o.block_size, -1)
@@ -377,7 +392,15 @@ class PreparedParallelDraftRound:
                     self.markov_token.copy_(self.greedy_tokens)
                 self.probabilities.zero_()
                 self.probabilities.scatter_(2, self.drafts[:, :, None], 1.0)
-            for i, proposal in enumerate(proposals):
+            if self.block is not None:
+                drafts, probabilities, valid = self.block()
+                positions = self.block.positions
+                self.drafts[:, :positions].copy_(drafts.view(b, positions))
+                self.probabilities[:, :positions].copy_(probabilities.view(b, positions, -1))
+                self.valid[:, :positions].copy_(valid.view(b, positions) & self.active[:, None]
+                    & (self.block.steps.view(1, positions) // 4 < limits[:, None] - 1))
+                self.sampled.copy_(drafts[positions - 1:].view(b))
+            for i, proposal in enumerate(() if self.block is not None else proposals):
                 if not self.vocabulary_parallel:
                     self.logits[:, 0].copy_(
                         self.draft.scratch.logits.view(b, block, -1)[:, i + o.logit_offset].float()

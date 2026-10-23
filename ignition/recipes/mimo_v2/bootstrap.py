@@ -116,6 +116,11 @@ class PreparationConfig:
     # the runtime composes it with a conditional switch over one verification body per width.
     # Larger batches keep joined graphs. Exclusive with split speculation.
     switch_speculation: bool = field(default_factory=lambda: os.environ.get("FLARE_MIMO_SWITCH_SPECULATION", "0") == "1")
+    # Sharded draft proposals of a one-request round sample every draft position in one row block
+    # (one candidate gather and one support broadcast) instead of one sharded proposal per position.
+    # Positions then ignore the block's own earlier drafts in penalty counts; outputs are unchanged.
+    draft_position_blocks: bool = field(
+        default_factory=lambda: os.environ.get("FLARE_MIMO_DRAFT_POSITION_BLOCKS", "1") == "1")
     # "w8a16" converts the draft's BF16 projections to block-FP8 (128x128 blocks, amax/448
     # scales) at load and runs them as W8A16 GEMVs with BF16 activations, halving draft weight
     # traffic; "bf16" keeps the checkpoint's BF16 projections. Draft batches above 32 rows
@@ -368,6 +373,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                 context_tokens=max(config.prefill_chunk_size, config.decode_tokens),
                 draft_candidates=candidate_collective,
             )
+            # One request's draft positions sample as one sharded row block.
+            speculation.draft_position_blocks = config.draft_position_blocks
 
     scoring = PromptScoring.allocate(config, device, buffers, frame=frame, group=group,
         ipc=package_storage.peer_storage, runtime=collective, coordinator=coordinator)
