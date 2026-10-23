@@ -112,6 +112,19 @@ impl AcceptanceProfile {
         self.rounds
     }
 
+    /// A new request's profile: this population's conditional acceptance, held with the
+    /// default prior's weight so the request's own observations take over quickly.
+    pub fn seeded(&self) -> Self {
+        let prior = DepthAcceptance::default().weight;
+        Self {
+            depths: self.depths.map(|source| source.map(|depth| DepthAcceptance {
+                probability: depth.probability,
+                weight: depth.weight.min(prior),
+            })),
+            rounds: 0,
+        }
+    }
+
     /// Only the accepted prefix and an explicitly observed rejection are samples.
     /// `copy_mask` identifies the proposal source at each evaluated draft depth.
     pub(super) fn observe(

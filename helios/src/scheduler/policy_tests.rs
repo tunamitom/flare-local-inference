@@ -2623,3 +2623,33 @@ fn cancelling_all_inflight_proposal_owners_keeps_the_charge_and_releases_reused_
     assert_eq!(s.refresh_credit_ns(), -3_000_000.0);
     assert!(!matches!(s.plan().unwrap().origin, PlanOrigin::RefreshContinuation(_)));
 }
+
+#[test]
+fn new_requests_start_from_population_acceptance_not_the_uninformed_prior() {
+    use crate::scheduler::speculation::ProposalSource;
+    let mut s = interactive_engine(2, true);
+    let first = add(&mut s, 1, 64, 2048);
+    let uninformed = s.request(first).unwrap().acceptance.expected_tokens(ProposalSource::Mtp, 2);
+    assert_eq!(uninformed, 1.5);
+    for _ in 0..128 {
+        s.acceptance_population.observe(7, 7, true, 0);
+    }
+    let second = add(&mut s, 2, 64, 2048);
+    let seeded = s.request(second).unwrap().acceptance.expected_tokens(ProposalSource::Mtp, 2);
+    assert!(seeded > 1.95, "seeded {seeded}");
+    // The seed carries only the prior's weight: the request's own rejections dominate quickly.
+    for _ in 0..4 {
+        s.request_mut(second).unwrap().acceptance.observe(1, 0, true, 0);
+    }
+    let own = s.request(second).unwrap().acceptance.expected_tokens(ProposalSource::Mtp, 2);
+    assert!(own < 1.35, "own {own}");
+}
+
+#[test]
+fn verified_rounds_feed_the_acceptance_population() {
+    use crate::scheduler::speculation::ProposalSource;
+    let mut s = interactive_engine(1, true);
+    assert_eq!(s.acceptance_population.expected_tokens(ProposalSource::Mtp, 2), 1.5);
+    s.acceptance_population.observe(1, 1, false, 0);
+    assert!(s.acceptance_population.expected_tokens(ProposalSource::Mtp, 2) > 1.5);
+}
