@@ -1379,6 +1379,8 @@ impl<'a> Worker<'a> {
                 realized,
                 nanos,
                 &completion.records,
+                completion.timing.gpu_ns.into_iter().flatten().min().unwrap_or(0),
+                completion.timing.wall_ns,
             );
         }
         if kind == GraphKind::ScoredPrefill {
