@@ -594,6 +594,7 @@ class Scheduler:
             if step.kind == "speculative":
                 offered = min(int(record[9]), lane.tokens - 1)
                 accepted = min(int(record[10]), offered)
+                _p0_log(step, lane, request, offered, accepted, int(record[8]) > int(record[10]))
                 request.acceptance.observe(offered, accepted, int(record[8]) > int(record[10]))
                 request.rounds += 1
             if emitted or (step.kind == "prefill" and consumed > request.consumed):
@@ -642,3 +643,17 @@ class Scheduler:
         self.cache[key] = Checkpoint(key, request.capture, pages, used=self.clock)
         request.capture = None
         self.stats["checkpoints"] += 1
+
+
+# P0 diagnostic (local, uncommitted): one JSON line per speculative lane-round.
+_P0 = None
+
+
+def _p0_log(step, lane, request, offered, accepted, rejected):
+    global _P0
+    import json
+    if _P0 is None:
+        _P0 = open("/home/tom/mimo-pro/flare/p0/rounds.jsonl", "a", buffering=1)
+    _P0.write(json.dumps({"b": step.batch, "w": step.width, "pos": lane.start, "offered": offered,
+                          "accepted": accepted, "rejected": rejected, "native": request.acceptance.native_confidence,
+                          "conf": [round(d[0], 5) for d in request.acceptance.depths]}) + "\n")

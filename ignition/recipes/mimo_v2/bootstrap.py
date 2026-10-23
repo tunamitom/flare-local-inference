@@ -722,7 +722,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             disposable.append(forward.decoder.scratch_tensors())
         if getattr(forward, "context", None) is not None:
             disposable.append(forward.context.scratch_tensors())
-    return PreparedModel(rebuild_weights={"weights": weights},
+    model = PreparedModel(rebuild_weights={"weights": weights},
         device=config.devices[rank],
         graphs=graphs,
         buffers=buffers,
@@ -771,3 +771,6 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             if c is not None
         ),
     )
+    if config.split_speculation:
+        model.proposal_confidence = confidence.host_view
+    return model
