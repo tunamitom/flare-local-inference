@@ -2106,9 +2106,7 @@ impl RequestScheduler {
             self.split.as_mut().unwrap().pending_budget = Some((fence, tokens));
         }
         if step.kind == GraphKind::Verification {
-            for lane in &step.lanes {
-                self.split.as_mut().unwrap().retained[lane.request.slot as usize] = None;
-            }
+            self.begin_verification(&step.lanes);
         }
         let expected_finish_ns = self
             .now_ns
@@ -2246,6 +2244,7 @@ impl RequestScheduler {
         let mut captures = Vec::new();
         let mut window_snapshots = Vec::new();
         let mut acceptance_observations = Vec::new();
+        let mut verified = Vec::new();
         for (row, lane) in step.lanes.iter().enumerate() {
             let kind = step.lane_kind(row);
             let Ok(request) = self.request_mut(lane.request) else {
@@ -2307,6 +2306,9 @@ impl RequestScheduler {
                 );
                 request.acceptance.observe(observation.0, observation.1, observation.2, observation.3);
                 acceptance_observations.push(observation);
+                if kind == GraphKind::Verification {
+                    verified.push((lane.request, offered, (vector.accepted_drafts as usize).min(offered)));
+                }
             }
             if record.status == 3 {
                 request.error_code = Some(record.error_code);
@@ -2404,6 +2406,9 @@ impl RequestScheduler {
         }
         for (offered, accepted, rejected, copy_mask) in acceptance_observations {
             self.acceptance_population.observe(offered, accepted, rejected, copy_mask);
+        }
+        for (request, offered, accepted) in verified {
+            self.observe_verification(request, offered, accepted);
         }
         self.advance_retirement(fence)?;
         for snapshot in window_snapshots {
