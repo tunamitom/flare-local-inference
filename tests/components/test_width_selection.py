@@ -52,3 +52,36 @@ def test_unmeasured_widths_are_never_chosen():
     costs = list(COSTS)
     costs[7] = 0.  # width 8 unmeasured
     assert select([0.999] * 7, costs, 8) == 7
+
+
+from ignition.components.width_selection import PreparedWidthCalibration
+
+
+def test_calibration_starts_neutral_and_learns_overconfidence_per_reached_depth():
+    sums = torch.zeros((7, 2), dtype=torch.float32)
+    conf = torch.full((2, 7), 0.9)
+    calibration = PreparedWidthCalibration(sums, conf, 7)
+    assert torch.allclose(calibration.ratio(), torch.ones(7))
+    emitted = torch.tensor([1, 0], dtype=torch.int32)
+    for _ in range(200):  # width 4 rounds accepting one draft: depth 1 hit, depth 2 rejected, 3 unreached
+        calibration.observe(4, torch.tensor([1, 0], dtype=torch.int32), emitted.clone().fill_(2))
+    ratio = calibration.ratio()
+    assert ratio[0] > 1.05 and ratio[1] == PreparedWidthCalibration.BOUNDS[0]
+    assert torch.allclose(ratio[2:], torch.ones(5))
+    before = sums.clone()
+    calibration.observe(4, torch.tensor([3, 0], dtype=torch.int32), torch.tensor([0, 0], dtype=torch.int32))
+    assert torch.equal(sums, before)  # a round that committed nothing teaches nothing
+    calibration.observe(1, torch.tensor([0, 0], dtype=torch.int32), torch.tensor([1, 0], dtype=torch.int32))
+    assert torch.equal(sums, before)  # width one offers no draft
+
+
+def test_calibrated_selection_verifies_shallower_for_an_overconfident_drafter():
+    conf = torch.zeros((2, 7)); conf[0] = torch.tensor([0.9, 0.85, 0.85, 0.8, 0.8, 0.8, 0.8])
+    cost = torch.zeros((2, 8)); cost[0] = torch.tensor(COSTS)
+    widths = []
+    for ratio in (1.0, 0.5):
+        sums = torch.zeros((7, 2)); sums[:, 1] = 1000.; sums[:, 0] = 1000. * ratio
+        lengths, selected = torch.tensor([8, 8], dtype=torch.int32), torch.zeros(1, dtype=torch.int32)
+        PreparedWidthSelection(conf, cost, lengths, selected, 8, PreparedWidthCalibration(sums, conf, 7))()
+        widths.append(int(selected[0]))
+    assert widths[0] > widths[1] >= 1
