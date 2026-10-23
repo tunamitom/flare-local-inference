@@ -605,6 +605,8 @@ pub struct RequestScheduler {
     split: Option<split::SplitSpeculation>,
     /// The one-request graph that chooses its verification width on device, if the package has one.
     device_width: Option<switch::DeviceWidth>,
+    /// Realized against predicted tokens of host-width speculative rounds, per batch and width.
+    realized: speculation::RealizedTokens,
     /// Conditional acceptance observed across all requests. New requests start from it
     /// rather than the uninformed prior, so a request that begins at width one is not
     /// held there by a prior that never sees a draft.
@@ -683,6 +685,7 @@ impl RequestScheduler {
             proposal_source: speculation::ProposalSource::Mtp,
             split: None,
             device_width: None,
+            realized: Default::default(),
             costs: cost::ActionCosts::default(),
             refresh: refresh::RefreshState::default(),
             tickets: HashMap::new(),
@@ -959,7 +962,7 @@ impl RequestScheduler {
             Some(device) if device.matches(kind, batch, capacity) => {
                 device.expected_tokens(request.consumed_tokens, prior)
             }
-            _ => prior,
+            _ => prior * self.realized.ratio(batch, capacity),
         }
     }
 
@@ -2245,6 +2248,7 @@ impl RequestScheduler {
         }
         // A switched graph verifies the width it chose, at most its capacity.
         let switched = self.switched(step.kind, step.batch_capacity, step.token_capacity);
+        let (step_batch, step_width, source) = (step.batch_capacity, step.token_capacity, self.proposal_source);
         // Validate every live lane before committing any completion state.
         for (row, lane) in step.lanes.iter().enumerate() {
             let kind = step.lane_kind(row);
@@ -2345,6 +2349,7 @@ impl RequestScheduler {
         let mut acceptance_observations = Vec::new();
         let mut verified = Vec::new();
         let mut device_rounds = Vec::new();
+        let mut realized_rounds = Vec::new();
         for (row, lane) in step.lanes.iter().enumerate() {
             let kind = step.lane_kind(row);
             let Ok(request) = self.request_mut(lane.request) else {
@@ -2410,6 +2415,10 @@ impl RequestScheduler {
                     device_rounds.push((lane.start_position, vector.verification_width.max(0) as usize,
                         vector.emitted_count.max(0) as usize));
                 } else {
+                    if kind == GraphKind::Speculative && lane.tokens > 1 {
+                        let predicted = request.acceptance.expected_tokens(source, lane.tokens);
+                        realized_rounds.push((predicted, vector.emitted_count.max(0) as f64));
+                    }
                     request.acceptance.observe(observation.0, observation.1, observation.2, observation.3);
                     acceptance_observations.push(observation);
                 }
@@ -2510,6 +2519,9 @@ impl RequestScheduler {
             if request.pending == 0 {
                 request.scheduled_consumed = request.consumed_tokens;
             }
+        }
+        for (predicted, emitted) in realized_rounds {
+            self.realized.observe(step_batch, step_width, predicted, emitted);
         }
         if let Some(device) = self.device_width.as_mut() {
             let gpu = timing.gpu_ns.into_iter().flatten().max().unwrap_or(0);
