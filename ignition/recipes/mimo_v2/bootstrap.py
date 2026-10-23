@@ -5,7 +5,7 @@ import hashlib
 import importlib.util
 import json
 import os
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import torch
@@ -53,6 +53,7 @@ from ignition.preparation.tuning import RecordedPreparationSession
 from ignition.preparation.tuning_replicas import TuningReplica
 from ignition.progress import phase
 
+from .config import ModelConfig
 from .recipe import RECIPE
 from .decoder import PreparedDecoder, Scratch
 from .dflash import SpeculativePreparation
@@ -74,6 +75,10 @@ ONESHOT_MAX_TOKENS = 64
 # `flare serve --quantized-activation-min-tokens` picks the threshold at load (0 serves pure A16).
 # FLARE_MIMO_A4_PREFILL_MIN_TOKENS=0 exports pure A16 without the A4 variants.
 A4_PREFILL_MIN_TOKENS = 512
+# With CSF expert scales, b12x's W4A16 kernels read compressed scales inline, skipping the shared
+# expansion that the MXFP4 A4 prefill kernel reads, for calls of at most 16 routed rows per expert
+# (768 MiMo tokens). A4 variants start at the first prefill capacity past that window.
+CSF_A4_PREFILL_MIN_TOKENS = 1024
 
 
 @dataclass(frozen=True)
@@ -98,6 +103,14 @@ class PreparationConfig:
     # Each rank proposes drafts from its vocabulary shard of the draft head and gathers only its
     # bounded candidates; False gathers full-vocabulary draft logits. Proposals are identical.
     vocabulary_parallel_draft: bool = True
+    # Speculative rounds of at most this many requests verify in two phases: shard summaries decide
+    # on device whether the round's nuclei fit a compact verifier, and the host then launches the
+    # compact or the dense continuation. Zero captures every round in one phase.
+    two_phase_max_batch: int = 4
+    # Split speculation: proposal graphs retain each request's drafts with per-position
+    # confidence from the drafter's own distributions, and verification graphs check the prefix
+    # the runtime chooses per step. Joined graphs keep one width per request history.
+    split_speculation: bool = field(default_factory=lambda: os.environ.get("FLARE_MIMO_SPLIT_SPECULATION", "0") == "1")
     # "w8a16" converts the draft's BF16 projections to block-FP8 (128x128 blocks, amax/448
     # scales) at load and runs them as W8A16 GEMVs with BF16 activations, halving draft weight
     # traffic; "bf16" keeps the checkpoint's BF16 projections. Draft batches above 32 rows
@@ -108,8 +121,11 @@ class PreparationConfig:
     # A4/A16 hybrid: prefill graphs of at least this many tokens are captured twice, with BF16 and
     # with dynamic MXFP4 (E8M0 per-32) activations over the same packed expert weights, and the
     # package serves MXFP4 from this capacity by default. Decode and verification graphs stay
-    # below it; zero prepares pure A16 (FLARE_MIMO_A4_PREFILL_MIN_TOKENS=0 at export).
-    a4_prefill_min_tokens: int = A4_PREFILL_MIN_TOKENS
+    # below it; zero prepares pure A16 (FLARE_MIMO_A4_PREFILL_MIN_TOKENS=0 at export). None selects
+    # the default for the expert scale encoding.
+    a4_prefill_min_tokens: int | None = None
+    # "csf" keeps routed expert block scales losslessly compressed and expands them per MoE call.
+    expert_scale_compression: str | None = None
 
     @property
     def a4_prefill(self):
@@ -119,6 +135,11 @@ class PreparationConfig:
         from ignition.components.capacity import image_capacity
 
         object.__setattr__(self, "image_concurrency", image_capacity(self.max_active, self.image_concurrency))
+        if self.expert_scale_compression not in (None, "csf"):
+            raise ValueError("MiMo expert scale compression must be None or 'csf'")
+        if self.a4_prefill_min_tokens is None:
+            object.__setattr__(self, "a4_prefill_min_tokens", A4_PREFILL_MIN_TOKENS
+                               if self.expert_scale_compression is None else CSF_A4_PREFILL_MIN_TOKENS)
         if (
             len(self.devices) not in (2, 4, 8)
             or len(set(self.devices)) != len(self.devices)
@@ -140,6 +161,9 @@ class PreparationConfig:
             and self.speculative_fixed_width not in self.speculative_widths
         ):
             raise ValueError("fixed verification width must belong to the prepared widths")
+        if self.split_speculation and (not self.dflash or self.draft_tokens < 1
+                                       or self.speculative_widths != tuple(range(1, max(self.speculative_widths) + 1))):
+            raise ValueError("split speculation requires DFlash drafts over contiguous widths from one")
         if self.snapshot_budget_bytes <= 0 or self.headroom_bytes < 0:
             raise ValueError("snapshot budget must be positive and headroom nonnegative")
 
@@ -185,6 +209,11 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     if config.a4_prefill:
         if config.a4_prefill_min_tokens <= config.decode_tokens:
             raise ValueError("A4 prefill must stay above every decode and verification graph")
+        if config.expert_scale_compression is not None:
+            text = ModelConfig.load(snapshot).text
+            if config.a4_prefill_min_tokens * text["num_experts_per_tok"] <= 16 * text["n_routed_experts"]:
+                raise ValueError("A4 prefill over CSF expert scales must route more than 16 rows per expert;"
+                                 f" use at least {CSF_A4_PREFILL_MIN_TOKENS} tokens")
         if importlib.util.find_spec("b12x.moe._shared.kernels.w4a16.mxfp4_a4_prefill") is None:
             raise ValueError("A4 prefill requires patches/b12x-mxfp4-a4-prefill.patch in the installed b12x")
         # b12x compiles MXFP4 launches for expert plans of at least this many tokens; each prefill
@@ -195,7 +224,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     weights = ModelWeights.load(manifest, device, shard=shard, progress=progress, dflash=config.dflash,
                                 expert_activation=config.expert_activation,
                                 draft_weight_format=config.draft_weight_format,
-                                draft_requests=config.request_capacity)
+                                draft_requests=config.request_capacity,
+                                expert_scale_compression=config.expert_scale_compression)
     release_unused()
     sequence = torch.zeros(1, dtype=torch.int64, device=device)
     with phase(progress, "Allocate model state and collectives"):
@@ -354,16 +384,17 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         + len(config.speculative_shapes)
         + len(config.batch_capacities)
         + len(PATCH_CAPACITIES)
+        + (len(config.batch_capacities) * (config.draft_tokens + 1) if config.split_speculation else 0)
     )
     with phase(progress, "Construct graph catalog", total=count) as stage:
 
-        def add(name, forward, kind, rows, tokens, fields, *, enabled=None, quantized=None):
+        def add(name, forward, kind, rows, tokens, fields, *, enabled=None, quantized=None, branch=None):
             if kind == "scored_prefill":
                 forward = PreparedScoredPrefill(forward, requests, inputs)
                 fields = (*fields, "prompt_target_tokens")
             forwards[name] = forward
             signatures[name] = GraphSignature(kind, rows, tokens, tuple(fields), speculation_enabled=enabled,
-                                              quantized_activations=quantized)
+                                              quantized_activations=quantized, branch=branch)
             stage.update(advance=1)
 
         forward_inputs = (*inputs.buffers(), "sampling_grammar_mask")
@@ -433,12 +464,54 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             from ignition.components.parallel_draft import PreparedParallelDraftRound
 
             speculation.sampling_buffers = GraphBufferPool(device, chunk_bytes=2 << 20)
-            for batch, width in sorted(config.speculative_shapes, key=lambda shape: shape[0] * shape[1], reverse=True):
+            if config.split_speculation:
+                from ignition.components.capacity import proposal_shapes
+                from ignition.components.split_draft import (
+                    PreparedDraftProposal, PreparedDraftVerification, PreparedProposalStorage)
+
+                confidence = package_storage.host_allocate(
+                    "proposal_confidence", (config.request_capacity, config.draft_tokens), torch.float32)
+                buffers["proposal_confidence"] = confidence.device_view
+                split = PreparedProposalStorage(speculation, config.draft_tokens)
+                buffers.update(split.buffers())
+                # The DFlash drafter always predicts its full block; a proposal keeps the first depth drafts.
+                for batch, depth in sorted(proposal_shapes(config.max_active, config.draft_tokens), reverse=True):
+                    name = f"proposal{batch}x{depth + 1}"
+                    source = PreparedParallelDraftRound(speculation, batch, depth + 1, name,
+                        buffers=speculation.sampling_buffers.cursor(), proposal_only=True)
+                    source.prepare()
+                    add(name, PreparedDraftProposal(source, confidence.device_view, split), "proposal",
+                        batch, depth + 1, forward_inputs, enabled=True)
+                for batch, width in sorted(config.speculative_shapes, key=lambda shape: shape[0] * shape[1],
+                                           reverse=True):
+                    name = f"verification{batch}x{width}"
+                    target = PreparedParallelDraftRound(speculation, batch, width, name, generate_proposals=False,
+                        buffers=speculation.sampling_buffers.cursor())
+                    target.prepare()
+                    add(name, PreparedDraftVerification(split, target), "verification", batch, width,
+                        forward_inputs, enabled=True)
+                    if width == 1:
+                        # Decoding without a proposal still retains the draft context.
+                        decode = PreparedParallelDraftRound(speculation, batch, 1, f"speculative{batch}x1",
+                            buffers=speculation.sampling_buffers.cursor())
+                        decode.prepare()
+                        add(f"speculative{batch}x1", decode, "speculative", batch, 1, forward_inputs, enabled=True)
+            for batch, width in (() if config.split_speculation else
+                                 sorted(config.speculative_shapes, key=lambda shape: shape[0] * shape[1], reverse=True)):
                 name = f"speculative{batch}x{width}"
+                two_phase = (width > 1 and batch <= config.two_phase_max_batch
+                             and speculation.draft_candidates is not None)
                 forward = PreparedParallelDraftRound(speculation, batch, width, name,
-                                                     buffers=speculation.sampling_buffers.cursor())
+                                                     buffers=speculation.sampling_buffers.cursor(),
+                                                     two_phase=two_phase)
                 forward.prepare()
-                add(name, forward, "speculative", batch, width, forward_inputs, enabled=True)
+                branch = (("two_phase_flag", f"{name}.compact", f"{name}.dense") if two_phase else None)
+                add(name, forward, "speculative", batch, width, forward_inputs, enabled=True, branch=branch)
+                if two_phase:
+                    from ignition.components.parallel_draft import RoundContinuation
+
+                    add(f"{name}.compact", RoundContinuation(forward, True), "continuation", batch, width, ())
+                    add(f"{name}.dense", RoundContinuation(forward, False), "continuation", batch, width, ())
         for capacity in reversed(PATCH_CAPACITIES):
             name = f"vision{capacity}"
             cursor = graph_buffers.cursor()
@@ -547,7 +620,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         retain_graphs=config.retain_graphs,
         materialize=materialize_cache,
         warmup_storage=package_storage,
-        compile_kinds=("prefill", "scored_prefill", "decode", "resume", "speculative", "vision"),
+        compile_kinds=("prefill", "scored_prefill", "decode", "resume", "speculative", "continuation", "vision"),
     )
     session.freeze()
     pool.clear_for_preparation()
@@ -568,6 +641,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     cache_regions = [history_region(buffers, "cache." + name, tensor, contract_proto.PAGED_KEY_VALUE)
         for name, tensor in pool.pages.items()]
     buffers["request_pending_token"] = requests.pending_token
+    if speculation is not None:
+        buffers["two_phase_flag"] = speculation.two_phase_flag
     server_config = {
         "identity": identity,
         "model_id": snapshot.name,
@@ -582,7 +657,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             image_profile="mimo"),
         "sampling_defaults": RECIPE.sampling_defaults.as_dict(),
         "assets": assets,
-        "model_contract": prepare_contract(signatures, buffers, pool, image_slots=config.image_concurrency, page_tokens=PAGE_TOKENS, draft_lag=0 if config.dflash else None, regions=cache_regions),
+        "model_contract": prepare_contract({name: s for name, s in signatures.items() if s.kind != "continuation"},
+            buffers, pool, image_slots=config.image_concurrency, page_tokens=PAGE_TOKENS, draft_lag=0 if config.dflash else None, regions=cache_regions),
     }
     if config.a4_prefill:
         server_config["quantized_activation_min_tokens"] = config.a4_prefill_min_tokens
@@ -593,6 +669,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         "weights_bytes": weights.allocated_bytes,
         "mapped_host_bytes": 0,
         "offloaded_bytes": 0,
+        "expert_scale_compression": config.expert_scale_compression,
         "continuation_bytes": pool.backing.nbytes,
         "preparation_state_rows": int(pool.memory_capacity[0].item()),
         "preparation_state_bytes": int(pool.memory_capacity[0].item()) * layout.row_bytes,

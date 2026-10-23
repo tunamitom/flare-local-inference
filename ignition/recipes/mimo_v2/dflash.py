@@ -274,10 +274,15 @@ class PreparedDraft:
                         scratch.embedding, name=f"{name}.layer{index}.attention_reduce_norm", **common),
                     PreparedAllReduceRMSNorm(scratch.mlp.output, scratch.output, after, scratch.embedding,
                         name=f"{name}.layer{index}.mlp_reduce_norm", **common)))
+        # A block-FP8 draft head runs as W8A16 GEMVs; verification keeps the target's BF16 head.
+        head = (projection(scratch.hidden, weights.draft.head, scratch.local_logits, session=session,
+                           name=name + ".head.projection", w8a16=w8a16)
+                if getattr(weights.draft, "head", None) is not None else None)
         self.head = (PreparedVocabularyProjection(scratch.hidden, weights.head, scratch.local_logits, scratch.logits,
-            runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head")
-            if gather_logits else vocabulary_shard_projection(scratch.hidden, weights.head, scratch.local_logits,
-                session=session, name=name + ".head.projection"))
+            runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head",
+            projection=head)
+            if gather_logits else head or vocabulary_shard_projection(scratch.hidden, weights.head,
+                scratch.local_logits, session=session, name=name + ".head.projection"))
 
     def __call__(self):
         hidden = torch.where((self.metadata.token_ids == self.weights.config.draft.noise_token)[:, None],
@@ -324,6 +329,9 @@ class SpeculativePreparation:
                                 else ContextBuffers.allocate(weights, context_tokens, pool.backing.device))
         # A candidate channel proposes from each rank's draft vocabulary shard instead of gathered logits.
         self.draft_candidates = draft_candidates
+        # Two-phase verification rounds publish their continuation choice here; the host reads byte 0.
+        self.two_phase_flag = torch.zeros(64, dtype=torch.uint8, device=pool.backing.device)
+        self.two_phase_fallbacks = torch.zeros(1, dtype=torch.int64, device=pool.backing.device)
         # Block-FP8 draft weights run as W8A16 GEMVs whose split-K scratch every graph shares:
         # all draft and context projections run in stream order on the main stream.
         draft = weights.draft_w8a16 if getattr(weights, "draft_w8a16", None) is not None else weights.draft

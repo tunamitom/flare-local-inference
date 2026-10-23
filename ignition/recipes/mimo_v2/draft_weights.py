@@ -36,6 +36,9 @@ class DraftWeights:
     norm: torch.Tensor
     mask_embedding: torch.Tensor
     layers: tuple[DraftLayerWeights, ...]
+    # Block-FP8 copy of the shared lm_head shard for draft logits only; None projects draft
+    # logits with the target's BF16 head. Verification always keeps the BF16 head.
+    head: object | None = None
 
     @classmethod
     def load(cls, snapshot, config, device, shard, *, progress=None, weight_format="bf16"):
@@ -96,25 +99,37 @@ class DraftWeights:
             return "bf16"
         return weight_format
 
-    def block_fp8(self):
-        """These weights with every projection quantized to block-FP8 for W8A16 GEMVs."""
+    def block_fp8(self, head=None):
+        """These weights with every projection quantized to block-FP8 for W8A16 GEMVs, and with a
+        BF16 vocabulary ``head`` shard, a block-FP8 copy of it for draft logits."""
         from ignition.components.w8a16_gemv import quantize_block_fp8
 
         layers = tuple(replace(layer, qkv=quantize_block_fp8(layer.qkv), output=quantize_block_fp8(layer.output),
             mlp=MLPWeights(quantize_block_fp8(layer.mlp.gate_up), quantize_block_fp8(layer.mlp.down)))
             for layer in self.layers)
         return replace(self, projection=quantize_block_fp8(self.projection),
-                       context_kv=quantize_block_fp8(self.context_kv), layers=layers)
+                       context_kv=quantize_block_fp8(self.context_kv), layers=layers).with_head(head)
+
+    def with_head(self, head):
+        """These weights with a block-FP8 copy of the BF16 vocabulary ``head`` shard for draft logits."""
+        from ignition.components.w8a16_gemv import quantize_block_fp8
+
+        return self if head is None else replace(self, head=quantize_block_fp8(head))
 
     @property
     def projection_shapes(self):
         """(N, K) of every projection, for sizing shared W8A16 scratch."""
-        matrices = [self.projection, self.context_kv]
+        matrices = [self.projection, self.context_kv] + ([self.head] if self.head is not None else [])
         for layer in self.layers:
             matrices += [layer.qkv, layer.output, layer.mlp.gate_up, layer.mlp.down]
-        return tuple(sorted({tuple(getattr(m, "values", m).shape) for m in matrices}))
+        return tuple(sorted({tuple(_values(m).shape) for m in matrices}))
+
+
+def _values(weight):
+    # A BF16 tensor's ``values`` is the sparse-tensor method, not a weight plane.
+    return weight if isinstance(weight, torch.Tensor) else weight.values
 
 
 def projection_rows(weight):
     """Output features of a BF16 or block-FP8 projection."""
-    return getattr(weight, "values", weight).shape[0]
+    return _values(weight).shape[0]

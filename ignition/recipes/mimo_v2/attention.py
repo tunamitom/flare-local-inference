@@ -90,14 +90,17 @@ def partial_rotary(values, positions, inverse):
 
 class PreparedAttention(torch.nn.Module):
     def __init__(self, layer, weights, config, shard, source, scratch, metadata, pool, *, mode,
-                 runtime, coordinator, session, name, workspace, reduce_output=True):
+                 runtime, coordinator, session, name, workspace, reduce_output=True, retained=None):
         super().__init__()
         self.geometry, self.scratch, self.metadata = config.attention(layer), scratch, metadata
         if mode not in ("prefill", "decode", "verify"):
             raise ValueError(f"unsupported MiMo attention mode: {mode}")
         self.mode, self.pool, self.layer = mode, pool, layer
         self.chunks = config.qkv_chunks(layer, shard)
-        self.projection = BlockFP8Projection(source, weights.qkv, session=session, name=name + ".qkv")
+        # Decode and verification rows follow the fused reduction and norm, which releases dependents
+        # at entry: the QKV GEMV then fetches its weights while that reduction waits on its peers.
+        self.projection = BlockFP8Projection(source, weights.qkv, session=session, name=name + ".qkv",
+                                             dependent=mode != "prefill")
         attended = scratch.attended.flatten(1)
         if isinstance(weights.output, BlockFP8Weight):
             self.output_projection = BlockFP8Projection(attended, weights.output, session=session, name=name + ".output")
@@ -107,7 +110,7 @@ class PreparedAttention(torch.nn.Module):
         # Without its reduction the layer returns this rank's partial for a fused reduction and norm.
         self.reduction = PreparedAllReduce(scratch.partial, scratch.output, runtime=runtime,
             coordinator=coordinator, session=session, name=name + ".reduce") if reduce_output else None
-        # (prefetcher, plan) issued right after the QKV projection in decode and verification.
+        # (prefetcher, plan) issued once the QKV projection completes in decode and verification.
         self.prefetch = None
         geometry = self.geometry
         self.inverse = 1.0 / (geometry.theta ** (torch.arange(0, geometry.rotary_dim, 2,
@@ -126,9 +129,13 @@ class PreparedAttention(torch.nn.Module):
                     width = scratch.key.shape[0] // rows
                     pages = (geometry.window + width + PAGE_TOKENS - 1) // PAGE_TOKENS
                     key, value = key[:rows * pages], value[:rows * pages]
-                    self.retained_key, self.retained_value = torch.zeros_like(scratch.key), torch.zeros_like(scratch.value)
-                    self.commit_writer = PreparedPagedKVWriter(self.retained_key, self.retained_value,
-                        self.key_cache, self.value_cache, self.slots, session=session, name=name + ".commit")
+                    if retained is None:
+                        self.retained_key, self.retained_value = torch.zeros_like(scratch.key), torch.zeros_like(scratch.value)
+                        self.commit_writer = PreparedPagedKVWriter(self.retained_key, self.retained_value,
+                            self.key_cache, self.value_cache, self.slots, session=session, name=name + ".commit")
+                    else:
+                        # The decoder commits these rows for every sliding layer in one launch.
+                        self.retained_key, self.retained_value = retained
                 self.staged_key, self.staged_value = key, value
                 self.pages = torch.arange(key.shape[0], dtype=torch.int32, device=source.device).view(rows, -1)
                 window = geometry.window - 1
@@ -137,7 +144,7 @@ class PreparedAttention(torch.nn.Module):
                 self.pages = torch.zeros((metadata.lengths.numel(), 1), dtype=torch.int32, device=source.device)
         else:
             key, value, self.pages = self.key_cache, self.value_cache, metadata.page_table
-        retained = None if self.commit_writer is None else (self.retained_key, self.retained_value)
+        retained = (self.retained_key, self.retained_value) if mode == "verify" and geometry.window > 0 else None
         self.fused = mode != "prefill" and qkv.serves(self.chunks, scratch.query, scratch.key, scratch.value,
                                                       geometry)
         self.retained = retained if self.fused else None
@@ -163,7 +170,9 @@ class PreparedAttention(torch.nn.Module):
         s, m, a = self.scratch, self.metadata, self.geometry
         projected = self.projection(hidden_states.reshape(-1, hidden_states.shape[-1]))
         if self.prefetch is not None:
-            self.prefetch[0].issue(self.prefetch[1])
+            # Ordered after the projection: issued beside it, the window's fill competes with the
+            # projection's weight stream for device memory.
+            self.prefetch[0].issue(self.prefetch[1], after=projected)
         if self.fused:
             # Split, partial RoPE, value scale and retained verification rows in one launch.
             qkv.rotate(projected, m.positions, self.inverse, s.query, s.key, s.value, self.value_scale,
@@ -233,5 +242,5 @@ class PreparedAttention(torch.nn.Module):
             self.commit_writer()
 
     def scratch_tensors(self):
-        retained = () if self.commit_writer is None else (self.retained_key, self.retained_value)
+        retained = (self.retained_key, self.retained_value) if self.mode == "verify" and self.geometry.window > 0 else ()
         return (self.slots, self.lengths, *retained)

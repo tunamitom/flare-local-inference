@@ -282,3 +282,47 @@ def test_mixed_execution_requires_vector_completions():
         _execution(signatures={"decode": GraphSignature("mixed", 2, 1, ("prefill_row",),
                     speculation_enabled=False, prefill_capacity=64),
                     "prefill": GraphSignature("prefill", 1, 16)})
+
+
+def test_two_phase_rounds_export_branches_and_hide_their_continuations(monkeypatch):
+    flag = _tensor("uint8", (64,))
+    flag.numel = lambda: 64
+    signatures = {
+        "speculative2x3": GraphSignature("speculative", 2, 3, ("tokens",), speculation_enabled=True,
+                                         branch=("two_phase_flag", "speculative2x3.compact", "speculative2x3.dense")),
+        "speculative2x3.compact": GraphSignature("continuation", 2, 3),
+        "speculative2x3.dense": GraphSignature("continuation", 2, 3),
+    }
+    base = _execution().buffers
+    execution = _execution(graphs={name: object() for name in signatures}, signatures=signatures,
+                           buffers={**base, "two_phase_flag": flag})
+    spans = [(4096, 4), (8192, 8), (12288, 512), (16384, 128), (20480, 1), (24576, 64)]
+    monkeypatch.setattr(execution, "_validate_resources", lambda: (9, [11, 12, 13], spans))
+    manifest = execution.manifest(all_variants=True)
+    assert [graph["name"] for graph in manifest["graphs"]] == ["speculative2x3"]
+    assert manifest["branches"] == [{"graph": "speculative2x3", "flag_buffer": "two_phase_flag",
+                                     "taken": "speculative2x3.compact", "fallback": "speculative2x3.dense"}]
+    from google.protobuf import json_format
+
+    from ignition.preparation.runtime_package_pb2 import Execution
+
+    encoded = json_format.ParseDict({"branches": manifest["branches"]}, Execution())
+    assert encoded.branches[0].taken == "speculative2x3.compact"
+    with pytest.raises(ValueError, match="exactly one branch"):
+        _execution(graphs={name: object() for name in signatures},
+                   signatures={**signatures, "speculative2x3": GraphSignature("speculative", 2, 3, ("tokens",),
+                               speculation_enabled=True)}, buffers={**base, "two_phase_flag": flag})
+    for branch in (("two_phase_flag", "a", "a"), ("two_phase_flag", "", "b")):
+        with pytest.raises(ValueError, match="distinct named continuations"):
+            GraphSignature("speculative", 2, 3, branch=branch)
+    with pytest.raises(ValueError, match="distinct named continuations"):
+        GraphSignature("decode", 2, 1, branch=("two_phase_flag", "a", "b"))
+    with pytest.raises(ValueError, match="read the inputs"):
+        GraphSignature("continuation", 2, 3, ("tokens",))
+
+
+def test_packages_without_two_phase_rounds_export_no_branches(monkeypatch):
+    execution = _execution()
+    monkeypatch.setattr(execution, "_validate_resources",
+                        lambda: (9, [11, 12], [(4096, 4), (8192, 8), (12288, 512), (16384, 128), (20480, 1)]))
+    assert "branches" not in execution.manifest()

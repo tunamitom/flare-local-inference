@@ -25,7 +25,7 @@ class PreparedVocabularyProjection:
     """
 
     def __init__(self, source, weight, local_output, output, *, runtime, session,
-                 coordinator, name, activation_mode="a16", buffers=None, row_indices=None):
+                 coordinator, name, activation_mode="a16", buffers=None, row_indices=None, projection=None):
         rows = source.shape[0]
         if row_indices is None and output.shape[0] != rows:
             raise ValueError("vocabulary output rows must match projected rows without row indices")
@@ -34,7 +34,8 @@ class PreparedVocabularyProjection:
                 or output.shape[0] < rows):
             raise ValueError("vocabulary row indices require one device int64 index per expanded output row")
         self.row_indices = row_indices
-        self.projection = vocabulary_shard_projection(source, weight, local_output, session=session,
+        # A caller-prepared ``projection`` into ``local_output`` replaces the shard projection.
+        self.projection = projection or vocabulary_shard_projection(source, weight, local_output, session=session,
             name=f"{name}.projection", activation_mode=activation_mode)
         world = 1 if runtime is None else runtime.world_size
         columns = local_output.shape[1] * world
@@ -43,13 +44,22 @@ class PreparedVocabularyProjection:
         self.gathered = output[:rows] if columns == output.shape[1] else (
             torch.empty((rows, columns), dtype=output.dtype, device=output.device) if buffers is None
             else buffers.zeros((rows, columns), output.dtype))
+        self.local_output = local_output
         self.gather = PreparedAllGather(local_output, self.gathered, runtime=runtime,
             session=session, coordinator=coordinator, name=f"{name}.gather")
         self.output = output
         self.padded = columns != output.shape[1]
 
     def __call__(self, source):
-        gathered = self.gather(self.projection(source))
+        self.projection(source)
+        return self.finish()
+
+    def project(self, source):
+        """Project into this rank's shard only; ``finish`` gathers it later, possibly in another graph."""
+        return self.projection(source)
+
+    def finish(self):
+        gathered = self.gather(self.local_output)
         if self.row_indices is not None:
             # Indexed reads materialize before the overlapping destination write.
             self.output.copy_(gathered[self.row_indices, :self.output.shape[1]])

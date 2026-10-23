@@ -132,3 +132,103 @@ def test_draft_block_fp8_conversion_keeps_shard_blocks_and_shapes():
     assert torch.equal(full.values[128:256].view(torch.uint8), shard.values.view(torch.uint8))
     assert torch.equal(full.scales[1:2], shard.scales)
     assert converted.projection_shapes == ((128, 640), (256, 256), (384, 256), (512, 256))
+    # A vocabulary head shard joins as a draft-only block-FP8 copy; without one draft logits keep BF16.
+    assert converted.head is None
+    head = matrix(640, 256)
+    with_head = weights.block_fp8(head)
+    assert isinstance(with_head.head, BlockFP8Weight) and with_head.head.values.shape == head.shape
+    assert torch.equal(with_head.head.values.view(torch.uint8), quantize_block_fp8(head).values.view(torch.uint8))
+    assert with_head.projection_shapes == tuple(sorted(converted.projection_shapes + ((640, 256),)))
+    assert converted.with_head(head).head.scales.shape == (5, 2)
+    assert converted.with_head(None) is converted
+
+
+def test_csf_scales_keep_a4_prefill_past_the_inline_window():
+    from ignition.recipes.mimo_v2.bootstrap import CSF_A4_PREFILL_MIN_TOKENS, PreparationConfig
+
+    native = PreparationConfig(dflash=True)
+    compressed = PreparationConfig(dflash=True, expert_scale_compression="csf")
+    assert native.expert_scale_compression is None and native.a4_prefill_min_tokens == 512
+    assert compressed.a4_prefill_min_tokens == CSF_A4_PREFILL_MIN_TOKENS == 1024 and compressed.a4_prefill
+    # MiMo routes eight of 384 experts: inline CSF scales cover calls of at most 768 tokens.
+    assert 768 * 8 <= 16 * 384 < CSF_A4_PREFILL_MIN_TOKENS * 8
+    assert PreparationConfig(dflash=True, expert_scale_compression="csf", a4_prefill_min_tokens=2048
+                             ).a4_prefill_min_tokens == 2048
+    with pytest.raises(ValueError, match="scale compression"):
+        PreparationConfig(dflash=True, expert_scale_compression="x4t")
+
+
+def test_planner_prepares_csf_expert_scales_with_the_declared_saving():
+    from ignition import planning
+    from ignition.recipes.mimo_v2.recipe import RECIPE
+
+    checkpoint = RECIPE.checkpoints[0]
+    gpus = tuple(planning.Gpu(i, "NVIDIA RTX PRO 6000 Blackwell", f"GPU-{i:04d}", 96 << 30, 95 << 30, (12, 0))
+                 for i in range(8))
+    settings = dict(concurrency=4, reserve_bytes=0, speculation=RECIPE.speculation)
+    native = planning.fit(RECIPE, checkpoint, gpus, **settings)
+    compressed = planning.fit(RECIPE, checkpoint, gpus, expert_scale_compression="csf", **settings)
+    assert native.expert_scale_compression is None and compressed.to_dict()["expert_scale_compression"] == "csf"
+    saved = native.weights_bytes - compressed.weights_bytes
+    assert 2.9e9 < saved < 3.0e9 and compressed.pages > native.pages
+
+
+def _expert_loader(world, rank, *, compression):
+    c = ModelConfig.from_dict({**config().text, "n_routed_experts": 2, "moe_intermediate_size": 64,
+                               "num_experts_per_tok": 1}, checkpoint_ranks=8)
+    loader = object.__new__(MiMoWeightLoader)
+    loader.config, loader.shard, loader.device = c, TensorParallelShard(rank, world), "cpu"
+    loader.expert_activation, loader.expert_scale_compression, loader.scale_scratch = "a16", compression, None
+    loader._session = SimpleNamespace(flush=lambda: None)
+    loader._copy = lambda target, value, numeric=True: target.copy_(value)
+    loader._require_open = lambda: None
+    loader._sources = {}
+    for layer in (0, 1):
+        for expert in range(2):
+            for index, projection in enumerate(("gate_proj", "up_proj", "down_proj")):
+                rows, columns = (128, 64) if projection == "down_proj" else (64, 128)
+                prefix = f"model.layers.{layer}.mlp.experts.{expert}.{projection}"
+                tag = 16 * layer + 4 * expert + index
+                # Each row and scale group carries its projection and row identity.
+                loader._sources[prefix + ".weight"] = (
+                    torch.arange(rows, dtype=torch.uint8)[:, None] + tag * 8).expand(rows, columns // 2).contiguous()
+                loader._sources[prefix + ".weight_scale"] = (
+                    torch.arange(columns // 32, dtype=torch.uint8)[None] * 64 + torch.arange(rows, dtype=torch.uint8)[:, None] % 64
+                    + tag).to(torch.uint8)
+    for name in ("load_qkv", "load_linear", "load_tensor", "load_tensors"):
+        setattr(loader, name, lambda *args, **kwargs: (None, None))
+    return loader
+
+
+@pytest.mark.parametrize("world", [1, 2])
+def test_csf_experts_load_gate_first_with_one_shared_scratch(monkeypatch, world):
+    from b12x.moe import fused_moe as moe
+
+    for rank in range(world):
+        prepared = []
+        monkeypatch.setattr(moe, "prepare_weights", lambda **kwargs: prepared.append(kwargs) or len(prepared))
+        native, compressed = (_expert_loader(world, rank, compression=mode) for mode in (None, "csf"))
+        native.load_layer(1)
+        compressed.load_layer(1)
+        (base,), (csf,) = prepared[:1], prepared[1:]
+        first, last = 64 // world * rank, 64 // world * (rank + 1)
+        local = last - first
+        assert base["scale_scratch"] is None and csf["scale_scratch"] is compressed.scale_scratch
+        assert base["plan"].source.w13_layout.value == "w13" and csf["plan"].source.w13_layout.value == "w31"
+        assert base["plan"].scale_compression is None and csf["plan"].scale_compression == "csf"
+        assert [tuple(t.shape) for t in compressed.scale_scratch] == [(2, 256, 8), (2, 256, 8)]
+        for expert in range(2):
+            source = lambda projection: compressed._sources[f"model.layers.1.mlp.experts.{expert}.{projection}.weight"]
+            scale = lambda projection: compressed._sources[f"model.layers.1.mlp.experts.{expert}.{projection}.weight_scale"]
+            w13, s13 = csf["weights"].w13[expert], csf["weights"].w13_block_scales[expert]
+            assert torch.equal(w13[:local], source("gate_proj")[first:last])
+            assert torch.equal(w13[local:], source("up_proj")[first:last])
+            assert torch.equal(s13[:local], scale("gate_proj")[first:last])
+            assert torch.equal(s13[local:], scale("up_proj")[first:last])
+            assert torch.equal(csf["weights"].w2_block_scales[expert], scale("down_proj")[:, first // 32:last // 32])
+            # The native order keeps up first; the halves and down projection hold the same bytes.
+            assert torch.equal(base["weights"].w13[expert], torch.cat((w13[local:], w13[:local])))
+            assert torch.equal(base["weights"].w2[expert], csf["weights"].w2[expert])
+        scratch = compressed.scale_scratch
+        compressed.load_layer(1)
+        assert prepared[-1]["scale_scratch"] is scratch
