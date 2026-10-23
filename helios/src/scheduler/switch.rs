@@ -67,26 +67,28 @@ impl DeviceWidth {
     }
 
     /// Round milliseconds of each width 1..=MAX_WIDTH at this context; zero marks a width the
-    /// graph must not choose. Unobserved widths follow the bucket's observed widths, then the
-    /// nearest bucket's, then `fallback` (milliseconds of an equivalent host-width round).
+    /// graph must not choose. Round cost is close to linear in the verification width, so every
+    /// width is priced from one weighted least-squares line through the bucket's observed widths
+    /// (else the nearest bucket's), never from its own mean alone: a width whose early rounds ran
+    /// slow would otherwise never be chosen again and so never be corrected. Without observations
+    /// the costs follow `fallback` (milliseconds of an equivalent host-width round).
     pub fn width_costs(&self, position: u64, fallback: impl Fn(usize) -> Option<f64>) -> [f32; MAX_WIDTH] {
         let bucket = context_bucket(position);
         let observed = nearest(bucket, |b| {
             let points: Vec<_> = (1..=self.capacity)
-                .filter_map(|w| self.costs[b][w - 1].get().map(|ms| (w as f64, ms)))
+                .filter_map(|w| {
+                    let mean = self.costs[b][w - 1];
+                    mean.get().map(|ms| (w as f64, ms, mean.weight))
+                })
                 .collect();
             (!points.is_empty()).then_some(points)
         });
         let mut costs = [0.0f32; MAX_WIDTH];
         for (index, cost) in costs.iter_mut().enumerate().take(self.capacity) {
-            let width = index + 1;
+            let width = (index + 1) as f64;
             let estimate = match &observed {
-                Some(points) => points
-                    .iter()
-                    .find(|(w, _)| *w as usize == width)
-                    .map(|&(_, ms)| ms)
-                    .unwrap_or_else(|| extrapolate(points, width as f64)),
-                None => fallback(width).unwrap_or(0.0),
+                Some(points) => fit(points, width),
+                None => fallback(index + 1).unwrap_or(0.0),
             };
             *cost = if estimate.is_finite() && estimate > 0.0 { estimate as f32 } else { 0.0 };
         }
@@ -101,16 +103,17 @@ fn nearest<T>(bucket: usize, value: impl Fn(usize) -> Option<T>) -> Option<T> {
         .map(|(_, _, v)| v)
 }
 
-/// Least-squares line through the observed (width, ms) points, or a proportional slope from one.
-fn extrapolate(points: &[(f64, f64)], width: f64) -> f64 {
-    if let [(w0, c0)] = points {
+/// Weighted least-squares line through observed (width, ms, weight) points, or a proportional
+/// slope through a single width.
+fn fit(points: &[(f64, f64, f64)], width: f64) -> f64 {
+    if let [(w0, c0, _)] = points {
         return c0 * (1.0 + WIDTH_SLOPE * (width - w0));
     }
-    let n = points.len() as f64;
-    let (sx, sy) = points.iter().fold((0.0, 0.0), |(x, y), (w, c)| (x + w, y + c));
-    let (mx, my) = (sx / n, sy / n);
-    let (sxy, sxx) = points.iter().fold((0.0, 0.0), |(xy, xx), (w, c)| {
-        (xy + (w - mx) * (c - my), xx + (w - mx) * (w - mx))
+    let total: f64 = points.iter().map(|p| p.2).sum();
+    let mx = points.iter().map(|p| p.0 * p.2).sum::<f64>() / total;
+    let my = points.iter().map(|p| p.1 * p.2).sum::<f64>() / total;
+    let (sxy, sxx) = points.iter().fold((0.0, 0.0), |(xy, xx), (w, c, n)| {
+        (xy + n * (w - mx) * (c - my), xx + n * (w - mx) * (w - mx))
     });
     let slope = if sxx > 0.0 { (sxy / sxx).max(0.0) } else { my * WIDTH_SLOPE };
     my + slope * (width - mx)
@@ -143,6 +146,16 @@ mod tests {
         let two = switch.width_costs(0, |_| None);
         assert_eq!((two[3], two[7]), (10.0, 14.0));
         assert!((two[5] - 12.0).abs() < 1e-4);
+        // One slow width cannot price itself out: it is read from the line through all widths.
+        let mut trapped = DeviceWidth::new(1, 8).unwrap();
+        for _ in 0..64 {
+            trapped.observe(0, 3, 2, 10_000_000);
+            trapped.observe(0, 5, 3, 11_000_000);
+            trapped.observe(0, 8, 5, 12_500_000);
+        }
+        trapped.observe(0, 4, 2, 30_000_000);
+        let costs = trapped.width_costs(0, |_| None);
+        assert!(costs[3] < 11.0 && costs[3] > 10.0, "{costs:?}");
         // Longer contexts borrow the nearest learned bucket until they learn their own.
         assert_eq!(switch.width_costs(200_000, |_| None), two);
         assert_eq!(switch.expected_tokens(200_000, 1.0), 4.0);
