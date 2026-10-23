@@ -157,7 +157,7 @@ def canonical_norm(norm_type, weight, eps):
 
 class PreparedDecoder:
     def __init__(self, weights, environment, scratch, metadata, pool, *, mode, runtime,
-                 vocabulary_runtime, coordinator, session, name, workspace, scoring=None, a4_prefill=None):
+                 vocabulary_runtime, coordinator, session, name, workspace, scoring=None, a4_prefill=None, defer_head_gather=False):
         layer_type, norm_type = environment.canonical
         self.weights, self.scratch, self.metadata, self.pool = weights, scratch, metadata, pool
         self.vision = environment.vision if mode == "prefill" else None
@@ -223,6 +223,8 @@ class PreparedDecoder:
             name=name + ".prompt", copy_source=True)
         self.head = PreparedVocabularyProjection(scratch.hidden, weights.head, scratch.local_logits, scratch.logits,
             runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head")
+        # A two-phase round projects the shard here and gathers full logits only in its dense continuation.
+        self.defer_head_gather = defer_head_gather
         self.prefetcher = None
         if L2_PREFETCH and mode != "prefill" and scratch.embedding.shape[0] <= L2_PREFETCH_MAX_TOKENS:
             self.prefetcher, plans = _shared_prefetch(weights, scratch.embedding.device)
@@ -247,7 +249,13 @@ class PreparedDecoder:
             self.scratch.hidden.copy_(self.scoring.source[self.metadata.sample_indices])
         else:
             self.scratch.hidden.copy_(self.norm(hidden[self.metadata.sample_indices]))
-        self.head(self.scratch.hidden)
+        self._head(self.scratch.hidden)
+
+    def _head(self, hidden):
+        if self.defer_head_gather:
+            self.head.project(hidden)
+        else:
+            self.head(hidden)
 
     def _fused(self, residual):
         s = self.scratch
@@ -261,7 +269,7 @@ class PreparedDecoder:
         if self.prefetcher is not None:
             self.prefetcher.join()
         s.hidden.copy_(s.normalized[self.metadata.sample_indices])
-        self.head(s.hidden)
+        self._head(s.hidden)
 
     def commit(self, counts):
         if self.window_commit is not None:

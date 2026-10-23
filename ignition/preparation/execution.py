@@ -25,11 +25,20 @@ class GraphSignature:
     # Set only on graphs captured in both activation precisions: True for the variant that quantizes
     # activations ahead of weight-quantized projections. Loading keeps one variant per capacity.
     quantized_activations: bool | None = None
+    # A two-phase round: (flag buffer, taken graph, fallback graph). After this graph completes the
+    # host reads the one-byte flag and launches one of the two continuation graphs.
+    branch: tuple[str, str, str] | None = None
 
     def __post_init__(self):
         if self.kind not in ("init", "restore", "snapshot", "prefill", "scored_prefill", "decode", "resume",
-                             "vision", "speculative", "mixed", "proposal", "verification"):
+                             "vision", "speculative", "mixed", "proposal", "verification", "continuation"):
             raise ValueError("unknown prepared graph operation")
+        if self.branch is not None and (self.kind != "speculative" or len(self.branch) != 3
+                or any(type(name) is not str or not name for name in self.branch)
+                or self.branch[1] == self.branch[2]):
+            raise ValueError("only speculative graphs branch, to two distinct named continuations")
+        if self.kind == "continuation" and self.inputs:
+            raise ValueError("continuations read the inputs their first phase uploaded")
         if self.kind == "scored_prefill" and (self.batch_capacity != 1
                 or self.token_capacity < 64 or self.token_capacity % 64
                 or "prompt_target_tokens" not in self.inputs):
@@ -48,7 +57,7 @@ class GraphSignature:
             raise ValueError("ordinary decode graphs require disabled speculation")
         if any(type(value) is not int or value <= 0 for value in (self.batch_capacity, self.token_capacity)):
             raise ValueError("graph capacities must be positive integers")
-        if self.kind in ("speculative", "proposal", "verification") and (
+        if self.kind in ("speculative", "proposal", "verification", "continuation") and (
                 self.batch_capacity not in BATCH_CAPACITIES or not 1 <= self.token_capacity <= 8):
             raise ValueError("speculative graphs require power-of-two batch capacities through 64 and width 1 through 8")
         if type(self.prefill_capacity) is not int or self.prefill_capacity < 0:
@@ -112,6 +121,12 @@ class PreparedExecution(PreparedGraphBundle):
         for signature in signatures.values():
             if not set(signature.inputs) <= self.buffers.keys():
                 raise ValueError("graph signature references an unregistered input buffer")
+        continuations = [name for name, s in signatures.items() if s.kind == "continuation"]
+        branched = [s.branch for s in signatures.values() if s.branch is not None]
+        targets = [name for branch in branched for name in branch[1:]]
+        if sorted(targets) != sorted(continuations) or any(
+                branch[0] not in self.buffers or self.buffers[branch[0]].numel() < 1 for branch in branched):
+            raise ValueError("every continuation belongs to exactly one branch over a registered flag buffer")
         from ignition.components.completion import validate_completion_buffers
         validate_completion_buffers(self.buffers, request_capacity(max_active))
         self.signatures = MappingProxyType(dict(signatures))
@@ -144,11 +159,17 @@ class PreparedExecution(PreparedGraphBundle):
                 offsets[name] = (cursor, nbytes)
                 cursor += nbytes
         graphs = []
+        branches = []
         speculative = any(signature.kind in ("speculative", "proposal", "verification") for signature in self.signatures.values())
         for (name, _), handle in zip(self.graphs.items(), handles, strict=True):
             signature = self.signatures[name]
             if not all_variants and signature.speculation_enabled not in (None, speculative):
                 continue
+            if signature.kind == "continuation":
+                continue
+            if signature.branch is not None:
+                flag, taken, fallback = signature.branch
+                branches.append({"graph": name, "flag_buffer": flag, "taken": taken, "fallback": fallback})
             inputs = (*reserved, *signature.inputs)
             graphs.append({"name": name, "kind": signature.kind, "handle": handle,
                 "sampling_mode": signature.sampling_mode,
@@ -164,9 +185,12 @@ class PreparedExecution(PreparedGraphBundle):
             if signature.quantized_activations is not None:
                 graphs[-1]["quantized_activations"] = signature.quantized_activations
         abi_version = 3 if self.buffers["completion_records"].shape[-1] == 24 else 2
-        return {"abi_version": abi_version, "context": context, "device": self.device,
-                "max_active": self.max_active, "input_frame_bytes": (cursor + 7) // 8 * 8,
-                "buffers": descriptors, "graphs": graphs}
+        manifest = {"abi_version": abi_version, "context": context, "device": self.device,
+                    "max_active": self.max_active, "input_frame_bytes": (cursor + 7) // 8 * 8,
+                    "buffers": descriptors, "graphs": graphs}
+        if branches:
+            manifest["branches"] = branches
+        return manifest
 
     def start_executor(self, *, peers=None):
         """Synchronize preparation and consume the bundle into the native executor."""

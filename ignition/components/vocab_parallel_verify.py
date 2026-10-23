@@ -171,8 +171,10 @@ def _summary_chunk_kernel(Scores, ChunkMax, ChunkSum, ChunkTop, stride, local, c
 
 
 @triton.jit
-def _summary_merge_kernel(ChunkMax, ChunkSum, ChunkTop, Maximum, ExpSum, TopScores, TopIds, chunks, offset,
+def _summary_merge_kernel(ChunkMax, ChunkSum, ChunkTop, Maximum, ExpSum, TopScores, TopIds, chunks, Offset,
                           K: tl.constexpr, CHUNKS: tl.constexpr):
+    # The rank's vocabulary offset is a device scalar, so every rank launches the same compiled kernel.
+    offset = tl.load(Offset)
     row = tl.program_id(0)
     lane = tl.arange(0, CHUNKS)
     maxima = tl.load(ChunkMax + row * chunks + lane, mask=lane < chunks, other=-float("inf"))
@@ -204,8 +206,10 @@ def fused_shard_summary(local_scores, rank_offset, candidates=SUMMARY_CANDIDATES
     exp_sum = torch.empty(rows, device=device)
     scores = torch.empty(rows, candidates, device=device)
     token_ids = torch.empty(rows, candidates, dtype=torch.int64, device=device)
+    if not isinstance(rank_offset, torch.Tensor):
+        rank_offset = torch.full((1,), int(rank_offset), dtype=torch.int64, device=device)
     _summary_merge_kernel[(rows,)](chunk_max, chunk_sum, chunk_top, maximum, exp_sum, scores, token_ids, chunks,
-                                   int(rank_offset), K=candidates, CHUNKS=triton.next_power_of_2(chunks),
+                                   rank_offset, K=candidates, CHUNKS=triton.next_power_of_2(chunks),
                                    num_warps=4)
     return ShardSummary(maximum, exp_sum, scores, token_ids)
 

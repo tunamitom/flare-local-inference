@@ -103,6 +103,10 @@ class PreparationConfig:
     # Each rank proposes drafts from its vocabulary shard of the draft head and gathers only its
     # bounded candidates; False gathers full-vocabulary draft logits. Proposals are identical.
     vocabulary_parallel_draft: bool = True
+    # Speculative rounds of at most this many requests verify in two phases: shard summaries decide
+    # on device whether the round's nuclei fit a compact verifier, and the host then launches the
+    # compact or the dense continuation. Zero captures every round in one phase.
+    two_phase_max_batch: int = 4
     # "w8a16" converts the draft's BF16 projections to block-FP8 (128x128 blocks, amax/448
     # scales) at load and runs them as W8A16 GEMVs with BF16 activations, halving draft weight
     # traffic; "bf16" keeps the checkpoint's BF16 projections. Draft batches above 32 rows
@@ -376,13 +380,13 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     )
     with phase(progress, "Construct graph catalog", total=count) as stage:
 
-        def add(name, forward, kind, rows, tokens, fields, *, enabled=None, quantized=None):
+        def add(name, forward, kind, rows, tokens, fields, *, enabled=None, quantized=None, branch=None):
             if kind == "scored_prefill":
                 forward = PreparedScoredPrefill(forward, requests, inputs)
                 fields = (*fields, "prompt_target_tokens")
             forwards[name] = forward
             signatures[name] = GraphSignature(kind, rows, tokens, tuple(fields), speculation_enabled=enabled,
-                                              quantized_activations=quantized)
+                                              quantized_activations=quantized, branch=branch)
             stage.update(advance=1)
 
         forward_inputs = (*inputs.buffers(), "sampling_grammar_mask")
@@ -454,10 +458,19 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             speculation.sampling_buffers = GraphBufferPool(device, chunk_bytes=2 << 20)
             for batch, width in sorted(config.speculative_shapes, key=lambda shape: shape[0] * shape[1], reverse=True):
                 name = f"speculative{batch}x{width}"
+                two_phase = (width > 1 and batch <= config.two_phase_max_batch
+                             and speculation.draft_candidates is not None)
                 forward = PreparedParallelDraftRound(speculation, batch, width, name,
-                                                     buffers=speculation.sampling_buffers.cursor())
+                                                     buffers=speculation.sampling_buffers.cursor(),
+                                                     two_phase=two_phase)
                 forward.prepare()
-                add(name, forward, "speculative", batch, width, forward_inputs, enabled=True)
+                branch = (("two_phase_flag", f"{name}.compact", f"{name}.dense") if two_phase else None)
+                add(name, forward, "speculative", batch, width, forward_inputs, enabled=True, branch=branch)
+                if two_phase:
+                    from ignition.components.parallel_draft import RoundContinuation
+
+                    add(f"{name}.compact", RoundContinuation(forward, True), "continuation", batch, width, ())
+                    add(f"{name}.dense", RoundContinuation(forward, False), "continuation", batch, width, ())
         for capacity in reversed(PATCH_CAPACITIES):
             name = f"vision{capacity}"
             cursor = graph_buffers.cursor()
@@ -566,7 +579,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         retain_graphs=config.retain_graphs,
         materialize=materialize_cache,
         warmup_storage=package_storage,
-        compile_kinds=("prefill", "scored_prefill", "decode", "resume", "speculative", "vision"),
+        compile_kinds=("prefill", "scored_prefill", "decode", "resume", "speculative", "continuation", "vision"),
     )
     session.freeze()
     pool.clear_for_preparation()
@@ -587,6 +600,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     cache_regions = [history_region(buffers, "cache." + name, tensor, contract_proto.PAGED_KEY_VALUE)
         for name, tensor in pool.pages.items()]
     buffers["request_pending_token"] = requests.pending_token
+    if speculation is not None:
+        buffers["two_phase_flag"] = speculation.two_phase_flag
     server_config = {
         "identity": identity,
         "model_id": snapshot.name,
@@ -601,7 +616,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             image_profile="mimo"),
         "sampling_defaults": RECIPE.sampling_defaults.as_dict(),
         "assets": assets,
-        "model_contract": prepare_contract(signatures, buffers, pool, image_slots=config.image_concurrency, page_tokens=PAGE_TOKENS, draft_lag=0 if config.dflash else None, regions=cache_regions),
+        "model_contract": prepare_contract({name: s for name, s in signatures.items() if s.kind != "continuation"},
+            buffers, pool, image_slots=config.image_concurrency, page_tokens=PAGE_TOKENS, draft_lag=0 if config.dflash else None, regions=cache_regions),
     }
     if config.a4_prefill:
         server_config["quantized_activation_min_tokens"] = config.a4_prefill_min_tokens
