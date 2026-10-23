@@ -237,12 +237,25 @@ impl GrammarCompiler {
             rules.push_str("start: tool_after_open tools_suffix ws\n");
         } else if let Some(end) = envelope.reasoning_end {
             if let Some((open, _)) = envelope.tool.filter(|_| envelope.tool_ends_reasoning) {
-                rules.push_str(&self.delimited_region("reasoning_done", end, &[end, open]));
-                rules.push_str(&self.delimited_region("reasoning_tool", open, &[end, open]));
-                // Only the outer tool opener implicitly ends reasoning.
-                rules.push_str(&format!(
-                    "start: (reasoning_done ws {branches} | reasoning_tool tool_after_open tools_suffix) ws\n",
-                ));
+                let special = self.factory.tok_env().tok_trie().get_special_token(open).is_some();
+                if special {
+                    rules.push_str(&self.delimited_region("reasoning_done", end, &[end, open], None));
+                    rules.push_str(&self.delimited_region("reasoning_tool", open, &[end, open], None));
+                    // Only the outer tool opener implicitly ends reasoning.
+                    rules.push_str(&format!(
+                        "start: (reasoning_done ws {branches} | reasoning_tool tool_after_open tools_suffix) ws\n",
+                    ));
+                } else {
+                    // A text opener ends reasoning only at a line start, like the output parser;
+                    // reasoning prose may quote it mid-line.
+                    let line_open = format!("\n{open}");
+                    rules.push_str(&self.delimited_region("reasoning_done", end, &[end, &line_open], Some(open)));
+                    rules.push_str(&self.delimited_region("reasoning_tool", &line_open, &[end, &line_open], Some(open)));
+                    rules.push_str(&format!(
+                        "start: (reasoning_done ws {branches} | reasoning_tool tool_after_open tools_suffix | {} tool_after_open tools_suffix) ws\n",
+                        self.marker(open)
+                    ));
+                }
             } else {
                 rules.push_str(&self.region("reasoning", end));
                 rules.push_str(&format!("start: reasoning ws {branches} ws\n"));
@@ -291,7 +304,7 @@ impl GrammarCompiler {
         }
     }
 
-    fn delimited_region(&self, name: &str, close: &str, ends: &[&str]) -> String {
+    fn delimited_region(&self, name: &str, close: &str, ends: &[&str], leading: Option<&str>) -> String {
         let trie = self.factory.tok_env().tok_trie();
         let literals: Vec<_> = ends
             .iter()
@@ -305,6 +318,14 @@ impl GrammarCompiler {
                 "(/(?s:.*)/ & ~(/(?s:.*)/ ({}) /(?s:.*)/))",
                 literals.join(" | ")
             )
+        };
+        // Text cannot begin with a delimiter that is only recognized at the region start.
+        let text = match leading {
+            Some(lead) => format!(
+                "({text} & ~({} /(?s:.*)/))",
+                serde_json::to_string(lead).unwrap()
+            ),
+            None => text,
         };
         let excluded: Vec<_> = ends
             .iter()
@@ -864,23 +885,29 @@ mod tests {
         };
         for (text, accepted) in [
             ("thought</think>{\"ok\":true}", true),
-            ("thought<tool_call><function=f></function>", true),
+            ("thought\n<tool_call><function=f></function>", true),
+            ("<tool_call><function=f></function>", true),
             (
-                "thought<tool_call><function=f></function></tool_call>",
+                "thought\n<tool_call><function=f></function></tool_call>",
                 true,
             ),
             ("thought</think><function=f></function>{\"ok\":true}", true),
             (
-                "thought<tool_call><function=f></function><function=f></function>",
+                "thought\n<tool_call><function=f></function><function=f></function>",
                 true,
             ),
             (
-                "thought<tool_call>literal</tool_call></think>{\"ok\":true}",
+                "thought\n<tool_call>literal</tool_call></think>{\"ok\":true}",
                 false,
+            ),
+            // A tool opener quoted mid-line in reasoning is prose, as in the output parser.
+            (
+                "thought <tool_call><function=f> quoted</think>{\"ok\":true}",
+                true,
             ),
             ("thought</think>{\"ok\":false}", false),
             (
-                "thought<tool_call><function=f></function>junk</tool_call>",
+                "thought\n<tool_call><function=f></function>junk</tool_call>",
                 false,
             ),
         ] {
@@ -908,7 +935,7 @@ mod tests {
             tool_body_start: false,
         };
         let schema = json!({"const":7});
-        let text = "thought<tool_call><function=f></function></tool_call>7";
+        let text = "thought\n<tool_call><function=f></function></tool_call>7";
         let tokens: Vec<_> = text.bytes().map(u32::from).collect();
         let mut grammar = compiler
             .compile_json_schema_in(&schema, Some(&envelope))
