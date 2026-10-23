@@ -76,3 +76,30 @@ def test_complete_rows_match_dense_verification(batch, width, top_k, fused):
 def test_flat_rows_request_the_dense_fallback(fused):
     complete, _ = _verify(4, 2, 1., 3, fused=fused)
     assert not bool(complete.any())
+
+
+def test_compact_eligibility_and_round_flag_on_cpu():
+    from ignition.components.vocab_parallel_verify import compact_eligible, compact_round
+
+    params = torch.tensor([[1., .95, 0., 1., 0., 0.],      # default sampling: eligible
+                           [1., .95, 0., 1.1, 0., 0.],     # repetition penalty
+                           [1., .95, 0., 1., -0., 0.],     # negative-zero presence is not neutral
+                           [1., .95, .05, 1., 0., 0.],     # min-p
+                           [0., 1., 0., 1., 0., 0.],       # greedy: eligible
+                           [.7, .9, 0., 1., 0., 0.]])
+    top_k = torch.tensor([20, 20, 20, 20, -1, 100])
+    grammar = torch.zeros(6, dtype=torch.int32)
+    logprobs = torch.zeros(6, dtype=torch.int32)
+    slots = torch.arange(6, dtype=torch.int32)
+    live = torch.ones(6, dtype=torch.bool)
+    eligible = compact_eligible(params, top_k, grammar, logprobs, slots, live)
+    assert eligible.tolist() == [True, False, False, False, True, False]
+    grammar[0] = 1
+    logprobs[4] = 1
+    assert compact_eligible(params, top_k, grammar, logprobs, slots, live)[[0, 4]].tolist() == [False, False]
+    live[1] = False
+    assert compact_eligible(params, top_k, grammar, logprobs, slots, live)[1].item()
+    fallbacks = torch.zeros(1, dtype=torch.int64)
+    ok = torch.tensor([True, True])
+    assert compact_round(ok, ok, fallbacks).item() and fallbacks.item() == 0
+    assert not compact_round(ok, torch.tensor([True, False]), fallbacks).item() and fallbacks.item() == 1
