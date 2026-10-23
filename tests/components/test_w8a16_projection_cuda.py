@@ -59,6 +59,33 @@ def test_w8a16_projections_share_scratch_through_compiled_replay(rows):
     graph.reset()
 
 
+@pytest.mark.parametrize("rows", [1, 8, 16, 32])
+def test_draft_head_shard_uses_its_tuned_configs_through_graph_replay(rows):
+    from ignition.components.w8a16_gemv import default_config
+
+    device = torch.device("cuda", 0)
+    generator = torch.Generator(device=device).manual_seed(rows)
+    # MiMo's TP8 vocabulary shard: 152,576 tokens over eight ranks.
+    head = quantize_block_fp8((torch.randn((19072, 6144), device=device, generator=generator) * .02)
+                              .to(torch.bfloat16))
+    assert default_config(rows, 19072, 6144).block_n == (128 if rows <= 8 else 64)
+    source = torch.randn((rows, 6144), device=device, dtype=torch.bfloat16, generator=generator)
+    logits = torch.empty((rows, 19072), device=device, dtype=torch.bfloat16)
+    workspace = W8A16Workspace(((19072, 6144),), device)
+    project = W8A16Projection(source, head, logits, session=None, name="head", workspace=workspace)
+    graph = torch.cuda.CUDAGraph()
+    project(source)
+    torch.cuda.synchronize()
+    with torch.cuda.graph(graph):
+        project(source)
+    graph.replay()
+    torch.cuda.synchronize()
+    expected = source.float() @ _dequantized(head).T
+    torch.testing.assert_close(logits.float(), expected, rtol=.02, atol=.02 * expected.abs().max().item())
+    assert not workspace.counters.any()
+    graph.reset()
+
+
 def test_quantization_layout_matches_amax_scales():
     device = torch.device("cuda", 0)
     weight = torch.randn((200, 256), device=device).to(torch.bfloat16)
