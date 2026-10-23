@@ -110,7 +110,7 @@ class PreparedAttention(torch.nn.Module):
         # Without its reduction the layer returns this rank's partial for a fused reduction and norm.
         self.reduction = PreparedAllReduce(scratch.partial, scratch.output, runtime=runtime,
             coordinator=coordinator, session=session, name=name + ".reduce") if reduce_output else None
-        # (prefetcher, plan) issued right after the QKV projection in decode and verification.
+        # (prefetcher, plan) issued once the QKV projection completes in decode and verification.
         self.prefetch = None
         geometry = self.geometry
         self.inverse = 1.0 / (geometry.theta ** (torch.arange(0, geometry.rotary_dim, 2,
@@ -170,7 +170,9 @@ class PreparedAttention(torch.nn.Module):
         s, m, a = self.scratch, self.metadata, self.geometry
         projected = self.projection(hidden_states.reshape(-1, hidden_states.shape[-1]))
         if self.prefetch is not None:
-            self.prefetch[0].issue(self.prefetch[1])
+            # Ordered after the projection: issued beside it, the window's fill competes with the
+            # projection's weight stream for device memory.
+            self.prefetch[0].issue(self.prefetch[1], after=projected)
         if self.fused:
             # Split, partial RoPE, value scale and retained verification rows in one launch.
             qkv.rotate(projected, m.positions, self.inverse, s.query, s.key, s.value, self.value_scale,
