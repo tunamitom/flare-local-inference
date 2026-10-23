@@ -151,9 +151,12 @@ fn packed_discovery_finishes_with_ragged_cohorts_and_legacy_producers() {
             }
             let mut discoveries = 0;
             let mut finished = false;
-            for sequence in 1..=2 * s.costs.len() as u64 {
+            // Calibrated retained proposals can wait several rounds behind optimistic packed forecasts.
+            for sequence in 1..=8 * s.costs.len() as u64 {
                 let plan = s.plan().unwrap();
-                if plan.origin == PlanOrigin::Ordinary && plan.kind != GraphKind::Verification {
+                // Realized acceptance rescales later confidences, so finish once no proposal awaits verification.
+                if plan.origin == PlanOrigin::Ordinary && plan.kind != GraphKind::Verification
+                    && s.split.as_ref().unwrap().retained.iter().all(Option::is_none) {
                     finished = true;
                     break;
                 }
