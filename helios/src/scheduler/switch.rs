@@ -269,4 +269,25 @@ mod scheduler_tests {
         assert!(s.device_widths(&graphs, &[one]).is_ok());
         assert!(s.device_widths(&graphs, &[]).is_ok() && s.device_width.is_none());
     }
+
+    #[test]
+    fn a_lone_request_is_not_padded_into_a_wider_host_width_graph() {
+        let mut s = super::super::tests::scheduler(2, 512, 64);
+        s.enable_speculation(&(1..=8).collect::<Vec<_>>()).unwrap();
+        let graphs = super::super::tests::duration_graphs(2);
+        s.measured_graph_durations(&graphs).unwrap();
+        let one = graphs.iter().position(|g| g.kind == GraphKind::Speculative && g.batch_capacity == 1 && g.token_capacity == 8).unwrap();
+        s.device_widths(&graphs, &[one]).unwrap();
+        // Make the batch-two graphs look cheaper than the switched graph.
+        for width in 1..=8 {
+            s.costs.set_measured(&ScheduledStep { packed_token_capacity: 0, kind: GraphKind::Speculative, batch_capacity: 2,
+                token_capacity: width, mixed: None, lanes: vec![], requires_feedback: true }, 100_000);
+        }
+        s.costs.set_measured(&ScheduledStep { packed_token_capacity: 0, kind: GraphKind::Speculative, batch_capacity: 1,
+            token_capacity: 8, mixed: None, lanes: vec![], requires_feedback: true }, 10_000_000);
+        let h = ready(&mut s);
+        let plan = s.plan().unwrap();
+        assert_eq!((plan.step.kind, plan.step.batch_capacity, plan.step.token_capacity), (GraphKind::Speculative, 1, 8));
+        assert_eq!(plan.step.lanes[0].request, h);
+    }
 }
