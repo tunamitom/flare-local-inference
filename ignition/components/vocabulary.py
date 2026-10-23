@@ -25,7 +25,7 @@ class PreparedVocabularyProjection:
     """
 
     def __init__(self, source, weight, local_output, output, *, runtime, session,
-                 coordinator, name, activation_mode="a16", buffers=None, row_indices=None):
+                 coordinator, name, activation_mode="a16", buffers=None, row_indices=None, projection=None):
         rows = source.shape[0]
         if row_indices is None and output.shape[0] != rows:
             raise ValueError("vocabulary output rows must match projected rows without row indices")
@@ -34,7 +34,8 @@ class PreparedVocabularyProjection:
                 or output.shape[0] < rows):
             raise ValueError("vocabulary row indices require one device int64 index per expanded output row")
         self.row_indices = row_indices
-        self.projection = vocabulary_shard_projection(source, weight, local_output, session=session,
+        # A caller-prepared ``projection`` into ``local_output`` replaces the shard projection.
+        self.projection = projection or vocabulary_shard_projection(source, weight, local_output, session=session,
             name=f"{name}.projection", activation_mode=activation_mode)
         world = 1 if runtime is None else runtime.world_size
         columns = local_output.shape[1] * world
