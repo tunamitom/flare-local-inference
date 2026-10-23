@@ -157,46 +157,62 @@ def _pack(x, ids):
 
 
 @triton.jit
-def _summary_kernel(Scores, Maximum, ExpSum, TopScores, TopIds, stride, local, offset,
-                    K: tl.constexpr, BLOCK: tl.constexpr):
+def _summary_chunk_kernel(Scores, ChunkMax, ChunkSum, ChunkTop, stride, local, chunks,
+                          K: tl.constexpr, BLOCK: tl.constexpr):
+    # One program per (row, chunk): chunk maximum, exp-sum relative to it, and its K best keys.
+    row, chunk = tl.program_id(0), tl.program_id(1)
+    ids = chunk * BLOCK + tl.arange(0, BLOCK)
+    x = tl.load(Scores + row * stride + ids, mask=ids < local, other=-float("inf")).to(tl.float32)
+    maximum = tl.max(x, 0)
+    safe = tl.where(maximum == -float("inf"), 0., maximum)
+    tl.store(ChunkMax + row * chunks + chunk, maximum)
+    tl.store(ChunkSum + row * chunks + chunk, tl.sum(tl.exp(x - safe), 0))
+    tl.store(ChunkTop + (row * chunks + chunk) * K + tl.arange(0, K), tl.topk(_pack(x, ids), K))
+
+
+@triton.jit
+def _summary_merge_kernel(ChunkMax, ChunkSum, ChunkTop, Maximum, ExpSum, TopScores, TopIds, chunks, offset,
+                          K: tl.constexpr, CHUNKS: tl.constexpr):
     row = tl.program_id(0)
-    lanes = tl.arange(0, BLOCK)
-    best = tl.full([K], -9223372036854775807 - 1, tl.int64)
-    running_max = -float("inf")
-    running_sum = 0.
-    for start in range(0, local, BLOCK):
-        ids = start + lanes
-        x = tl.load(Scores + row * stride + ids, mask=ids < local, other=-float("inf")).to(tl.float32)
-        chunk_max = tl.max(x, 0)
-        new_max = tl.maximum(running_max, chunk_max)
-        safe = tl.where(new_max == -float("inf"), 0., new_max)
-        running_sum = running_sum * tl.exp(running_max - safe) + tl.sum(tl.exp(x - safe), 0)
-        running_max = new_max
-        chunk = tl.topk(_pack(x, ids), K)
-        best = tl.topk(tl.reshape(tl.join(best, chunk), [2 * K]), K)
+    lane = tl.arange(0, CHUNKS)
+    maxima = tl.load(ChunkMax + row * chunks + lane, mask=lane < chunks, other=-float("inf"))
+    sums = tl.load(ChunkSum + row * chunks + lane, mask=lane < chunks, other=0.)
+    maximum = tl.max(maxima, 0)
+    safe = tl.where(maximum == -float("inf"), 0., maximum)
+    scale = tl.where(maxima == -float("inf"), 0., tl.exp(maxima - safe))
+    slot = tl.arange(0, CHUNKS * K)
+    keys = tl.load(ChunkTop + row * chunks * K + slot, mask=slot < chunks * K, other=-9223372036854775807 - 1)
+    best = tl.topk(keys, K)
     out = tl.arange(0, K)
-    tl.store(Maximum + row, running_max)
-    tl.store(ExpSum + row, running_sum)
+    tl.store(Maximum + row, maximum)
+    tl.store(ExpSum + row, tl.sum(sums * scale, 0))
     tl.store(TopScores + row * K + out, _key_score((best >> 32).to(tl.int32)))
     tl.store(TopIds + row * K + out, _LOW - (best & _LOW) + offset)
 
 
-def fused_shard_summary(local_scores, rank_offset, candidates=SUMMARY_CANDIDATES, block=4096):
-    """shard_summary in one kernel: one program per row streams the shard once."""
+def fused_shard_summary(local_scores, rank_offset, candidates=SUMMARY_CANDIDATES, block=2048):
+    """shard_summary in two kernels: per-chunk summaries in parallel, then one merge program per row."""
     rows, local = local_scores.shape
     device = local_scores.device
+    chunks = triton.cdiv(local, block)
+    chunk_max = torch.empty(rows, chunks, device=device)
+    chunk_sum = torch.empty(rows, chunks, device=device)
+    chunk_top = torch.empty(rows, chunks, candidates, dtype=torch.int64, device=device)
+    _summary_chunk_kernel[(rows, chunks)](local_scores, chunk_max, chunk_sum, chunk_top, local_scores.stride(0),
+                                          local, chunks, K=candidates, BLOCK=block, num_warps=4)
     maximum = torch.empty(rows, device=device)
     exp_sum = torch.empty(rows, device=device)
     scores = torch.empty(rows, candidates, device=device)
     token_ids = torch.empty(rows, candidates, dtype=torch.int64, device=device)
-    _summary_kernel[(rows,)](local_scores, maximum, exp_sum, scores, token_ids, local_scores.stride(0), local,
-                             int(rank_offset), K=candidates, BLOCK=block, num_warps=8)
+    _summary_merge_kernel[(rows,)](chunk_max, chunk_sum, chunk_top, maximum, exp_sum, scores, token_ids, chunks,
+                                   int(rank_offset), K=candidates, CHUNKS=triton.next_power_of_2(chunks),
+                                   num_warps=4)
     return ShardSummary(maximum, exp_sum, scores, token_ids)
 
 
 @triton.jit
 def _merge_kernel(Maximum, ExpSum, Scores, Ids, TopK, TopP, OutIds, OutProbs, Complete, rows, vocab,
-                  WORLD: tl.constexpr, K: tl.constexpr):
+                  WORLD: tl.constexpr, K: tl.constexpr, NUCLEUS: tl.constexpr):
     row = tl.program_id(0)
     C: tl.constexpr = WORLD * K
     ranks = tl.arange(0, WORLD)
@@ -230,25 +246,35 @@ def _merge_kernel(Maximum, ExpSum, Scores, Ids, TopK, TopP, OutIds, OutProbs, Co
     bound = tl.max(tl.where(last == -float("inf"), 0., tl.exp(last - safe_max)), 0) / normalizer
     complete = (global_max != -float("inf")) & (((k_enabled == 0) | (top_k <= K)) &
                                                  ((k_enabled & (top_k <= K)) | (smallest > bound)))
+    # Only the first NUCLEUS IDs are published; a larger nucleus takes the dense path.
+    complete = complete & (tl.sum(kept.to(tl.int32), 0) <= NUCLEUS)
     nucleus = tl.where(kept, probabilities, 0.)
     nucleus = nucleus / tl.maximum(tl.sum(nucleus, 0), 1.1754943508222875e-38)
     by_id = tl.sort((tl.where(kept, ids, vocab) << 32) | nucleus.to(tl.int32, bitcast=True).to(tl.int64))
     out_ids = by_id >> 32
-    tl.store(OutIds + row * C + slot, tl.where(out_ids < vocab, out_ids, -1))
-    tl.store(OutProbs + row * C + slot, (by_id & _LOW).to(tl.int32).to(tl.float32, bitcast=True))
+    published = slot < NUCLEUS
+    tl.store(OutIds + row * NUCLEUS + slot, tl.where(out_ids < vocab, out_ids, -1), mask=published)
+    tl.store(OutProbs + row * NUCLEUS + slot, (by_id & _LOW).to(tl.int32).to(tl.float32, bitcast=True),
+             mask=published)
     tl.store(Complete + row, complete)
 
 
-def fused_merge_summaries(maximum, exp_sum, scores, token_ids, top_k, top_p, vocab):
-    """merge_summaries in one single-CTA program per row."""
+NUCLEUS_SLOTS = 128
+
+
+def fused_merge_summaries(maximum, exp_sum, scores, token_ids, top_k, top_p, vocab, nucleus=NUCLEUS_SLOTS):
+    """merge_summaries in one single-CTA program per row, publishing at most `nucleus` IDs per row.
+
+    Rows whose nucleus holds more IDs are reported incomplete, so the caller verifies them densely.
+    """
     world, rows, candidates = scores.shape
     device = scores.device
-    out_ids = torch.empty(rows, world * candidates, dtype=torch.int64, device=device)
-    out_probs = torch.empty(rows, world * candidates, device=device)
+    out_ids = torch.empty(rows, nucleus, dtype=torch.int64, device=device)
+    out_probs = torch.empty(rows, nucleus, device=device)
     complete = torch.empty(rows, dtype=torch.bool, device=device)
     _merge_kernel[(rows,)](maximum.contiguous(), exp_sum.contiguous(), scores.contiguous(), token_ids.contiguous(),
                            top_k, top_p, out_ids, out_probs, complete, rows, vocab, WORLD=world, K=candidates,
-                           num_warps=4)
+                           NUCLEUS=nucleus, num_warps=4)
     return MergedTarget(out_ids, out_probs, complete)
 
 
@@ -266,6 +292,10 @@ def _union_kernel(Ids, Probs, Drafts, Target, UnionIds, DraftColumns, Scratch, w
     ids = tl.where(ids >= 0, ids, 1 << 40)
     ordered = tl.sort((ids << 16) | entry.to(tl.int64))
     tl.store(Scratch + request * N + entry, ordered >> 16)
+    # Unused columns: zero target mass, and a valid ID (0) the draft lookup may read; zero target makes them inert.
+    tl.store(UnionIds + request * N + entry, tl.zeros([N], tl.int64))
+    for position in range(width):
+        tl.store(Target + (request * width + position) * N + entry, tl.zeros([N], tl.float32))
     tl.debug_barrier()
     previous = tl.load(Scratch + request * N + entry - 1, mask=entry > 0, other=-1)
     sorted_ids = ordered >> 16
@@ -290,14 +320,15 @@ def fused_compact_chain_verify(merged, batch, width, draft_ids, draft_token_prob
     entries = width * C + width - 1
     N = triton.next_power_of_2(entries)
     device = merged.token_ids.device
-    target = torch.zeros(batch, width, N, device=device)
-    union = torch.full((batch, N), -1, dtype=torch.int64, device=device)
+    target = torch.empty(batch, width, N, device=device)
+    union = torch.empty(batch, N, dtype=torch.int64, device=device)
     draft_columns = torch.empty(batch, width - 1, dtype=torch.int32, device=device)
     scratch = torch.empty(batch, N, dtype=torch.int64, device=device)
     _union_kernel[(batch,)](merged.token_ids, merged.probabilities, draft_ids.contiguous(), target, union,
                             draft_columns, scratch, width, entries, C=C, N=N, num_warps=8)
-    draft = draft_token_probs(union.clamp_min(0)[:, None, :].expand(batch, width - 1, N))
-    draft = torch.where((union >= 0)[:, None, :], draft, 0.)
+    # Unused columns read token 0's draft probability; with zero target mass they affect neither the acceptance
+    # ratio of a draft (whose column is always used) nor the residual max(target - draft, 0).
+    draft = draft_token_probs(union[:, None, :].expand(batch, width - 1, N))
     accepted = torch.zeros(batch, dtype=torch.int32, device=device)
     emitted = torch.zeros(batch, dtype=torch.int32, device=device)
     tokens, _, _ = sampling.chain_speculative_sampling(draft.contiguous(), draft_columns, target, accepted, emitted,
