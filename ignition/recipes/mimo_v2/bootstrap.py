@@ -5,7 +5,7 @@ import hashlib
 import importlib.util
 import json
 import os
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import torch
@@ -107,6 +107,10 @@ class PreparationConfig:
     # on device whether the round's nuclei fit a compact verifier, and the host then launches the
     # compact or the dense continuation. Zero captures every round in one phase.
     two_phase_max_batch: int = 4
+    # Split speculation: proposal graphs retain each request's drafts with per-position
+    # confidence from the drafter's own distributions, and verification graphs check the prefix
+    # the runtime chooses per step. Joined graphs keep one width per request history.
+    split_speculation: bool = field(default_factory=lambda: os.environ.get("FLARE_MIMO_SPLIT_SPECULATION", "0") == "1")
     # "w8a16" converts the draft's BF16 projections to block-FP8 (128x128 blocks, amax/448
     # scales) at load and runs them as W8A16 GEMVs with BF16 activations, halving draft weight
     # traffic; "bf16" keeps the checkpoint's BF16 projections. Draft batches above 32 rows
@@ -157,6 +161,9 @@ class PreparationConfig:
             and self.speculative_fixed_width not in self.speculative_widths
         ):
             raise ValueError("fixed verification width must belong to the prepared widths")
+        if self.split_speculation and (not self.dflash or self.draft_tokens < 1
+                                       or self.speculative_widths != tuple(range(1, max(self.speculative_widths) + 1))):
+            raise ValueError("split speculation requires DFlash drafts over contiguous widths from one")
         if self.snapshot_budget_bytes <= 0 or self.headroom_bytes < 0:
             raise ValueError("snapshot budget must be positive and headroom nonnegative")
 
@@ -377,6 +384,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         + len(config.speculative_shapes)
         + len(config.batch_capacities)
         + len(PATCH_CAPACITIES)
+        + (len(config.batch_capacities) * (config.draft_tokens + 1) if config.split_speculation else 0)
     )
     with phase(progress, "Construct graph catalog", total=count) as stage:
 
@@ -456,7 +464,40 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             from ignition.components.parallel_draft import PreparedParallelDraftRound
 
             speculation.sampling_buffers = GraphBufferPool(device, chunk_bytes=2 << 20)
-            for batch, width in sorted(config.speculative_shapes, key=lambda shape: shape[0] * shape[1], reverse=True):
+            if config.split_speculation:
+                from ignition.components.capacity import proposal_shapes
+                from ignition.components.split_draft import (
+                    PreparedDraftProposal, PreparedDraftVerification, PreparedProposalStorage)
+
+                confidence = package_storage.host_allocate(
+                    "proposal_confidence", (config.request_capacity, config.draft_tokens), torch.float32)
+                buffers["proposal_confidence"] = confidence.device_view
+                split = PreparedProposalStorage(speculation, config.draft_tokens)
+                buffers.update(split.buffers())
+                # The DFlash drafter always predicts its full block; a proposal keeps the first depth drafts.
+                for batch, depth in sorted(proposal_shapes(config.max_active, config.draft_tokens), reverse=True):
+                    name = f"proposal{batch}x{depth + 1}"
+                    source = PreparedParallelDraftRound(speculation, batch, depth + 1, name,
+                        buffers=speculation.sampling_buffers.cursor(), proposal_only=True)
+                    source.prepare()
+                    add(name, PreparedDraftProposal(source, confidence.device_view, split), "proposal",
+                        batch, depth + 1, forward_inputs, enabled=True)
+                for batch, width in sorted(config.speculative_shapes, key=lambda shape: shape[0] * shape[1],
+                                           reverse=True):
+                    name = f"verification{batch}x{width}"
+                    target = PreparedParallelDraftRound(speculation, batch, width, name, generate_proposals=False,
+                        buffers=speculation.sampling_buffers.cursor())
+                    target.prepare()
+                    add(name, PreparedDraftVerification(split, target), "verification", batch, width,
+                        forward_inputs, enabled=True)
+                    if width == 1:
+                        # Decoding without a proposal still retains the draft context.
+                        decode = PreparedParallelDraftRound(speculation, batch, 1, f"speculative{batch}x1",
+                            buffers=speculation.sampling_buffers.cursor())
+                        decode.prepare()
+                        add(f"speculative{batch}x1", decode, "speculative", batch, 1, forward_inputs, enabled=True)
+            for batch, width in (() if config.split_speculation else
+                                 sorted(config.speculative_shapes, key=lambda shape: shape[0] * shape[1], reverse=True)):
                 name = f"speculative{batch}x{width}"
                 two_phase = (width > 1 and batch <= config.two_phase_max_batch
                              and speculation.draft_candidates is not None)
