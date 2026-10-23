@@ -752,6 +752,9 @@ impl RequestScheduler {
                         selected |= 1 << slot;
                     }
                 }
+                if self.pads_switched_request(following, batch, selected) {
+                    continue;
+                }
                 let rate = ValueRate::new(horizon, value, age_price);
                 if best.is_none_or(|(_, old)| rate.compare(old).is_gt()) {
                     best = Some((fill(selected), rate));
@@ -892,6 +895,9 @@ impl RequestScheduler {
             return;
         }
         let selected = best_cohort::<REQUEST_LANES>(&offers[..count], batch);
+        if self.pads_switched_request(kind, batch, selected) {
+            return;
+        }
         let expected = offers[..count]
             .iter()
             .filter(|(s, _)| selected & (1 << s) != 0)

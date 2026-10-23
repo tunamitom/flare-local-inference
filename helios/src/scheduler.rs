@@ -939,6 +939,14 @@ impl RequestScheduler {
         self.switched(step.kind, step.batch_capacity, step.token_capacity)
     }
 
+    /// A lone request belongs to the switched graph: a wider host-width speculative graph
+    /// would carry it at that batch's cost without choosing its width from the round's drafts.
+    fn pads_switched_request(&self, kind: GraphKind, batch: usize, selected: u64) -> bool {
+        kind == GraphKind::Speculative
+            && self.device_width.as_ref().is_some_and(|device| batch > device.batch)
+            && selected.count_ones() as usize <= self.device_width.as_ref().map_or(0, |d| d.batch)
+    }
+
     fn switched(&self, kind: GraphKind, batch: usize, capacity: usize) -> bool {
         self.device_width.as_ref().is_some_and(|d| d.matches(kind, batch, capacity))
     }
