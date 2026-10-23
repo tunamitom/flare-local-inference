@@ -329,6 +329,9 @@ class SpeculativePreparation:
                                 else ContextBuffers.allocate(weights, context_tokens, pool.backing.device))
         # A candidate channel proposes from each rank's draft vocabulary shard instead of gathered logits.
         self.draft_candidates = draft_candidates
+        # Two-phase verification rounds publish their continuation choice here; the host reads byte 0.
+        self.two_phase_flag = torch.zeros(64, dtype=torch.uint8, device=pool.backing.device)
+        self.two_phase_fallbacks = torch.zeros(1, dtype=torch.int64, device=pool.backing.device)
         # Block-FP8 draft weights run as W8A16 GEMVs whose split-K scratch every graph shares:
         # all draft and context projections run in stream order on the main stream.
         draft = weights.draft_w8a16 if getattr(weights, "draft_w8a16", None) is not None else weights.draft

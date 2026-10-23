@@ -44,13 +44,22 @@ class PreparedVocabularyProjection:
         self.gathered = output[:rows] if columns == output.shape[1] else (
             torch.empty((rows, columns), dtype=output.dtype, device=output.device) if buffers is None
             else buffers.zeros((rows, columns), output.dtype))
+        self.local_output = local_output
         self.gather = PreparedAllGather(local_output, self.gathered, runtime=runtime,
             session=session, coordinator=coordinator, name=f"{name}.gather")
         self.output = output
         self.padded = columns != output.shape[1]
 
     def __call__(self, source):
-        gathered = self.gather(self.projection(source))
+        self.projection(source)
+        return self.finish()
+
+    def project(self, source):
+        """Project into this rank's shard only; ``finish`` gathers it later, possibly in another graph."""
+        return self.projection(source)
+
+    def finish(self):
+        gathered = self.gather(self.local_output)
         if self.row_indices is not None:
             # Indexed reads materialize before the overlapping destination write.
             self.output.copy_(gathered[self.row_indices, :self.output.shape[1]])

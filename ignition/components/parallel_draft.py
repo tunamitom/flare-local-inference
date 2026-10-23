@@ -82,7 +82,7 @@ class PreparedParallelDraftRound:
                     logits=((batch, 1, vocab), torch.float32))
 
     def __init__(self, owner, batch, width, name, *, generate_proposals=True, buffers=None, proposal_only=False,
-                 target_token_capacity=None):
+                 target_token_capacity=None, two_phase=False):
         self.owner, self.batch, self.width = owner, batch, width
         self.name, self.buffers = name, buffers
         tokens = batch * width if target_token_capacity is None else target_token_capacity
@@ -92,6 +92,12 @@ class PreparedParallelDraftRound:
         self.target_token_capacity = tokens
         self.generate_proposals = generate_proposals
         self.proposal_only = proposal_only
+        # A two-phase round stops at shard logits; its continuations verify compactly or densely.
+        self.two_phase = two_phase
+        if two_phase and (proposal_only or not generate_proposals or width < 2
+                          or getattr(owner, "draft_candidates", None) is None
+                          or getattr(owner, "two_phase_flag", None) is None):
+            raise ValueError("two-phase rounds verify generated proposals over a candidate channel and flag")
         o, b, w = owner, batch, width
         device, blocks = o.pool.backing.device, o.inputs.page_tables.shape[1]
         self.candidate_runtime = getattr(o, "draft_candidates", None) if generate_proposals and w > 1 else None
@@ -134,6 +140,7 @@ class PreparedParallelDraftRound:
             name=name + ".target",
             workspace=o.workspace,
             **o.collectives,
+            **({"defer_head_gather": True} if two_phase else {}),
         )
         self.context = None if proposal_only else o.forwards.context(
             o.weights,
@@ -295,10 +302,38 @@ class PreparedParallelDraftRound:
         )
         commit.prepare()
         self.operations = target, proposals, verify, commit
+        self.compact = None
+        if self.two_phase:
+            from .two_phase_verify import PreparedTwoPhaseVerification
+
+            self.compact = PreparedTwoPhaseVerification(
+                self.decoder.scratch.local_logits, o.requests, *args[1:], self.drafts, self.probabilities,
+                self.valid, o.inputs.query_lengths[:b], verifier=verify, rng=o.rng,
+                logprob_requested=o.completion.requested, flag=o.two_phase_flag, fallbacks=o.two_phase_fallbacks,
+                rank=o.weights.shard.rank, world=self.candidate_runtime.world_size, runtime=self.candidate_runtime,
+                session=o.session, coordinator=o.collectives["coordinator"], name=self.name + ".compact")
+            self.compact.prepare()
 
     def __call__(self):
         self.propose()
-        self.verify()
+        if self.two_phase:
+            self.verify_begin()
+            self.compact.decide()
+        else:
+            self.verify()
+
+    def continue_compact(self):
+        """Taken continuation of a two-phase round: compact verification, then the shared tail."""
+        self.compact.compact()
+        self.verify_finish()
+
+    def continue_dense(self):
+        """Fallback continuation of a two-phase round: gather full logits and verify densely."""
+        target, _, verify, _ = self.operations
+        self.decoder.head.finish()
+        target()
+        verify()
+        self.verify_finish()
 
     def propose(self, advance_rng=True, observer=None, allowed=None):
         if not self.generate_proposals:
@@ -374,8 +409,16 @@ class PreparedParallelDraftRound:
         o.generation.copy_(torch.where(matches.any(1), o.requests.generation, o.generation))
 
     def verify(self, proposal_valid=None):
-        o, b, w = self.owner, self.batch, self.width
-        target, _, verify, commit = self.operations
+        target, _, verify, _ = self.operations
+        self.verify_begin(proposal_valid)
+        target()
+        verify()
+        if proposal_valid is not None:
+            verify.output.valid.logical_and_(proposal_valid)
+        self.verify_finish()
+
+    def verify_begin(self, proposal_valid=None):
+        o, b = self.owner, self.batch
         slots = o.inputs.row_slot_ids[:b].long()
         safe = slots.clamp(0, o.requests.capacity - 1)
         active = self.active if proposal_valid is None else self.active & proposal_valid
@@ -385,10 +428,10 @@ class PreparedParallelDraftRound:
             self.before, limits, states, o.inputs.page_tables[safe], self.candidates, o.inputs.live_rows
         )
         self.decoder()
-        target()
-        verify()
-        if proposal_valid is not None:
-            verify.output.valid.logical_and_(proposal_valid)
+
+    def verify_finish(self):
+        o, b, w = self.owner, self.batch, self.width
+        _, _, _, commit = self.operations
         commit()
         counts = commit.emitted_count
         if w > 1:
@@ -398,3 +441,16 @@ class PreparedParallelDraftRound:
             self.rows, (counts - 1).long().clamp_min(0)
         ]
         save_hidden(hidden, o.pool.last_hidden, self.metadata.state_rows, counts > 0)
+
+
+class RoundContinuation:
+    """One continuation of a two-phase round as a capturable forward."""
+
+    def __init__(self, round, taken):
+        self.round, self.taken = round, taken
+
+    def __call__(self):
+        if self.taken:
+            self.round.continue_compact()
+        else:
+            self.round.continue_dense()
