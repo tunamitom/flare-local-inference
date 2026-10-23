@@ -705,7 +705,7 @@ impl Inputs {
                 }
             }
             if binding.indexing == InputIndexing::SubmissionRow
-                && binding.source != ValueSource::SamplingParameters
+                && !matches!(binding.source, ValueSource::SamplingParameters | ValueSource::WidthCosts)
             {
                 write_raw(&mut self.staging, input, 0, self.integers.iter().copied())?;
             }
