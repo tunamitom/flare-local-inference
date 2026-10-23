@@ -25,10 +25,14 @@ def _dense(scores, top_k, top_p):
     return sampling.top_p_renorm_probs(sampling.softmax(masked), top_p, is_deterministic=True)
 
 
-def _verify(batch, width, sharpness, seed, top_k_value=0):
+def _verify(batch, width, sharpness, seed, top_k_value=0, fused=False):
     from flashinfer import sampling
 
-    from ignition.components.vocab_parallel_verify import compact_chain_verify, merge_summaries, shard_summary
+    from ignition.components import vocab_parallel_verify as vp
+
+    shard_summary, merge_summaries, compact_chain_verify = (
+        (vp.fused_shard_summary, vp.fused_merge_summaries, vp.fused_compact_chain_verify) if fused
+        else (vp.shard_summary, vp.merge_summaries, vp.compact_chain_verify))
 
     g = torch.Generator(device="cuda").manual_seed(seed)
     rows = batch * width
@@ -56,17 +60,19 @@ def _verify(batch, width, sharpness, seed, top_k_value=0):
     return complete, (tokens == dense).all(-1) & (compact_emitted == emitted)
 
 
+@pytest.mark.parametrize("fused", [False, True])
 @pytest.mark.parametrize("batch,width", [(1, 5), (4, 2)])
 @pytest.mark.parametrize("top_k", [0, 20])
-def test_complete_rows_match_dense_verification(batch, width, top_k):
+def test_complete_rows_match_dense_verification(batch, width, top_k, fused):
     complete_rows = 0
     for seed in range(20):
-        complete, same = _verify(batch, width, 18., seed, top_k)
+        complete, same = _verify(batch, width, 18., seed, top_k, fused)
         assert bool(same[complete].all())
         complete_rows += int(complete.sum())
     assert complete_rows >= 10 * batch
 
 
-def test_flat_rows_request_the_dense_fallback():
-    complete, _ = _verify(4, 2, 1., 3)
+@pytest.mark.parametrize("fused", [False, True])
+def test_flat_rows_request_the_dense_fallback(fused):
+    complete, _ = _verify(4, 2, 1., 3, fused=fused)
     assert not bool(complete.any())
