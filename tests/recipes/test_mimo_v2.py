@@ -132,6 +132,15 @@ def test_draft_block_fp8_conversion_keeps_shard_blocks_and_shapes():
     assert torch.equal(full.values[128:256].view(torch.uint8), shard.values.view(torch.uint8))
     assert torch.equal(full.scales[1:2], shard.scales)
     assert converted.projection_shapes == ((128, 640), (256, 256), (384, 256), (512, 256))
+    # A vocabulary head shard joins as a draft-only block-FP8 copy; without one draft logits keep BF16.
+    assert converted.head is None
+    head = matrix(640, 256)
+    with_head = weights.block_fp8(head)
+    assert isinstance(with_head.head, BlockFP8Weight) and with_head.head.values.shape == head.shape
+    assert torch.equal(with_head.head.values.view(torch.uint8), quantize_block_fp8(head).values.view(torch.uint8))
+    assert with_head.projection_shapes == tuple(sorted(converted.projection_shapes + ((640, 256),)))
+    assert converted.with_head(head).head.scales.shape == (5, 2)
+    assert converted.with_head(None) is converted
 
 
 def test_csf_scales_keep_a4_prefill_past_the_inline_window():
