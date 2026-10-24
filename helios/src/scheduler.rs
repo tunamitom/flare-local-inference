@@ -2520,6 +2520,9 @@ impl RequestScheduler {
                 request.scheduled_consumed = request.consumed_tokens;
             }
         }
+        if !realized_rounds.is_empty() {
+            self.realized.age_others(step_batch, step_width);
+        }
         for (predicted, emitted) in realized_rounds {
             self.realized.observe(step_batch, step_width, predicted, emitted);
         }

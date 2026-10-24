@@ -2629,19 +2629,19 @@ fn new_requests_start_from_population_acceptance_not_the_uninformed_prior() {
     use crate::scheduler::speculation::ProposalSource;
     let mut s = interactive_engine(2, true);
     let first = add(&mut s, 1, 64, 2048);
-    let uninformed = s.request(first).unwrap().acceptance.expected_tokens(ProposalSource::Mtp, 2);
+    let uninformed = s.request(first).unwrap().acceptance.expected_tokens(speculation::ProposalSource::Mtp, 2);
     assert_eq!(uninformed, 1.5);
     for _ in 0..128 {
         s.acceptance_population.observe(7, 7, true, 0);
     }
     let second = add(&mut s, 2, 64, 2048);
-    let seeded = s.request(second).unwrap().acceptance.expected_tokens(ProposalSource::Mtp, 2);
+    let seeded = s.request(second).unwrap().acceptance.expected_tokens(speculation::ProposalSource::Mtp, 2);
     assert!(seeded > 1.95, "seeded {seeded}");
     // The seed carries only the prior's weight: the request's own rejections dominate quickly.
     for _ in 0..4 {
         s.request_mut(second).unwrap().acceptance.observe(1, 0, true, 0);
     }
-    let own = s.request(second).unwrap().acceptance.expected_tokens(ProposalSource::Mtp, 2);
+    let own = s.request(second).unwrap().acceptance.expected_tokens(speculation::ProposalSource::Mtp, 2);
     assert!(own < 1.35, "own {own}");
 }
 
@@ -2649,9 +2649,9 @@ fn new_requests_start_from_population_acceptance_not_the_uninformed_prior() {
 fn verified_rounds_feed_the_acceptance_population() {
     use crate::scheduler::speculation::ProposalSource;
     let mut s = interactive_engine(1, true);
-    assert_eq!(s.acceptance_population.expected_tokens(ProposalSource::Mtp, 2), 1.5);
+    assert_eq!(s.acceptance_population.expected_tokens(speculation::ProposalSource::Mtp, 2), 1.5);
     s.acceptance_population.observe(1, 1, false, 0);
-    assert!(s.acceptance_population.expected_tokens(ProposalSource::Mtp, 2) > 1.5);
+    assert!(s.acceptance_population.expected_tokens(speculation::ProposalSource::Mtp, 2) > 1.5);
 }
 
 #[test]
@@ -2686,4 +2686,35 @@ fn speculative_costs_are_read_at_the_live_context() {
     assert_eq!(s.costs.duration(GraphKind::Speculative, 1, 8), Some(20 * MS));
     s.costs.set_context(context_bucket(500_000));
     assert_eq!(s.costs.duration(GraphKind::Speculative, 1, 8), Some(20 * MS));
+}
+
+#[test]
+fn concurrency_four_widens_past_one_draft_when_wider_rounds_pay() {
+    // MiMo DG19 batch-4 costs: width 3 (12 rows) and 4 (16 rows) now beat width 2 per token, but
+    // a population that has only verified one draft has never observed the deeper depths.
+    let mut s = interactive_engine(4, false);
+    s.enable_speculation(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+    s.configure_policy(PolicyConfig::throughput()).unwrap();
+    let handles: Vec<_> = (1..=4).map(|id| add(&mut s, id, 64, 4096)).collect();
+    for h in &handles {
+        let r = s.request_mut(*h).unwrap();
+        r.phase = RequestPhase::Decode;
+        r.consumed_tokens = 64;
+        r.scheduled_consumed = 64;
+        r.generated_tokens = 1;
+        for round in 0..128 {
+            r.acceptance.observe(1, usize::from(round % 4 != 0), true, 0);
+        }
+    }
+    for batch in [1, 2, 4] {
+        for width in 1..=8 {
+            set_cost(&mut s, GraphKind::Speculative, batch, width, 200 * MS);
+        }
+    }
+    for (width, us) in [(1, 10_000), (2, 14_240), (3, 17_870), (4, 20_110), (5, 22_750), (6, 24_620)] {
+        set_cost(&mut s, GraphKind::Speculative, 4, width, us * 1000);
+    }
+    let plan = s.plan().unwrap();
+    assert_eq!(plan.batch_capacity, 4);
+    assert!(plan.token_capacity >= 3, "width {}", plan.token_capacity);
 }

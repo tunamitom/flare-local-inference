@@ -208,6 +208,9 @@ impl RealizedTokens {
     const PRIOR: f64 = 16.0;
     const DECAY: f64 = 0.995;
     const BOUNDS: (f64, f64) = (0.5, 1.25);
+    /// Per round of the batch at another width: a half-life of about 700 rounds, ten seconds of
+    /// concurrency-4 decode.
+    const AGE: f64 = 0.999;
 
     fn index(batch: usize, width: usize) -> Option<(usize, usize)> {
         let b = BATCH_CAPACITIES.iter().position(|&capacity| capacity == batch)?;
@@ -222,6 +225,19 @@ impl RealizedTokens {
         let (realized, expected) = &mut self.sums[b][w];
         *realized = *realized * Self::DECAY + emitted;
         *expected = *expected * Self::DECAY + predicted;
+    }
+
+    /// One round of `batch` at `width` completed: the batch's other widths age toward the prior.
+    /// A ratio learned from a few unlucky rounds, or against predictions the profiles have since
+    /// corrected, would otherwise keep a shape unchosen and so never be re-observed.
+    pub fn age_others(&mut self, batch: usize, width: usize) {
+        let Some((b, w)) = Self::index(batch, width) else { return };
+        for (other, (realized, expected)) in self.sums[b].iter_mut().enumerate() {
+            if other != w {
+                *realized *= Self::AGE;
+                *expected *= Self::AGE;
+            }
+        }
     }
 
     pub fn ratio(&self, batch: usize, width: usize) -> f64 {
@@ -250,6 +266,10 @@ mod realized_tests {
             realized.observe(4, 2, 1.0, 5.0);
         }
         assert_eq!(realized.ratio(4, 2), 1.25);
+        for _ in 0..8000 {
+            realized.age_others(8, 1);
+        }
+        assert!((realized.ratio(8, 3) - 1.0).abs() < 0.02, "{}", realized.ratio(8, 3));
         realized.observe(3, 2, 1.0, 1.0);
         realized.observe(8, 9, 1.0, 1.0);
         realized.observe(8, 2, f64::NAN, 1.0);
