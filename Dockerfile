@@ -13,6 +13,8 @@ RUN apt-get update \
 WORKDIR /src
 COPY flare/ flare/
 COPY helios/ helios/
+# helios/src/frontend/templates.rs compiles the recipes' chat templates in.
+COPY ignition/recipes/ ignition/recipes/
 
 ARG TARGETARCH
 RUN --mount=type=cache,target=/usr/local/cargo/registry \

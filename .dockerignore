@@ -18,3 +18,9 @@ helios/**
 !helios/proto/**
 !helios/native/
 !helios/native/**
+!ignition/
+ignition/**
+!ignition/recipes/
+!ignition/recipes/*/
+!ignition/recipes/*/assets/
+!ignition/recipes/*/assets/chat_template*.jinja
