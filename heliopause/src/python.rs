@@ -207,6 +207,10 @@ pub(crate) fn execution_manifest(value: &Bound<'_, PyAny>) -> PyResult<Execution
         input_frame_bytes: field!(value, "input_frame_bytes", usize),
         buffers,
         graphs,
+        // In-process execution launches every graph directly: no two-phase continuations and no
+        // device-selected widths.
+        branches: Vec::new(),
+        switched: Vec::new(),
     })
 }
 
