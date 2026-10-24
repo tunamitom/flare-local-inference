@@ -1,0 +1,22 @@
+--- a/b12x/comm/pcie/pcie_oneshot.py	2026-10-24 09:59:38.529448057 +0700
++++ b/b12x/comm/pcie/pcie_oneshot.py	2026-10-24 09:59:38.538623539 +0700
+@@ -1675,7 +1675,7 @@
+             and tp8_owner
+             and inp.dtype in (torch.float16, torch.bfloat16)
+             and hidden in (4096, 6144)
+-            and 2 <= rows <= 8
++            and 2 <= rows <= 24
+         ):
+             return "stage_tp8_owner"
+         if (
+--- a/b12x/moe/_shared/kernels/w4a16/kernel/config.py	2026-10-24 09:59:38.530226263 +0700
++++ b/b12x/moe/_shared/kernels/w4a16/kernel/config.py	2026-10-24 09:59:38.538718008 +0700
+@@ -182,7 +182,7 @@
+ 
+ _MAX_DIRECT_TOPK_ROUTE_M = 6
+ 
+-_W4A16_SMALL_M_DIRECT_MAX_M = 8
++_W4A16_SMALL_M_DIRECT_MAX_M = 16
+ 
+ _FC2_DIRECT_MIN_EXPERT_CAPACITY = 1024
+ 
