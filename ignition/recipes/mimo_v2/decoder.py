@@ -22,11 +22,13 @@ from .qkv import WindowCommit
 L2_PREFETCH = os.environ.get("FLARE_MIMO_L2_PREFETCH", "1") != "0"
 L2_PREFETCH_MAX_TOKENS = 256
 # Decode and verification reductions up to this payload run b12x's one-shot all-reduce with the
-# residual add and RMSNorm in the same launch: eight 6144-wide BF16 rows (96 KiB). On TP8 the
-# fused one-shot takes 17.4 µs at eight rows against 24.4 µs for the two-shot, but 69.8 µs at
-# twelve. Larger payloads keep the two-shot route and the separate add and norm;
-# FLARE_MIMO_FUSED_REDUCE_NORM_MAX_BYTES=0 at export disables the fusion.
-FUSED_REDUCE_NORM_MAX_BYTES = int(os.environ.get("FLARE_MIMO_FUSED_REDUCE_NORM_MAX_BYTES", 96 << 10))
+# residual add and RMSNorm in the same launch: twenty-four 6144-wide BF16 rows (288 KiB). b12x picks
+# its TP8 owner transport for 2..24 rows (patches/b12x-decode-past-eight-rows.patch; stock stops at
+# eight and stages generically past it: 69.8 µs at twelve rows). With the owner transport the fused
+# launch takes 17.5 / 22.1 / 27.4 / 36.3 µs at 8 / 12 / 16 / 24 rows, against 27.3 µs for the twelve-row
+# two-shot before the separate add and norm. Larger payloads keep the two-shot route and the separate
+# add and norm; FLARE_MIMO_FUSED_REDUCE_NORM_MAX_BYTES=0 at export disables the fusion.
+FUSED_REDUCE_NORM_MAX_BYTES = int(os.environ.get("FLARE_MIMO_FUSED_REDUCE_NORM_MAX_BYTES", 288 << 10))
 
 
 @dataclass(frozen=True)
