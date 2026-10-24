@@ -62,17 +62,20 @@ pub fn validate_widths(widths: &[usize]) -> Result<()> {
 
 /// Conditional acceptance of one draft depth given that every shallower draft was accepted.
 /// Starts from a 0.5 prior worth two observations with bounded effective sample
-/// weight. After saturation, each outcome has weight `1 / DEPTH_MEMORY`.
+/// weight. After saturation, each outcome has weight `1 / DEPTH_MEMORY`. `observed` marks a
+/// depth that this profile, or the population it was seeded from, has verified at least once.
 #[derive(Clone, Copy)]
 struct DepthAcceptance {
     probability: f64,
     weight: f64,
+    observed: bool,
 }
 impl Default for DepthAcceptance {
     fn default() -> Self {
         Self {
             probability: 0.5,
             weight: 2.0,
+            observed: false,
         }
     }
 }
@@ -80,6 +83,7 @@ impl DepthAcceptance {
     fn observe(&mut self, accepted: bool) {
         self.weight = (self.weight + 1.0).min(DEPTH_MEMORY);
         self.probability += (if accepted { 1.0 } else { 0.0 } - self.probability) / self.weight;
+        self.observed = true;
     }
 }
 const DEPTH_MEMORY: f64 = 128.0;
@@ -98,11 +102,20 @@ impl AcceptanceProfile {
             .map(|d| d.probability)
     }
 
+    /// A depth nobody has verified carries the deepest verified depth's conditional, not the
+    /// prior: a batch that only ever verifies one draft would otherwise value every wider width
+    /// at 0.5 per extra draft and never widen, though block-drafter conditionals stay near flat
+    /// with depth.
     pub fn expected_tokens(&self, source: ProposalSource, width: usize) -> f64 {
         let mut chain = 1.0;
         let mut total = f64::from(width != 0);
+        let mut carried = None;
         for depth in &self.depths[source as usize][..width.saturating_sub(1).min(7)] {
-            chain *= depth.probability;
+            let probability = if depth.observed { depth.probability } else { carried.unwrap_or(depth.probability) };
+            if depth.observed {
+                carried = Some(depth.probability);
+            }
+            chain *= probability;
             total += chain;
         }
         total
@@ -120,6 +133,7 @@ impl AcceptanceProfile {
             depths: self.depths.map(|source| source.map(|depth| DepthAcceptance {
                 probability: depth.probability,
                 weight: depth.weight.min(prior),
+                observed: depth.observed,
             })),
             rounds: 0,
         }
@@ -243,3 +257,28 @@ mod realized_tests {
     }
 }
 
+
+#[cfg(test)]
+mod acceptance_tests {
+    use super::{AcceptanceProfile, ProposalSource::Mtp};
+
+    #[test]
+    fn unverified_depths_carry_the_deepest_verified_conditional() {
+        let mut profile = AcceptanceProfile::default();
+        assert_eq!(profile.expected_tokens(Mtp, 3), 1.75);
+        for round in 0..400 {
+            profile.observe(1, usize::from(round % 4 != 0), true, 0);
+        }
+        let first = profile.probability(Mtp, 0).unwrap();
+        assert!((first - 0.75).abs() < 0.1, "{first}");
+        let expected = 1.0 + first + first * first;
+        assert!((profile.expected_tokens(Mtp, 3) - expected).abs() < 1e-12);
+        let seeded = profile.seeded();
+        assert!((seeded.expected_tokens(Mtp, 3) - expected).abs() < 1e-12);
+        profile.observe(2, 1, true, 0);
+        let first = profile.probability(Mtp, 0).unwrap();
+        let second = profile.probability(Mtp, 1).unwrap();
+        let expected = 1.0 + first + first * second + first * second * second;
+        assert!((profile.expected_tokens(Mtp, 4) - expected).abs() < 1e-12);
+    }
+}
