@@ -50,3 +50,9 @@ selene-manager/**
 !ignition/recipes/step5/assets/**
 !ignition/recipes/kimi3/assets/
 !ignition/recipes/kimi3/assets/**
+!ignition/
+ignition/**
+!ignition/recipes/
+!ignition/recipes/*/
+!ignition/recipes/*/assets/
+!ignition/recipes/*/assets/**
