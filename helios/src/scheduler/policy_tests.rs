@@ -1241,6 +1241,27 @@ fn prefill_reaches_its_stop_in_one_pass_when_splitting_costs_more() {
 }
 
 #[test]
+fn prefill_beyond_one_pass_leads_with_the_largest_graph_when_splitting_costs_more() {
+    // 4200 tokens: 4096 + 128 (66 ms) beats 2048 + 4096 (92 ms) despite 2048's better step rate.
+    let mut s = interactive_engine(1, false);
+    set_cost(&mut s, GraphKind::Prefill, 1, 2048, 30 * MS);
+    set_cost(&mut s, GraphKind::Prefill, 1, 4096, 62 * MS);
+    add(&mut s, 1, 4200, 128);
+    assert_eq!(step(&mut s, 0).kind, GraphKind::Init);
+    let plan = s.plan().unwrap();
+    assert_eq!((plan.kind, plan.token_capacity, plan.lanes[0].tokens), (GraphKind::Prefill, 4096, 4096));
+    // When the smaller lead is cheaper overall, it still leads.
+    let mut s = interactive_engine(1, false);
+    set_cost(&mut s, GraphKind::Prefill, 1, 128, 40 * MS);
+    set_cost(&mut s, GraphKind::Prefill, 1, 2048, 30 * MS);
+    set_cost(&mut s, GraphKind::Prefill, 1, 4096, 62 * MS);
+    add(&mut s, 1, 4200, 128);
+    step(&mut s, 0);
+    let plan = s.plan().unwrap();
+    assert_eq!((plan.token_capacity, plan.lanes[0].tokens), (2048, 2048));
+}
+
+#[test]
 fn equivalent_prefill_tails_use_the_smaller_graph_despite_a_faster_padded_estimate() {
     let mut s = interactive_engine(1, false);
     set_cost(&mut s, GraphKind::Prefill, 1, 4096, MS);

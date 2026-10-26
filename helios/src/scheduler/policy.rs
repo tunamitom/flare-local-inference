@@ -286,8 +286,9 @@ impl RequestScheduler {
 
     /// A lone request's chunk that stops short of its next prefill stop (a message end or the
     /// prompt end) leaves a remainder that costs another pass. True when one larger graph reaches
-    /// the stop for no more than both passes together. Requests that share the GPU keep smaller
-    /// chunks, which interleave the others' decoding.
+    /// the stop for no more than both passes together, or, for a stop beyond one largest pass,
+    /// when leading with the largest graph covers the stop for no more. Requests that share the
+    /// GPU keep smaller chunks, which interleave the others' decoding.
     fn split_costs_more(
         &self,
         request: &LiveRequest,
@@ -311,10 +312,37 @@ impl RequestScheduler {
             .unwrap_or(request.prompt_tokens);
         if duration_ns == 0
             || work >= segment
-            || start + segment != stop
             || self.slots.iter().filter(|s| s.request.is_some()).count() != 1
         {
             return false;
+        }
+        if start + segment != stop {
+            // The stop lies beyond one largest pass: lead with the largest graph when it and the
+            // passes covering its remainder cost no more than this chunk and the passes covering
+            // its own remainder. Remainders are priced at the smallest covering graphs.
+            if segment != largest || start + segment > stop {
+                return false;
+            }
+            let cost = |capacity: usize| self.costs.duration(kind, batch, capacity).filter(|&ns| ns > 0);
+            let cover = |mut tokens: usize| -> Option<u64> {
+                let mut total = 0u64;
+                while tokens > largest {
+                    total = total.checked_add(cost(largest)?)?;
+                    tokens -= largest;
+                }
+                if tokens > 0 {
+                    let capacity = *catalog.iter().filter(|&&c| c >= tokens).min()?;
+                    total = total.checked_add(cost(capacity)?)?;
+                }
+                Some(total)
+            };
+            let remaining = stop - start;
+            let (Some(lead), Some(lead_rest), Some(rest)) =
+                (cost(largest), cover(remaining - largest), cover(remaining - work))
+            else {
+                return false;
+            };
+            return lead.saturating_add(lead_rest) <= duration_ns.saturating_add(rest);
         }
         let Some(rest_ns) = catalog
             .iter()
