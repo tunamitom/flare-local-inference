@@ -1,4 +1,3 @@
-diff -ru a/b12x/comm/pcie/pcie_twoshot_bf16.py b/b12x/comm/pcie/pcie_twoshot_bf16.py
 --- a/b12x/comm/pcie/pcie_twoshot_bf16.py
 +++ b/b12x/comm/pcie/pcie_twoshot_bf16.py
 @@ -49,7 +49,7 @@
@@ -10,7 +9,7 @@ diff -ru a/b12x/comm/pcie/pcie_twoshot_bf16.py b/b12x/comm/pcie/pcie_twoshot_bf1
  
  
  @dataclass(frozen=True)
-@@ -64,7 +64,7 @@
+@@ -63,7 +63,7 @@
  def _make_layout(max_rows: int, row_elems: int, world_size: int) -> _TwoShotBf16Layout:
      if world_size not in SUPPORTED_WORLD_SIZES:
          raise ValueError(
@@ -19,7 +18,7 @@ diff -ru a/b12x/comm/pcie/pcie_twoshot_bf16.py b/b12x/comm/pcie/pcie_twoshot_bf1
          )
      if max_rows <= 0 or max_rows % world_size != 0:
          raise ValueError("max_rows must be positive and divisible by world size")
-@@ -110,7 +110,7 @@
+@@ -105,7 +105,7 @@
  
  
  class PCIeTwoShotBF16:
@@ -28,7 +27,7 @@ diff -ru a/b12x/comm/pcie/pcie_twoshot_bf16.py b/b12x/comm/pcie/pcie_twoshot_bf1
  
      def __init__(self, *args, **kwargs) -> None:
          raise RuntimeError("use PCIeTwoShotBF16.from_exchange_group()")
-@@ -184,7 +184,7 @@
+@@ -183,7 +183,7 @@
              normalized_row_elems = int(row_elems)
              if world_size not in SUPPORTED_WORLD_SIZES:
                  raise ValueError(
@@ -37,10 +36,9 @@ diff -ru a/b12x/comm/pcie/pcie_twoshot_bf16.py b/b12x/comm/pcie/pcie_twoshot_bf1
                  )
              if device_obj.type != "cuda":
                  raise ValueError("PCIe twoshot requires a CUDA device")
-diff -ru a/b12x/comm/pcie/_tuning.py b/b12x/comm/pcie/_tuning.py
 --- a/b12x/comm/pcie/_tuning.py
 +++ b/b12x/comm/pcie/_tuning.py
-@@ -18,7 +18,7 @@
+@@ -19,7 +19,7 @@
      "OneshotAllReducePool.all_reduce": (2, 3, 4, 6, 8, 10),
      "OneshotAllReducePool.all_reduce_fused_add_rms_norm": (2, 3, 4, 6, 8, 10),
      "DmaAllReduce.all_reduce": (2, 3, 4, 6, 8, 10),
@@ -49,10 +47,9 @@ diff -ru a/b12x/comm/pcie/_tuning.py b/b12x/comm/pcie/_tuning.py
      "PCIeTwoShotBF16.reduce_scatter": (4,),
      "PCIeTwoShotBF16.all_gather": (4,),
      "TwoShotReduceScatter.reduce_scatter_fp8": (2, 4, 8),
-diff -ru a/b12x/comm/pcie/_twoshot_bf16_cute.py b/b12x/comm/pcie/_twoshot_bf16_cute.py
 --- a/b12x/comm/pcie/_twoshot_bf16_cute.py
 +++ b/b12x/comm/pcie/_twoshot_bf16_cute.py
-@@ -55,7 +55,8 @@
+@@ -54,7 +54,8 @@
  )
  
  _PACK_ELEMS = 8  # bf16 values per 16-byte pack
@@ -62,22 +59,10 @@ diff -ru a/b12x/comm/pcie/_twoshot_bf16_cute.py b/b12x/comm/pcie/_twoshot_bf16_c
  
  
  class _TwoShotBf16Launch:
-@@ -495,9 +496,9 @@
+@@ -494,9 +495,9 @@
          device_index,
      )
      del device_index  # part of the process-local cache key
--    if world_size != _SUPPORTED_WORLD_SIZE:
-+    if world_size not in _SUPPORTED_WORLD_SIZES:
-         raise ValueError(
--            "single-rounding BF16 two-shot launchers require world size 4, "
-+            "single-rounding BF16 two-shot launchers require world size 4 or 8, "
-             f"got {world_size}"
-         )
-     if rank < 0 or rank >= world_size:
-@@ -888,9 +889,9 @@
-         device_index,
-     )
-     del device_index
 -    if world_size != _SUPPORTED_WORLD_SIZE:
 +    if world_size not in _SUPPORTED_WORLD_SIZES:
          raise ValueError(

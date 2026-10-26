@@ -1,9 +1,8 @@
-diff -ruN a/b12x/comm/pcie/_oneshot_cute.py b/b12x/comm/pcie/_oneshot_cute.py
 --- a/b12x/comm/pcie/_oneshot_cute.py
 +++ b/b12x/comm/pcie/_oneshot_cute.py
-@@ -1099,6 +1099,10 @@
-         shard_packs: Int64,
-         epsilon: Float32,
+@@ -1508,6 +1508,10 @@
+         group_weights_ptr: cute.Pointer,
+         group_ids_ptr: cute.Pointer,
      ) -> None:
 +        # Release programmatic dependents at entry. A dependent waits in-kernel for this
 +        # grid to complete before it reads the normalized rows, so the release only lets
@@ -12,16 +11,15 @@ diff -ruN a/b12x/comm/pcie/_oneshot_cute.py b/b12x/comm/pcie/_oneshot_cute.py
          tidx, _, _ = cute.arch.thread_idx()
          bidx, _, _ = cute.arch.block_idx()
          gdim, _, _ = cute.arch.grid_dim()
-@@ -1683,7 +1687,7 @@
-         1,
+@@ -2281,7 +2285,7 @@
+         _dummy(cutlass.Uint32, 4),
          current_cuda_stream(),
          compile_spec=KernelCompileSpec.from_key(
--            "comm.pcie.oneshot_fused_rmsnorm", 2, cache_key
-+            "comm.pcie.oneshot_fused_rmsnorm", 3, cache_key
+-            "comm.pcie.oneshot_fused_rmsnorm", 9, cache_key
++            "comm.pcie.oneshot_fused_rmsnorm", 10, cache_key
          ),
      )
  
-diff -ruN a/b12x/gemm/blockscaled/_block_fp8_gemv.py b/b12x/gemm/blockscaled/_block_fp8_gemv.py
 --- a/b12x/gemm/blockscaled/_block_fp8_gemv.py
 +++ b/b12x/gemm/blockscaled/_block_fp8_gemv.py
 @@ -13,6 +13,11 @@
@@ -133,7 +131,7 @@ diff -ruN a/b12x/gemm/blockscaled/_block_fp8_gemv.py b/b12x/gemm/blockscaled/_bl
                  s0 = weight_scale * lhs_scale[Int64(col0) * self.blocks + Int64(kb)]
                  s1 = weight_scale * lhs_scale[Int64(col1) * self.blocks + Int64(kb)]
                  acc0 = acc0 + d0 * s0
-@@ -193,19 +225,21 @@
+@@ -193,18 +225,20 @@
  
  
  @program_cache(scope="preparation")
@@ -150,16 +148,14 @@ diff -ruN a/b12x/gemm/blockscaled/_block_fp8_gemv.py b/b12x/gemm/blockscaled/_bl
              *fake,
              Int32(1),
              current_cuda_stream(),
-             compile_spec=KernelCompileSpec.from_key(
--                "gemm.block_fp8.gemv", 2, (ordinal, n, k)
-+                "gemm.block_fp8.gemv",
-+                2,
-+                (ordinal, n, k, "dependent") if dependent else (ordinal, n, k),
-             ),
+-            compile_spec=KernelCompileSpec.from_key("gemm.block_fp8.gemv", 2, (n, k)),
++            compile_spec=KernelCompileSpec.from_key(
++                "gemm.block_fp8.gemv", 2, (n, k, "dependent") if dependent else (n, k)
++            ),
          )
  
-diff -ruN a/b12x/gemm/blockscaled/_block_fp8_row_quant.py b/b12x/gemm/blockscaled/_block_fp8_row_quant.py
---- a/b12x/gemm/blockscaled/_block_fp8_row_quant.py
+     def run(lhs, lhs_scale, rhs, rhs_scale, output, stream=None):
+--- /dev/null
 +++ b/b12x/gemm/blockscaled/_block_fp8_row_quant.py
 @@ -0,0 +1,153 @@
 +"""Per-token 128-group FP8 quantization of BF16 rows for the block-FP8 GEMV.
@@ -315,5 +311,3 @@ diff -ruN a/b12x/gemm/blockscaled/_block_fp8_row_quant.py b/b12x/gemm/blockscale
 +        run_compiled(raw, (*pointers, Int32(m), cuda_stream_from_int_or_current(stream)))
 +
 +    return attach_programs(run, raw)
-Binary files a/b12x/gemm/blockscaled/__pycache__/_block_fp8_gemv.cpython-312.pyc and b/b12x/gemm/blockscaled/__pycache__/_block_fp8_gemv.cpython-312.pyc differ
-Binary files a/b12x/gemm/blockscaled/__pycache__/_block_fp8_row_quant.cpython-312.pyc and b/b12x/gemm/blockscaled/__pycache__/_block_fp8_row_quant.cpython-312.pyc differ
