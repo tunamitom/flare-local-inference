@@ -30,7 +30,6 @@ exec docker run --name mimo-pro --network host --init \
     --mtp-draft-tokens 7 \
     --mtp-adaptive-verification \
     --scheduler-policy throughput \
-    --min-checkpoint-segment 256 \
     --kv-cache-limit memory \
     --prefix-cache-memory 64G \
     --prefix-cache-disk /prefix-cache \
