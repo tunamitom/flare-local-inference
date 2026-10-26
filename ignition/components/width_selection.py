@@ -214,8 +214,15 @@ class PreparedSelectedVerification:
                 destination.copy_(source[:, :destination.shape[1]])
         t.active.copy_(s.active)
         t.verify(s.active)
+        commit = t.operations[3]
+        if t.width != s.width:
+            # The host planned one round of the switch's full width: every record it completes reports
+            # that width, whichever body ran (field 15 is the verification width).
+            records = commit.records.index_select(0, commit.frame.long())
+            width = records[..., 15]
+            records[..., 15] = torch.where(width == t.width, s.width, width)
+            commit.records.index_copy_(0, commit.frame.long(), records)
         if self.calibration is not None:
-            commit = t.operations[3]
             self.calibration.observe(t.width, commit.accepted_drafts, commit.emitted_count)
         if self.costs is not None:
             self.costs.observe()
