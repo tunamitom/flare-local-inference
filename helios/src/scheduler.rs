@@ -83,6 +83,31 @@ pub fn prefill_capacities(chunk_size: usize) -> impl Iterator<Item = usize> {
         .chain(std::iter::once(chunk_size))
 }
 
+/// Drop message ends fewer than `min_segment` tokens past the previous retained checkpoint.
+///
+/// Each retained message end stops prefill for its own pass. A message end that close to the
+/// previous checkpoint saves a later branch at most `min_segment` tokens of re-prefill, while
+/// stopping there always costs a pass now: a brief assistant reply between a long document and
+/// a question otherwise splits the question's prefill.
+/// Distances are measured from the previous retained end or the restored prefix, so a branch
+/// re-prefills fewer than `min_segment` tokens.
+fn skip_short_segments(boundaries: Vec<usize>, consumed: usize, min_segment: usize) -> Vec<usize> {
+    let mut previous = consumed;
+    boundaries
+        .into_iter()
+        .filter(|&position| {
+            if position <= consumed {
+                return true;
+            }
+            let keep = position - previous >= min_segment;
+            if keep {
+                previous = position;
+            }
+            keep
+        })
+        .collect()
+}
+
 fn checkpoint_boundaries(
     mut boundaries: Vec<usize>,
     consumed: usize,
@@ -1523,8 +1548,9 @@ impl RequestScheduler {
             (self.limits.snapshots as usize / self.limits.max_active).max(1)
         };
         let endpoints = 1 + usize::from(spec.max_new_tokens > 1 && consumed < spec.prompt.len() as u64);
+        let min_segment = self.policy.min_checkpoint_segment;
         let message_boundaries = checkpoint_boundaries(
-            spec.message_boundaries,
+            skip_short_segments(spec.message_boundaries, consumed as usize, min_segment),
             consumed as usize,
             spec.prompt.len(),
             checkpoint_budget.saturating_sub(endpoints),

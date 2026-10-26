@@ -874,6 +874,11 @@ pub struct ServingOptions {
     #[arg(long, value_name = "N", help_heading = "Advanced serving options")]
     pub quantized_activation_min_tokens: Option<usize>,
 
+    /// Prefill passes over message ends fewer than N tokens past the previous checkpoint, so a
+    /// branch there re-prefills at most N tokens; 0 stops at every retained message end [default: 0].
+    #[arg(long, value_name = "N", help_heading = "Advanced serving options")]
+    pub min_checkpoint_segment: Option<usize>,
+
     /// Host memory for prefix checkpoints and prepared inputs, e.g. 16G; 0 disables [default: prefix_cache.memory, else disabled].
     #[arg(long, value_name = "SIZE", value_parser = parse_size, help_heading = "Prefix cache options")]
     pub prefix_cache_memory: Option<u64>,
@@ -997,6 +1002,9 @@ impl ServingOptions {
                 "--mtp-adaptive-verification-alpha".into(),
                 alpha.to_string(),
             ]);
+        }
+        if let Some(tokens) = self.min_checkpoint_segment {
+            options.extend(["--min-checkpoint-segment".into(), tokens.to_string()]);
         }
         if let Some(storage) = self.embedding_table_storage {
             options.extend([

@@ -144,6 +144,17 @@ fn checkpoint_targets_follow_token_distance_and_exclude_reused_prefixes() {
 }
 
 #[test]
+fn short_segments_past_the_previous_checkpoint_do_not_stop_prefill() {
+    // A brief reply 20 tokens after a long document's end shares the question's pass.
+    assert_eq!(skip_short_segments(vec![8100, 8120, 8170], 0, 128), [8100]);
+    // Distances run from the previous retained end, not the dropped one.
+    assert_eq!(skip_short_segments(vec![300, 400, 450, 600], 0, 128), [300, 450, 600]);
+    // The restored prefix is the first reference; ends at or before it pass through for budgeting.
+    assert_eq!(skip_short_segments(vec![50, 1000, 1100, 1200], 1000, 128), [50, 1000, 1200]);
+    assert_eq!(skip_short_segments(vec![10, 20], 0, 0), [10, 20]);
+}
+
+#[test]
 fn small_snapshot_shares_prioritize_endpoints_and_allow_completion() {
     for snapshots in [0, 1, 2, 4, 8, 12] {
         for output in [1, 3] {

@@ -16,6 +16,9 @@ pub struct PolicyConfig {
     pub adaptation_ms: f64,
     pub estimate_ttl_ns: u64,
     pub adaptive_verification_alpha: f64,
+    /// Message ends fewer than this many tokens past the previous retained checkpoint do not
+    /// stop prefill; zero stops at every retained message end.
+    pub min_checkpoint_segment: usize,
 }
 
 impl Default for PolicyConfig {
@@ -30,6 +33,7 @@ impl Default for PolicyConfig {
             adaptation_ms: 100.0,
             estimate_ttl_ns: 30_000_000_000,
             adaptive_verification_alpha: 1.0,
+            min_checkpoint_segment: 0,
         }
     }
 }

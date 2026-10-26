@@ -321,6 +321,11 @@ impl Bootstrap {
                     .ok_or_else(|| format!("{name} must be finite and nonnegative"))?;
             }
         }
+        if let Some(value) = object.get("min_checkpoint_segment") {
+            scheduling_policy.min_checkpoint_segment = value.as_u64()
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or("min_checkpoint_segment must be a nonnegative integer")?;
+        }
         if let Some(value) = object.get("mtp_adaptive_verification_alpha") {
             scheduling_policy.adaptive_verification_alpha = value.as_f64()
                 .filter(|v| v.is_finite() && *v > 0.0)
