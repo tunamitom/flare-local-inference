@@ -181,9 +181,15 @@ class PreparationConfig:
     def speculative_round_shapes(self):
         from ignition.components.capacity import parallel_speculative_shapes
 
-        return parallel_speculative_shapes(self.max_active, self.speculative_widths,
+        if not self.dflash:
+            return ()
+        shapes = parallel_speculative_shapes(self.max_active, self.speculative_widths,
             self.speculative_token_capacity, self.speculative_graph_budget,
-            fixed_width=self.speculative_fixed_width) if self.dflash else ()
+            fixed_width=self.speculative_fixed_width)
+        # Every row of a packed round verifies its pending token, so one request admits at most
+        # packed - batch drafts. Proposing deeper only adds draft sampling to the round: a one-request
+        # round of k target rows proposes k - 1 positions, as the rectangular catalog did.
+        return tuple((batch, min(width, packed - batch + 1), packed) for batch, width, packed in shapes)
 
     @property
     def decode_tokens(self):
