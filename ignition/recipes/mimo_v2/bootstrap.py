@@ -13,7 +13,7 @@ import torch
 from ignition.components.completion import CompletionOutputs
 from ignition.components.draft_sampling import SHARD_PAYLOAD_COLUMNS
 from ignition.components.prompt_logprobs import (
-    PreparedScoredPrefill, PromptScoring, prefill_graph_count, prefill_modes,
+    PreparedScoredPrefill, PromptScoring, prefill_modes,
 )
 
 from ignition.components.capacity import (
@@ -285,7 +285,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         )
         # One payload row of draft candidates per proposal row and rank.
         candidate_collective = (create_all_gather_runtime(group, device,
-            max_rows=max(batch for batch, _ in config.speculative_shapes),
+            max_rows=max(batch for batch, _, _ in config.speculative_round_shapes),
             columns=SHARD_PAYLOAD_COLUMNS * shard.world_size, ipc=ipc) if sharded_draft else None)
         context_collective = (create_all_gather_runtime(group, device,
             max_rows=tokens, columns=6144, ipc=ipc) if config.dflash else None)
