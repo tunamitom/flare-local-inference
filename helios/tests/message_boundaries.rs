@@ -93,18 +93,31 @@ fn continuation_clips_marks_and_segments_before_mapping() {
     assert_eq!(rendered.token_ids,frontend.encode(&rendered.text,false).unwrap());
 }
 
+/// Whether a prompt rendered with the generation prompt begins the same history rendered with an
+/// assistant reply. The last message then keeps no checkpoint: the prompt endpoint serves the next turn.
+fn prompt_begins_reply(frontend: &Frontend, messages: &[Value], options: &Map<String, Value>, prompt: &str) -> bool {
+    let mut replied = messages.to_vec();
+    replied.push(json!({"role":"assistant","content":"OK"}));
+    let mut history = options.clone();
+    history.insert("add_generation_prompt".into(), false.into());
+    let reply = frontend.render_chat(&replied, &history).unwrap();
+    reply.text.len() > prompt.len() && reply.text.starts_with(prompt)
+}
+
 fn check_messages(frontend: &Frontend, messages: &[Value]) -> (Vec<u32>, Vec<usize>) {
     let options = json!({"add_generation_prompt":true});
     let rendered = frontend
         .render_chat(messages, options.as_object().unwrap())
         .unwrap();
     let boundaries = rendered.message_boundaries;
+    let begins_reply = prompt_begins_reply(frontend, messages, &Map::new(), &rendered.text);
     for count in 1..=messages.len() {
         let prefix = frontend
             .render_chat(&messages[..count], &Map::new())
             .unwrap();
+        // Only the last message may drop its checkpoint, and only when the prompt begins the reply.
         assert!(
-            boundaries.contains(&prefix.token_ids.len()),
+            boundaries.contains(&prefix.token_ids.len()) || (count == messages.len() && begins_reply),
             "message {count} has no checkpoint"
         );
         assert_eq!(
@@ -136,7 +149,8 @@ fn every_role_transition_and_empty_message_has_a_boundary() {
         {"role":"user","content":"Follow-up"}
     ]);
     let (tokens, boundaries) = check_messages(&frontend, messages.as_array().unwrap());
-    assert_eq!(boundaries.len(), 8);
+    // The generation prompt begins the rendered reply, so the last message needs no checkpoint.
+    assert_eq!(boundaries.len(), 7);
     let mut changed = messages.as_array().unwrap().clone();
     changed[2]["content"] = "Different question".into();
     let (other, other_boundaries) = check_messages(&frontend, &changed);
@@ -169,7 +183,9 @@ fn gemma_templates_preserve_size_specific_thinking_prefixes() {
             assert_eq!(rendered.text, expected);
             let prefix = expected.find("<|turn>model").unwrap();
             let ids = frontend.encode(&expected[..prefix], false).unwrap();
-            assert_eq!(rendered.message_boundaries.last(), Some(&ids.len()));
+            let history = json!({"bos_token":"<bos>","enable_thinking":thinking});
+            let begins_reply = prompt_begins_reply(&frontend, &messages, history.as_object().unwrap(), &rendered.text);
+            assert_eq!(rendered.message_boundaries.last() == Some(&ids.len()), !begins_reply, "thinking {thinking}");
         }
     }
 }
@@ -228,12 +244,16 @@ fn gemma_templates_checkpoint_preamble_messages_and_tool_rounds() {
             let full = frontend.render_chat(messages, &options(true, thinking)).unwrap();
             assert!(full.text.contains("<|tool_call>call:lookup{q:null}<tool_call|>"));
             // An assistant tool call is complete only after the tool responses inlined into its turn.
+            let begins_reply = prompt_begins_reply(&frontend, messages, &options(false, thinking), &full.text);
+            let mut dropped = 0;
             for count in [1, 2, 4, 5, 6] {
                 let prefix = frontend.render_chat(&messages[..count], &options(false, thinking)).unwrap();
                 assert!(full.text.starts_with(&prefix.text), "{count}");
-                assert!(full.message_boundaries.contains(&prefix.token_ids.len()), "{count}");
+                let kept = full.message_boundaries.contains(&prefix.token_ids.len());
+                assert!(kept || (count == messages.len() && begins_reply), "{count}");
+                dropped += usize::from(!kept);
             }
-            assert_eq!(full.message_boundaries.len(), 5);
+            assert_eq!(full.message_boundaries.len(), 5 - dropped);
         }
     }
 }
@@ -302,4 +322,29 @@ fn segmented_xtml_preserves_block_hints_through_json_escaping() {
     let changed = render(&messages);
     assert!(changed.token_ids.starts_with(&marked.token_ids[..cut]));
     assert!(changed.message_boundaries.contains(&cut));
+}
+
+#[test]
+fn mimo_drops_only_the_last_message_checkpoint_when_the_generation_prompt_begins_the_reply() {
+    let frontend = frontend(include_str!("../../ignition/recipes/mimo_v2/assets/chat_template.jinja"), TemplateEncoding::Text);
+    let messages = json!([
+        {"role":"system","content":"Be brief."},
+        {"role":"user","content":"First question"},
+        {"role":"assistant","content":"First answer"},
+        {"role":"user","content":"Second question"}
+    ]);
+    let messages = messages.as_array().unwrap();
+    let options = json!({"add_generation_prompt":true});
+    let full = frontend.render_chat(messages, options.as_object().unwrap()).unwrap();
+    assert!(prompt_begins_reply(&frontend, messages, &Map::new(), &full.text));
+    let ends: Vec<_> = (1..=messages.len())
+        .map(|count| frontend.render_chat(&messages[..count], &Map::new()).unwrap().token_ids.len())
+        .collect();
+    // Every earlier message end keeps its checkpoint; the prompt endpoint covers the last one.
+    for end in &ends[..ends.len() - 1] {
+        assert!(full.message_boundaries.contains(end), "{end}");
+    }
+    assert!(!full.message_boundaries.contains(ends.last().unwrap()));
+    let plain = frontend.render_chat(messages, json!({"add_generation_prompt":false}).as_object().unwrap()).unwrap();
+    assert_eq!(plain.message_boundaries, full.message_boundaries);
 }

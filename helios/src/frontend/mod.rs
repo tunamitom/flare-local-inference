@@ -536,14 +536,17 @@ impl Frontend {
                 "Cannot apply chat template to an empty conversation. Provide at least one message.",
             ))));
         }
-        self.render_jinja(messages, options)
+        self.render_jinja(messages, options, true)
     }
 
+    /// Render a chat template; without `tokenize` only the final text is produced.
     fn render_jinja(
         &self,
         messages: &[Json],
         options: &Map<String, Json>,
+        tokenize: bool,
     ) -> Result<RenderedPrompt> {
+        let source_messages = messages;
         let mut context = self.defaults.clone();
         context.extend(options.clone());
         let continuation = match context.remove("continue_final_message") {
@@ -686,6 +689,7 @@ impl Frontend {
                 }
             }
         }
+        let continued = final_text.is_some();
         let mut text: String = segments
             .iter()
             .map(|segment| segment.text.as_str())
@@ -698,6 +702,21 @@ impl Frontend {
             if !preserved_space {
                 text.truncate(text.trim_end().len());
             }
+        }
+        if !tokenize {
+            return Ok(RenderedPrompt {
+                message_boundaries: Vec::new(),
+                text,
+                token_ids: Vec::new(),
+                image_sources,
+                image_checkpoint_hints,
+            });
+        }
+        if !continued
+            && context.get("add_generation_prompt") == Some(&Json::Bool(true))
+            && self.reply_covers_last_message(source_messages, options, &text, byte_boundaries.last().copied())?
+        {
+            byte_boundaries.pop();
         }
         let mut remaining = text.len();
         let mut token_ids = Vec::new();
@@ -735,6 +754,37 @@ impl Frontend {
             image_sources,
             image_checkpoint_hints,
         })
+    }
+
+    /// Whether the last byte boundary ends the history and the generation prompt begins its reply.
+    ///
+    /// Prefill stops at every retained message end to publish a checkpoint, so a chat request
+    /// otherwise ends with a separate pass over only the generation prompt. When the prompt is
+    /// a prefix of the history rendered with an assistant reply, the next turn restores the
+    /// prompt endpoint checkpoint, which already covers the last message. Templates whose
+    /// replies do not begin with the generation prompt, such as ones that strip reasoning from
+    /// history, keep the boundary.
+    fn reply_covers_last_message(
+        &self,
+        messages: &[Json],
+        options: &Map<String, Json>,
+        prompt: &str,
+        last_boundary: Option<usize>,
+    ) -> Result<bool> {
+        let Some(last_boundary) = last_boundary else {
+            return Ok(false);
+        };
+        let mut history_options = options.clone();
+        history_options.insert("add_generation_prompt".into(), false.into());
+        history_options.insert("continue_final_message".into(), false.into());
+        let history = self.render_jinja(messages, &history_options, false)?.text;
+        if history.len() != last_boundary || !prompt.starts_with(&history) {
+            return Ok(false);
+        }
+        let mut replied = messages.to_vec();
+        replied.push(serde_json::json!({"role": "assistant", "content": "OK"}));
+        let reply = self.render_jinja(&replied, &history_options, false)?.text;
+        Ok(reply.len() > prompt.len() && reply.starts_with(prompt))
     }
 
     fn mark_continuation(&self, messages: &mut [Json], field: &str) -> Result<String> {
