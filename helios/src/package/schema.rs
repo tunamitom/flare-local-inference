@@ -18,8 +18,10 @@ pub mod wire {
 pub const FORMAT_VERSION: u32 = 2;
 /// Bound on one serialized signed body, matching the metadata tensor limit.
 pub const MAX_BODY: usize = 128 << 20;
-/// Bound on the complete serialized envelope.
-pub const MAX_ENVELOPE: usize = 128 << 20;
+/// Bound on the complete serialized envelope. Each signed body keeps the [`MAX_BODY`] bound;
+/// the envelope carries the package body plus one body per deployment and rank, so a TP8 package
+/// whose rank bodies are each within bounds can exceed one body's worth (MiMo C64/T256 does).
+pub const MAX_ENVELOPE: usize = 1 << 30;
 /// Executable compressed chunk size. Authentication covers chunks of exactly this size.
 pub const MAX_CHUNK: usize = 4 << 20;
 /// Bound on compressed chunks for one executable resource (4 TiB at the fixed chunk size).

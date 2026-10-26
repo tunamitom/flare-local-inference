@@ -102,7 +102,11 @@ fn check_commitment(commitment: &[u8], body: &[u8], what: &str) -> Result<()> {
 /// Decode and bound-check an envelope without trusting anything it says.
 pub fn envelope(bytes: &[u8]) -> Result<wire::ProtectedPackage> {
     if bytes.len() > schema::MAX_ENVELOPE {
-        return Err(invalid("package envelope exceeds its limit"));
+        return Err(invalid(format!(
+            "package envelope exceeds its limit: {} bytes > {}",
+            bytes.len(),
+            schema::MAX_ENVELOPE
+        )));
     }
     let envelope = wire::ProtectedPackage::decode(bytes)
         .map_err(|_| invalid("invalid payload package envelope"))?;

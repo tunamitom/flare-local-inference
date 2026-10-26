@@ -77,15 +77,15 @@ impl Metadata {
         if primary.format() != container::PAYLOAD_FORMAT {
             return Err(invalid("expected a payload-format model package"));
         }
-        let envelope = read_metadata(&primary.tensor(MANIFEST)?)?;
+        let envelope = read_metadata(&primary.tensor(MANIFEST)?, schema::MAX_ENVELOPE)?;
         let locations =
-            wire::LocationSet::decode(read_metadata(&primary.tensor(LOCATIONS)?)?.as_slice())
+            wire::LocationSet::decode(read_metadata(&primary.tensor(LOCATIONS)?, schema::MAX_BODY)?.as_slice())
                 .map_err(|e| invalid(format!("invalid payload locations: {e}")))?;
         schema::validate_locations(&locations)?;
         let derivations = if primary.tensor_names().any(|name| name == DERIVATIONS) {
             Some(
                 wire::DerivationSet::decode(
-                    read_metadata(&primary.tensor(DERIVATIONS)?)?.as_slice(),
+                    read_metadata(&primary.tensor(DERIVATIONS)?, schema::MAX_BODY)?.as_slice(),
                 )
                 .map_err(|e| invalid(format!("invalid payload derivations: {e}")))?,
             )
@@ -360,8 +360,8 @@ fn verify_payload(
     Ok(())
 }
 
-fn read_metadata(source: &Slice) -> Result<Vec<u8>> {
-    if source.is_empty() || source.len() > schema::MAX_BODY as u64 {
+fn read_metadata(source: &Slice, limit: usize) -> Result<Vec<u8>> {
+    if source.is_empty() || source.len() > limit as u64 {
         return Err(invalid("invalid package metadata tensor length"));
     }
     let mut bytes = vec![0; source.len() as usize];
