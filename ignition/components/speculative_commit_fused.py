@@ -195,9 +195,13 @@ def _commit(Generation, Consumed, consumed_stride, Generated, Pending, Status, E
 
 
 def fusable(commit) -> bool:
-    """Whether this commit's operands fit the one-program commit."""
+    """Whether this commit's operands fit the one-program commit.
+
+    The program predates verification-survival rows and does not write them, so a commit that
+    publishes survival (``_survival``) keeps the unfused commit.
+    """
     state = commit.state
-    return (commit.history is None and state.generation.is_cuda and state.capacity <= 64
+    return (commit.history is None and getattr(commit, "_survival", None) is None and state.generation.is_cuda and state.capacity <= 64
             and commit.inputs.shape[0] <= 64 and state.eos_token_ids.shape[1] == EOS_CAPACITY
             and state.rng_counter.dim() == 1 and commit.records.is_contiguous())
 
