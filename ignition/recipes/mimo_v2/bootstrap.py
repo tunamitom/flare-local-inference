@@ -112,6 +112,12 @@ class PreparationConfig:
     # Positions then ignore the block's own earlier drafts in penalty counts; outputs are unchanged.
     draft_position_blocks: bool = field(
         default_factory=lambda: os.environ.get("FLARE_MIMO_DRAFT_POSITION_BLOCKS", "1") == "1")
+    # Device-selected width for one-request rounds (local divergence, owner waiver): a prefix
+    # proposes the full draft block and picks the verification width from the drafts' calibrated
+    # survival against device-measured round costs; the runtime composes it with a conditional
+    # switch over one verification body per width. Larger batches keep packed rounds.
+    switch_speculation: bool = field(
+        default_factory=lambda: os.environ.get("FLARE_MIMO_SWITCH_SPECULATION", "0") == "1")
     # "w8a16" converts the draft's BF16 projections to block-FP8 (128x128 blocks, amax/448
     # scales) at load and runs them as W8A16 GEMVs with BF16 activations, halving draft weight
     # traffic; "bf16" keeps the checkpoint's BF16 projections. Draft batches above 32 rows
@@ -189,7 +195,15 @@ class PreparationConfig:
         # Every row of a packed round verifies its pending token, so one request admits at most
         # packed - batch drafts. Proposing deeper only adds draft sampling to the round: a one-request
         # round of k target rows proposes k - 1 positions, as the rectangular catalog did.
-        return tuple((batch, min(width, packed - batch + 1), packed) for batch, width, packed in shapes)
+        shapes = tuple((batch, min(width, packed - batch + 1), packed) for batch, width, packed in shapes)
+        if self.switch_speculation:
+            # The switched graph owns every one-request round that offers drafts.
+            shapes = tuple(shape for shape in shapes if shape[0] != 1 or shape[1] == 1)
+        return shapes
+
+    @property
+    def switch_widths(self):
+        return max(self.speculative_widths) if self.dflash and self.switch_speculation else 0
 
     @property
     def decode_tokens(self):
@@ -206,6 +220,53 @@ class PreparationConfig:
 
 @torch.no_grad()
 @with_autotune_effort
+def _prepare_switch(config, speculation, *, add, buffers, forward_inputs, package_storage, device):
+    """One-request rounds that choose their verification width on device (local divergence).
+
+    The prefix proposes the full draft block, records each position's confidence for the host,
+    and selects a width; one continuation body per width copies the proposal into a target round
+    of that width and verifies it. Bodies share the prefix's proposal buffers, so each target's
+    scratch starts beyond them; bodies never run together and may share each other's scratch.
+    """
+    from ignition.components.parallel_draft import PreparedParallelDraftRound
+    from ignition.components.width_selection import (
+        PreparedRoundCosts, PreparedSelectedVerification, PreparedSelectionPrefix, PreparedWidthCalibration,
+        PreparedWidthSelection, selection_broadcast)
+
+    widths = config.switch_widths
+    drafts = widths - 1
+    pool = speculation.sampling_buffers
+    name = f"speculative1x{widths}-switch"
+    source = PreparedParallelDraftRound(speculation, 1, widths, name + ".proposal", buffers=pool.cursor(),
+                                        proposal_only=True)
+    source.prepare()
+    slots = config.request_capacity
+    confidence_frames = package_storage.host_allocate("proposal_confidence", (2, slots, drafts), torch.float32)
+    prefix_limits = torch.zeros(slots, dtype=torch.int32, device=device)
+    selected = torch.ones(1, dtype=torch.int32, device=device)
+    buffers.update(proposal_confidence=confidence_frames.device_view, speculative_prefix_limits=prefix_limits,
+                   switch_selected_width=selected)
+    confidence = torch.zeros((1, drafts), dtype=torch.float32, device=device)
+    calibration = PreparedWidthCalibration(torch.zeros((drafts, 2), dtype=torch.float32, device=device),
+                                           confidence, drafts)
+    costs = PreparedRoundCosts(*PreparedRoundCosts.allocate(widths, device), selected)
+    selection = PreparedWidthSelection(confidence, costs.costs, speculation.inputs.query_lengths, selected, widths,
+        calibration=calibration, broadcast=selection_broadcast(source, selected))
+    bodies = tuple(f"{name}.w{width}" for width in range(1, widths + 1))
+    for width, body in zip(range(1, widths + 1), bodies, strict=True):
+        cursor = pool.cursor()
+        cursor.join(source.buffers)
+        target = PreparedParallelDraftRound(speculation, 1, width, body, generate_proposals=False, buffers=cursor)
+        target.prepare()
+        add(body, PreparedSelectedVerification(source, target, calibration=calibration, costs=costs),
+            "continuation", 1, width, ())
+    inputs = tuple(field for field in forward_inputs if field != "query_lengths") + ("speculative_prefix_limits",)
+    add(name, PreparedSelectionPrefix(source, prefix_limits, confidence_frames.device_view, confidence, selection,
+                                      costs),
+        "speculative", 1, widths, inputs, enabled=True, packed_tokens=widths, draft_tokens=drafts,
+        confidence_width=drafts, switch=("switch_selected_width", bodies))
+
+
 def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storage=None):
     if package_storage is None:
         raise ValueError("MiMo preparation requires package storage")
@@ -396,18 +457,21 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                          for capacity in capacities)
         + len(modes) * 4 * len(config.batch_capacities)
         + len(config.speculative_round_shapes)
+        + (config.switch_widths + 1 if config.switch_widths else 0)
         + len(config.batch_capacities)
         + len(PATCH_CAPACITIES)
     )
     with phase(progress, "Construct graph catalog", total=count) as stage:
 
-        def add(name, forward, kind, rows, tokens, fields, *, enabled=None, packed_tokens=0, quantized=None):
+        def add(name, forward, kind, rows, tokens, fields, *, enabled=None, packed_tokens=0, quantized=None,
+                draft_tokens=None, confidence_width=0, switch=None):
             if kind == "scored_prefill":
                 forward = PreparedScoredPrefill(forward, requests, inputs)
                 fields = (*fields, "prompt_target_tokens")
             forwards[name] = forward
             signatures[name] = GraphSignature(kind, rows, tokens, tuple(fields), speculation_enabled=enabled,
-                packed_token_capacity=packed_tokens, quantized_activations=quantized)
+                packed_token_capacity=packed_tokens, quantized_activations=quantized, draft_tokens=draft_tokens,
+                confidence_width=confidence_width, switch=switch)
             stage.update(advance=1)
 
         forward_inputs = (*inputs.buffers(), "sampling_grammar_mask")
@@ -483,6 +547,9 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                                                      buffers=speculation.sampling_buffers.cursor(), target_token_capacity=packed)
                 forward.prepare()
                 add(name, forward, "speculative", batch, width, forward_inputs, enabled=True, packed_tokens=packed)
+            if config.switch_widths:
+                _prepare_switch(config, speculation, add=add, buffers=buffers, forward_inputs=forward_inputs,
+                                package_storage=package_storage, device=device)
         for capacity in reversed(PATCH_CAPACITIES):
             name = f"vision{capacity}"
             cursor = graph_buffers.cursor()
@@ -627,7 +694,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             image_profile="mimo"),
         "sampling_defaults": RECIPE.sampling_defaults.as_dict(),
         "assets": assets,
-        "model_contract": prepare_contract(signatures, buffers, pool, image_slots=config.image_concurrency, page_tokens=PAGE_TOKENS, draft_lag=0 if config.dflash else None, regions=cache_regions),
+        "model_contract": prepare_contract({name: signature for name, signature in signatures.items()
+                                            if signature.kind != "continuation"}, buffers, pool, image_slots=config.image_concurrency, page_tokens=PAGE_TOKENS, draft_lag=0 if config.dflash else None, regions=cache_regions),
     }
     if config.a4_prefill:
         server_config["quantized_activation_min_tokens"] = config.a4_prefill_min_tokens

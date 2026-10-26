@@ -302,3 +302,58 @@ def test_execution_requires_vector_completions():
     buffers["completion_records"] = _tensor("int64", (2, 4, 8))
     with pytest.raises(ValueError, match="completion vectors"):
         _execution(buffers=buffers)
+
+
+def test_switch_declares_uncatalogued_continuations_and_its_selector(monkeypatch):
+    buffers = {"frame_index": _tensor("int32", (1,)), "submission_sequence": _tensor("int64", (1,)),
+               "completion_records": _tensor("int64", (2, 4, 24)), "tokens": _tensor("int64", (16,)),
+               "selected": SimpleNamespace(dtype="torch.int32", shape=(1,), stride=lambda: (1,), numel=lambda: 1)}
+    signatures = {
+        "switched": GraphSignature("speculative", 1, 3, ("tokens",), speculation_enabled=True,
+                                   switch=("selected", ("switched.w1", "switched.w2", "switched.w3"))),
+        "switched.w1": GraphSignature("continuation", 1, 1),
+        "switched.w2": GraphSignature("continuation", 1, 2),
+        "switched.w3": GraphSignature("continuation", 1, 3),
+    }
+    execution = PreparedExecution(device=0, graphs=dict.fromkeys(signatures, object()), signatures=signatures,
+                                  buffers=buffers)
+    spans = [(4096, 4), (8192, 8), (12288, 1536), (16384, 128), (20480, 4)]
+    monkeypatch.setattr(execution, "_validate_resources", lambda: (9, [11, 12, 13, 14], spans))
+    manifest = execution.manifest(all_variants=True)
+    assert [graph["name"] for graph in manifest["graphs"]] == ["switched"]
+    assert manifest["switches"] == [{"graph": "switched", "selector_buffer": "selected",
+                                     "bodies": ["switched.w1", "switched.w2", "switched.w3"]}]
+    from ignition.preparation.runtime_package_pb2 import Execution
+
+    encoded = Execution(switches=manifest["switches"])
+    assert list(Execution.FromString(encoded.SerializeToString()).switches[0].bodies) == [
+        "switched.w1", "switched.w2", "switched.w3"]
+
+
+@pytest.mark.parametrize("change", [
+    dict(signatures={"switched": GraphSignature("speculative", 1, 2, (), switch=("selected", ("w1", "w2"))),
+                     "w1": GraphSignature("continuation", 1, 1)}),
+    dict(selector="tokens"),
+    dict(selector="missing"),
+])
+def test_switch_requires_owned_continuations_and_an_int32_selector(change):
+    buffers = {"frame_index": _tensor("int32", (1,)), "submission_sequence": _tensor("int64", (1,)),
+               "completion_records": _tensor("int64", (2, 4, 24)), "tokens": _tensor("int64", (16,)),
+               "selected": SimpleNamespace(dtype="torch.int32", shape=(1,), numel=lambda: 1)}
+    selector = change.get("selector", "selected")
+    signatures = change.get("signatures") or {
+        "switched": GraphSignature("speculative", 1, 2, (), switch=(selector, ("w1", "w2"))),
+        "w1": GraphSignature("continuation", 1, 1), "w2": GraphSignature("continuation", 1, 2)}
+    with pytest.raises(ValueError):
+        PreparedExecution(device=0, graphs=dict.fromkeys(signatures, object()), signatures=signatures,
+                          buffers=buffers)
+
+
+@pytest.mark.parametrize("signature", [
+    lambda: GraphSignature("decode", 1, 1, (), switch=("selected", ("w1",))),
+    lambda: GraphSignature("speculative", 1, 2, (), switch=("selected", ("w1", "w1"))),
+    lambda: GraphSignature("continuation", 1, 1, ("tokens",)),
+])
+def test_switch_signatures_reject_malformed_declarations(signature):
+    with pytest.raises(ValueError):
+        signature()

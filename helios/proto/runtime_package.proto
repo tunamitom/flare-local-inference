@@ -677,6 +677,15 @@ message Execution {
   uint64 input_frame_bytes = 3;
   repeated Buffer buffers = 4;
   repeated ExecutionGraph graphs = 5;
+  // Local divergence (owner waiver): device-selected verification widths. Each switch names a
+  // catalogued speculative graph that writes a 1-based width to an int32 selector buffer, and its
+  // uncatalogued continuation bodies ordered by width; loading composes them with a conditional node.
+  repeated ExecutionSwitch switches = 6;
+}
+message ExecutionSwitch {
+  string graph = 1;
+  string selector_buffer = 2;
+  repeated string bodies = 3;
 }
 message Buffer {
   string name = 1;
