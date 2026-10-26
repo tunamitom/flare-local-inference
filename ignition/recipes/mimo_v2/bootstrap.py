@@ -218,8 +218,6 @@ class PreparationConfig:
         return max(self.speculative_widths) - 1 if self.dflash else 0
 
 
-@torch.no_grad()
-@with_autotune_effort
 def _prepare_switch(config, speculation, *, add, buffers, forward_inputs, package_storage, device):
     """One-request rounds that choose their verification width on device (local divergence).
 
@@ -267,6 +265,8 @@ def _prepare_switch(config, speculation, *, add, buffers, forward_inputs, packag
         confidence_width=drafts, switch=("switch_selected_width", bodies))
 
 
+@torch.no_grad()
+@with_autotune_effort
 def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storage=None):
     if package_storage is None:
         raise ValueError("MiMo preparation requires package storage")
