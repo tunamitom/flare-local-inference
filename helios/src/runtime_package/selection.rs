@@ -266,8 +266,29 @@ impl LoadOptions {
             }) {
                 return Err(invalid("activation precision variants must be captured in both precisions"));
             }
+            // Device-selected widths (local divergence): a catalogued speculative prefix and its
+            // uncatalogued continuation bodies, which only the composed switch launches.
+            let mut bodies = HashSet::new();
+            for switch in &execution.switches {
+                let selector = execution.buffers.iter().find(|b| b.name == switch.selector_buffer);
+                let prefix = execution.graphs.iter().find(|g| g.name == switch.graph);
+                if prefix.is_none_or(|g| g.kind != "speculative" || g.batch_capacity != 1
+                        || switch.bodies.len() as u64 != g.token_capacity)
+                    || selector.is_none_or(|b| b.nbytes < 4 || b.dtype != "int32")
+                {
+                    return Err(invalid("invalid execution switch"));
+                }
+                for body in &switch.bodies {
+                    if names.contains(body) || !bodies.insert(body.clone()) {
+                        return Err(invalid("execution switch bodies must be distinct uncatalogued graphs"));
+                    }
+                }
+            }
+            if execution.switches.iter().map(|s| &s.graph).collect::<HashSet<_>>().len() != execution.switches.len() {
+                return Err(invalid("graph declares more than one execution switch"));
+            }
             let resources: HashSet<_> = package.graphs.iter().map(|g| g.name.clone()).collect();
-            if names != resources {
+            if names.union(&bodies).cloned().collect::<HashSet<_>>() != resources {
                 return Err(invalid("execution catalog must describe every captured graph exactly once"));
             }
             execution.graphs.retain(|graph| {
@@ -318,8 +339,11 @@ impl LoadOptions {
                 return Err(invalid("selected graph catalogs differ between ranks"));
             }
             rank_catalog = Some(catalog);
-            let selected: HashSet<_> = execution.graphs.iter().map(|g| g.name.as_str()).collect();
-            package.graphs.retain(|g| selected.contains(g.name.as_str()));
+            let mut selected: HashSet<_> = execution.graphs.iter().map(|g| g.name.clone()).collect();
+            // A selected switch keeps its bodies; an unselected prefix drops them with it.
+            execution.switches.retain(|switch| selected.contains(&switch.graph));
+            selected.extend(execution.switches.iter().flat_map(|switch| switch.bodies.iter().cloned()));
+            package.graphs.retain(|g| selected.contains(&g.name));
             prune_kernels(package)?;
         }
         let object = config
@@ -1385,6 +1409,77 @@ mod tests {
 
     fn round_config(budget: usize) -> Value {
         serde_json::json!({"speculative_token_capacity": budget, "speculative_widths": [1,6]})
+    }
+
+    fn switch_package(selector_dtype: &str) -> Package {
+        let mut package = round_package(8, 48, true);
+        let execution = package.execution.as_mut().unwrap();
+        // The switched prefix owns every one-request round that offers drafts.
+        execution.graphs.retain(|graph| !(graph.kind == "speculative" && graph.batch_capacity == 1
+            && graph.token_capacity > 1));
+        execution.graphs.push(wire::ExecutionGraph {
+            name: "switch-b1".into(), kind: "speculative".into(), sampling_mode: "general".into(),
+            batch_capacity: 1, token_capacity: 6, packed_token_capacity: 6, draft_tokens: Some(5),
+            verify_tokens: Some(6), draft_source: 1, confidence_width: 5, ..Default::default()
+        });
+        execution.buffers.push(wire::Buffer {
+            name: "selected".into(), nbytes: 4, dtype: selector_dtype.into(), shape: vec![1], strides: vec![1],
+            ..Default::default()
+        });
+        let bodies: Vec<String> = (1..=6).map(|width| format!("switch-b1.w{width}")).collect();
+        execution.switches.push(wire::ExecutionSwitch {
+            graph: "switch-b1".into(), selector_buffer: "selected".into(), bodies: bodies.clone(),
+        });
+        refresh_graph_resources(&mut package);
+        package.graphs.extend(bodies.iter().map(|name| Graph {
+            name: name.clone(), flags: 0, resource: name.clone(), node_count: 1, edge_count: 0, functions: vec![0],
+        }));
+        package
+    }
+
+    #[test]
+    fn execution_switches_keep_their_bodies_with_a_selected_prefix_and_drop_them_with_it() {
+        let mut ranks = [switch_package("int32"), switch_package("int32")];
+        LoadOptions::default().select(&mut ranks, &mut round_config(48)).unwrap();
+        for package in &ranks {
+            let execution = package.execution.as_ref().unwrap();
+            assert_eq!(execution.switches.len(), 1);
+            assert!(execution.graphs.iter().any(|graph| graph.name == "switch-b1"));
+            assert!(execution.graphs.iter().all(|graph| !graph.name.starts_with("switch-b1.w")));
+            assert_eq!(package.graphs.iter().filter(|graph| graph.name.starts_with("switch-b1.w")).count(), 6);
+        }
+        // Serving without speculation drops the prefix, and its bodies with it.
+        let mut ranks = [switch_package("int32"), switch_package("int32")];
+        LoadOptions { mtp_draft_tokens: Some(0), ..Default::default() }
+            .select(&mut ranks, &mut round_config(48)).unwrap();
+        for package in &ranks {
+            assert!(package.execution.as_ref().unwrap().switches.is_empty());
+            assert!(package.graphs.iter().all(|graph| !graph.name.starts_with("switch-b1")));
+        }
+    }
+
+    #[test]
+    fn execution_switches_reject_catalogued_bodies_and_non_int32_selectors() {
+        let mut ranks = [switch_package("int64"), switch_package("int64")];
+        assert!(LoadOptions::default().select(&mut ranks, &mut round_config(48)).is_err());
+        let catalogued = || {
+            let mut package = switch_package("int32");
+            let execution = package.execution.as_mut().unwrap();
+            let mut body = execution.graphs.iter().find(|graph| graph.name == "switch-b1").unwrap().clone();
+            body.name = "switch-b1.w6".into();
+            (body.packed_token_capacity, body.draft_tokens, body.confidence_width) = (5, Some(4), 4);
+            execution.graphs.push(body);
+            let bodies: Vec<_> = package.graphs.iter().filter(|g| g.name.starts_with("switch-b1.w")
+                && g.name != "switch-b1.w6").map(|g| g.name.clone()).collect();
+            refresh_graph_resources(&mut package);
+            package.graphs.extend(bodies.into_iter().map(|name| Graph {
+                name: name.clone(), flags: 0, resource: name, node_count: 1, edge_count: 0, functions: vec![0],
+            }));
+            package
+        };
+        let mut ranks = [catalogued(), catalogued()];
+        let error = LoadOptions::default().select(&mut ranks, &mut round_config(48)).unwrap_err().to_string();
+        assert!(error.contains("uncatalogued"), "{error}");
     }
 
     #[test]

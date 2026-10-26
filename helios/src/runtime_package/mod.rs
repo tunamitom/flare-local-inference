@@ -58,9 +58,15 @@ use crate::{
     startup::{Phase, StartupProgress},
 };
 use driver::{
-    Access, AllocationProperties, CopyEndpoint, CopyParams, Driver, Handle, KernelParams, Location,
-    MemsetParams, TensorMap,
+    Access, AllocationProperties, CONDITIONAL_ASSIGN_DEFAULT, CONDITIONAL_SWITCH, ConditionalParams,
+    CopyEndpoint, CopyParams, Driver, Handle, KernelParams, Location, MemsetParams,
+    NODE_TYPE_CONDITIONAL, NodeParams, TensorMap,
 };
+
+/// Selects a conditional SWITCH body from a device-written 1-based width (native/select_conditional.cu,
+/// SASS for sm_80+ families plus compute_80 PTX); serving images disable PTX JIT, so SASS is required.
+/// Local divergence (owner waiver): device-selected verification widths are not an upstream operation.
+const SELECT_CONDITIONAL_FATBIN: &[u8] = include_bytes!("../../native/select_conditional.fatbin");
 use format::{Blob, Memory, Node, Package, Reference, Relocation, RelocationKind, invalid};
 
 struct Storage {
@@ -769,6 +775,14 @@ impl NativeResources {
                 )?;
                 dynamic_shared.insert(function as usize, bytes as u32);
             }
+            // Graphs of a device-selected width are composed after loading: the prefix and its
+            // bodies stay templates until a conditional SWITCH graph clones them.
+            let switches = self.execution.as_ref().map(|e| e.switches.clone()).unwrap_or_default();
+            let members: std::collections::HashSet<String> = switches
+                .iter()
+                .flat_map(|s| std::iter::once(s.graph.clone()).chain(s.bodies.iter().cloned()))
+                .collect();
+            let mut held: HashMap<String, (Handle, u64)> = HashMap::new();
             for graph in &package.graphs {
                 let mut handle = null_mut();
                 driver.check("cuGraphCreate", (driver.graph_create)(&mut handle, 0))?;
@@ -980,6 +994,11 @@ impl NativeResources {
                 }
                 dependencies.finish()?;
                 records.finish()?;
+                if members.contains(&graph.name) {
+                    held.insert(graph.name.clone(), (handle, graph.flags));
+                    phase.advance(1);
+                    continue;
+                }
                 let mut executable = null_mut();
                 driver.check(
                     "cuGraphInstantiateWithFlags",
@@ -996,10 +1015,166 @@ impl NativeResources {
                 self.templates.pop();
                 phase.advance(1);
             }
+            for switch in &switches {
+                // Selection drops an unselected prefix together with its bodies.
+                let Some(&(prefix, flags)) = held.get(&switch.graph) else {
+                    continue;
+                };
+                let bodies = switch
+                    .bodies
+                    .iter()
+                    .map(|name| {
+                        held.get(name)
+                            .map(|&(body, _)| body)
+                            .ok_or_else(|| invalid("execution switch body was not loaded"))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let selector = self.execution_buffer(&switch.selector_buffer, 4)?;
+                let executable = self.compose_switch(prefix, &bodies, selector, flags)?;
+                self.executables.push(executable);
+                self.names.push(switch.graph.clone());
+            }
+            for (handle, _) in held.into_values() {
+                driver.check("cuGraphDestroy", (driver.graph_destroy)(handle))?;
+                self.templates.retain(|template| *template != handle);
+            }
             self.functions.clear();
             driver.check("cuCtxSynchronize", (driver.context_sync)())?;
         }
         Ok(())
+    }
+
+    /// Device address of a named execution buffer holding at least `nbytes`.
+    fn execution_buffer(&self, name: &str, nbytes: usize) -> Result<u64> {
+        let buffer = self
+            .execution
+            .as_ref()
+            .and_then(|e| e.buffers.iter().find(|b| b.name == name))
+            .ok_or_else(|| invalid("execution switch selector buffer is missing"))?;
+        let reference = buffer
+            .reference
+            .as_ref()
+            .ok_or_else(|| invalid("missing execution buffer reference"))?;
+        let allocation = self.allocation(&reference.allocation)?;
+        let offset = protobuf::size(reference.offset)?;
+        if protobuf::size(buffer.nbytes)? < nbytes
+            || offset.checked_add(nbytes).is_none_or(|end| end > allocation.nbytes)
+        {
+            return Err(invalid("execution switch selector buffer is too small"));
+        }
+        Ok((allocation.address + offset) as u64)
+    }
+
+    /// One executable: `prefix`, a kernel that reads the 1-based width at `selector`, and a
+    /// conditional SWITCH whose body `w - 1` clones `bodies[w - 1]`. Widths outside
+    /// `1..=bodies.len()` clamp to the nearest body.
+    unsafe fn compose_switch(
+        &mut self,
+        prefix: Handle,
+        bodies: &[Handle],
+        selector: u64,
+        flags: u64,
+    ) -> Result<Handle> {
+        let driver = self.driver.clone();
+        let branches = u32::try_from(bodies.len())
+            .ok()
+            .filter(|&n| n > 0)
+            .ok_or_else(|| invalid("execution switch needs at least one body"))?;
+        unsafe {
+            let function = self.select_conditional_function()?;
+            let mut graph = null_mut();
+            driver.check("cuGraphCreate", (driver.graph_create)(&mut graph, 0))?;
+            self.templates.push(graph);
+            let mut handle = 0u64;
+            driver.check(
+                "cuGraphConditionalHandleCreate",
+                (driver.graph_conditional_handle)(&mut handle, graph, self.context, 0, CONDITIONAL_ASSIGN_DEFAULT),
+            )?;
+            let mut head = null_mut();
+            driver.check(
+                "cuGraphAddChildGraphNode",
+                (driver.graph_child)(&mut head, graph, null(), 0, prefix),
+            )?;
+            let (mut handle_argument, mut selector_argument, mut branch_argument) = (handle, selector, branches);
+            let mut arguments: [Handle; 3] = [
+                (&raw mut handle_argument).cast(),
+                (&raw mut selector_argument).cast(),
+                (&raw mut branch_argument).cast(),
+            ];
+            let params = KernelParams {
+                function,
+                grid: [1; 3],
+                block: [1; 3],
+                shared: 0,
+                arguments: arguments.as_mut_ptr(),
+                extra: null_mut(),
+                kernel: null_mut(),
+                context: null_mut(),
+            };
+            let mut select = null_mut();
+            driver.check(
+                "cuGraphAddKernelNode_v2",
+                (driver.graph_kernel)(&mut select, graph, &head, 1, &params),
+            )?;
+            let mut node = NodeParams {
+                kind: NODE_TYPE_CONDITIONAL,
+                reserved0: [0; 3],
+                conditional: ConditionalParams {
+                    handle,
+                    kind: CONDITIONAL_SWITCH,
+                    size: branches,
+                    graphs_out: null_mut(),
+                    context: self.context,
+                },
+                padding: [0; 29 * 8 - size_of::<ConditionalParams>()],
+                reserved2: 0,
+            };
+            let mut conditional = null_mut();
+            driver.check(
+                "cuGraphAddNode_v2",
+                (driver.graph_node)(&mut conditional, graph, &select, null(), 1, &mut node),
+            )?;
+            if node.conditional.graphs_out.is_null() {
+                return Err(invalid("conditional node returned no body graphs"));
+            }
+            let outputs = std::slice::from_raw_parts(node.conditional.graphs_out, bodies.len());
+            for (&output, &body) in outputs.iter().zip(bodies) {
+                let mut child = null_mut();
+                driver.check(
+                    "cuGraphAddChildGraphNode",
+                    (driver.graph_child)(&mut child, output, null(), 0, body),
+                )?;
+            }
+            let mut executable = null_mut();
+            driver.check(
+                "cuGraphInstantiateWithFlags",
+                (driver.graph_instantiate)(&mut executable, graph, flags),
+            )?;
+            driver.check("cuGraphUpload", (driver.graph_upload)(executable, null_mut()))?;
+            driver.check("cuCtxSynchronize", (driver.context_sync)())?;
+            driver.check("cuGraphDestroy", (driver.graph_destroy)(graph))?;
+            self.templates.retain(|template| *template != graph);
+            Ok(executable)
+        }
+    }
+
+    /// The SWITCH selector kernel, loaded once per context.
+    unsafe fn select_conditional_function(&mut self) -> Result<Handle> {
+        let driver = self.driver.clone();
+        let symbol = c"flare_select_conditional";
+        // cuModuleLoadData reads the fat binary in place; give it 8-byte alignment.
+        let mut image = vec![0u64; SELECT_CONDITIONAL_FATBIN.len().div_ceil(8)];
+        // SAFETY: the destination holds at least as many bytes as the source.
+        unsafe {
+            std::ptr::copy_nonoverlapping(SELECT_CONDITIONAL_FATBIN.as_ptr(), image.as_mut_ptr().cast::<u8>(),
+                SELECT_CONDITIONAL_FATBIN.len());
+            let mut module = null_mut();
+            driver.check("cuModuleLoadData", (driver.module_load)(&mut module, image.as_ptr().cast()))?;
+            self.modules.push(module);
+            let mut function = null_mut();
+            driver.check("cuModuleGetFunction", (driver.function)(&mut function, module, symbol.as_ptr()))?;
+            Ok(function)
+        }
     }
 
     unsafe fn clamp_cooperative_launch(&self, params: &mut KernelParams) -> Result<()> {
