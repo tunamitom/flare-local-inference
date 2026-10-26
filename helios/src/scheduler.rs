@@ -254,11 +254,6 @@ pub struct LiveRequest {
     window_restore: bool,
     epoch: u64,
     acceptance: speculation::AcceptanceProfile,
-    /// With Markov acceptance, the profile for the other previous-round outcome; `acceptance`
-    /// is the profile for the outcome the request is in, so every reader sees the right curve.
-    acceptance_alternate: speculation::AcceptanceProfile,
-    /// Whether the request's last speculative round accepted every offered draft.
-    acceptance_streak: bool,
     accounting: RequestAccounting,
     pub handle: RequestHandle,
     pub state_slot: StateSlotId,
@@ -1571,8 +1566,6 @@ impl RequestScheduler {
             window_restore: false,
             epoch: 0,
             acceptance: speculation::AcceptanceProfile::default(),
-            acceptance_alternate: speculation::AcceptanceProfile::default(),
-            acceptance_streak: false,
             accounting: self.accounting(),
             handle,
             state_slot: StateSlotId((1 + slot * execution_rows) as u32),
@@ -2398,7 +2391,6 @@ impl RequestScheduler {
         let step = submission.step;
         let now_ns = self.now_ns;
         let proposal_source = self.proposal_source;
-        let markov_acceptance = self.policy.markov_acceptance;
         let mut useful_tokens = [0u64; REQUEST_LANES];
         let mut generated = Vec::new();
         let mut boundaries = Vec::new();
@@ -2461,16 +2453,6 @@ impl RequestScheduler {
                     vector.emitted_count > vector.accepted_drafts,
                     survival.map(|rows| &rows[lane.request.slot as usize]),
                 );
-                // Acceptance runs in spans: after a round that accepted every offered draft the
-                // next round's prefixes survive far more often than after a rejection. Each
-                // outcome learns its own curve; the next round plans with the one it follows.
-                if markov_acceptance && offered > 0 {
-                    let streak = vector.accepted_drafts as usize >= offered;
-                    if streak != request.acceptance_streak {
-                        std::mem::swap(&mut request.acceptance, &mut request.acceptance_alternate);
-                        request.acceptance_streak = streak;
-                    }
-                }
             }
             if record.status == 3 {
                 request.error_code = Some(record.error_code);

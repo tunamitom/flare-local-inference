@@ -19,8 +19,6 @@ pub struct PolicyConfig {
     /// Message ends fewer than this many tokens past the previous retained checkpoint do not
     /// stop prefill; zero stops at every retained message end.
     pub min_checkpoint_segment: usize,
-    /// Keep separate prefix-survival curves after fully accepted and after rejected rounds.
-    pub markov_acceptance: bool,
 }
 
 impl Default for PolicyConfig {
@@ -36,7 +34,6 @@ impl Default for PolicyConfig {
             estimate_ttl_ns: 30_000_000_000,
             adaptive_verification_alpha: 1.0,
             min_checkpoint_segment: 0,
-            markov_acceptance: false,
         }
     }
 }

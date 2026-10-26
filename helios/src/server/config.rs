@@ -321,10 +321,6 @@ impl Bootstrap {
                     .ok_or_else(|| format!("{name} must be finite and nonnegative"))?;
             }
         }
-        if let Some(value) = object.get("mtp_markov_acceptance") {
-            scheduling_policy.markov_acceptance = value.as_bool()
-                .ok_or("mtp_markov_acceptance must be a boolean")?;
-        }
         if let Some(value) = object.get("min_checkpoint_segment") {
             scheduling_policy.min_checkpoint_segment = value.as_u64()
                 .and_then(|value| usize::try_from(value).ok())

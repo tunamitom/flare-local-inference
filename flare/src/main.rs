@@ -260,9 +260,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(alpha) = args.serving.mtp_adaptive_verification_alpha {
         config["mtp_adaptive_verification_alpha"] = alpha.into();
     }
-    if args.serving.mtp_markov_acceptance {
-        config["mtp_markov_acceptance"] = true.into();
-    }
     if let Some(tokens) = args.serving.min_checkpoint_segment {
         config["min_checkpoint_segment"] = tokens.into();
     }

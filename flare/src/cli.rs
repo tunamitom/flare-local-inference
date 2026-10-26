@@ -869,11 +869,6 @@ pub struct ServingOptions {
         help_heading = "Advanced speculation options")]
     pub mtp_adaptive_verification_alpha: Option<f64>,
 
-    /// Learn separate prefix-survival curves after rounds that accepted every offered draft and
-    /// after rejections, and plan each round with the curve for the outcome it follows.
-    #[arg(long, help_heading = "Advanced speculation options")]
-    pub mtp_markov_acceptance: bool,
-
     /// Token capacity from which prefill graphs captured in both activation precisions run with
     /// quantized activations; 0 keeps them unquantized [default: package setting].
     #[arg(long, value_name = "N", help_heading = "Advanced serving options")]
@@ -1007,9 +1002,6 @@ impl ServingOptions {
                 "--mtp-adaptive-verification-alpha".into(),
                 alpha.to_string(),
             ]);
-        }
-        if self.mtp_markov_acceptance {
-            options.push("--mtp-markov-acceptance".into());
         }
         if let Some(tokens) = self.min_checkpoint_segment {
             options.extend(["--min-checkpoint-segment".into(), tokens.to_string()]);
