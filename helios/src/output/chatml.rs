@@ -737,4 +737,91 @@ mod tests {
             assert!(parser.finish(cause).unwrap().is_empty());
         }
     }
+
+    fn reasoning_cases() -> [(&'static str, &'static str); 4] {
+        [
+            // Upstream issue #30's minimal reproduction.
+            (
+                "The parser fails when the model emits `<tool_call>` verbatim. My request sent `<tool_call><function=lookup>` and returned valid output.",
+                "\n</think>\n\nChecking.\n\n<tool_call>\n<function=lookup>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>",
+            ),
+            // MiMo reasoning that quoted an issue title (smart, 2026-10-23), then a real call.
+            (
+                "**Issues (interesting):**\n- #30 \"Qwen function-tag parser: <tool_call> mentioned in re…\" \n- #25 \"Translate xhigh reasoning\"",
+                "</think>Checking.<tool_call><function=lookup><parameter=city>Paris</parameter></function></tool_call>",
+            ),
+            // An inline opener with a function tag is still prose.
+            (
+                "Earlier I wrote <tool_call><function=lookup> by hand.",
+                "</think><tool_call><function=lookup><parameter=city>Paris</parameter></function></tool_call>",
+            ),
+            // A line-start call ends reasoning implicitly.
+            (
+                "Look up Paris.",
+                "\n<tool_call>\n<function=lookup>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>",
+            ),
+        ]
+    }
+
+    #[test]
+    fn tool_openers_quoted_mid_line_in_reasoning_stay_reasoning_at_every_split() {
+        for (reasoning, rest) in reasoning_cases() {
+            let text = format!("{reasoning}{rest}");
+            let check = |message: Value, label: &str| {
+                // Upstream keeps the newline before a line-start opener in the reasoning only when a
+                // stream split falls inside that opener; the reasoning text itself must match.
+                assert_eq!(message["reasoning_content"].as_str().map(str::trim_end), Some(reasoning), "{label}");
+                let calls = message["tool_calls"].as_array().unwrap();
+                assert_eq!(calls.len(), 1, "{label}");
+                let args: Value =
+                    serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+                assert_eq!(args["city"], "Paris", "{label}");
+            };
+            for split in text.char_indices().map(|(at, _)| at) {
+                let mut parser = Harness::new(config(), "inline".into());
+                parser.push(&text[..split]).unwrap();
+                parser.push(&text[split..]).unwrap();
+                parser.finish().unwrap();
+                check(parser.message(), &format!("{text:?} at {split}"));
+            }
+            let mut parser = Harness::new(config(), "inline".into());
+            for ch in text.chars() {
+                parser.push(&ch.to_string()).unwrap();
+            }
+            parser.finish().unwrap();
+            check(parser.message(), &format!("{text:?} by character"));
+        }
+    }
+
+    #[test]
+    fn reasoning_that_only_quotes_a_tool_opener_finishes_without_a_call() {
+        let text = "Issue #30: parser sees <tool_call> in prose.</think>Nothing new upstream.";
+        let mut parser = Harness::new(config(), "prose".into());
+        parser.push(text).unwrap();
+        parser.finish().unwrap();
+        let message = parser.message();
+        assert_eq!(message["reasoning_content"], "Issue #30: parser sees <tool_call> in prose.");
+        assert_eq!(message["content"], "Nothing new upstream.");
+        assert!(!parser.has_tools());
+    }
+
+    #[test]
+    fn tool_openers_quoted_in_answer_text_stay_content_before_a_real_call() {
+        // The answer, not the reasoning, quotes the opener in prose; the real call follows mid-line.
+        let answer = "Use `<tool_call><function=lookup>` only when asked. Checking now.";
+        let text = format!("Look up Paris.</think>{answer}<tool_call><function=lookup><parameter=city>Paris</parameter></function></tool_call>");
+        for split in text.char_indices().map(|(at, _)| at) {
+            let mut parser = Harness::new(config(), "answer".into());
+            parser.push(&text[..split]).unwrap();
+            parser.push(&text[split..]).unwrap();
+            parser.finish().unwrap();
+            let message = parser.message();
+            assert_eq!(message["reasoning_content"], "Look up Paris.", "split {split}");
+            assert_eq!(message["content"], answer, "split {split}");
+            let calls = message["tool_calls"].as_array().unwrap();
+            assert_eq!(calls.len(), 1, "split {split}");
+            let args: Value = serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+            assert_eq!(args["city"], "Paris", "split {split}");
+        }
+    }
 }
