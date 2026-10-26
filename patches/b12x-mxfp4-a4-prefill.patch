@@ -906,7 +906,7 @@ diff -ruN a/b12x/moe/_shared/kernels/w4a16/kernel/execution.py b/b12x/moe/_share
 diff -ruN a/b12x/moe/_shared/kernels/w4a16/mxfp4_a4_prefill.py b/b12x/moe/_shared/kernels/w4a16/mxfp4_a4_prefill.py
 --- a/b12x/moe/_shared/kernels/w4a16/mxfp4_a4_prefill.py	1970-01-01 08:00:00.000000000 +0800
 +++ b/b12x/moe/_shared/kernels/w4a16/mxfp4_a4_prefill.py	2026-10-21 17:22:48.275727570 +0700
-@@ -0,0 +1,1937 @@
+@@ -0,0 +1,1939 @@
 +"""MXFP4-activation (A4) prefill MoE GEMMs over W4A16 packed FP4 weights.
 +
 +Dynamic-E8M0-group-quant path (PLAN-w4a16-port.md §5): prefill contracts
@@ -981,6 +981,7 @@ diff -ruN a/b12x/moe/_shared/kernels/w4a16/mxfp4_a4_prefill.py b/b12x/moe/_share
 +    f32_to_raw_bits,
 +    pack_f32x2_to_bfloat2,
 +)
++from b12x._lib.program_cache import register_program_cache
 +
 +# Position m of a 16-group holds physical K offset PI[m] (both operands permute
 +# K identically, so K32 scale-group boundaries survive).
@@ -2070,6 +2071,7 @@ diff -ruN a/b12x/moe/_shared/kernels/w4a16/mxfp4_a4_prefill.py b/b12x/moe/_share
 +MXFP4_PREFILL_ROUTE_BLOCK = BLOCK_M
 +_FAKE_ELEMENTS = 1 << 30
 +_LAUNCH_CACHE: dict[tuple, tuple] = {}
++register_program_cache(_LAUNCH_CACHE)
 +
 +
 +def mxfp4_prefill_scale_format_supported(scale_format: str | None) -> bool:
