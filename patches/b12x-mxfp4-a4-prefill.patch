@@ -906,7 +906,7 @@ diff -ruN a/b12x/moe/_shared/kernels/w4a16/kernel/execution.py b/b12x/moe/_share
 diff -ruN a/b12x/moe/_shared/kernels/w4a16/mxfp4_a4_prefill.py b/b12x/moe/_shared/kernels/w4a16/mxfp4_a4_prefill.py
 --- a/b12x/moe/_shared/kernels/w4a16/mxfp4_a4_prefill.py	1970-01-01 08:00:00.000000000 +0800
 +++ b/b12x/moe/_shared/kernels/w4a16/mxfp4_a4_prefill.py	2026-10-21 17:22:48.275727570 +0700
-@@ -0,0 +1,1939 @@
+@@ -0,0 +1,1940 @@
 +"""MXFP4-activation (A4) prefill MoE GEMMs over W4A16 packed FP4 weights.
 +
 +Dynamic-E8M0-group-quant path (PLAN-w4a16-port.md §5): prefill contracts
@@ -2228,6 +2228,7 @@ diff -ruN a/b12x/moe/_shared/kernels/w4a16/mxfp4_a4_prefill.py b/b12x/moe/_share
 +    cached = _LAUNCH_CACHE.get(key)
 +    if cached is not None:
 +        return cached
++    spec_key = key[1:]  # programs are rank-independent; the device only scopes the memo
 +    stream = current_cuda_stream()
 +    quant = b12x_compile(
 +        Mxfp4A4Quantize(size_k=hidden_size, terms=terms),
@@ -2239,7 +2240,7 @@ diff -ruN a/b12x/moe/_shared/kernels/w4a16/mxfp4_a4_prefill.py b/b12x/moe/_share
 +        Int32(1),
 +        stream,
 +        compile_spec=KernelCompileSpec.from_key(
-+            "moe.w4a16.mxfp4_prefill.quant", 2, key
++            "moe.w4a16.mxfp4_prefill.quant", 2, spec_key
 +        ),
 +    )
 +    gemms = []
@@ -2277,7 +2278,7 @@ diff -ruN a/b12x/moe/_shared/kernels/w4a16/mxfp4_a4_prefill.py b/b12x/moe/_share
 +                Int32(1),
 +                stream,
 +                compile_spec=KernelCompileSpec.from_key(
-+                    f"moe.w4a16.mxfp4_prefill.{phase}", 2, key
++                    f"moe.w4a16.mxfp4_prefill.{phase}", 2, spec_key
 +                ),
 +            )
 +        )

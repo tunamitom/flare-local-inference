@@ -285,7 +285,7 @@
 +            Int32(1),
 +            current_cuda_stream(),
 +            compile_spec=KernelCompileSpec.from_key(
-+                "gemm.block_fp8.row_quant", 1, (ordinal, k, bool(dependent))
++                "gemm.block_fp8.row_quant", 1, (k, bool(dependent))
 +            ),
 +        )
 +
