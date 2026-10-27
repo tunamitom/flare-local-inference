@@ -61,6 +61,15 @@
     "image_tokens": {
       "feature_token": 151655,
       "span": null
+    },
+    "audio_preparation": 1,
+    "audio_tokens": {
+      "feature_token": 151669
     }
+  },
+  "audio": {
+    "frame_capacities": [
+      6000
+    ]
   }
 }

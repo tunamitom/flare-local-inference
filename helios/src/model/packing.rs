@@ -102,6 +102,11 @@ impl Inputs {
                             ImageTensor => {
                                 graph.kind == GraphKind::Vision && binding.indexing == Scalar
                             }
+                            AudioTensor => {
+                                // Audio preparations upload named tensors of their own geometry:
+                                // log-mel frames, the segment's frame count, and its arena slot.
+                                graph.kind == GraphKind::Audio && binding.indexing == Scalar
+                            }
                             LiveRows | PrefillRow => binding.indexing == Scalar,
                             ImageFeatureSlot => binding.indexing == Scalar && elements == 1
                                 && matches!(graph.kind, GraphKind::Vision | GraphKind::Prefill | GraphKind::ScoredPrefill | GraphKind::Mixed),
@@ -129,7 +134,7 @@ impl Inputs {
                         {
                             return Err("row input cannot cover the prepared request slots".into());
                         }
-                        if matches!(binding.source, SamplingParameters | ImageTensor | PageTable)
+                        if matches!(binding.source, SamplingParameters | ImageTensor | AudioTensor | PageTable)
                             && binding.value_offset != 0
                         {
                             return Err("value offset requires an integer value source".into());
@@ -168,7 +173,7 @@ impl Inputs {
                             ValueSource::PromptPosition => {
                                 config.contract.frontend.position_dimensions
                             }
-                            ValueSource::PageTable | ValueSource::ImageTensor => width,
+                            ValueSource::PageTable | ValueSource::ImageTensor | ValueSource::AudioTensor => width,
                             _ => 1,
                         };
                         if width == 0
@@ -185,6 +190,7 @@ impl Inputs {
                                 && buffer.dtype != Dtype::Float32)
                             || (binding.source != ValueSource::SamplingParameters
                                 && binding.source != ValueSource::ImageTensor
+                                && binding.source != ValueSource::AudioTensor
                                 && !matches!(buffer.dtype, Dtype::Int32 | Dtype::Int64))
                             || (binding.indexing != InputIndexing::Scalar
                                 && elements < width * graph.batch_capacity)
@@ -226,7 +232,7 @@ impl Inputs {
         let maximum = graphs
             .iter()
             .flat_map(|g| &g.inputs)
-            .filter(|b| b.binding.source != ValueSource::ImageTensor)
+            .filter(|b| !matches!(b.binding.source, ValueSource::ImageTensor | ValueSource::AudioTensor))
             .map(|b| b.elements)
             .max()
             .unwrap_or(0);
@@ -393,6 +399,9 @@ impl Inputs {
             }
             if binding.source == ValueSource::ImageTensor {
                 return Err("vision tensors require an image submission".into());
+            }
+            if binding.source == ValueSource::AudioTensor {
+                return Err("audio tensors require an audio submission".into());
             }
             if binding.indexing == InputIndexing::Scalar {
                 self.integers.clear();

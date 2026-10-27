@@ -35,7 +35,7 @@ class GraphSignature:
 
     def __post_init__(self):
         if self.kind not in ("init", "restore", "snapshot", "prefill", "scored_prefill", "decode", "resume",
-                             "vision", "speculative", "mixed", "continuation"):
+                             "vision", "audio", "speculative", "mixed", "continuation"):
             raise ValueError("unknown prepared graph operation")
         if self.switch is not None and (self.kind != "speculative" or len(self.switch) != 2
                 or type(self.switch[0]) is not str or not self.switch[0] or not self.switch[1]

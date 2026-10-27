@@ -72,27 +72,34 @@ def graph_contracts(signatures, inputs, *, continuation, pending, cursor=None, r
         if kind == "speculative" and "speculative_prefix_limits" in signature.inputs:
             selected["speculative_prefix_limits"] = binding("speculative_prefix_limits", p.SPECULATIVE_PREFIX_LIMIT)
         values = [selected[field] for field in signature.inputs if field in selected]
-        states = [] if kind == "vision" else [dict(view=continuation, access=p.READ_WRITE)]
-        if pending is not None and kind not in ("snapshot", "vision"):
+        # A feature producer publishes into the shared arena and owns no continuation or pending token.
+        producer = kind in ("vision", "audio")
+        states = [] if producer else [dict(view=continuation, access=p.READ_WRITE)]
+        if pending is not None and not producer and kind != "snapshot":
             states.append(dict(view=pending, access=p.WRITE if kind in ("init", "restore") else p.READ_WRITE))
         result.append(dict(graph=name, kind=p.GraphOperation.Value(kind.upper()), inputs=values, state=states,
             state_rows_per_request=signature.token_capacity if rows is None and kind == "speculative" else (rows or 1),
             draft_cursor=cursor if signature.speculation_enabled and kind in ("speculative", "mixed") else None,
             embedding_tables=list(embedding_tables) if kind in (
                 "prefill", "scored_prefill", "decode", "speculative", "mixed") else [],
-            pending_token=pending if kind not in ("init", "restore", "snapshot", "vision") else None))
+            pending_token=pending if not producer and kind not in ("init", "restore", "snapshot") else None))
     return result
 
 
 def frontend(*, tools, assistant_marker, message_end_markers, prefix_boundary, wrapping_newlines=0,
              tag_separator="", terminal_markers=(), image_preparation=None, image_layout=None,
-             position_dimensions=0, rejected_tokens=(), image_tokens=None):
+             position_dimensions=0, rejected_tokens=(), image_tokens=None, audio_preparation=None,
+             audio_tokens=None):
     return dict(tools=dict(kind=tools, wrapping_newlines=wrapping_newlines, tag_separator=tag_separator),
         reasoning=dict(kind=p.THINK_TAGS, open="<think>", close="</think>",
                        wrapping_newlines=wrapping_newlines, terminal_markers=list(terminal_markers)),
         image_preparation=image_preparation, image_layout=image_layout, position_dimensions=position_dimensions,
         rejected_tokens=list(rejected_tokens), assistant_marker=assistant_marker,
-        message_end_markers=list(message_end_markers), prefix_boundary=prefix_boundary, image_tokens=image_tokens)
+        message_end_markers=list(message_end_markers), prefix_boundary=prefix_boundary, image_tokens=image_tokens,
+        # Audio preparation is optional; recipes that prepare none emit no audio keys at all, which
+        # the contract's defaulted audio fields accept.
+        **({"audio_preparation": audio_preparation, "audio_tokens": audio_tokens}
+           if audio_preparation is not None else {}))
 
 
 def prefix_boundary(roles, *, append_role=None, minimum_messages=1, required_start="", required_end="", required_marker=""):
@@ -102,10 +109,11 @@ def prefix_boundary(roles, *, append_role=None, minimum_messages=1, required_sta
 
 
 def model_contract(*, vocabulary, input_vocabulary=None, vision=None, page_tokens, page_tables, graphs, frontend,
-                   regions):
+                   regions, audio=None):
     return dict(version=2, vocabulary=vocabulary, input_vocabulary=input_vocabulary or vocabulary,
         vision={"feature_slots": 0, **(vision or dict(features_per_request=0, max_images=0, patches_per_feature=0, patch_capacities=[]))},
-        cache=dict(page_tokens=page_tokens, page_tables=page_tables, regions=regions), graphs=graphs, frontend=frontend)
+        cache=dict(page_tokens=page_tokens, page_tables=page_tables, regions=regions), graphs=graphs, frontend=frontend,
+        **({"audio": audio} if audio is not None else {}))
 
 
 def vision_inputs(fields):
@@ -113,6 +121,11 @@ def vision_inputs(fields):
                          p.REQUEST_GENERATION if name == "vision_generation" else
                          p.IMAGE_FEATURE_SLOT if name == "vision_feature_slot" else p.IMAGE_TENSOR,
                          p.SCALAR, tensor=name) for name in fields}
+
+
+def audio_inputs(fields):
+    """Every audio graph input is a named output of the frontend's audio preparation."""
+    return {name: binding(name, p.AUDIO_TENSOR, p.SCALAR, tensor=name) for name in fields}
 
 
 def history_region(buffers, name, tensor, kind, *, tokens_per_record=1, window_tokens=0):
