@@ -807,6 +807,9 @@ impl NativeResources {
             let edge_mode = std::env::var("FLARE_GRAPH_PROGRAMMATIC_EDGES").unwrap_or_default();
             let kept: Option<Vec<&str>> = edge_mode.strip_prefix("only:").map(|list| list.split(',').collect());
             let serialize_all = edge_mode == "off";
+            // dest:<substring>[,...] keeps a programmatic edge only into kernels whose symbol contains one.
+            let kept_destinations: Option<Vec<&str>> =
+                edge_mode.strip_prefix("dest:").map(|list| list.split(',').filter(|s| *s != "pairs").collect());
             let mut programmatic: Vec<(usize, &str)> = Vec::new();
             // Inline composition populates a switch's prefix into the composed graph and each body
             // into its conditional branch, so no member executes as a cloned child graph.
@@ -1092,12 +1095,15 @@ impl NativeResources {
                         incoming[edge.destination] = true;
                         if edge.data != [0; 8] {
                             annotated += 1;
+                            let allowed = kept_destinations.as_ref().is_none_or(|kept| {
+                                kept.iter().any(|part| symbols[edge.destination].contains(part))
+                            });
                             if edge_mode.contains("pairs") {
                                 let short = |name: &str| name.chars().take(70).collect::<String>();
                                 *pairs.entry((short(symbols[edge.source]), short(symbols[edge.destination]), edge.data))
                                     .or_default() += 1;
                             }
-                            if serialize {
+                            if serialize || !allowed {
                                 edge.data = [0; 8];
                             }
                         }
