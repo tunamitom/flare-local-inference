@@ -117,7 +117,9 @@ impl Inputs {
                             }
                             LiveRows | PrefillRow => binding.indexing == Scalar,
                             ImageFeatureSlot => binding.indexing == Scalar && elements == 1
-                                && matches!(graph.kind, GraphKind::Vision | GraphKind::Prefill | GraphKind::ScoredPrefill | GraphKind::Mixed),
+                                // Audio publishes into the same arena and reads the same slot,
+                                // so an audio graph may bind it exactly as a vision one does.
+                                && matches!(graph.kind, GraphKind::Vision | GraphKind::Audio | GraphKind::Prefill | GraphKind::ScoredPrefill | GraphKind::Mixed),
                             PageTable | LiveStateRows => binding.indexing == RequestRow,
                             PromptToken | PromptTargetToken
                             | PromptAndPendingToken
