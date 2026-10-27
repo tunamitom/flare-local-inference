@@ -36,7 +36,7 @@ pub(crate) fn prepare_input(
             },
             conditioning: vec![],
             token_expansions: vec![],
-            conditioned_inputs: vec![],
+            conditioned_inputs: vec![], audio_inputs: vec![],
         });
     }
     let processor = processor.ok_or("image processing is unavailable")?;
@@ -82,7 +82,7 @@ pub(crate) fn prepare_input(
             ..Default::default()
         },
         conditioning,
-        conditioned_inputs: vec![],
+        conditioned_inputs: vec![], audio_inputs: vec![],
     })
 }
 

@@ -250,6 +250,7 @@ impl RequestScheduler {
             RequestPhase::Initialize => GraphKind::Init,
             RequestPhase::Restore => GraphKind::Restore,
             RequestPhase::Vision => GraphKind::Vision,
+            RequestPhase::Audio => GraphKind::Audio,
             RequestPhase::Prefill => request.prefill_kind(),
             RequestPhase::Resume => GraphKind::Resume,
             RequestPhase::Decode if self.speculative_widths.is_empty() => GraphKind::Decode,
@@ -262,7 +263,8 @@ impl RequestScheduler {
     pub(super) fn eligible(&self, request: &LiveRequest) -> bool {
         if request.window_snapshot_ready
             || self.request_kind(request).is_none()
-            || (request.phase == RequestPhase::Vision && !request.conditioned_inputs_ready)
+            || (matches!(request.phase, RequestPhase::Vision | RequestPhase::Audio)
+                && !request.conditioned_inputs_ready)
         {
             return false;
         }
@@ -602,18 +604,32 @@ impl RequestScheduler {
             }
             following = following.saturating_add(restore);
         }
-        let patches = next_window.map_or(&r.vision_patches, |window| &window.patches);
-        let skip = usize::from(kind == GraphKind::Vision);
-        for patches in patches.iter().skip(skip) {
-            let cost = self
-                .capabilities
-                .vision
-                .patch_capacities
-                .iter()
-                .filter(|n| *n >= patches)
-                .filter_map(|n| self.costs.duration(GraphKind::Vision, 1, *n))
-                .min()
-                .unwrap_or(0);
+        let work_queue = next_window.map_or(&r.conditioned_steps, |window| &window.work);
+        let skip = usize::from(matches!(
+            kind,
+            GraphKind::Vision | GraphKind::Audio
+        ));
+        for pending in work_queue.iter().skip(skip) {
+            // Each remaining conditioned run costs the cheapest captured graph that covers it.
+            let cost = match *pending {
+                ConditionedWork::Vision { patches } => self
+                    .capabilities
+                    .vision
+                    .patch_capacities
+                    .iter()
+                    .filter(|n| **n >= patches)
+                    .filter_map(|n| self.costs.duration(GraphKind::Vision, 1, *n))
+                    .min(),
+                ConditionedWork::Audio { frames, .. } => self
+                    .capabilities
+                    .audio
+                    .frame_capacities
+                    .iter()
+                    .filter(|n| **n >= frames)
+                    .filter_map(|n| self.costs.duration(GraphKind::Audio, 1, *n))
+                    .min(),
+            }
+            .unwrap_or(0);
             if cost == 0 {
                 return work;
             }
@@ -625,8 +641,10 @@ impl RequestScheduler {
     fn following_kind(&self, r: &LiveRequest, kind: GraphKind) -> Option<GraphKind> {
         let phase = match kind {
             GraphKind::Snapshot => r.boundary_capture?.resume,
-            GraphKind::Init | GraphKind::Restore | GraphKind::Vision => {
-                if r.vision_patches.len() > usize::from(kind == GraphKind::Vision) {
+            GraphKind::Init | GraphKind::Restore | GraphKind::Vision | GraphKind::Audio => {
+                if r.conditioned_steps.len()
+                    > usize::from(matches!(kind, GraphKind::Vision | GraphKind::Audio))
+                {
                     return None;
                 }
                 if r.consumed_tokens == r.prompt_tokens as u64 {
@@ -657,7 +675,11 @@ impl RequestScheduler {
     ) -> Option<(u64, ValueRate)> {
         if !matches!(
             kind,
-            GraphKind::Init | GraphKind::Restore | GraphKind::Snapshot | GraphKind::Vision
+            GraphKind::Init
+                | GraphKind::Restore
+                | GraphKind::Snapshot
+                | GraphKind::Vision
+                | GraphKind::Audio
         ) {
             return None;
         }
@@ -900,8 +922,16 @@ impl RequestScheduler {
                     continue;
                 }
             }
-            if kind == GraphKind::Vision && capacity < r.vision_patches[0] {
-                continue;
+            // A conditioned graph run must be able to hold the work at the head of the queue.
+            if matches!(kind, GraphKind::Vision | GraphKind::Audio) {
+                let required = r
+                    .conditioned_steps
+                    .front()
+                    .filter(|work| work.phase() == request_phase(kind))
+                    .and_then(|work| work.capacity());
+                if required.is_some_and(|required| capacity < required) {
+                    continue;
+                }
             }
             offers[count] = (
                 slot,
@@ -982,6 +1012,7 @@ impl RequestScheduler {
             GraphKind::Prefill,
             GraphKind::ScoredPrefill,
             GraphKind::Vision,
+            GraphKind::Audio,
             GraphKind::Init,
             GraphKind::Restore,
             GraphKind::Snapshot,
@@ -1009,6 +1040,10 @@ impl RequestScheduler {
                 }
             } else if kind == GraphKind::Vision {
                 for &capacity in &self.capabilities.vision.patch_capacities {
+                    self.add_candidate(output, kind, 1, capacity, mask, values, age_price);
+                }
+            } else if kind == GraphKind::Audio {
+                for &capacity in &self.capabilities.audio.frame_capacities {
                     self.add_candidate(output, kind, 1, capacity, mask, values, age_price);
                 }
             } else {
@@ -1334,4 +1369,12 @@ pub(super) fn bits(mut mask: u64) -> impl Iterator<Item = usize> {
 
 pub(super) fn scratch() -> std::cell::RefCell<Vec<Candidate>> {
     std::cell::RefCell::new(Vec::new())
+}
+
+/// The request phase that runs a conditioned graph kind.
+fn request_phase(kind: GraphKind) -> RequestPhase {
+    match kind {
+        GraphKind::Audio => RequestPhase::Audio,
+        _ => RequestPhase::Vision,
+    }
 }

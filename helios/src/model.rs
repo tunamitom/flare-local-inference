@@ -2,6 +2,8 @@
 
 pub mod admission;
 pub mod catalog;
+#[cfg(feature = "server")]
+pub mod media;
 pub mod contract;
 pub(crate) mod inputs;
 mod packing;
@@ -18,7 +20,10 @@ pub use contract::PreparedContract;
 pub use inputs::{InputStep, pack_inputs};
 pub use packing::Inputs;
 #[cfg(feature = "server")]
-pub use prompt::{prepare_image_inputs, prepare_input, prepare_output, reasoning_delimiter_tokens};
+pub use prompt::{
+    prepare_image_inputs, prepare_input, prepare_media_inputs, prepare_output,
+    reasoning_delimiter_tokens,
+};
 #[cfg(feature = "server")]
 pub(crate) use prompt::validate_conditioned_inputs;
 
@@ -321,6 +326,7 @@ pub struct PreparedInput {
     pub data: PromptData,
     pub conditioning: Vec<crate::cache::ConditioningEvent>,
     pub conditioned_inputs: Vec<crate::frontend::images::PreparedImageInput>,
+    pub audio_inputs: Vec<crate::frontend::audio::PreparedAudioInput>,
 }
 
 pub fn scheduler_capabilities(config: &ModelConfig) -> SchedulerCapabilities {
@@ -328,6 +334,7 @@ pub fn scheduler_capabilities(config: &ModelConfig) -> SchedulerCapabilities {
         vocabulary: config.contract.vocabulary,
         page_tokens: config.contract.cache.page_tokens,
         vision: config.contract.vision.clone(),
+        audio: config.contract.audio.clone().unwrap_or_default(),
         draft_pages_per_request: config
             .contract
             .cache
@@ -441,13 +448,23 @@ pub fn validate_prompt_data(config: &ModelConfig, tokens: &[u32], data: &PromptD
         return Err("prompt arrays violate prepared geometry".into());
     }
     if let Some(layout) = &config.contract.frontend.image_tokens {
+        // Every conditioned feature token, of any media kind, occupies a feature position; all
+        // other tokens do not. Audio and video features share the vision arena and its indices.
+        let feature_tokens: Vec<u32> = [
+            Some(layout.feature_token),
+            config.contract.frontend.audio_tokens.as_ref().map(|layout| layout.feature_token),
+            config.contract.frontend.video_tokens.as_ref().map(|layout| layout.feature_token),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
         if data.vision_token_indices.len() != tokens.len()
             || tokens
                 .iter()
                 .zip(&data.vision_token_indices)
-                .any(|(token, index)| (*token == layout.feature_token) != (*index >= 0))
+                .any(|(token, index)| feature_tokens.contains(token) != (*index >= 0))
         {
-            return Err("image feature tokens do not match their feature indices".into());
+            return Err("conditioned feature tokens do not match their feature indices".into());
         }
         if let Some(span) = &layout.span {
             if data.spans.iter().any(|s| {

@@ -257,8 +257,13 @@ pub(super) async fn generate(
         .step_by(decoded.request.choices)
         .map(|p| PromptUsage {
             tokens: p.prompt.tokens.len(),
-            image_tokens: p.prompt.conditioned_inputs.iter()
-                .map(|input| input.geometry.tokens).sum(),
+            image_tokens: p
+                .prompt
+                .conditioned_inputs
+                .iter()
+                .map(|input| input.geometry.tokens)
+                .sum::<usize>()
+                + p.prompt.audio_inputs.iter().map(|input| input.tokens()).sum::<usize>(),
         })
         .collect();
     let observation = decoded.observation;

@@ -234,6 +234,10 @@ pub struct RenderedPrompt {
     pub image_sources: Vec<String>,
     /// Indices in image_sources whose expanded spans end at requested checkpoints.
     pub image_checkpoint_hints: Vec<usize>,
+    /// Audio clips in template order; each expands to its encoder's feature count.
+    pub audio_sources: Vec<crate::frontend::audio::AudioSource>,
+    /// Video clips in template order; each expands to a timestamped grid block.
+    pub video_sources: Vec<crate::frontend::images::video::VideoSource>,
     pub text: String,
     pub token_ids: Vec<u32>,
     pub message_boundaries: Vec<usize>,
@@ -599,6 +603,8 @@ impl Frontend {
         let mut messages = messages.to_vec();
         let mut image_sources = Vec::new();
         let mut image_checkpoint_hints = Vec::new();
+        let mut audio_sources = Vec::new();
+        let mut video_sources = Vec::new();
         let mut checkpoint_hints = Vec::new();
         for (index, message) in messages.iter_mut().enumerate() {
             if !message.is_object() {
@@ -631,6 +637,14 @@ impl Frontend {
                         }
                         image_sources.push(url.to_owned());
                         *part = serde_json::json!({"type":"image"});
+                    } else if kind == "input_audio" {
+                        audio_sources.push(crate::frontend::audio::AudioSource::from_part(part)?);
+                        *part = serde_json::json!({"type":"audio"});
+                    } else if kind == "video_url" {
+                        video_sources.push(
+                            crate::frontend::images::video::VideoSource::from_part(part)?,
+                        );
+                        *part = serde_json::json!({"type":"video"});
                     }
                 }
             }
@@ -720,6 +734,8 @@ impl Frontend {
                 token_ids: Vec::new(),
                 image_sources,
                 image_checkpoint_hints,
+                audio_sources,
+                video_sources,
             });
         }
         if !continued
@@ -763,6 +779,8 @@ impl Frontend {
             token_ids,
             image_sources,
             image_checkpoint_hints,
+            audio_sources,
+            video_sources,
         })
     }
 

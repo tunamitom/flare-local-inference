@@ -442,7 +442,8 @@ Results never move across another
 assistant message.
 
 Named tool selection and strict function schemas are rejected. Hosted search,
-computer execution, file stores, audio, and remote image downloads are unsupported. Images must be
+computer execution, file stores, and remote media downloads are unsupported.
+Images must be
 base64 PNG, JPEG, or static WebP data. Images are encoded sequentially into
 bounded feature windows. Chunked prefill consumes each window before its storage
 is reused; the total image tokens across a conversation may exceed
@@ -450,6 +451,23 @@ is reused; the total image tokens across a conversation may exceed
 must fit a prepared vision graph and one feature window. The whole request must
 fit the HTTP body limit and the context shared by images, text, and generated
 output. Animated images are unsupported.
+
+Audio is a base64 `input_audio` part in WAV, MP3, M4A, OGG, FLAC, WebM, AAC or
+Opus form. It is decoded to 24 kHz mono and turned into a 100-frame-per-second
+log-mel, which the audio tower encodes in 60-second segments; each second of
+audio costs about 6.25 prompt tokens, so a 10 s voice note is 63 tokens and the
+300 s limit is about 1,875. A part shorter than a segment still occupies one
+segment slot, and every request audio part must fit the package's declared frame
+capacities.
+
+Video is a `video_url` data URL (`data:video/mp4;base64,...`); remote URLs are
+rejected. The clip is sampled to 32 frames regardless of its source rate, each
+frame is resized to the per-frame budget
+`min(total_max_pixels * 2 / frames, max_pixels)` at the 32-pixel
+patch-times-merge factor, and two frames form one temporal patch. Video prompt
+tokens are `ceil(frames/2) * (H/16) * (W/16) / 4` plus a timestamp label per
+grid, so a 30-second 720p screen recording costs about 14,080 video tokens —
+budget video deliberately, it is far more expensive than an image.
 
 Image costs are the token counts that usage reports in
 `prompt_tokens_details.multimodal_tokens.image`: the profile normalizes each

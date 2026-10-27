@@ -59,6 +59,132 @@ fn audio_graphs_accept_their_named_tensors_and_reject_other_kinds() {
     assert!(error.to_string().contains("incompatible row indexing"), "{error}");
 }
 
+#[test]
+fn audio_submissions_upload_the_named_preparation_outputs() {
+    use crate::{
+        execution::GraphKind,
+        frontend::audio::ProcessedAudio,
+        scheduler::{RequestHandle, ScheduledLane, ScheduledStep},
+    };
+    let mut config = config();
+    // One arena slot per conditioned request, one feature per published patch group; audio
+    // features publish into that same arena.
+    config.contract.vision = crate::model::VisionCapabilities {
+        feature_slots: 2,
+        features_per_request: 512,
+        max_images: 1,
+        patches_per_feature: 4,
+        patch_capacities: vec![1024],
+    };
+    let syntax = &mut config.contract.frontend;
+    syntax.image_preparation = Some(ImagePreparationKind::Mimo);
+    syntax.image_layout = Some(ImageLayoutKind::Mimo);
+    syntax.image_tokens = Some(ImageTokenLayout { feature_token: 100, span: None });
+    syntax.audio_preparation = Some(AudioPreparationKind::Mimo);
+    syntax.audio_tokens = Some(AudioTokenLayout { feature_token: 101 });
+    config.contract.audio = Some(crate::model::AudioCapabilities {
+        frame_capacities: vec![6000],
+    });
+    let tensor = |buffer: &str| ValueBinding {
+        buffer: buffer.into(),
+        source: ValueSource::AudioTensor,
+        indexing: InputIndexing::Scalar,
+        value_offset: 0,
+        padding: 0,
+        tensor: buffer.into(),
+    };
+    let mut inputs = vec![
+        tensor("audio_features"),
+        tensor("audio_frames"),
+        tensor("audio_slot"),
+        tensor("audio_generation"),
+        tensor("audio_feature_offset"),
+    ];
+    inputs.push(ValueBinding {
+        buffer: "submission_sequence".into(),
+        source: ValueSource::RequestSlot,
+        indexing: InputIndexing::Scalar,
+        value_offset: 0,
+        padding: 0,
+        tensor: String::new(),
+    });
+    inputs.push(ValueBinding {
+        buffer: "request_generation".into(),
+        source: ValueSource::RequestGeneration,
+        indexing: InputIndexing::Scalar,
+        value_offset: 0,
+        padding: 0,
+        tensor: String::new(),
+    });
+    config.contract.graphs.push(GraphContract {
+        graph: "Audio-1-6000".into(),
+        kind: GraphOperation::Audio,
+        inputs,
+        state: vec![],
+        state_rows_per_request: 1,
+        draft_cursor: None,
+        embedding_tables: vec![],
+        pending_token: None,
+    });
+    let mut prepared = manifest(&config);
+    // The synthetic manifest sizes a scalar buffer at one element; a segment's mel frames are
+    // `frames * mels` floats, so the declared buffer is widened to the graph's capacity.
+    let extent = 6000 * 128 * 4;
+    for buffer in &mut prepared.buffers {
+        if buffer.name == "audio_features" {
+            buffer.nbytes = extent;
+        }
+    }
+    for graph in &mut prepared.graphs {
+        for binding in &mut graph.input_bindings {
+            if binding.buffer_name == "audio_features" {
+                binding.nbytes = extent;
+            }
+        }
+    }
+    let mut uploads = Inputs::new(&config, &prepared).unwrap();
+    let handle = RequestHandle { slot: 0, generation: 3 };
+    let step = ScheduledStep {
+        draft_tokens: 0,
+        packed_token_capacity: 0,
+        kind: GraphKind::Audio,
+        batch_capacity: 1,
+        token_capacity: 6000,
+        mixed: None,
+        lanes: vec![ScheduledLane { request: handle, start_position: 0, tokens: 0 }],
+        requires_feedback: false,
+    };
+    let audio = ProcessedAudio {
+        frames: 101,
+        mels: 128,
+        values: vec![0.5; 101 * 128],
+    };
+    uploads.pack_audio(&step, &config, handle, 1, &audio, 7).unwrap();
+    let uploads = uploads.uploads();
+    let find = |name: &str| uploads.iter().find(|upload| upload.buffer == name).unwrap();
+    assert_eq!(find("audio_features").bytes.len(), 101 * 128 * 4);
+    assert_eq!(find("audio_frames").bytes, 101i32.to_le_bytes());
+    assert_eq!(find("audio_slot").bytes, 1i32.to_le_bytes());
+    assert_eq!(find("audio_generation").bytes, 3i64.to_le_bytes());
+    assert_eq!(find("audio_feature_offset").bytes, 7i32.to_le_bytes());
+    // `RequestSlot` writes through the buffer's own integer width.
+    assert_eq!(find("submission_sequence").bytes, 0i64.to_le_bytes());
+    assert_eq!(find("request_generation").bytes, 3i64.to_le_bytes());
+    // A feature extent the graph cannot hold, and an arena slot outside the prepared slots, are
+    // rejected before anything reaches the device.
+    let oversized = ProcessedAudio {
+        frames: 6001,
+        mels: 128,
+        values: vec![0.5; 6001 * 128],
+    };
+    let rejected = Inputs::new(&config, &prepared)
+        .unwrap()
+        .pack_audio(&step, &config, handle, 1, &oversized, 7);
+    assert!(rejected.is_err(), "a segment wider than its graph is rejected");
+    let mut fresh = Inputs::new(&config, &prepared).unwrap();
+    assert!(fresh.pack_audio(&step, &config, handle, 2, &audio, 7).is_err());
+}
+
 pub(super) fn config() -> ModelConfig {
     ModelConfig {
         max_top_logprobs: 0,

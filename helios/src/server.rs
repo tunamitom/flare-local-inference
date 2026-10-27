@@ -511,6 +511,8 @@ fn error_code(failure: &Error) -> &'static str {
         Error::Admission(AdmissionError::Feature(_)) => "unsupported_feature",
         Error::Admission(AdmissionError::Grammar(_)) => "invalid_grammar",
         Error::Admission(AdmissionError::Image(_)) => "invalid_image",
+        Error::Admission(AdmissionError::Audio(_)) => "invalid_audio",
+        Error::Admission(AdmissionError::Video(_)) => "invalid_video",
         Error::Admission(AdmissionError::Invalid(_)) => "invalid_request",
         Error::Execution(ExecutionError::Capacity(_)) => "execution_capacity_exceeded",
         _ => "server_error",

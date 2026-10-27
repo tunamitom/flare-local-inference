@@ -102,6 +102,6 @@ pub(crate) fn prepare_input(
             spans: Vec::new(),
         },
         conditioning,
-        conditioned_inputs: vec![],
+        conditioned_inputs: vec![], audio_inputs: vec![],
     })
 }

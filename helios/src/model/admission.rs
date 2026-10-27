@@ -165,7 +165,9 @@ pub fn validate_prompt(config: &ModelConfig, prompt: &crate::server::Prompt) -> 
         || (prompt.max_new_tokens == 0 && !prompt.prompt_logprobs)
         || prompt.max_new_tokens > i32::MAX as u32
         || (!config.contract.vision.enabled()
-            && (!prompt.conditioned_inputs.is_empty() || !prompt.conditioning.is_empty()))
+            && (!prompt.conditioned_inputs.is_empty()
+                || !prompt.audio_inputs.is_empty()
+                || !prompt.conditioning.is_empty()))
     {
         return Err("prompt, output limit, or inputs violate the prepared model contract".into());
     }
@@ -175,6 +177,7 @@ pub fn validate_prompt(config: &ModelConfig, prompt: &crate::server::Prompt) -> 
         &prompt.tokens,
         &prompt.data,
         &prompt.conditioned_inputs,
+        &prompt.audio_inputs,
     )
 }
 

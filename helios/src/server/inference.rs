@@ -33,6 +33,16 @@ pub struct Message {
 pub enum Part {
     Text(String),
     Image(String),
+    /// One clip from OpenAI's `input_audio` part: its container format and base64 payload.
+    Audio {
+        format: String,
+        data: String,
+    },
+    /// One clip from a `video_url` part with its sampling controls.
+    Video {
+        url: String,
+        options: crate::frontend::images::video::VideoOptions,
+    },
     Reasoning(String),
     ToolCall {
         id: Option<String>,
@@ -183,7 +193,23 @@ fn content(parts: &[Part]) -> Result<Value> {
         match part {
             Part::Text(text) => values.push(json!({"type":"text","text":text})),
             Part::Image(url) => values.push(json!({"type":"image_url","image_url":{"url":url}})),
-            _ => return Err("tool result content must contain text or images".into()),
+            Part::Audio { format, data } => values.push(json!({
+                "type":"input_audio","input_audio":{"data":data,"format":format}
+            })),
+            Part::Video { url, options } => {
+                let mut value = json!({"type":"video_url","video_url":{"url":url}});
+                if let Some(frames) = options.num_frames {
+                    value["num_frames"] = json!(frames);
+                }
+                if let Some(fps) = options.fps {
+                    value["fps"] = json!(fps);
+                }
+                if let Some(pixels) = options.max_pixels {
+                    value["max_pixels"] = json!(pixels);
+                }
+                values.push(value);
+            }
+            _ => return Err("tool result content must contain text, images, audio, or video".into()),
         }
     }
     if values.is_empty() {
@@ -270,7 +296,7 @@ pub fn template_messages(
         };
         for (part_index, part) in message.parts.iter().enumerate() {
             match part {
-                Part::Text(_) | Part::Image(_) => {
+                Part::Text(_) | Part::Image(_) | Part::Audio { .. } | Part::Video { .. } => {
                     if current.get("tool_calls").is_some() {
                         flush(&mut current, &mut ordinary, &mut ordinary_hints, &mut out)?;
                     }

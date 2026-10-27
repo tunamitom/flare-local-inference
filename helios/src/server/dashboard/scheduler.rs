@@ -501,6 +501,7 @@ fn phase(phase: RequestPhase) -> &'static str {
         RequestPhase::Inbound => "inbound",
         RequestPhase::Restore => "restore",
         RequestPhase::Vision => "vision",
+        RequestPhase::Audio => "audio",
         RequestPhase::Prefill => "prefill",
         RequestPhase::Resume => "resume",
         RequestPhase::Decode => "decode",

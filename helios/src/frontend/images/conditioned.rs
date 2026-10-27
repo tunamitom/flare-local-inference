@@ -86,6 +86,13 @@ pub enum ImageSource {
         bytes: Arc<[u8]>,
         decoded: Arc<std::sync::Mutex<Option<RetainedDecoded>>>,
     },
+    /// One video temporal grid: the two sampled frames a vision graph packs into a patch stack.
+    VideoPair {
+        first: Arc<RgbImage>,
+        second: Arc<RgbImage>,
+        /// Identity of the described pair, so a cached payload is checked like an image's.
+        identity: [u8; 32],
+    },
 }
 
 impl ImageSource {
@@ -136,6 +143,29 @@ impl PreparedImageInput {
             token_span,
             feature_range,
             source: input.source,
+            processor,
+        }
+    }
+
+    /// One video temporal grid, described as the pair's frames and geometry.
+    pub fn video(
+        pair: &super::video::VideoPairDescription,
+        first: Arc<RgbImage>,
+        second: Arc<RgbImage>,
+        token_span: Range<usize>,
+        feature_range: Range<usize>,
+        processor: Arc<ImageProcessor>,
+    ) -> Self {
+        Self {
+            identity: pair.identity,
+            geometry: pair.geometry,
+            token_span,
+            feature_range,
+            source: ImageSource::VideoPair {
+                first,
+                second,
+                identity: pair.identity,
+            },
             processor,
         }
     }
@@ -236,6 +266,24 @@ impl PreparedImageInput {
                         _lease: None,
                     },
                 }
+            }
+            ImageSource::VideoPair {
+                first,
+                second,
+                identity,
+            } => {
+                let video = self
+                    .processor
+                    .video()
+                    .ok_or("prepared model does not support video inputs")?;
+                if video.pair_identity(&self.geometry, first, second) != *identity {
+                    return Err("video frames differ from their prompt description".into());
+                }
+                let result = video.process_pair(first, second, &self.geometry)?;
+                if !self.valid_processed(&result) {
+                    return Err("video preprocessing differs from its prompt geometry".into());
+                }
+                return Ok(result);
             }
         };
         if self.processor.semantic_identity(&image.image) != self.identity {

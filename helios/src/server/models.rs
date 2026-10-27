@@ -56,6 +56,19 @@ impl ModelCatalog {
             .flatten();
         // Match vLLM's ModelCard / ModelPermission wire fields while
         // advertising only features supported by this server.
+        let input_modalities: Vec<&str> = {
+            let mut modalities = vec!["text"];
+            if model.contract.vision.enabled() {
+                modalities.push("image");
+            }
+            if model.contract.audio.is_some() {
+                modalities.push("audio");
+            }
+            if model.contract.frontend.video_tokens.is_some() {
+                modalities.push("video");
+            }
+            modalities
+        };
         let card = json!({
             "id": id,
             "object": "model",
@@ -92,11 +105,7 @@ impl ModelCatalog {
                 "max_image_tokens_per_image": limits.map_or(0, |l| l.max_image_tokens_per_image()),
                 "max_image_pixels": limits.map_or(0, |l| l.max_input_pixels),
                 "max_image_bytes": limits.map_or(0, |l| l.max_encoded_bytes),
-                "input_modalities": if model.contract.vision.enabled() {
-                    vec!["text", "image"]
-                } else {
-                    vec!["text"]
-                },
+                "input_modalities": input_modalities,
                 "output_modalities": ["text"],
             },
         });

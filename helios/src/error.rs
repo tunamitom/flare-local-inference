@@ -75,6 +75,10 @@ pub enum AdmissionError {
     #[error(transparent)]
     Image(Failure),
     #[error(transparent)]
+    Audio(Failure),
+    #[error(transparent)]
+    Video(Failure),
+    #[error(transparent)]
     Unavailable(Failure),
 }
 

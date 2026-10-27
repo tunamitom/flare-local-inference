@@ -110,7 +110,7 @@ pub(super) fn decode(bytes: &[u8], max_samples: usize) -> Result<Waveform> {
 }
 
 #[cfg(test)]
-pub(super) fn encode_pcm16(sample_rate: u32, channels: &[Vec<i16>]) -> Vec<u8> {
+pub(crate) fn encode_pcm16(sample_rate: u32, channels: &[Vec<i16>]) -> Vec<u8> {
     let frames = channels[0].len();
     let count = channels.len() as u16;
     let data_len = frames * 2 * count as usize;

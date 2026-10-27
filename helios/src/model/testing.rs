@@ -272,6 +272,9 @@ pub fn manifest(config: &ModelConfig) -> ExecutionManifest {
                 }
             };
             let dtype = match b.source {
+                // An audio graph's buffers hold the named preparation outputs verbatim.
+                AudioTensor => crate::frontend::audio::packing::tensor_dtype(&b.tensor)
+                    .unwrap_or(Dtype::Int64),
                 SamplingParameters => Dtype::Float32,
                 RequestSlot if b.buffer == "row_slot_ids" || b.buffer == "admission_slots" => {
                     Dtype::Int32

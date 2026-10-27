@@ -29,6 +29,7 @@ fn scheduler_with_concurrency(snapshots: u32, mtp: bool, page_tokens: usize, act
                 patches_per_feature: 4,
                 patch_capacities: vec![256, 1024, 4096, 16384],
             },
+            audio: Default::default(),
             draft_pages_per_request: 1,
             completion_inputs: vec![],
             speculative_allocations: vec![],

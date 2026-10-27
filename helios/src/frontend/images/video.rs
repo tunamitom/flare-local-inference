@@ -79,6 +79,92 @@ pub struct VideoOptions {
     pub max_pixels: Option<usize>,
 }
 
+impl VideoOptions {
+    /// Reads the sampling controls an OpenAI `video_url` part carries beside its URL.
+    pub fn from_part(part: &serde_json::Value) -> Result<Self> {
+        let video = part
+            .get("video_url")
+            .filter(|value| value.is_object())
+            .ok_or_else(|| input("video_url must be an object"))?;
+        let number = |key: &str| -> Result<Option<usize>> {
+            match video.get(key).filter(|value| !value.is_null()) {
+                None => Ok(None),
+                Some(value) => value
+                    .as_u64()
+                    .filter(|count| *count > 0)
+                    .and_then(|count| usize::try_from(count).ok())
+                    .map(Some)
+                    .ok_or_else(|| input(format!("{key} must be a positive integer"))),
+            }
+        };
+        let fps = match video.get("fps").filter(|value| !value.is_null()) {
+            None => None,
+            Some(value) => Some(
+                value
+                    .as_f64()
+                    .filter(|fps| fps.is_finite() && *fps > 0.0)
+                    .ok_or_else(|| input("fps must be a positive number"))?,
+            ),
+        };
+        Ok(Self {
+            num_frames: number("num_frames")?,
+            fps,
+            max_pixels: number("max_pixels")?,
+        })
+    }
+}
+
+/// One `video_url` content part: a base64 data URL and its sampling controls.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VideoSource {
+    pub url: String,
+    pub options: VideoOptions,
+}
+
+impl VideoSource {
+    /// Reads an OpenAI `video_url` part. Remote URLs are never fetched: the clip has to arrive as
+    /// a `data:video/<type>;base64,` URL.
+    pub fn from_part(part: &serde_json::Value) -> Result<Self> {
+        let url = part
+            .get("video_url")
+            .and_then(|value| value.get("url"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| input("video_url.url must be a string"))?;
+        let Some(rest) = url.strip_prefix("data:") else {
+            return Err(input(
+                "video_url requires a base64 data URL; remote video URLs are not fetched",
+            ));
+        };
+        let (media, payload) = rest
+            .split_once(";base64,")
+            .ok_or_else(|| input("video_url data URL must be base64 encoded"))?;
+        if !media.starts_with("video/") {
+            return Err(input(format!(
+                "video_url data URL must carry a video media type, not {media}"
+            )));
+        }
+        if payload.is_empty() {
+            return Err(input("video_url data URL carries no payload"));
+        }
+        Ok(Self {
+            url: url.into(),
+            options: VideoOptions::from_part(part)?,
+        })
+    }
+
+    /// The encoded bytes of the clip, and the media type the URL names.
+    pub fn encoded(&self) -> Result<(&str, &str)> {
+        let rest = self
+            .url
+            .strip_prefix("data:")
+            .ok_or_else(|| input("video_url requires a base64 data URL"))?;
+        let (media, payload) = rest
+            .split_once(";base64,")
+            .ok_or_else(|| input("video_url data URL must be base64 encoded"))?;
+        Ok((media, payload))
+    }
+}
+
 /// One frame pair of a described clip: one temporal grid of the vision graph's input.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct VideoPairDescription {
@@ -347,7 +433,7 @@ impl VideoProfile {
         })
     }
 
-    fn pair_identity(&self, geometry: &ImageGeometry, first: &RgbImage, second: &RgbImage) -> [u8; 32] {
+    pub(crate) fn pair_identity(&self, geometry: &ImageGeometry, first: &RgbImage, second: &RgbImage) -> [u8; 32] {
         let mut hash = Sha256::new();
         hash.update(b"flare-conditioned-video-v1\0");
         hash.update(self.identity_domain);
