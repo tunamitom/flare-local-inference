@@ -60,7 +60,10 @@ def _server_options(configuration, model, plan) -> dict:
         "reserve_bytes": plan.reserve_bytes,
         "api_key": configuration.get("server.api_key").value,
         "queue_capacity": 4 * plan.concurrency, "frontend_workers": plan.concurrency,
-        "max_body_bytes": plan.max_images * recipe.image_bytes + recipe.context * _BODY_BYTES_PER_TOKEN,
+        # The server refuses a body limit above 256 MiB, so the capacity-derived figure is a
+        # budget to spend, not a floor: eight 32 MiB images plus a full context's worth of tokens
+        # overshoots it, and a package carrying that number will not start at all.
+        "max_body_bytes": min(256 << 20, plan.max_images * recipe.image_bytes + recipe.context * _BODY_BYTES_PER_TOKEN),
         "context_hint": "context is limited by the checkpoint and available cache capacity",
         "capacity_hint": "--max-concurrency sets the request limit; a lower [memory] reserve leaves more KV pages",
         **({"decode_weight_bytes": checkpoint.decode_weight_bytes} if checkpoint.decode_weight_bytes > 0 else {}),
