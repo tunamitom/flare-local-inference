@@ -12,7 +12,7 @@ from ignition.components.rms_norm import PreparedRMSNorm
 from ignition.components.varlen_attention import PreparedVarlenAttention
 
 PATCH_CAPACITIES = (256, 1024, 4096, 16384, 32768)
-FEATURES = 16384
+FEATURES = 32768
 HIDDEN = 6144
 
 

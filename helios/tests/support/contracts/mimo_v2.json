@@ -4,14 +4,15 @@
   "input_vocabulary": 152576,
   "vision": {
     "feature_slots": 4,
-    "features_per_request": 16384,
-    "max_images": 4,
+    "features_per_request": 32768,
+    "max_images": 8,
     "patches_per_feature": 4,
     "patch_capacities": [
       256,
       1024,
       4096,
-      16384
+      16384,
+      32768
     ]
   },
   "cache": {

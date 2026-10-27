@@ -3,12 +3,12 @@
 from ignition.preparation import contract as c
 from ignition.preparation import runtime_package_pb2 as p
 
-from .vision import PATCH_CAPACITIES
+from .vision import FEATURES, PATCH_CAPACITIES
 
 
 VOCABULARY = 152576
 INPUT_VOCABULARY = 152576
-VISION = {'features_per_request': 16384, 'max_images': 4, 'patches_per_feature': 4,
+VISION = {'features_per_request': FEATURES, 'max_images': 8, 'patches_per_feature': 4,
           'patch_capacities': list(PATCH_CAPACITIES)}
 FRONTEND = c.frontend(tools=p.QWEN_CODER, terminal_markers=["<tool_call>"],
     assistant_marker="<|im_start|>assistant\n", message_end_markers=["<|im_end|>"], rejected_tokens=[151656],

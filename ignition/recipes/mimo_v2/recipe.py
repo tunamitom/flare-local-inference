@@ -50,7 +50,7 @@ RECIPE = Recipe(
         scale_compressed_device_bytes={"csf": 568_511_624_448 - 24_148_134_148 + 8 * (64 << 20)},
         expansion_bytes=14 << 30),),
     context=1048576, page_tokens=128, concurrency=32, max_concurrency=64, prefill_chunk=4096,
-    speculation=Speculation(draft_tokens=7, token_capacity=128, packed_verification=True, graph_budget=64), max_draft_tokens=7, max_images=4, image_bytes=32 << 20,
+    speculation=Speculation(draft_tokens=7, token_capacity=128, packed_verification=True, graph_budget=64), max_draft_tokens=7, max_images=8, image_bytes=32 << 20,
     verification_rows=0,
     ranks=MappingProxyType({world: RankCosts(33_816_576 // world, 3_276_800 // world, 8 << 30)
                             for world in (2, 4, 8)}),
