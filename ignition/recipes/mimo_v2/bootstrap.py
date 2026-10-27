@@ -355,9 +355,12 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             group, device, max_rows=max(config.decode_samples, 0 if sharded_draft else draft_rows), columns=152576,
             ipc=ipc
         )
-        # One payload row of draft candidates per proposal row and rank.
+        # One payload row of draft candidates per proposal row and rank; a one-request round samples
+        # its draft positions as one block of width - 1 rows, the switched prefix's included.
+        candidate_rows = max((batch if batch > 1 else width - 1 for batch, width, _ in config.speculative_round_shapes),
+                             default=1)
         candidate_collective = (create_all_gather_runtime(group, device,
-            max_rows=max(batch for batch, _, _ in config.speculative_round_shapes),
+            max_rows=max(candidate_rows, config.switch_widths - 1, 1),
             columns=SHARD_PAYLOAD_COLUMNS * shard.world_size, ipc=ipc) if sharded_draft else None)
         context_collective = (create_all_gather_runtime(group, device,
             max_rows=tokens, columns=6144, ipc=ipc) if config.dflash else None)
