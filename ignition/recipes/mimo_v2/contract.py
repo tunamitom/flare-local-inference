@@ -13,13 +13,20 @@ VISION = {'features_per_request': FEATURES, 'max_images': 8, 'patches_per_featur
           'patch_capacities': list(PATCH_CAPACITIES)}
 AUDIO = {'frame_capacities': list(AUDIO_CAPACITIES)}
 AUDIO_FEATURE_TOKEN = 151669
+# Video settings the Helios frontend sizes clips with: 32 uniform frames, each frame capped so the
+# whole clip stays inside total_max_pixels, standardized in 0..255 RGB like the image path.
+VIDEO = {'mimo': dict(min_pixels=8192, max_pixels=8388608, total_max_pixels=268435456,
+                      num_frames=32, max_frames=3600,
+                      pixel_mean=[123.675, 116.28, 103.53], pixel_std=[58.395, 57.12, 57.375])}
+VIDEO_TOKENS = dict(feature_token=151656, start_token=151652, end_token=151653)
 FRONTEND = c.frontend(tools=p.QWEN_CODER, terminal_markers=["<tool_call>"],
     assistant_marker="<|im_start|>assistant\n", message_end_markers=["<|im_end|>"], rejected_tokens=[151656],
     prefix_boundary=c.prefix_boundary(["system", "developer"], append_role="user", minimum_messages=0,
         required_start="<|im_start|>system\n", required_marker="<|im_end|>"),
     image_tokens=dict(feature_token=151655, span=None),
     image_preparation=p.MIMO_IMAGE_PREPARATION, image_layout=p.MIMO_IMAGE_LAYOUT,
-    audio_preparation=p.MIMO_AUDIO_PREPARATION, audio_tokens=dict(feature_token=AUDIO_FEATURE_TOKEN))
+    audio_preparation=p.MIMO_AUDIO_PREPARATION, audio_tokens=dict(feature_token=AUDIO_FEATURE_TOKEN),
+    video=VIDEO, video_tokens=VIDEO_TOKENS)
 
 
 def prepare(signatures, buffers, pool, *, image_slots=4, page_tokens, draft_lag, rows=1, embedding_tables=(), regions=()):
