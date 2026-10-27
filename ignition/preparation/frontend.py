@@ -136,6 +136,32 @@ def image_settings(config, model, profile):
     return {profile: result}
 
 
+def audio_settings(config, model, profile):
+    """Log-mel preprocessing and the tokenizer's frame-to-token arithmetic."""
+    if profile != "mimo":
+        raise ValueError("unsupported audio preprocessing profile")
+    _expected(config, {"sampling_rate": 24000, "hop_length": 240, "window_size": 960, "nfft": 960,
+        "n_mels": 128, "fmin": 0, "fmax": None, "kernel_size": 3, "stride_size": 2, "avg_pooler": 2,
+        "encoder_layers": 24, "encoder_attention_heads": 16, "encoder_ffn_dim": 4096,
+        "encoder_causal": True, "encoder_attn_window_size": [128, 0], "encoder_skip_layer_id": 3,
+        "hybrid_attention": True, "swa_per_block": 2, "num_quantizers": 20, "ln_type": "LayerNorm",
+        "activation_function": "gelu", "rope_theta": 10000, "rope_type": "default",
+        "codebook_size": [1024, 1024, *[256], *[128] * 17]}, "audio tokenizer configuration")
+    processor = model["processor_config"]
+    _expected(processor, {"audio_sampling_rate": 24000, "audio_nfft": 960, "audio_hop_length": 240,
+        "audio_window_size": 960, "audio_n_mels": 128, "audio_kernel_size": 3, "audio_stride_size": 2,
+        "audio_avg_pooler": 2, "audio_group_size": 4, "audio_segment_size": 6000}, "audio processor configuration")
+    _expected(model["audio_config"], {"audio_channels": 20, "audio_segment_size": 6000, "group_size": 4,
+        "input_full_attention": True, "input_local_layers": 6, "input_local_dim": 1024,
+        "input_local_attn_heads": 16, "input_local_head_dim": 64, "input_local_intermediate_size": 4096,
+        "out_hidden_size": 6144, "projection_layers": 2, "rope_theta": 640000,
+        "partial_rotary_factor": 1.0, "add_post_norm": True, "speech_vocab_size": "1280",
+        "speech_zeroemb_idx": "1024"}, "audio tower configuration")
+    return {"mimo": dict(sampling_rate=24000, n_fft=960, hop_length=240, window_length=960, n_mels=128,
+        f_min=0.0, f_max=None, segment_frames=config.get("audio_segment_size", 6000),
+        kernel_size=3, stride=2, pooling=2, group_size=4, max_seconds=config["max_audio_seconds"])}
+
+
 def _native_image_placeholder(snapshot, model, encoder):
     from tokenizers import Tokenizer
 
@@ -154,7 +180,7 @@ def _native_image_placeholder(snapshot, model, encoder):
 
 
 def prepare_frontend(snapshot, *, eos_token_ids, image_profile=None, preprocessor=None,
-                     prompt_encoder=PromptEncoder.PROMPT_JINJA):
+                     prompt_encoder=PromptEncoder.PROMPT_JINJA, audio_profile=None):
     """Resolve checkpoint structure during preparation; sampling is recipe-owned."""
     if not isinstance(prompt_encoder, PromptEncoder):
         raise ValueError("prompt_encoder must be a PromptEncoder")
@@ -180,4 +206,7 @@ def prepare_frontend(snapshot, *, eos_token_ids, image_profile=None, preprocesso
         path = snapshot / "preprocessor_config.json" if preprocessor is None else Path(preprocessor)
         result["image"] = image_settings({} if image_profile == "deepseek_row_major" else json.loads(path.read_text()),
             json.loads((snapshot / "config.json").read_text()), image_profile)
+    if audio_profile is not None:
+        result["audio"] = audio_settings(json.loads((snapshot / "audio_tokenizer" / "config.json").read_text()),
+            json.loads((snapshot / "config.json").read_text()), audio_profile)
     return result

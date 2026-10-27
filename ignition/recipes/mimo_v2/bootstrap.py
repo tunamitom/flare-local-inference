@@ -60,6 +60,7 @@ from .decoder import PreparedDecoder, Scratch
 from .dflash import SpeculativePreparation
 from .model import DecoderEnvironment
 from .pool import PAGE_TOKENS, ContinuationPool, continuation_layout, page_bytes
+from .audio import AUDIO_CAPACITIES, AudioInputs, AudioScratch, PreparedAudio, PreparedAudioGeneration
 from .vision import FEATURES, HIDDEN, PATCH_CAPACITIES, PreparedVision, VisionInputs, VisionScratch
 from .vision_state import PreparedVisionGeneration
 from ignition.components.vision_state import PrefillVisionInputs, VisionState
@@ -407,14 +408,17 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             auxiliary_columns=auxiliary_columns,
         )
         vision_inputs = VisionInputs.allocate(device)
+        audio_inputs = AudioInputs.allocate(device)
         vision_prefill = PrefillVisionInputs.allocate(config.prefill_chunk_size, device)
         vision_state = VisionState(inputs, vision_prefill, requests, image_slots=config.image_concurrency, image_token=weights.config.text["image_token_id"],
                                    features=FEATURES, hidden=HIDDEN)
         vision_storage = {}
+        audio_storage = {}
         environment = DecoderEnvironment.load(snapshot, vision_state)
         buffers = dict(
             inputs.buffers(),
             **vision_inputs.buffers(),
+            **audio_inputs.buffers(),
             **vision_prefill.buffers(),
             **commands.buffers(),
             **{name: getattr(admission, name) for name in admission.__dataclass_fields__},
@@ -471,6 +475,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         + (config.switch_widths + 1 if config.switch_widths else 0)
         + len(config.batch_capacities)
         + len(PATCH_CAPACITIES)
+        + len(AUDIO_CAPACITIES)
     )
     with phase(progress, "Construct graph catalog", total=count) as stage:
 
@@ -578,6 +583,15 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             )
             forward = PreparedVisionGeneration(encoder, vision_state, completion, frame, sequence, buffers=cursor)
             add(name, forward, "vision", 1, capacity, (*vision_inputs.buffers(), "vision_feature_slot"))
+        for capacity in reversed(AUDIO_CAPACITIES):
+            # Audio features publish into the vision arena; the graph owns no per-request state.
+            name = f"audio{capacity}"
+            cursor = graph_buffers.cursor()
+            audio_storage[capacity] = AudioScratch.allocate(capacity, device, buffers=cursor)
+            encoder = PreparedAudio(weights.audio, audio_storage[capacity], audio_inputs, session=session,
+                                    workspace=arena, name=name, buffers=cursor)
+            forward = PreparedAudioGeneration(encoder, vision_state, completion, frame, sequence, buffers=cursor)
+            add(name, forward, "audio", 1, capacity, (*audio_inputs.buffers(),))
         row_inputs = ("request_state_rows", "row_slot_ids", "row_generations", "live_rows")
         for enabled in modes:
             suffix = "-no-mtp" if config.dflash and not enabled else ""
@@ -702,7 +716,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         "page_tokens": PAGE_TOKENS,
         "frontend": prepare_frontend(snapshot,
             eos_token_ids=json.loads((snapshot / "generation_config.json").read_text())["eos_token_id"],
-            image_profile="mimo"),
+            image_profile="mimo", audio_profile="mimo"),
         "sampling_defaults": RECIPE.sampling_defaults.as_dict(),
         "assets": assets,
         "model_contract": prepare_contract({name: signature for name, signature in signatures.items()
@@ -754,6 +768,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         arena.tensor,
         metadata,
         vision_storage,
+        audio_storage,
         vision_state.arena,
         graph_buffers.chunks,
     ]
@@ -772,7 +787,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             disposable.append(forward.decoder.scratch_tensors())
         if getattr(forward, "context", None) is not None:
             disposable.append(forward.context.scratch_tensors())
-    return PreparedModel(rebuild_weights=declare_weights(weights, components=('embedding', 'norm', 'head', 'draft', 'vision')),
+    return PreparedModel(rebuild_weights=declare_weights(weights, components=('embedding', 'norm', 'head', 'draft', 'vision', 'audio')),
         device=config.devices[rank],
         graphs=graphs,
         buffers=buffers,
@@ -787,6 +802,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             weights,
             vision_state,
             vision_inputs,
+            audio_inputs,
             vision_prefill,
             vision_storage,
             graph_buffers,

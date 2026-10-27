@@ -37,6 +37,8 @@ class ModelWeights:
     # Block-FP8 copy of the draft weights for graphs within the W8A16 GEMV's row limit, when larger
     # draft graphs keep BF16 in ``draft``.
     draft_w8a16: object | None = None
+    # Replicated audio tokenizer, residual codebooks, and grouped local transformer.
+    audio: object | None = None
 
     @classmethod
     def load(cls, manifest, device, *, shard, progress=None, dflash=True, expert_activation="a16",
@@ -61,10 +63,12 @@ class ModelWeights:
             elif draft_weight_format == "w8a16":
                 draft = draft.with_head(head)
         from .vision_weights import VisionWeights
+        from .audio_weights import AudioWeights
 
         vision = VisionWeights.load(manifest, config.text, device, shard, progress=progress)
+        audio = AudioWeights.load(manifest, device, progress=progress)
         return cls(config, shard, embedding, norm, head, layers,
-                   torch.cuda.memory_allocated(device) - before, draft, vision, draft_w8a16)
+                   torch.cuda.memory_allocated(device) - before, draft, vision, draft_w8a16, audio)
 
 
 class MiMoWeightLoader(DirectWeightLoader):

@@ -20,6 +20,45 @@ fn prompt_scoring_recognizes_features_without_protected_image_spans() {
     assert!(!data.is_image_position(6));
 }
 
+#[test]
+fn audio_graphs_accept_their_named_tensors_and_reject_other_kinds() {
+    // Audio preparations upload named tensors (log-mel frames, the segment's frame count, and its
+    // arena slot) with scalar indexing on an `audio` graph. Any other kind keeps the row sources
+    // it was prepared with.
+    let mut config = config();
+    let binding = |buffer: &str, tensor: &str| ValueBinding {
+        buffer: buffer.into(),
+        source: ValueSource::AudioTensor,
+        indexing: InputIndexing::Scalar,
+        value_offset: 0,
+        padding: 0,
+        tensor: tensor.into(),
+    };
+    config.contract.graphs.push(GraphContract {
+        graph: "Audio-1-6000".into(),
+        kind: GraphOperation::Audio,
+        inputs: vec![
+            binding("sampling_parameters", "audio_features"),
+            binding("sampling_top_k", "audio_frames"),
+        ],
+        state: vec![],
+        state_rows_per_request: 1,
+        draft_cursor: None,
+        embedding_tables: vec![],
+        pending_token: None,
+    });
+    let prepared = manifest(&config);
+    config.contract.validate(&prepared).unwrap();
+    assert!(Inputs::new(&config, &prepared).is_ok());
+
+    let mut rowed = config.clone();
+    let graph = rowed.contract.graphs.iter_mut().find(|graph| graph.kind == GraphOperation::Audio).unwrap();
+    graph.inputs[0].indexing = InputIndexing::PackedToken;
+    let prepared = manifest(&rowed);
+    let error = Inputs::new(&rowed, &prepared).err().unwrap();
+    assert!(error.to_string().contains("incompatible row indexing"), "{error}");
+}
+
 pub(super) fn config() -> ModelConfig {
     ModelConfig {
         max_top_logprobs: 0,
