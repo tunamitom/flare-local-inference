@@ -229,7 +229,11 @@ pub fn metadata() -> PreparedContract {
             message_end_markers: vec![],
             prefix_boundary: None,
             image_tokens: None,
+            audio_preparation: None,
+            audio_tokens: None,
+            video_tokens: None,
         },
+        audio: None,
     }
 }
 

@@ -32,6 +32,8 @@ fn numeric_effort_matches_python_reference_bytes_and_checkpoint_token_ids() {
             image_placeholder_token_id: None,
             template_encoding: Default::default(),
             image: None,
+            audio: None,
+            video: None,
         },
     )
     .unwrap();
@@ -64,6 +66,8 @@ fn official_encoder_renders_and_initializes_native_output_state() {
         image_placeholder_token_id: None,
         template_encoding: Default::default(),
         image: None,
+        audio: None,
+        video: None,
     };
     let frontend = Frontend::load_with_settings(
         FrontendAssets {

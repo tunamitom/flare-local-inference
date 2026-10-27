@@ -158,6 +158,7 @@ impl SchedulerView {
                             | GraphKind::Decode
                             | GraphKind::Speculative
                             | GraphKind::Vision
+                            | GraphKind::Audio
                     )
                 };
                 if model_work(graph.kind) || !bins[column].is_some_and(model_work) {
@@ -459,6 +460,7 @@ fn shape(graph: &GraphLabel) -> String {
         GraphKind::Resume => "resume",
         GraphKind::Snapshot => "snapshot",
         GraphKind::Vision => "vision",
+        GraphKind::Audio => "audio",
     };
     if graph.kind == GraphKind::Mixed {
         format!(
@@ -489,6 +491,7 @@ fn kind_style(kind: GraphKind) -> (&'static str, Color) {
         GraphKind::Resume => ("U", GOLD),
         GraphKind::Snapshot => ("C", MUTED),
         GraphKind::Vision => ("V", GOLD),
+        GraphKind::Audio => ("A", GOLD),
     }
 }
 

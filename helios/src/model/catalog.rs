@@ -155,6 +155,17 @@ fn validate_inner(config: &ModelConfig, manifest: &ExecutionManifest) -> Result<
             SamplingMode::General,
         )?;
     }
+    for &frames in config.contract.audio.iter().flat_map(|audio| &audio.frame_capacities) {
+        select(
+            config,
+            manifest,
+            GraphKind::Audio,
+            1,
+            frames,
+            0,
+            SamplingMode::General,
+        )?;
+    }
     if !config.speculative_widths.is_empty() {
         for batch in batches(config) {
             if !manifest.graphs.iter().any(|graph| graph.kind == GraphKind::Speculative
@@ -240,6 +251,11 @@ pub fn select_shape_with_drafts(
             }
             GraphKind::Vision => {
                 batch == 1 && config.contract.vision.patch_capacities.contains(&tokens)
+            }
+            GraphKind::Audio => {
+                batch == 1
+                    && config.contract.audio.as_ref()
+                        .is_some_and(|audio| audio.frame_capacities.contains(&tokens))
             }
             GraphKind::Speculative => {
                 config.speculative_widths.contains(&tokens)

@@ -51,6 +51,7 @@ contract_enum!(ValueSource {
     GrammarEnabled = 30, CopyTokenIds = 31, CopyTokenCount = 32,
     CopyConsumedTokens = 33, CopyGeneration = 34, CopyGrammarMask = 35,
     CopyGrammarCount = 36, ImageTensor = 37, ImageFeatureSlot = 38, PromptTargetToken = 39, SpeculativePrefixLimit = 40,
+    AudioTensor = 41,
 });
 contract_enum!(InputIndexing { Scalar = 1, SubmissionRow = 2, RequestRow = 3, PackedToken = 4, ActiveRow = 5 });
 contract_enum!(StateAccessKind { Read = 1, Write = 2, ReadWrite = 3 });
@@ -58,7 +59,8 @@ contract_enum!(ToolParserKind { QwenCoder = 1, GlmArgumentTags = 2, Dsml = 3, Xt
 contract_enum!(ReasoningParserKind { ThinkTags = 1, XtmlThink = 2, MmThink = 3, ChannelThought = 4 });
 contract_enum!(ImagePreparationKind { Qwen = 1, Mimo = 2, Deepseek = 3, Moonvit = 4, Step = 5, Radio = 6, DeepseekRowMajor = 7, Glm = 8, PatchMerge = 9 });
 contract_enum!(ImageLayoutKind { Qwen = 1, Mimo = 2, Deepseek = 3, Moonvit = 4, Step = 5, Radio = 6, DeepseekRowMajor = 7, Glm = 8, Bracketed = 9 });
-contract_enum!(GraphOperation { Init = 1, Restore = 2, Snapshot = 3, Prefill = 4, Decode = 5, Resume = 6, Vision = 7, Speculative = 8, Mixed = 9, ScoredPrefill = 12 });
+contract_enum!(AudioPreparationKind { Mimo = 1 });
+contract_enum!(GraphOperation { Init = 1, Restore = 2, Snapshot = 3, Prefill = 4, Decode = 5, Resume = 6, Vision = 7, Speculative = 8, Mixed = 9, ScoredPrefill = 12, Audio = 14 });
 
 impl TryFrom<GraphKind> for GraphOperation {
     type Error = crate::Error;
@@ -73,6 +75,7 @@ impl TryFrom<GraphKind> for GraphOperation {
             GraphKind::Decode => Self::Decode,
             GraphKind::Resume => Self::Resume,
             GraphKind::Vision => Self::Vision,
+            GraphKind::Audio => Self::Audio,
             GraphKind::Speculative => Self::Speculative,
             GraphKind::Mixed => Self::Mixed,
         })
@@ -96,6 +99,9 @@ pub struct PreparedContract {
     pub cache: CacheContract,
     pub graphs: Vec<GraphContract>,
     pub frontend: FrontendContract,
+    /// Captured audio encoder capacities; absent in packages prepared without audio.
+    #[cfg_attr(any(feature = "frontend", feature = "runtime-package"), serde(default))]
+    pub audio: Option<super::AudioCapabilities>,
 }
 
 #[derive(Clone, Debug)]
@@ -296,6 +302,12 @@ pub struct FrontendContract {
     pub message_end_markers: Vec<String>,
     pub prefix_boundary: Option<PrefixBoundary>,
     pub image_tokens: Option<ImageTokenLayout>,
+    #[cfg_attr(any(feature = "frontend", feature = "runtime-package"), serde(default))]
+    pub audio_preparation: Option<AudioPreparationKind>,
+    #[cfg_attr(any(feature = "frontend", feature = "runtime-package"), serde(default))]
+    pub audio_tokens: Option<AudioTokenLayout>,
+    #[cfg_attr(any(feature = "frontend", feature = "runtime-package"), serde(default))]
+    pub video_tokens: Option<VideoTokenLayout>,
 }
 
 #[derive(Clone, Debug)]
@@ -310,6 +322,37 @@ pub struct FrontendContract {
 pub struct ImageTokenLayout {
     pub feature_token: u32,
     pub span: Option<ImageSpan>,
+}
+
+/// Audio features replace a run of one feature token inside the template's audio envelope.
+#[derive(Clone, Debug)]
+#[cfg_attr(
+    any(feature = "frontend", feature = "runtime-package"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
+#[cfg_attr(
+    any(feature = "frontend", feature = "runtime-package"),
+    serde(deny_unknown_fields)
+)]
+pub struct AudioTokenLayout {
+    pub feature_token: u32,
+}
+
+/// Video features replace the template's vision envelope with timestamped frame-pair groups
+/// between the start and end tokens; the image layout implementation owns the group syntax.
+#[derive(Clone, Debug)]
+#[cfg_attr(
+    any(feature = "frontend", feature = "runtime-package"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
+#[cfg_attr(
+    any(feature = "frontend", feature = "runtime-package"),
+    serde(deny_unknown_fields)
+)]
+pub struct VideoTokenLayout {
+    pub feature_token: u32,
+    pub start_token: u32,
+    pub end_token: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -355,6 +398,32 @@ impl PreparedContract {
             || self.frontend.image_layout.is_some() != self.frontend.image_preparation.is_some()
         {
             return Err("image processing and prepared vision capacities must agree".into());
+        }
+        let audio = self.audio.as_ref().is_some_and(|audio| audio.enabled());
+        if let Some(capacities) = &self.audio {
+            capacities.validate()?;
+        }
+        if audio != self.frontend.audio_tokens.is_some()
+            || self.frontend.audio_tokens.is_some() != self.frontend.audio_preparation.is_some()
+            || (audio && !self.vision.enabled())
+            || self.frontend.audio_tokens.as_ref().is_some_and(|layout| {
+                layout.feature_token as usize >= self.input_vocabulary
+                    || self.frontend.image_tokens.as_ref().is_some_and(|image| image.feature_token == layout.feature_token)
+            })
+        {
+            return Err("audio processing, its feature token, and prepared audio capacities must agree".into());
+        }
+        if let Some(video) = &self.frontend.video_tokens {
+            let tokens = [video.feature_token, video.start_token, video.end_token];
+            let image = self.frontend.image_tokens.as_ref().map(|layout| layout.feature_token);
+            if !self.vision.enabled()
+                || tokens.iter().any(|token| *token as usize >= self.input_vocabulary)
+                || tokens[0] == tokens[1] || tokens[0] == tokens[2] || tokens[1] == tokens[2]
+                || tokens.iter().any(|token| Some(*token) == image)
+                || self.frontend.rejected_tokens.contains(&video.feature_token)
+            {
+                return Err("video token layout requires prepared vision and distinct accepted tokens".into());
+            }
         }
         for region in &self.cache.regions {
             region.storage.validate(manifest)?;

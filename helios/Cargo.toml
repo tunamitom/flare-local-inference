@@ -119,6 +119,13 @@ test = false
 bench = false
 
 [[bin]]
+name = "test_mimo_media"
+path = "tests/tools/test_mimo_media.rs"
+required-features = ["server", "test-tools"]
+test = false
+bench = false
+
+[[bin]]
 name = "test_package_protection"
 path = "tests/tools/test_package_protection.rs"
 required-features = ["runtime-package", "test-tools"]

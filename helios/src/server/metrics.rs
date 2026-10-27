@@ -222,7 +222,7 @@ pub(super) struct Metrics {
     replay_gpu_ns: AtomicU64,
     replay_readiness_wait_ns: AtomicU64,
     replay_readiness_samples: AtomicU64,
-    launches: [AtomicU64; 9],
+    launches: [AtomicU64; 10],
     sampling_launches: [AtomicU64; 5],
     speculative: [[RoundMetrics; 8]; 7],
     draft_sources: [[[AtomicU64; 2]; 2]; 7],
@@ -363,6 +363,7 @@ impl Metrics {
             GraphKind::Snapshot => 6,
             GraphKind::Speculative => 7,
             GraphKind::Mixed => 8,
+            GraphKind::Audio => 9,
         };
         self.launches[index].fetch_add(1, Ordering::Relaxed);
         let sampling_index = match kind {
@@ -899,6 +900,7 @@ impl Metrics {
             "snapshot",
             "speculative",
             "mixed",
+            "audio",
         ]
         .into_iter()
         .zip(&self.launches)
@@ -1384,7 +1386,7 @@ mod tests {
             text.lines()
                 .filter(|line| line.starts_with("flare_graph_launches_total{"))
                 .count(),
-            9
+            10
         );
     }
 }

@@ -20,6 +20,7 @@ mod qwen;
 mod radio;
 mod resize;
 mod step;
+pub mod video;
 
 use std::fmt::Write as _;
 use std::io::Cursor;
@@ -228,6 +229,8 @@ pub struct ImagePreparationCounts {
     pub decoded_source_bytes: u64,
 }
 
+/// Image preprocessing plus the optional video and audio profiles prepared beside it. Video
+/// frame pairs reuse the image patch layout and vision graphs; audio has its own graphs.
 #[derive(Clone)]
 pub struct ImageProcessor {
     limits: ImageLimits,
@@ -235,6 +238,8 @@ pub struct ImageProcessor {
     identity_domain: [u8; 32],
     counts: std::sync::Arc<PreparationCounters>,
     decoded_budget: std::sync::Arc<conditioned::DecodedBudget>,
+    video: Option<std::sync::Arc<video::VideoProfile>>,
+    audio: Option<std::sync::Arc<super::audio::AudioProfile>>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -357,7 +362,30 @@ impl ImageProcessor {
                 Profile::Qwen(qwen::QwenProcessor::load(&settings, limits)?)
             }
         };
-        Ok(Self { limits, profile, identity_domain, counts: Default::default(), decoded_budget })
+        Ok(Self { limits, profile, identity_domain, counts: Default::default(), decoded_budget, video: None, audio: None })
+    }
+
+    /// Prepares video frame pairs through this processor's vision limits.
+    pub fn with_video(mut self, settings: &video::VideoSettings) -> Result<Self> {
+        if !matches!(self.profile, Profile::MiMo(_)) {
+            return Err("video preprocessing requires the MiMo image profile".into());
+        }
+        self.video = Some(std::sync::Arc::new(video::VideoProfile::load(settings, self.limits)?));
+        Ok(self)
+    }
+
+    /// Prepares audio clips whose features share the vision feature arena.
+    pub fn with_audio(mut self, settings: &super::audio::AudioSettings) -> Result<Self> {
+        self.audio = Some(std::sync::Arc::new(super::audio::AudioProfile::load(settings, self.limits.max_encoded_bytes)?));
+        Ok(self)
+    }
+
+    pub fn video(&self) -> Option<&video::VideoProfile> {
+        self.video.as_deref()
+    }
+
+    pub fn audio(&self) -> Option<&super::audio::AudioProfile> {
+        self.audio.as_deref()
     }
 
     /// Identity of the decoded representation consumed by this preparation profile.

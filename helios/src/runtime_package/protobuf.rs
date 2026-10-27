@@ -155,8 +155,37 @@ pub(super) fn frontend_settings(value: wire::FrontendSettings) -> Result<serde_j
             })
         })
         .transpose()?;
+    let audio = value
+        .audio
+        .map(|audio| -> Result<serde_json::Value> {
+            use wire::audio_settings::Profile;
+            Ok(match required(audio.profile, "audio profile")? {
+                Profile::Mimo(config) => serde_json::json!({"mimo": {
+                    "sampling_rate": config.sampling_rate, "n_fft": config.n_fft, "hop_length": config.hop_length,
+                    "window_length": config.window_length, "n_mels": config.n_mels, "f_min": config.f_min,
+                    "f_max": config.f_max, "segment_frames": config.segment_frames, "kernel_size": config.kernel_size,
+                    "stride": config.stride, "pooling": config.pooling, "group_size": config.group_size,
+                    "max_seconds": config.max_seconds,
+                }}),
+            })
+        })
+        .transpose()?;
+    let video = value
+        .video
+        .map(|video| -> Result<serde_json::Value> {
+            use wire::video_settings::Profile;
+            Ok(match required(video.profile, "video profile")? {
+                Profile::Mimo(config) => serde_json::json!({"mimo": {
+                    "min_pixels": config.min_pixels, "max_pixels": config.max_pixels,
+                    "total_max_pixels": config.total_max_pixels, "num_frames": config.num_frames,
+                    "max_frames": config.max_frames, "pixel_mean": config.pixel_mean, "pixel_std": config.pixel_std,
+                }}),
+            })
+        })
+        .transpose()?;
     Ok(
-        serde_json::json!({"tokenizer": tokenizer, "image": image, "eos_token_ids": value.eos_token_ids,
+        serde_json::json!({"tokenizer": tokenizer, "image": image, "audio": audio, "video": video,
+                          "eos_token_ids": value.eos_token_ids,
                           "template_encoding": value.template_encoding,
                           "prompt_encoder": value.prompt_encoder,
                           "image_placeholder_token_id": value.image_placeholder_token_id}),
@@ -485,6 +514,8 @@ mod tests {
             }),
             eos_token_ids: vec![17, 23],
             image: None,
+            audio: None,
+            video: None,
         };
         let decoded = wire::FrontendSettings::decode(value.encode_to_vec().as_slice()).unwrap();
         let json = frontend_settings(decoded).unwrap();
@@ -613,6 +644,8 @@ mod tests {
             image: Some(wire::ImageSettings {
                 profile: Some(wire::image_settings::Profile::Deepseek4(wire::Empty {})),
             }),
+            audio: None,
+            video: None,
         };
         let json = frontend_settings(value).unwrap();
         assert_eq!(json["image"], serde_json::json!({"deepseek4": {}}));

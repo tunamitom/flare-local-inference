@@ -4,6 +4,10 @@ mod deepseek;
 mod boundaries;
 mod templates;
 #[cfg(feature = "images")]
+pub mod audio;
+#[cfg(feature = "images")]
+pub(crate) mod ffmpeg;
+#[cfg(feature = "images")]
 pub mod images;
 mod json;
 mod jinja;
@@ -122,6 +126,12 @@ pub struct FrontendSettings {
     pub template_encoding: TemplateEncoding,
     #[cfg(feature = "images")]
     pub image: Option<images::ImageSettings>,
+    #[cfg(feature = "images")]
+    #[serde(default)]
+    pub audio: Option<audio::AudioSettings>,
+    #[cfg(feature = "images")]
+    #[serde(default)]
+    pub video: Option<images::video::VideoSettings>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

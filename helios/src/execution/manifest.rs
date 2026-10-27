@@ -69,6 +69,7 @@ pub enum GraphKind {
     Mixed,
     Resume,
     Vision,
+    Audio,
 }
 
 impl GraphKind {
@@ -122,6 +123,7 @@ impl TryFrom<&str> for GraphKind {
             "mixed" => Ok(Self::Mixed),
             "resume" => Ok(Self::Resume),
             "vision" => Ok(Self::Vision),
+            "audio" => Ok(Self::Audio),
             _ => Err(Error::execution(
                 ExecutionError::Manifest,
                 format!("unsupported graph kind {value:?}"),
@@ -535,7 +537,9 @@ impl ExecutionManifest {
                             || (graph.token_capacity >= 64
                                 && graph.token_capacity.is_multiple_of(64)))
                 }
-                GraphKind::Vision => graph.batch_capacity == 1 && graph.token_capacity > 0,
+                GraphKind::Vision | GraphKind::Audio => {
+                    graph.batch_capacity == 1 && graph.token_capacity > 0
+                }
                 _ => {
                     BATCH_CAPACITIES.contains(&graph.batch_capacity)
                         && graph.batch_capacity <= self.request_capacity()

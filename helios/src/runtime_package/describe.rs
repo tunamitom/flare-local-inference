@@ -243,6 +243,22 @@ pub(super) fn frontend_json(
             "wrapping_newlines": r.wrapping_newlines,
             "terminal_markers": r.terminal_markers,
         })),
+        "audio": settings.audio.as_ref().and_then(|audio| audio.profile.as_ref()).map(|profile| {
+            use wire::audio_settings::Profile;
+            match profile {
+                Profile::Mimo(c) => json!({"profile": "mimo", "sampling_rate": c.sampling_rate, "n_mels": c.n_mels,
+                    "segment_frames": c.segment_frames, "max_seconds": c.max_seconds,
+                    "feature_token": contract.and_then(|c| c.audio_tokens.as_ref()).map(|t| t.feature_token)}),
+            }
+        }),
+        "video": settings.video.as_ref().and_then(|video| video.profile.as_ref()).map(|profile| {
+            use wire::video_settings::Profile;
+            match profile {
+                Profile::Mimo(c) => json!({"profile": "mimo", "min_pixels": c.min_pixels, "max_pixels": c.max_pixels,
+                    "total_max_pixels": c.total_max_pixels, "num_frames": c.num_frames, "max_frames": c.max_frames,
+                    "feature_token": contract.and_then(|c| c.video_tokens.as_ref()).map(|t| t.feature_token)}),
+            }
+        }),
         "assistant_marker": contract.map(|c| c.assistant_marker.clone()),
         "message_end_markers": contract.map(|c| c.message_end_markers.clone()),
         "rejected_tokens": contract.map_or(0, |c| c.rejected_tokens.len()),
@@ -674,6 +690,8 @@ mod tests {
             template_encoding: 0,
             prompt_encoder: wire::PromptEncoder::DeepseekV41 as i32,
             image_placeholder_token_id: Some(7),
+            audio: None,
+            video: None,
         };
         let disabled = wire::VisionCapacity {
             feature_slots: 0,

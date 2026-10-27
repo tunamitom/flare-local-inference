@@ -279,15 +279,29 @@ impl Bootstrap {
             return Err("image preparation identifier differs from its settings".into());
         }
         let images = if model.contract.vision.enabled() {
-            Some(ImageProcessor::load(
+            let mut processor = ImageProcessor::load(
                 frontend_settings
                     .image
                     .ok_or("vision requires prepared image settings")?,
                 image_limits(&model.contract.vision, model.limits.max_sequence_tokens)?,
-            )?)
+            )?;
+            if frontend_settings.video.is_some() != model.contract.frontend.video_tokens.is_some() {
+                return Err("video settings and the prepared video token layout must agree".into());
+            }
+            if let Some(video) = &frontend_settings.video {
+                processor = processor.with_video(video)?;
+            }
+            let audio_prepared = model.contract.audio.as_ref().is_some_and(|audio| audio.enabled());
+            if frontend_settings.audio.is_some() != audio_prepared {
+                return Err("audio settings and prepared audio capacities must agree".into());
+            }
+            if let Some(audio) = &frontend_settings.audio {
+                processor = processor.with_audio(audio)?;
+            }
+            Some(processor)
         } else {
-            if frontend_settings.image.is_some() {
-                return Err("text-only model must not declare image settings".into());
+            if frontend_settings.image.is_some() || frontend_settings.video.is_some() || frontend_settings.audio.is_some() {
+                return Err("text-only model must not declare image, video, or audio settings".into());
             }
             None
         };

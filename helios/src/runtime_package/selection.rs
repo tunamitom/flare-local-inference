@@ -235,7 +235,7 @@ impl LoadOptions {
                         && graph.prefill_capacity <= config["prefill_chunk_size"].as_u64().unwrap_or(0)
                         && graph.speculation_enabled.is_some()
                         && if speculative { (1..=8).contains(&graph.token_capacity) } else { graph.token_capacity == 1 },
-                    GraphKind::Prefill | GraphKind::ScoredPrefill | GraphKind::Vision => graph.batch_capacity == 1 && graph.token_capacity > 0,
+                    GraphKind::Prefill | GraphKind::ScoredPrefill | GraphKind::Vision | GraphKind::Audio => graph.batch_capacity == 1 && graph.token_capacity > 0,
                     GraphKind::Speculative => BATCH_CAPACITIES.contains(&(graph.batch_capacity as usize)) && (1..=8).contains(&graph.token_capacity),
                     _ => BATCH_CAPACITIES.contains(&(graph.batch_capacity as usize)) && graph.token_capacity == 1,
                 };

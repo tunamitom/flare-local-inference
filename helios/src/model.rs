@@ -77,6 +77,37 @@ impl VisionCapabilities {
     }
 }
 
+/// Captured audio encoder graphs. Audio features share the vision feature arena, so the slot
+/// and per-window feature capacities stay in `VisionCapabilities`; each capacity here is the
+/// number of log-mel frames one graph encodes.
+#[cfg_attr(
+    any(feature = "frontend", feature = "runtime-package"),
+    derive(serde::Serialize, serde::Deserialize)
+)]
+#[cfg_attr(
+    any(feature = "frontend", feature = "runtime-package"),
+    serde(deny_unknown_fields)
+)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct AudioCapabilities {
+    pub frame_capacities: Vec<usize>,
+}
+
+impl AudioCapabilities {
+    pub fn enabled(&self) -> bool {
+        !self.frame_capacities.is_empty()
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.frame_capacities.iter().any(|n| *n == 0 || *n > i32::MAX as usize)
+            || self.frame_capacities.windows(2).any(|p| p[0] >= p[1])
+        {
+            return Err("invalid prepared audio capacities".into());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ModelConfig {
     pub max_top_logprobs: usize,

@@ -62,6 +62,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         image_placeholder_token_id: Some(placeholder),
         template_encoding: Default::default(),
         image: None,
+        audio: None,
+        video: None,
     };
     let frontend = Frontend::load_with_settings(
         FrontendAssets {
