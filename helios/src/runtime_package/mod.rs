@@ -785,6 +785,11 @@ impl NativeResources {
                 .flat_map(|s| std::iter::once(s.graph.clone()).chain(s.bodies.iter().cloned()))
                 .collect();
             let mut held: HashMap<String, (Handle, u64)> = HashMap::new();
+            // Local divergence: FLARE_GRAPH_PROGRAMMATIC_EDGES=off loads every programmatic edge as
+            // a full-completion edge (the effective schedule before #104) for packages whose
+            // programmatic dependents are not yet qualified under real overlap.
+            let serialize = std::env::var("FLARE_GRAPH_PROGRAMMATIC_EDGES").is_ok_and(|value| value == "off");
+            let mut programmatic: Vec<(usize, &str)> = Vec::new();
             for graph in &package.graphs {
                 let mut handle = null_mut();
                 driver.check("cuGraphCreate", (driver.graph_create)(&mut handle, 0))?;
@@ -994,13 +999,20 @@ impl NativeResources {
                     data.clear();
                     Ok(())
                 };
+                let mut annotated = 0;
                 for begin in (0..graph.edge_count).step_by(4096) {
                     let mut sources = Vec::new();
                     let mut destinations = Vec::new();
                     let mut data = Vec::new();
                     for _ in begin..(begin + 4096).min(graph.edge_count) {
-                        let edge = protobuf::edge(records.read()?)?;
+                        let mut edge = protobuf::edge(records.read()?)?;
                         dependencies.add(&edge)?;
+                        if edge.data != [0; 8] {
+                            annotated += 1;
+                            if serialize {
+                                edge.data = [0; 8];
+                            }
+                        }
                         if data.last().is_some_and(|previous| previous != &edge.data) {
                             // A mixed batch can apply its first annotation to every
                             // edge. Flush at each change so programmatic ports and
@@ -1015,6 +1027,9 @@ impl NativeResources {
                 }
                 dependencies.finish()?;
                 records.finish()?;
+                if annotated > 0 {
+                    programmatic.push((annotated, &graph.name));
+                }
                 if members.contains(&graph.name) {
                     held.insert(graph.name.clone(), (handle, graph.flags));
                     phase.advance(1);
@@ -1035,6 +1050,18 @@ impl NativeResources {
                 driver.check("cuGraphDestroy", (driver.graph_destroy)(handle))?;
                 self.templates.pop();
                 phase.advance(1);
+            }
+            if !programmatic.is_empty() {
+                programmatic.sort_by(|a, b| b.cmp(a));
+                let total: usize = programmatic.iter().map(|(count, _)| count).sum();
+                let largest: Vec<String> =
+                    programmatic.iter().take(4).map(|(count, name)| format!("{name}={count}")).collect();
+                eprintln!(
+                    "programmatic edges: {total} in {} graphs ({}){}",
+                    programmatic.len(),
+                    largest.join(", "),
+                    if serialize { ", loaded as full dependencies" } else { "" }
+                );
             }
             for switch in &switches {
                 // Selection drops an unselected prefix together with its bodies.
