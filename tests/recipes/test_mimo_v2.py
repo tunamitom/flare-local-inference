@@ -239,3 +239,18 @@ def test_switch_continuations_compile_like_speculative_rounds():
 
     # An uncompiled continuation captures its target verification eagerly, thousands of extra kernels.
     assert {"speculative", "continuation"} <= set(COMPILED_KINDS)
+
+
+def test_one_request_switch_catalog_sizes_its_bodies():
+    from ignition.recipes.mimo_v2.bootstrap import PreparationConfig
+
+    class OneRequest(PreparationConfig):
+        # A one-request catalog: the switched graph owns every round that offers drafts.
+        speculative_round_shapes = ((1, 1, 1),)
+        speculative_widths = (1, 2, 3, 4, 5, 6, 7, 8)
+        request_capacity = 1
+
+    config = OneRequest.__new__(OneRequest)
+    config.__dict__.update(dflash=True, switch_speculation=True)
+    assert config.switch_widths == 8
+    assert config.decode_tokens == 8 and config.decode_samples == 8

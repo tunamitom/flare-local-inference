@@ -208,11 +208,14 @@ class PreparationConfig:
 
     @property
     def decode_tokens(self):
-        return max((packed for _, _, packed in self.speculative_round_shapes), default=self.request_capacity)
+        # Switch bodies verify up to the switch width in rows the round shapes no longer list.
+        return max(max((packed for _, _, packed in self.speculative_round_shapes), default=self.request_capacity),
+                   self.switch_widths)
 
     @property
     def decode_samples(self):
-        return max((batch * width for batch, width, _ in self.speculative_round_shapes), default=self.request_capacity)
+        return max(max((batch * width for batch, width, _ in self.speculative_round_shapes),
+                       default=self.request_capacity), self.switch_widths)
 
     @property
     def draft_tokens(self):
@@ -738,7 +741,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         memory.update(scoring.memory_report())
     if config.dflash:
         server_config.update(
-            speculative_widths=tuple(sorted({width for _, width, _ in config.speculative_round_shapes})),
+            speculative_widths=tuple(sorted({width for _, width, _ in config.speculative_round_shapes}
+                                            | ({config.switch_widths} if config.switch_widths else set()))),
             speculative_token_capacity=speculative_token_capacity(config.max_active, max(config.speculative_widths), config.speculative_token_capacity),
             speculative_fixed_width=config.speculative_fixed_width,
         )
