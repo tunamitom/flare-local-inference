@@ -1380,3 +1380,63 @@ def test_off_multihost_keeps_coordinator_warmup_without_tuning_cache(backend, mo
     assert calls == ["warmup"]
     assert len(agreed) == 1 and agreed[0][0]["source"] == "default"
     assert ("prepare", False, ("collective",)) in events
+
+
+@pytest.mark.parametrize("enabled,effort", [(False, "default"), (True, "off"), (True, "default")])
+def test_clock_lock_scopes_tuning_without_changing_cache(backend, monkeypatch, enabled, effort):
+    from ignition.preparation import clocks
+
+    events = []
+
+    @contextmanager
+    def lock(uuid):
+        events.append(("lock", uuid))
+        try:
+            yield
+        finally:
+            events.append(("unlock", uuid))
+
+    monkeypatch.setattr(clocks, "locked_gpu_clocks", lock)
+    session = make_session(device=0, checkpoint="revision", lock_gpu_clocks=enabled, autotune_effort=effort)
+    session.device.uuid = "GPU-test"
+    ordinary = make_session(device=0, checkpoint="revision", autotune_effort=effort)
+    assert session.namespace == ordinary.namespace
+    ordinary.close()
+    active = enabled and effort != "off"
+    request = declaration("projection", benchmark=lambda state: events.append("benchmark"))
+    session.declare((request,))
+    session.register_finalizer(lambda: events.append("bind"))
+    session.tune()
+    if active:
+        assert events.index(("lock", "GPU-test")) < events.index("benchmark")
+        assert events.index("benchmark") < events.index(("unlock", "GPU-test")) < events.index("bind")
+    else:
+        assert not any(isinstance(event, tuple) for event in events)
+    session.close()
+
+
+def test_clock_lock_released_on_tuning_failure(backend, monkeypatch):
+    from ignition.preparation import clocks
+
+    events = []
+
+    @contextmanager
+    def lock(uuid):
+        events.append("lock")
+        try:
+            yield
+        finally:
+            events.append("unlock")
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("race failed")
+
+    monkeypatch.setattr(clocks, "locked_gpu_clocks", lock)
+    session = make_session(device=0, checkpoint="revision", lock_gpu_clocks=True)
+    session.device.uuid = "GPU-test"
+    session.declare((declaration("projection"),))
+    monkeypatch.setattr(session, "_prepare_job", fail)
+    with pytest.raises(RuntimeError, match="race failed"):
+        session.tune()
+    assert events == ["lock", "unlock"]
+    session.close()

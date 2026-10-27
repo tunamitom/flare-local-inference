@@ -1,4 +1,4 @@
-"""The `ignition` preparation and development serving command line."""
+"""The `ignition` preparation and diagnostic command line."""
 
 import argparse
 from pathlib import Path
@@ -22,7 +22,7 @@ def _parser() -> argparse.ArgumentParser:
             name, help=summary, description=summary, allow_abbrev=False, add_help=False,
             formatter_class=argparse.RawDescriptionHelpFormatter)
         subparser.add_argument("-h", "--help",
-                               action=RecipeHelp if name in ("export", "serve") else "help",
+                               action=RecipeHelp if name in ("export", "debug-serve") else "help",
                                help="show this help message and exit")
         subparser.set_defaults(handler=handler)
         subparser.add_argument("--config", type=Path, metavar="PATH",
@@ -40,7 +40,9 @@ def _parser() -> argparse.ArgumentParser:
     exporting.add_argument("--repo-id", metavar="NAMESPACE/REPOSITORY",
                            help="Hugging Face target used to organize local exports (default: recipe target)")
     _preparation_arguments(exporting)
-    serving = command("serve", serve.serve, "prepare in this process and serve over HTTP, with peer ranks on other hosts")
+    serving = command("debug-serve", serve.debug_serve,
+                      "prepare and run diagnostic HTTP requests; not for actual serving or performance"
+                      " comparisons against other runtimes. Use ignition export and flare run for those workflows.")
     serving.add_argument("--host", metavar="ADDR", help="listening address (default: server.host, else 127.0.0.1)")
     serving.add_argument("--port", type=int, metavar="N", help="listening port (default: server.port, else 8000)")
     _preparation_arguments(serving)
@@ -121,7 +123,8 @@ def _preparation_arguments(running):
     running.add_argument("model", nargs="?", metavar="MODEL",
                          help="recipe alias, repository id, or checkpoint directory (default: defaults.model)")
     running.add_argument("--gpus", metavar="LIST",
-                         help="GPU indices as NVML enumerates them, such as 0, 0,1, or 0-3;"
+                         help="GPU indices relative to CUDA_VISIBLE_DEVICES when set, otherwise NVML indices;"
+                              " such as 0, 0,1, or 0-3;"
                               " their count is the tensor-parallel size (default: first GPUs that fit)")
     running.add_argument("--max-concurrency", type=int, metavar="N",
                          help="maximum simultaneously active requests (default: defaults.max_concurrency,"
@@ -170,9 +173,10 @@ def _preparation_arguments(running):
     advanced.add_argument("--native-dense-activations", action="store_true",
                           help="use quantized activations instead of auto precision for dense projections:"
                                " A8 for FP8 weights and A4 for FP4 weights; explicit recipe precision is retained")
-    advanced.add_argument("--draft-head-quantization", choices=("nvfp4",),
-                          help="prepare a separate NVFP4 vocabulary head for learned draft proposals;"
-                               " target verification retains its precision (DeepSeek V4/V4.1)")
+    advanced.add_argument("--draft-head-quantization", choices=("nvfp4", "mxfp8"),
+                          help="prepare a separate quantized vocabulary head for learned draft proposals;"
+                               " target verification retains its precision (NVFP4: DeepSeek V4/V4.1;"
+                               " MXFP8: DeepSeek V4.1; default: checkpoint precision)")
     advanced.add_argument("--markov-head-quantization", choices=("nvfp4",),
                           help="prepare the draft Markov transition projection as NVFP4"
                                " (DeepSeek V4/V4.1; default: checkpoint precision)")
@@ -185,6 +189,9 @@ def _preparation_arguments(running):
                           help="kernel search effort: off uses heuristics without races; default races"
                                " the pruned candidate set; audit lifts the performance exclusions to"
                                " check that pruning drops no winners (default: default)")
+    advanced.add_argument("--lock-gpu-clocks", action="store_true",
+                          help="lock each tuning GPU to its maximum supported graphics clock during"
+                               " autotuning; requires root or noninteractive sudo for nvidia-smi")
     advanced.add_argument("--compile-workers", type=int, metavar="N",
                           help="CPU compiler process budget per host, shared by local preparation ranks;"
                                " bounded by available RAM and device memory (default: automatic)")
@@ -207,7 +214,7 @@ def _preparation_arguments(running):
                                " default: checkpoint precision)")
     advanced.add_argument("--language-model-only", action="store_true",
                           help="prepare no vision encoder and reject images; its weights and scratch become KV"
-                               " pages (Kimi K3; default: the recipe's image support)")
+                               " pages (recipes with a separable encoder; default: the recipe's image support)")
 
 
 def main(argv=None) -> int:

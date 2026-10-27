@@ -1,8 +1,10 @@
 # Direct execution: reproducing model faults without Helios
 
-`ignition serve --direct` is a diagnostic and qualification path, requested by
+`ignition debug-serve --direct` is a diagnostic and qualification path, requested by
 project owner Luke Alonso, for reproducing and bisecting model-level faults. It
-is not production serving and never replaces it. Production serving loads an
+is not for actual serving or apples-to-apples performance comparisons against
+other runtimes. Those workflows use `ignition export` and `flare run PACKAGE`.
+Production serving loads an
 exported package in Helios, which owns scheduling, input packing, graph replay
 and output without Python ([AGENTS.md](../AGENTS.md), "Python prepares; Helios
 serves"). Direct execution prepares the model in the Ignition process, then
@@ -22,22 +24,23 @@ there is no package.
 
 ## Usage
 
-On one host, GLM-5.3 Flash at TP1 on a GB300:
+On one host, reproduce an eight-request GLM-5.3 Flash workload at TP1 on a GB300:
 
 ```sh
-CUDA_VISIBLE_DEVICES=1 .venv/bin/ignition serve glm-5.3-flash --gpus 0 \
-  --max-concurrency 8 --port 8000 --direct
-CUDA_VISIBLE_DEVICES=1 .venv/bin/ignition serve glm-5.3-flash --gpus 0 \
-  --max-concurrency 8 --port 8000 --direct --eager
+CUDA_VISIBLE_DEVICES=1 .venv/bin/ignition debug-serve glm-5.3-flash --gpus 0 \
+  --max-concurrency 8 --direct
+CUDA_VISIBLE_DEVICES=1 .venv/bin/ignition debug-serve glm-5.3-flash --gpus 0 \
+  --max-concurrency 8 --direct --eager
 ```
 
-Across DGX Sparks, rank zero adds `--ranks N --rendezvous ADDR:PORT` and each
+Across DGX Sparks, this example prepares 16 concurrent requests. Rank zero
+adds `--ranks N --rendezvous ADDR:PORT` and each
 peer runs `ignition join` exactly as for in-process serving
 ([multi-host.md](multi-host.md)); peers learn the execution mode from rank zero:
 
 ```sh
-.venv/bin/ignition serve glm-5.3-flash --ranks 4 --rendezvous 10.200.0.12:29630 \
-  --gpus 0 --max-concurrency 16 --host 0.0.0.0 --port 8000 --direct
+.venv/bin/ignition debug-serve glm-5.3-flash --ranks 4 --rendezvous 10.200.0.12:29630 \
+  --gpus 0 --max-concurrency 16 --host 0.0.0.0 --direct
 .venv/bin/ignition join 10.200.0.12:29630 --rank 1 --ranks 4   # and ranks 2, 3
 ```
 
@@ -45,17 +48,17 @@ Every host needs the same Flare, Ignition and FlashInfer sources, as for any
 multi-host preparation. Preparation flags (`--max-concurrency`,
 `--prefill-chunk-size`, `--mtp-draft-tokens`, `--no-mtp-adaptive-verification`,
 `--no-mtp`, `--no-context-parallel`, `--no-stream-overlap`, `--no-compile`)
-apply as they do to `ignition serve`; direct execution runs what they prepared.
+apply as they do to `ignition debug-serve`; direct execution runs what they prepared.
 `--verbose` also prints every step's graph, row count and GPU time.
 `--graph-times PATH` makes graph replay save its estimate of every graph's time
 to `PATH` every 10 s and when it stops; `--eager` with the same file chooses
 decode rounds from those times (see "Eager forwards"):
 
 ```sh
-CUDA_VISIBLE_DEVICES=1 .venv/bin/ignition serve glm-5.3-flash --gpus 0 \
-  --max-concurrency 8 --port 8000 --direct --graph-times glm-tp1-c8.json
-CUDA_VISIBLE_DEVICES=1 .venv/bin/ignition serve glm-5.3-flash --gpus 0 \
-  --max-concurrency 8 --port 8000 --direct --eager --graph-times glm-tp1-c8.json
+CUDA_VISIBLE_DEVICES=1 .venv/bin/ignition debug-serve glm-5.3-flash --gpus 0 \
+  --max-concurrency 8 --direct --graph-times glm-tp1-c8.json
+CUDA_VISIBLE_DEVICES=1 .venv/bin/ignition debug-serve glm-5.3-flash --gpus 0 \
+  --max-concurrency 8 --direct --eager --graph-times glm-tp1-c8.json
 ```
 
 The listener answers non-streaming `POST /v1/chat/completions`, `GET

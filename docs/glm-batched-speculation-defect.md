@@ -91,7 +91,7 @@ how many of them were in graphs above 16 query rows.
 | Spark TP2, same package | cached 10K ×2 | 2/2 |
 | Spark TP2, `--no-compile`, DSA indexer forced to its fused route at every row count (diagnostic, see below), concurrency 8 | cached 10K ×8, three seeds | 7/8 (+1 neighbour), 8/8, 8/8; no corrupt replies |
 | Spark TP2, same diagnostic | cached 10K ×2 | 2/2 |
-| Spark TP2, prepared and served in one process (`ignition serve --no-compile`), concurrency 8 | cached 10K ×8, three seeds | 8/8, 6/8 (+2 neighbour), 6/8 (+1 neighbour, 1 misplaced); no corrupt replies |
+| Spark TP2, prepared and served in one process (`ignition debug-serve --no-compile`), concurrency 8 | cached 10K ×8, three seeds | 8/8, 6/8 (+2 neighbour), 6/8 (+1 neighbour, 1 misplaced); no corrupt replies |
 | Spark TP2, same server | cached 10K ×2 | 2/2 |
 | Spark TP2, exported with the fix in section 7, compiled, adaptive MTP, concurrency 8 | cached 10K ×8, three seeds | 4/8 (+4 neighbour), 8/8, 7/8 (+1 neighbour); no corrupt replies |
 | Spark TP2, same package | cached 10K ×2; uncached 96K ×3 | 2/2; 3/3 |
@@ -137,7 +137,7 @@ concurrency 8 in graphs of 24 to 48 rows. The same package without the change
 corrupts six to eight replies of eight. The corruption therefore follows the
 tiled route. The tiled route is nevertheless correct when called directly
 (section 6), and the same TP2 configuration prepared and served in one process
-with `ignition serve` is also correct, so the fault lies in what an exported
+with `ignition debug-serve` is also correct, so the fault lies in what an exported
 package carries rather than in the kernel's arithmetic.
 
 GLM's `IndexScratch` holds the `active_width` tensor that every indexer layer

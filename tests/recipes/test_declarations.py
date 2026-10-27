@@ -341,7 +341,7 @@ def test_deepseek41_native_checkpoint_and_scale_compression(monkeypatch, tmp_pat
       "--mla-compute-mode", "auto", "--expert-scale-compression", "native"],
      (8, 2, 3, 64, 32, "auto", None)),
 ])
-@pytest.mark.parametrize("command", ["export", "serve"])
+@pytest.mark.parametrize("command", ["export", "debug-serve"])
 def test_deepseek41_recipe_defaults_and_adapter_preserve_packed_gpu_planning(monkeypatch, tmp_path, flags, expected, command):
     from ignition.cli import _parser, preparation
     from ignition.cli.config import Configuration

@@ -60,7 +60,7 @@ in the CPU suite.
 
 ```powershell
 .\flare\target\release\flare.exe run C:\models\qwen38-tp1-mtp5.safetensors `
-  --publisher-keys C:\models\publisher.json --gpus 0 --host 127.0.0.1 --port 8001
+  --publisher-keys C:\models\publisher.json --gpus 0
 ```
 
 Publisher acceptance, request sampling, graph-capacity selection, and HTTP APIs
@@ -96,7 +96,7 @@ even when the buffered handle is idle. Diagnose table reads separately from grap
 replay using the `flare_engram_disk_{plan,submit,wait,complete}_nanoseconds_total`
 counters; their help text describes platform-specific timing boundaries.
 
-The `ignition serve` development handoff for shared RAM embedding tables uses
+The `ignition debug-serve` development handoff for shared RAM embedding tables uses
 Linux file descriptors. On Windows, export a package and load it with
 `flare run --embedding-table-storage ram`; native resident-table serving uses
 the Windows reader and does not require this development handoff.
@@ -173,13 +173,13 @@ The toolkit's PTX assembler must support SM121; Ignition selects it from the
 configured toolkit. Use an explicit memory reserve for the OS and compiler
 workers, such as `[memory] reserve = "8G"`.
 
-From the repository root in that x64 preparation environment, export to the
-model cache. Replace `CACHE_ENTRY` with the printed entry path when converting
+From the repository root in that x64 preparation environment, export four-request
+capacity to the model cache. Replace `CACHE_ENTRY` with the printed entry path when converting
 to a standalone package:
 
 ```powershell
 python -m ignition export qwen3.8-27b --gpus 0 --max-concurrency 4 `
-  --prefill-chunk-size 4096 --no-compile --config C:\models\ignition.toml
+  --no-compile --config C:\models\ignition.toml
 python -m ignition convert CACHE_ENTRY --config C:\models\ignition.toml `
   --form packed --output C:\models\qwen38-27b.safetensors
 ```

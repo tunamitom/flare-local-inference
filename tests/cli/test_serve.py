@@ -196,7 +196,7 @@ def test_server_options_advertise_canonical_names_independently_of_checkpoint_so
 @pytest.mark.parametrize("extension", [None, types.SimpleNamespace()])
 def test_diagnostic_serving_requires_native_http_before_preparation(host, monkeypatch, capsys, extension):
     monkeypatch.setitem(sys.modules, "flare_heliopause", extension)
-    assert main(["serve", "qwen3.8-flash", "--gpus", "0", "--port", str(free_port())]) == 2
+    assert main(["debug-serve", "qwen3.8-flash", "--gpus", "0", "--port", str(free_port())]) == 2
     assert "qualification Cargo feature" in capsys.readouterr().err
     assert "prepared" not in host and "gpus" not in host
 
@@ -211,7 +211,7 @@ def test_direct_serving_does_not_require_native_http(host, monkeypatch):
 
     monkeypatch.setattr(serve.Host, "discover", discover)
     with pytest.raises(RuntimeError, match="GPU discovery reached"):
-        main(["serve", "qwen3.8-flash", "--direct", "--gpus", "0",
+        main(["debug-serve", "qwen3.8-flash", "--direct", "--gpus", "0",
               "--port", str(free_port())])
     assert discovered == [True] and "prepared" not in host
 
@@ -232,7 +232,7 @@ def test_diagnostic_serving_retains_storage_until_native_shutdown(host, monkeypa
             return 0
 
     monkeypatch.setattr(serve, "_serve_prepared", serve_prepared)
-    assert main(["serve", "qwen3.8-flash", "--gpus", "0",
+    assert main(["debug-serve", "qwen3.8-flash", "--gpus", "0",
                  "--port", str(free_port())]) == 0
     assert host["exports"] == 0 and closed == [True]
 
@@ -256,7 +256,7 @@ def test_diagnostic_startup_failure_retains_undrained_host_storage(host, monkeyp
     monkeypatch.setattr(Prepared, "close", close, raising=False)
     monkeypatch.setattr(Prepared, "__exit__", PreparedModel.__exit__)
     with pytest.raises(RuntimeError, match="native startup retained resources") as caught:
-        main(["serve", "qwen3.8-flash", "--gpus", "0", "--port", str(free_port())])
+        main(["debug-serve", "qwen3.8-flash", "--gpus", "0", "--port", str(free_port())])
     assert caught.value is original and "native drain was not confirmed" in original.__notes__[0]
     assert released == [] and not host["prepared"].closed
 
@@ -309,7 +309,7 @@ def test_preparation_flags_reach_the_exported_plan(host):
 def test_history_drafts_reach_serving_without_changing_preparation(host, monkeypatch, flags, enabled):
     received = []
     monkeypatch.setattr(serve, '_serve_prepared', lambda prepared, bind, options: received.append(options) or 0)
-    assert main(['serve', 'qwen3.8-flash', '--port', str(free_port()), *flags]) == 0
+    assert main(['debug-serve', 'qwen3.8-flash', '--port', str(free_port()), *flags]) == 0
     assert host['plan'].speculation == resolve('qwen3.8-flash').recipe.speculation
     assert received[0].get('history_drafts') is enabled
     assert host['exports'] == 0
@@ -317,7 +317,7 @@ def test_history_drafts_reach_serving_without_changing_preparation(host, monkeyp
 
 @pytest.mark.parametrize('flags', [['--no-mtp'], ['--mtp-draft-tokens', '0'], ['--direct']])
 def test_history_drafts_reject_disabled_or_direct_execution(host, capsys, flags):
-    assert main(['serve', 'qwen3.8-flash', '--port', str(free_port()), '--history-drafts', *flags]) == 2
+    assert main(['debug-serve', 'qwen3.8-flash', '--port', str(free_port()), '--history-drafts', *flags]) == 2
     assert '--history-drafts requires' in capsys.readouterr().err
     assert 'prepared' not in host
 
@@ -386,7 +386,7 @@ def test_development_listener_and_authentication_use_configuration(host, tmp_pat
     config.write_text(f'[server]\nport = {port}\napi_key = "secret"\n')
     calls = []
     monkeypatch.setattr(serve, "_serve_prepared", lambda prepared, bind, options: calls.append((bind, options)))
-    assert main(["serve", "qwen3.8-flash", "--gpus", "0", "--config", str(config)]) == 0
+    assert main(["debug-serve", "qwen3.8-flash", "--gpus", "0", "--config", str(config)]) == 0
     assert calls[0][0] == f"127.0.0.1:{port}"
     assert calls[0][1]["api_key"] == "secret"
     assert host["exports"] == 0
@@ -398,7 +398,7 @@ def test_listener_flags_override_configuration(host, tmp_path, monkeypatch):
     port = free_port()
     calls = []
     monkeypatch.setattr(serve, "_serve_prepared", lambda prepared, bind, options: calls.append(bind))
-    assert main(["serve", "qwen3.8-flash", "--gpus", "0", "--config", str(config),
+    assert main(["debug-serve", "qwen3.8-flash", "--gpus", "0", "--config", str(config),
                  "--host", "127.0.0.1", "--port", str(port)]) == 0
     assert calls == [f"127.0.0.1:{port}"]
 
@@ -407,9 +407,9 @@ def test_an_address_in_use_fails_before_preparation(host, capsys):
     with socket.socket() as occupied:
         occupied.bind(("127.0.0.1", 0))
         occupied.listen()
-        assert main(["serve", "qwen3.8-flash", "--port", str(occupied.getsockname()[1])]) == 2
+        assert main(["debug-serve", "qwen3.8-flash", "--port", str(occupied.getsockname()[1])]) == 2
     assert "cannot listen on" in capsys.readouterr().err and "prepared" not in host
-    assert main(["serve", "qwen3.8-flash", "--host", "localhost", "--port", str(free_port())]) == 2
+    assert main(["debug-serve", "qwen3.8-flash", "--host", "localhost", "--port", str(free_port())]) == 2
 
 
 @pytest.mark.parametrize("exception,code,message", [
@@ -565,7 +565,7 @@ def test_multihost_export_dispatches_with_configured_cache(host, tmp_path, monke
     assert _OPTIONS.get() is None
 
 
-@pytest.mark.parametrize('command', ['export', 'serve'])
+@pytest.mark.parametrize('command', ['export', 'debug-serve'])
 def test_local_tuning_gpus_cannot_change_multihost_sharding(tmp_path, capsys, command):
     arguments = [command, 'qwen3.8-flash', '--ranks', '2', '--tuning-gpus', '0,1']
     assert main(arguments) != 0
@@ -648,6 +648,12 @@ def test_autotune_effort_reaches_plan_and_startup_line(host, capsys, monkeypatch
 def test_native_dense_activations_reach_plan(host, monkeypatch, native):
     monkeypatch.setattr(serve, "_serve_prepared", lambda *args: 0)
     flags = ["--native-dense-activations"] if native else []
-    assert main(["serve", "qwen3.8-flash", "--port", str(free_port()), *flags]) == 0
+    assert main(["debug-serve", "qwen3.8-flash", "--port", str(free_port()), *flags]) == 0
     assert host["plan"].native_dense_activations is native
     assert host["plan"].to_dict()["native_dense_activations"] is native
+
+
+def test_lock_gpu_clocks_reaches_preparation_plan(host):
+    assert export("qwen3.8-flash", "--lock-gpu-clocks") == 0
+    assert host["plan"].lock_gpu_clocks is True
+    assert host["plan"].to_dict()["lock_gpu_clocks"] is True

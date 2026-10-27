@@ -46,7 +46,7 @@ before committing; a design acknowledgment cannot authorize them.
    default-false opt-ins. Enums, callbacks, schema names, and metadata fields
    cannot serve as alternative model allowlists. Review each member and its
    consumers for a concrete meaning independent of model identity.
-4. **Use FlashInfer/b12x and NVIDIA directly.** Target SM120/SM121, reuse proven
+4. **Use FlashInfer/b12x and NVIDIA directly.** Target SM103/SM120/SM121, reuse proven
    operators and sampling, and avoid interchangeable backends or portability layers.
    Remove superseded internal paths unless compatibility is explicitly required.
    Package version validation is required by principle 13.
@@ -92,7 +92,9 @@ before committing; a design acknowledgment cannot authorize them.
     shapes, tails, inactive rows, graph transitions, cache boundaries, request
     lifecycle, and allocation stability. Preserve native frontend and request-local
     sampling semantics. Performance claims require equivalent baselines, complete
-    GPU steps across all ranks, and actual Helios service measurements. Correctness
+    GPU steps across all ranks, and actual Helios service measurements. Comparisons
+    against other runtimes must use exported packages with `flare run`;
+    `ignition debug-serve` timings are diagnostic only. Correctness
     failures block performance claims; keep raw measurements and disclose unrun
     checks and material limitations.
 13. **Validate the supported model package contract.** Serving requires execution

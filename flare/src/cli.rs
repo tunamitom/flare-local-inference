@@ -803,8 +803,21 @@ pub struct ServingOptions {
     pub embedding_table_cache_size: Option<u64>,
 
     /// Retain embedding scales in host RAM while weights remain on disk; adds to the row-cache budget.
-    #[arg(long, help_heading = "Serving options")]
+    /// Enabled by default on discrete GPUs; disabled on unified-memory GPUs.
+    #[arg(
+        long,
+        overrides_with = "no_embedding_table_resident_scales",
+        help_heading = "Serving options"
+    )]
     pub embedding_table_resident_scales: bool,
+
+    /// Read embedding scales from disk instead of retaining them in host RAM.
+    #[arg(
+        long,
+        overrides_with = "embedding_table_resident_scales",
+        help_heading = "Serving options"
+    )]
+    pub no_embedding_table_resident_scales: bool,
 
     /// Disk workers per embedding table; shares a fixed I/O budget [default: 4 on Windows, 1 elsewhere].
     #[arg(long, value_name = "N", help_heading = "Advanced serving options",
@@ -1026,6 +1039,9 @@ impl ServingOptions {
         if self.embedding_table_resident_scales {
             options.push("--embedding-table-resident-scales".into());
         }
+        if self.no_embedding_table_resident_scales {
+            options.push("--no-embedding-table-resident-scales".into());
+        }
         // Every rank keeps its own records under its host's directory; rank zero's store drives
         // all of them, so every rank needs the same settings.
         if let Some(bytes) = self.prefix_cache_memory {
@@ -1059,7 +1075,13 @@ impl ServingOptions {
             memory_limit: self.memory_limit,
             embedding_table_storage: self.embedding_table_storage,
             embedding_table_cache_bytes: self.embedding_table_cache_size,
-            embedding_table_resident_scales: self.embedding_table_resident_scales,
+            embedding_table_resident_scales: if self.embedding_table_resident_scales {
+                Some(true)
+            } else if self.no_embedding_table_resident_scales {
+                Some(false)
+            } else {
+                None
+            },
             embedding_table_workers: self.embedding_table_workers,
             max_concurrency: self.max_concurrency.map(NonZeroUsize::get),
             mtp_draft_tokens: self.mtp_draft_tokens,
@@ -1832,7 +1854,10 @@ mod tests {
             "--embedding-table-cache-size",
             "1G",
         ]);
-        assert!(args.load_options().embedding_table_resident_scales);
+        assert_eq!(
+            args.load_options().embedding_table_resident_scales,
+            Some(true)
+        );
         assert_eq!(
             args.load_options().embedding_table_cache_bytes,
             Some(1 << 30)
@@ -1841,11 +1866,40 @@ mod tests {
             args.rank_options()
                 .contains(&"--embedding-table-resident-scales".to_owned())
         );
-        assert!(
-            !run(&["flare", "run", "model.safetensors"])
+        assert_eq!(
+            run(&["flare", "run", "model.safetensors"])
                 .load_options()
-                .embedding_table_resident_scales
+                .embedding_table_resident_scales,
+            None
         );
+    }
+
+    #[test]
+    fn resident_embedding_scale_overrides_reach_every_rank() {
+        let enable = "--embedding-table-resident-scales";
+        let disable = "--no-embedding-table-resident-scales";
+        for (flags, expected) in [
+            (vec![disable], false),
+            (vec![enable, disable], false),
+            (vec![disable, enable], true),
+        ] {
+            let mut argv = vec!["flare", "run", "model.safetensors"];
+            argv.extend(flags);
+            let args = run(&argv);
+            assert_eq!(
+                args.load_options().embedding_table_resident_scales,
+                Some(expected)
+            );
+            let forwarded = args.rank_options();
+            let mut peer_argv = vec!["flare", "run", "model.safetensors"];
+            peer_argv.extend(forwarded.iter().map(String::as_str));
+            assert_eq!(
+                run(&peer_argv)
+                    .load_options()
+                    .embedding_table_resident_scales,
+                Some(expected)
+            );
+        }
     }
 
     #[test]

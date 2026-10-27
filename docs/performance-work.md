@@ -6,6 +6,12 @@ against a baseline with the same checkpoint, GPU assignment, activation
 precision, graph capacity, sampling settings, cache conditions, and completed
 work. Correctness failures block performance claims.
 
+Use `ignition export` and `flare run PACKAGE` for performance comparisons
+against other runtimes. `ignition debug-serve`, including native, `--direct`,
+and `--eager` execution, is for fault diagnosis only. Its preparation resources,
+cache backing, and loading lifecycle differ from package serving, so its timings
+cannot establish apples-to-apples serving performance.
+
 Before changing model or preparation code, read
 [model development](model-development.md) and
 [preparation development](preparation-development.md). Inspect fusion boundaries,

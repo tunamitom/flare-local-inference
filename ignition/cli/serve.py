@@ -196,7 +196,7 @@ def _export_hosts(args):
                          mla_compute_mode=args.mla_compute_mode)
     plan = replace(plan, compile_workers=compiler_workers(configuration, args.compile_workers), hub_cache=hub_cache,
                    autotune_effort=tuning_effort(configuration, args.autotune_effort),
-                   native_dense_activations=args.native_dense_activations)
+                   lock_gpu_clocks=args.lock_gpu_clocks, native_dense_activations=args.native_dense_activations)
     environment.apply(configuration, local, plan.recipe.b12x_environment)
     options = _server_options(configuration, model, plan)
     options.pop("api_key")
@@ -260,7 +260,7 @@ def _prepare(args):
         host = Host.discover()
         plan = derive(configuration, model, host, gpus=args.gpus, concurrency=concurrency,
                       compile_workers=args.compile_workers, tuning_gpus=args.tuning_gpus, autotune_effort=args.autotune_effort,
-                      native_dense_activations=args.native_dense_activations,
+                      lock_gpu_clocks=args.lock_gpu_clocks, native_dense_activations=args.native_dense_activations,
                       image_concurrency=args.image_concurrency,
                       speculation=speculation(args, model, configuration), prefill_chunk=args.prefill_chunk_size,
                       context_parallel=context_parallel(args, model), stream_overlap=stream_overlap(args, model),
@@ -372,11 +372,12 @@ def _serving_progress(verbose):
     return Progress()
 
 
-def serve(args) -> int:
-    """Prepare in this process and serve over HTTP; with --ranks, one peer rank per other host joins.
+def debug_serve(args) -> int:
+    """Prepare in this process for diagnostic HTTP requests, optionally across ranks.
 
     Requires heliopause's qualification build, which embeds the HTTP server in Python. With
     --direct, Ignition's diagnostic step loop serves instead, without Helios or that build.
+    Actual serving and comparisons against other runtimes use exported packages with flare run.
     """
     from ignition.progress import phase
 
@@ -393,7 +394,7 @@ def serve(args) -> int:
     if args.direct and args.history_drafts:
         raise UsageError("--history-drafts requires native serving; it does not apply to --direct")
     if not args.direct:
-        requirement = ("ignition serve requires Heliopause's qualification Cargo feature; rebuild ./heliopause "
+        requirement = ("ignition debug-serve requires Heliopause's qualification Cargo feature; rebuild ./heliopause "
                        "with --config-settings 'build-args=--features=qualification'")
         try:
             import flare_heliopause
@@ -444,7 +445,7 @@ def serve(args) -> int:
                          language_model_only=args.language_model_only, mla_compute_mode=args.mla_compute_mode)
     plan = replace(plan, compile_workers=compiler_workers(configuration, args.compile_workers), hub_cache=hub_cache,
                    autotune_effort=tuning_effort(configuration, args.autotune_effort),
-                   native_dense_activations=args.native_dense_activations)
+                   lock_gpu_clocks=args.lock_gpu_clocks, native_dense_activations=args.native_dense_activations)
     if rendezvous is None:
         plan = tuning_devices(plan, host, args.tuning_gpus)
         local = plan.gpus

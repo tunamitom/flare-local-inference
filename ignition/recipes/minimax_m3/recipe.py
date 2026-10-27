@@ -18,6 +18,7 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         draft_prefix_selection=speculation.draft_prefix_selection)
     config = PreparationConfig(compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
         native_dense_activations=plan.native_dense_activations,
+        lock_gpu_clocks=plan.lock_gpu_clocks and plan.autotune_effort != "off",
         image_concurrency=plan.image_concurrency if not plan.language_model_only else None,
         devices=tuple(range(plan.world_size)) if ranks is None else (0,) * plan.world_size,
         hosts=None if ranks is None else ranks.hosts, roce_ring=plan.roce_ring,

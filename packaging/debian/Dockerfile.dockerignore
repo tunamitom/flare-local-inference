@@ -4,6 +4,16 @@
 !flare/Cargo.lock
 !flare/src/
 !flare/src/**
+!selene/
+!selene/Cargo.toml
+!selene/Cargo.lock
+!selene/src/
+!selene/src/**
+!eos/
+!eos/Cargo.toml
+!eos/Cargo.lock
+!eos/src/
+!eos/src/**
 !helios/
 !helios/Cargo.toml
 !helios/build.rs
@@ -17,6 +27,8 @@
 !ignition/recipes/qwen38/assets/**
 !ignition/recipes/step5/assets/
 !ignition/recipes/step5/assets/**
+!ignition/recipes/kimi3/assets/
+!ignition/recipes/kimi3/assets/**
 !LICENSE
 !NOTICE
 !packaging/

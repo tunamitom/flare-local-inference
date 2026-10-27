@@ -2,7 +2,7 @@
 
 Production serving loads an exported package in Helios, which owns scheduling,
 input packing and graph replay without Python (see AGENTS.md, "Python
-prepares; Helios serves"). At the project owner's request, `ignition serve
+prepares; Helios serves"). At the project owner's request, `ignition debug-serve
 --direct` instead prepares a model in process and drives its prepared
 execution from Python: a small fixed scheduler packs the same graph inputs
 Helios packs, and rank zero replays the captured graphs, or with `--eager`

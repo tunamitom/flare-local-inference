@@ -63,6 +63,7 @@ class PreparationConfig:
     image_concurrency: int | None = None
     compile_workers: int | None = None
     native_dense_activations: bool = False
+    lock_gpu_clocks: bool = False
     autotune_effort: str = "default"
     tuning_replica: TuningReplica | None = None
     devices: tuple[int, ...] = (0, 1, 2, 3)
@@ -90,6 +91,8 @@ class PreparationConfig:
 
         Speculation(self.draft_tokens, draft_head_quantization=self.draft_head_quantization,
                     markov_head_quantization=self.markov_head_quantization)
+        if self.draft_head_quantization not in (None, "nvfp4"):
+            raise ValueError("DeepSeek V4 draft head quantization must be omitted or nvfp4")
 
         object.__setattr__(self, "image_concurrency", image_capacity(self.max_active, self.image_concurrency))
         if type(self.stream_overlap) is not bool:
@@ -222,7 +225,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         ).hexdigest()
         session = RecordedPreparationSession(
             compile_workers=config.compile_workers, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
-            native_dense_activations=config.native_dense_activations,
+            native_dense_activations=config.native_dense_activations, lock_gpu_clocks=config.lock_gpu_clocks,
             device=device,
             checkpoint=identity,
             workload_schema="deepseek4-vision",

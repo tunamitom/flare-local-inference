@@ -79,6 +79,7 @@ def prepare(
     config = PreparationConfig(
         prompt_logprobs=plan.prompt_logprobs,
         compile_workers=plan.compile_workers, native_dense_activations=plan.native_dense_activations,
+        lock_gpu_clocks=plan.lock_gpu_clocks and plan.autotune_effort != "off",
         tuning_replica=plan.tuning_replica,
         devices=tuple(range(plan.world_size)) if ranks is None else (0,) * plan.world_size,
         hosts=None if ranks is None else ranks.hosts,

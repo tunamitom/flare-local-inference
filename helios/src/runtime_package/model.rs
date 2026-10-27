@@ -412,24 +412,12 @@ impl NativeModel {
                 "embedding row cache requires an embedding table catalog",
             ));
         }
-        if options.embedding_table_resident_scales && engram.is_empty() {
+        if options.embedding_table_resident_scales == Some(true) && engram.is_empty() {
             return Err(invalid(
                 "resident embedding scales require an embedding table catalog",
             ));
         }
         let ram = options.embedding_table_storage == Some(crate::engram::Storage::Ram);
-        let resident_bytes = engram
-            .iter()
-            .flat_map(|(index, _)| &index.tables)
-            .flat_map(|table| table.planes.iter().enumerate())
-            .filter(|(ordinal, _)| {
-                ram || (options.embedding_table_resident_scales && *ordinal == 1)
-            })
-            .try_fold(0u64, |bytes, (_, plane)| {
-                bytes
-                    .checked_add(plane.resident_bytes()? as u64)
-                    .ok_or_else(|| invalid("resident embedding tables exceed the memory budget"))
-            })?;
         let engram_tokens = engram.iter().map(|(_, ranks)| {
             ranks.iter().flat_map(|rank| packages[*rank].execution.as_ref().unwrap().graphs.iter())
                 .filter(|graph| crate::execution::GraphKind::try_from(graph.kind.as_str())
@@ -625,6 +613,22 @@ impl NativeModel {
                     .collect::<Vec<_>>()
                     .join(" / "),
             );
+            let embedding_table_resident_scales = options.embedding_resident_scales(
+                !engram.is_empty(),
+                model.ranks.iter().any(|rank| rank.integrated),
+            );
+            let resident_bytes = engram
+                .iter()
+                .flat_map(|(index, _)| &index.tables)
+                .flat_map(|table| table.planes.iter().enumerate())
+                .filter(|(ordinal, _)| {
+                    ram || (embedding_table_resident_scales && *ordinal == 1)
+                })
+                .try_fold(0u64, |bytes, (_, plane)| {
+                    bytes
+                        .checked_add(plane.resident_bytes()? as u64)
+                        .ok_or_else(|| invalid("resident embedding tables exceed the memory budget"))
+                })?;
             let embedding_table_cache_bytes = options.embedding_cache_bytes(
                 !engram.is_empty(),
                 model.ranks.iter().any(|rank| rank.integrated),
@@ -712,7 +716,7 @@ impl NativeModel {
                         storage,
                         group_budget,
                         options.embedding_workers(),
-                        options.embedding_table_resident_scales,
+                        embedding_table_resident_scales,
                     )?;
                     for (delivery_rank, local) in ranks.into_iter().enumerate() {
                         bindings.push((local, shared.clone(), delivery_rank));
@@ -724,7 +728,7 @@ impl NativeModel {
                     .map(|(_, shared, rank)| (shared, rank))
                     .collect();
                 let label = match storage {
-                    crate::engram::Storage::Disk if options.embedding_table_resident_scales => {
+                    crate::engram::Storage::Disk if embedding_table_resident_scales => {
                         "disk weights, RAM scales"
                     }
                     crate::engram::Storage::Disk => "disk",

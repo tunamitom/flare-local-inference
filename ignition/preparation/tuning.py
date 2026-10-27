@@ -27,6 +27,19 @@ _COLLECTIVES_PER_JOB = 96
 _REQUESTS_PER_JOB = 192
 
 
+def _prepare_compiler_toolchain():
+    """Resolve forward math libraries before native program identities are recorded."""
+    from torch._inductor import config
+    from torch._inductor.runtime.compile_tasks import _set_triton_libdevice_path
+
+    from .compilation import _OPTIONS
+
+    # Inductor selects the CUDA toolkit's libdevice for eager precision. Native
+    # discovery and later materialization must see that same library identity.
+    with config.patch(emulate_precision_casts=_OPTIONS["emulate_precision_casts"]):
+        _set_triton_libdevice_path()
+
+
 def with_autotune_effort(prepare):
     """Apply the preparation config's effort throughout bootstrap declarations."""
     @wraps(prepare)
@@ -52,7 +65,7 @@ class RecordedPreparationSession(PreparationSession):
     def __init__(self, *, device, checkpoint: str, workload_schema: str,
                  numerical_policy: str, search_limits=None, namespace=None, race_budget=None,
                  coordinator=None, headroom_bytes=0, benchmark_storage=None, compile_workers=None,
-                 tuning_replica=None, autotune_effort="default", native_dense_activations=False):
+                 tuning_replica=None, autotune_effort="default", native_dense_activations=False, lock_gpu_clocks=False):
         if not isinstance(checkpoint, str) or not checkpoint:
             raise ValueError("tuning requires an exact checkpoint revision")
         if any(not isinstance(value, str) or not value for value in (workload_schema, numerical_policy)):
@@ -65,6 +78,8 @@ class RecordedPreparationSession(PreparationSession):
                         numerical_policy=numerical_policy)
         self.autotune_effort = AutotuneEffort(autotune_effort).value
         self.native_dense_activations = native_dense_activations
+        self.lock_gpu_clocks = lock_gpu_clocks
+        _prepare_compiler_toolchain()
         with b12x_autotune_effort(self.autotune_effort):
             super().__init__(device=device, autotune=self.autotune_effort != "off", compile_workers=0,
                              namespace=identity, race_budget=race_budget, prime=False,
@@ -150,6 +165,31 @@ class RecordedPreparationSession(PreparationSession):
         for index, request in enumerate(requests):
             jobs[group_chunk[root(index)]].append(request)
         return tuple(tuple(job) for job in jobs if job)
+
+    @contextmanager
+    def _tuning_clocks(self):
+        if not self.lock_gpu_clocks or not self.autotune:
+            yield
+            return
+        from ignition.errors import PreparationError
+        from .clocks import locked_gpu_clocks
+
+        with ExitStack() as stack:
+            failure = None
+            try:
+                stack.enter_context(locked_gpu_clocks(self.device.uuid))
+            except Exception as error:
+                failure = error
+            ready = failure is None
+            if self._replica_coordinator is not None:
+                ready = all(self._replica_coordinator.gather(ready))
+            elif self._coordinator is not None:
+                ready = self._coordinator.same_on_every_rank(ready) and ready
+            if failure is not None:
+                raise failure
+            if not ready:
+                raise PreparationError("GPU clock locking failed on another preparation rank")
+            yield
 
     def _prepare_job(self, requests, *, progress, autotune):
         autotune = autotune and self.autotune
@@ -307,23 +347,24 @@ class RecordedPreparationSession(PreparationSession):
             if bounded < self.compile_workers:
                 self.configure_compile_workers(bounded)
             jobs = self._jobs(requests)
-            for index, job in enumerate(jobs, 1):
-                # A completed b12x job stops its live display. Each job needs its own lifecycle.
-                with ExitStack() as display_stack:
-                    update = progress
-                    if show_progress:
-                        title = "b12x / kernel autotuning"
-                        if len(jobs) > 1:
-                            title += f" · job {index}/{len(jobs)}"
-                        display = display_stack.enter_context(PreparationDisplay(
-                            global_rank=0, console=console, transient=True, title=title))
+            with self._tuning_clocks():
+                for index, job in enumerate(jobs, 1):
+                    # A completed b12x job stops its live display. Each job needs its own lifecycle.
+                    with ExitStack() as display_stack:
+                        update = progress
+                        if show_progress:
+                            title = "b12x / kernel autotuning"
+                            if len(jobs) > 1:
+                                title += f" · job {index}/{len(jobs)}"
+                            display = display_stack.enter_context(PreparationDisplay(
+                                global_rank=0, console=console, transient=True, title=title))
 
-                        def update(status):
-                            display.update(status)
-                            if progress is not None:
-                                progress(status)
+                            def update(status):
+                                display.update(status)
+                                if progress is not None:
+                                    progress(status)
 
-                    results.append(self._prepare_job(job, progress=update, autotune=self.autotune))
+                        results.append(self._prepare_job(job, progress=update, autotune=self.autotune))
             if self._stop.is_set():
                 raise RuntimeError("b12x tuning was cancelled before serving preparation completed")
             selections = []
@@ -476,6 +517,7 @@ def declare(session, requests, *, coordinator=None):
     if isinstance(session, RecordedPreparationSession):
         session.declare(requests, coordinator=coordinator)
     else:
+        _prepare_compiler_toolchain()
         options = {} if coordinator is None else {"coordinator": coordinator}
         session.prepare(requests, **options)
 

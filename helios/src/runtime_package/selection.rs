@@ -16,7 +16,8 @@ pub struct LoadOptions {
     /// Per-host RAM bytes for disk-backed embedding rows; zero disables, absent selects by memory topology.
     pub embedding_table_cache_bytes: Option<u64>,
     /// Keep original scale-plane bytes in host RAM while embedding weights remain on disk.
-    pub embedding_table_resident_scales: bool,
+    /// When absent, enabled for disk tables on discrete GPUs.
+    pub embedding_table_resident_scales: Option<bool>,
     /// Disk workers per table: four on Windows, one elsewhere. Share 128 slots and 8 MiB staging.
     pub embedding_table_workers: Option<usize>,
     pub max_concurrency: Option<usize>,
@@ -42,6 +43,12 @@ impl LoadOptions {
     pub fn embedding_workers(&self) -> usize {
         self.embedding_table_workers
             .unwrap_or(if cfg!(windows) { 4 } else { 1 })
+    }
+
+    pub(super) fn embedding_resident_scales(&self, has_tables: bool, integrated: bool) -> bool {
+        has_tables
+            && self.embedding_table_storage.unwrap_or_default() == crate::engram::Storage::Disk
+            && self.embedding_table_resident_scales.unwrap_or(!integrated)
     }
 
     pub(super) fn embedding_cache_bytes(&self, has_tables: bool, integrated: bool) -> u64 {
@@ -86,7 +93,7 @@ impl LoadOptions {
         {
             return Err(invalid("embedding row cache requires disk table storage"));
         }
-        if self.embedding_table_resident_scales
+        if self.embedding_table_resident_scales == Some(true)
             && self.embedding_table_storage == Some(crate::engram::Storage::Ram)
         {
             return Err(invalid(
@@ -751,6 +758,27 @@ mod tests {
     }
 
     #[test]
+    fn resident_scale_defaults_follow_storage_and_memory_topology() {
+        use crate::engram::Storage;
+        for storage in [None, Some(Storage::Disk), Some(Storage::Ram)] {
+            for override_value in [None, Some(false), Some(true)] {
+                let options = LoadOptions {
+                    embedding_table_storage: storage,
+                    embedding_table_resident_scales: override_value,
+                    ..Default::default()
+                };
+                for integrated in [false, true] {
+                    assert!(!options.embedding_resident_scales(false, integrated));
+                    assert_eq!(
+                        options.embedding_resident_scales(true, integrated),
+                        storage != Some(Storage::Ram) && override_value.unwrap_or(!integrated)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn cached_disk_rows_reject_resident_table_storage_before_cuda() {
         let options = LoadOptions {
             embedding_table_storage: Some(crate::engram::Storage::Ram),
@@ -769,7 +797,7 @@ mod tests {
     #[test]
     fn resident_scales_allow_cached_disk_rows_and_reject_whole_table_ram() {
         let mut options = LoadOptions {
-            embedding_table_resident_scales: true,
+            embedding_table_resident_scales: Some(true),
             embedding_table_cache_bytes: Some(1 << 30),
             ..Default::default()
         };

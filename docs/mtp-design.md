@@ -12,7 +12,7 @@ select the draft-token maximum and default verification policy.
 with continuations from shared decoded history. `--no-history-drafts` disables
 that augmentation. History drafting defaults to off and is selected at startup;
 Ignition exports no history preference. Both settings use the same captured
-MTP graphs and buffers. Development native `ignition serve` accepts the same
+MTP graphs and buffers. Development native `ignition debug-serve` accepts the same
 options.
 
 With copying enabled, each loaded model retains the most recent 65,536 committed

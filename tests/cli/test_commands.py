@@ -75,8 +75,8 @@ def test_capacity_errors_exit_four_with_aligned_continuation_lines(host, tmp_pat
 def test_unknown_commands_flags_and_abbreviations_are_usage_errors(host, capsys):
     for arguments in (["export", "qwen3.8-flash", "--context", "4096"], ["export", "qwen3.8-flash", "--gpu", "0"],
                       ["export", "qwen3.8-flash", "--max", "2"], ["join", "10.0.0.1:29600"],
-                      ["join", "10.0.0.1:29600", "--rank", "1", "--ranks", "17"], ["serve", "--ranks", "17"],
-                      ["run", "qwen3.8-flash"], ["plan", "qwen3.8-flash"],
+                      ["join", "10.0.0.1:29600", "--rank", "1", "--ranks", "17"], ["debug-serve", "--ranks", "17"],
+                      ["serve", "qwen3.8-flash"], ["run", "qwen3.8-flash"], ["plan", "qwen3.8-flash"],
                       ["prepare", "qwen3.8-flash"], ["models"], ["pull"], ["status"], ["bench"], ["config"], ["skill"]):
         with pytest.raises(SystemExit) as exit:
             main(arguments)
@@ -85,14 +85,14 @@ def test_unknown_commands_flags_and_abbreviations_are_usage_errors(host, capsys)
 
 
 def test_multi_host_ranks_parse_for_rank_zero_and_its_peers():
-    rank_zero = _parser().parse_args(["serve", "glm-5.3-flash", "--ranks", "4", "--rendezvous", "10.0.0.1:29600"])
+    rank_zero = _parser().parse_args(["debug-serve", "glm-5.3-flash", "--ranks", "4", "--rendezvous", "10.0.0.1:29600"])
     assert (rank_zero.model, rank_zero.ranks, rank_zero.rendezvous) == ("glm-5.3-flash", 4, "10.0.0.1:29600")
     peer = _parser().parse_args(["join", "10.0.0.1:29600", "--rank", "3", "--ranks", "4"])
     assert (peer.rendezvous, peer.rank, peer.ranks, peer.gpu) == ("10.0.0.1:29600", 3, 4, 0)
 
 
 def test_runtime_memory_flags_do_not_select_preparation_or_diagnostic_behavior(capsys):
-    for command in (["export"], ["serve"]):
+    for command in (["export"], ["debug-serve"]):
         for flags in (["--kv-cache-limit", "context"], ["--memory-limit", "30G"]):
             with pytest.raises(SystemExit) as error:
                 main([*command, "qwen3.8-flash", *flags])
@@ -101,7 +101,7 @@ def test_runtime_memory_flags_do_not_select_preparation_or_diagnostic_behavior(c
 
 
 def test_served_model_name_is_a_runtime_override(capsys):
-    for command in (["export"], ["serve"]):
+    for command in (["export"], ["debug-serve"]):
         with pytest.raises(SystemExit) as error:
             main([*command, "qwen3.8-flash", "--served-model-name", "local-model"])
         assert error.value.code == 2
@@ -109,7 +109,7 @@ def test_served_model_name_is_a_runtime_override(capsys):
 
 
 def test_stream_overlap_flag_is_a_preparation_flag_that_overlapping_recipes_accept(host, tmp_path, capsys):
-    for command in (["export"], ["serve"]):
+    for command in (["export"], ["debug-serve"]):
         assert _parser().parse_args([*command, "glm-5.3-flash", "--no-stream-overlap"]).no_stream_overlap
         assert not _parser().parse_args([*command, "glm-5.3-flash"]).no_stream_overlap
     for model in ("qwen3.8-flash", "glm-5.3-flash", "deepseek-v4-flash", "deepseek-v4.1-flash"):
@@ -122,17 +122,17 @@ def test_stream_overlap_flag_is_a_preparation_flag_that_overlapping_recipes_acce
 
 
 def test_direct_execution_is_an_explicit_serve_diagnostic(host, capsys):
-    arguments = _parser().parse_args(["serve", "glm-5.3-flash", "--direct", "--eager"])
+    arguments = _parser().parse_args(["debug-serve", "glm-5.3-flash", "--direct", "--eager"])
     assert arguments.direct and arguments.eager
-    arguments = _parser().parse_args(["serve", "glm-5.3-flash"])
+    arguments = _parser().parse_args(["debug-serve", "glm-5.3-flash"])
     assert not arguments.direct and not arguments.eager
-    assert main(["serve", "glm-5.3-flash", "--eager"]) == 2
+    assert main(["debug-serve", "glm-5.3-flash", "--eager"]) == 2
     assert "--eager applies only to --direct" in failure(capsys)[0]
-    arguments = _parser().parse_args(["serve", "glm-5.3-flash", "--direct", "--graph-times", "times.json"])
+    arguments = _parser().parse_args(["debug-serve", "glm-5.3-flash", "--direct", "--graph-times", "times.json"])
     assert arguments.graph_times == Path("times.json")
-    assert main(["serve", "glm-5.3-flash", "--graph-times", "times.json"]) == 2
+    assert main(["debug-serve", "glm-5.3-flash", "--graph-times", "times.json"]) == 2
     assert "--graph-times applies only to --direct" in failure(capsys)[0]
-    assert main(["serve", "glm-5.3-flash", "--direct", "--eager", "--graph-times", "/nonexistent/times.json"]) == 2
+    assert main(["debug-serve", "glm-5.3-flash", "--direct", "--eager", "--graph-times", "/nonexistent/times.json"]) == 2
     assert "graph replay with --graph-times saves it" in failure(capsys)[0]
     for arguments in (["export", "glm-5.3-flash", "--direct"], ["export", "glm-5.3-flash", "--eager"],
                       ["join", "10.0.0.1:29600", "--rank", "1", "--ranks", "2", "--direct"]):
@@ -243,7 +243,7 @@ def test_deepseek_v4_vision_uses_only_checkpoint_integrated_dspark():
 
 
 def test_roce_ring_requires_multiple_hosts_before_model_or_gpu_work(tmp_path, capsys):
-    for arguments in (["export"], ["serve"]):
+    for arguments in (["export"], ["debug-serve"]):
         assert main([*arguments, "qwen3.8-flash", "--roce-ring"]) == 2
         assert "--roce-ring requires at least two hosts" in failure(capsys)[0]
     args = _parser().parse_args(["export", "qwen3.8-flash",
@@ -280,8 +280,17 @@ def test_fabric_transfers_follow_the_chain_shape():
     assert _checkpoint_fabric(args) == dict(ring=False, chain=True, streams=8)
 
 
-@pytest.mark.parametrize("command", ["export", "serve"])
+@pytest.mark.parametrize("command", ["export", "debug-serve"])
 def test_native_dense_activations_flag(command):
     parser = _parser()
     assert not parser.parse_args([command, "deepseek-v4.1-flash"]).native_dense_activations
     assert parser.parse_args([command, "deepseek-v4.1-flash", "--native-dense-activations"]).native_dense_activations
+
+
+@pytest.mark.parametrize("command", ["export", "debug-serve"])
+def test_lock_gpu_clocks_flag(command):
+    from ignition.cli import _parser
+
+    parser = _parser()
+    assert not parser.parse_args([command, "deepseek-v4.1-flash"]).lock_gpu_clocks
+    assert parser.parse_args([command, "deepseek-v4.1-flash", "--lock-gpu-clocks"]).lock_gpu_clocks

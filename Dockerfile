@@ -13,6 +13,8 @@ RUN apt-get update \
 WORKDIR /src
 COPY flare/ flare/
 COPY helios/ helios/
+COPY eos/ eos/
+COPY selene/ selene/
 # helios/src/frontend/templates.rs compiles the recipes' chat templates in.
 COPY ignition/recipes/ ignition/recipes/
 

@@ -16,7 +16,7 @@ def selected(*flags, alias="deepseek-v4.1-flash", configuration=None):
     return preparation.speculation(args, resolve(alias), configuration)
 
 
-@pytest.mark.parametrize("command", ["export", "serve"])
+@pytest.mark.parametrize("command", ["export", "debug-serve"])
 def test_graph_budget_flag_parses_independently_of_token_capacity(command):
     args = _parser().parse_args([command, "deepseek-v4.1-flash", "--speculative-graph-budget", "48",
                                  "--speculative-token-capacity", "96"])

@@ -30,7 +30,7 @@ def test_layout_selection_is_not_a_cli_argument():
     assert not hasattr(args, "draft_prefix_selection")
 
 
-@pytest.mark.parametrize("command", ("export", "serve"))
+@pytest.mark.parametrize("command", ("export", "debug-serve"))
 @pytest.mark.parametrize("flags", [
     ("--packed-verification",), ("--packed-verification=true",),
     ("--draft-prefix-selection", "cpu"), ("--draft-prefix-selection=gpu",),

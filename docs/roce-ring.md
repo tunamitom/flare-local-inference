@@ -183,7 +183,7 @@ Run the corresponding command on each peer from its checkout root:
 ```
 
 Rank zero sends the `--roce-ring` setting to peers. The plan records `roce_ring`.
-`ignition serve` also accepts the option
+`ignition debug-serve` also accepts the option
 with `--ranks` for development without package export.
 
 Provision the shared preparation token described in the multi-host guide.

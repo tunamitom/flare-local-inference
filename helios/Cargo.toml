@@ -22,6 +22,7 @@ server = ["dep:serde", "images", "grammar", "dep:axum", "dep:tokio", "dep:async-
 roce = ["dep:cc", "runtime-package"]
 
 [dependencies]
+flare-eos = { path = "../eos" }
 deepseek-recipe = { git = "https://github.com/local-inference-lab/deepseek-recipe", rev = "6a2d2aaed79c9cd4eebaaf9471635ca09b93ae0e", optional = true }
 deepseek-recipe-core = { git = "https://github.com/local-inference-lab/deepseek-recipe", rev = "6a2d2aaed79c9cd4eebaaf9471635ca09b93ae0e", optional = true }
 deepseek-recipe-encoding = { git = "https://github.com/local-inference-lab/deepseek-recipe", rev = "6a2d2aaed79c9cd4eebaaf9471635ca09b93ae0e", optional = true }
@@ -32,6 +33,7 @@ zstd = { version = "0.13", optional = true }
 brotli = { version = "8", optional = true }
 ring = { version = "0.17.14", optional = true }
 thiserror = "2.0"
+flare-selene = { path = "../selene" }
 serde = { version = "1.0", features = ["derive"], optional = true }
 prost = { version = "0.14", optional = true }
 blake2 = "0.10"
@@ -54,6 +56,7 @@ crossterm = { version = "0.28", default-features = false, optional = true }
 twox-hash = { version = "2.1", default-features = false, features = ["xxhash3_64"] }
 
 [dev-dependencies]
+flare-selene = { path = "../selene", features = ["test-support"] }
 minijinja = { version = "=2.24.0", features = ["loader", "preserve_order", "loop_controls"] }
 minijinja-contrib = { version = "=2.24.0", features = ["pycompat"] }
 

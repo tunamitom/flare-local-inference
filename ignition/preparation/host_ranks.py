@@ -13,7 +13,7 @@ carries the handshake, the preparation assignment, memory reports and the serve
 command, and stays open for the group's lifetime: losing it ends the process on
 the other side, because a rank cannot complete collectives without its peers.
 The executor connection carries Helios's per-step coordination, or rank zero's
-steps under Ignition's diagnostic direct execution (`ignition serve --direct`).
+steps under Ignition's diagnostic direct execution (`ignition debug-serve --direct`).
 """
 
 import fcntl

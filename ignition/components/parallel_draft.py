@@ -271,7 +271,13 @@ class PreparedParallelDraftRound:
             )
         if target is not None:
             target.prepare()
-        for proposal in proposals:
+        for index, proposal in enumerate(proposals):
+            bias = None if self.markov is None else getattr(self.markov, "logits", None)
+            if (self.draft is not None and self.selector is None and self.candidate_runtime is None
+                    and (self.markov is None or bias is not None)):
+                block = self.draft_inputs.shape[1]
+                proposal.bind_logits(self.draft.scratch.logits.view(b, block, -1)[:, index + o.logit_offset],
+                    bias)
             proposal.prepare()
         if self.proposal_only:
             prepare_sampling_broadcasts(proposals, None, collectives=o.collectives, session=o.session,
@@ -366,14 +372,18 @@ class PreparedParallelDraftRound:
                     & (self.block.steps.view(1, positions) // 4 < limits[:, None] - 1))
                 self.sampled.copy_(drafts[positions - 1:].view(b))
             for i, proposal in enumerate(() if self.block is not None else proposals):
-                if not self.vocabulary_parallel:
-                    self.logits[:, 0].copy_(
-                        self.draft.scratch.logits.view(b, block, -1)[:, i + o.logit_offset].float()
-                    )
-                if self.markov is not None:
-                    self.logits[:, 0].add_(self.markov())
-                if self.selector is not None:
-                    self.selector(self.logits[:, 0], self.markov_token, i + o.logit_offset)
+                if getattr(proposal, "source_logits", None) is not None:
+                    if self.markov is not None:
+                        self.markov()
+                else:
+                    if not self.vocabulary_parallel:
+                        self.logits[:, 0].copy_(
+                            self.draft.scratch.logits.view(b, block, -1)[:, i + o.logit_offset].float()
+                        )
+                    if self.markov is not None:
+                        self.logits[:, 0].add_(self.markov())
+                    if self.selector is not None:
+                        self.selector(self.logits[:, 0], self.markov_token, i + o.logit_offset)
                 if observer is not None:
                     observer.record_embedding(i, self.markov.embedding)
                 self.offset.copy_(self.base_offset + 4 * i)

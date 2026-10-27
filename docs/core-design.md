@@ -76,7 +76,7 @@ library to become useful.
 vLLM's device, backend, model, and distributed-execution breadth creates a
 large compatibility matrix. Changes to cache layouts, compilation, offload,
 and scheduling must coexist across those combinations. Flare limits that
-obligation to selected model recipes, FlashInfer/b12x, NVIDIA SM120/SM121,
+obligation to selected model recipes, FlashInfer/b12x, NVIDIA SM103/SM120/SM121,
 and supported single-host and cross-node tensor-parallel configurations.
 It can use one prepared-execution contract throughout the
 runtime because backend portability and general vLLM feature parity are
@@ -210,7 +210,7 @@ available byte and unit of bandwidth, with predictable response times.
 ### Make a smaller promise than vLLM
 
 [vLLM's broad model, hardware, and distributed-serving support](https://docs.vllm.ai/en/latest/design/arch_overview/)
-is valuable and expensive to reproduce. Flare chooses NVIDIA SM120/SM121,
+is valuable and expensive to reproduce. Flare chooses NVIDIA SM103/SM120/SM121,
 FlashInfer/b12x, selected model recipes, and interactive workloads on one host
 or supported cross-node tensor-parallel groups. [Multi-host serving](multi-host.md)
 uses prepared RoCEnante collectives; [Orbit](orbit.md) manages the hosts,

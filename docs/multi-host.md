@@ -260,14 +260,15 @@ from Orbit identities. Checkpoint and export frames use that token for
 authentication without encryption. Payloads travel through rank-owned helpers on the CX7 interfaces,
 using direct peer connections or ring relays selected by `--roce-ring`.
 
-The example prepares GLM-5.3 Flash on two Sparks. Run from each checkout root.
+The example prepares GLM-5.3 Flash for eight concurrent requests on two Sparks.
+Run from each checkout root.
 On `maxwell`, whose preparation address is `10.200.0.12`, publish to its model
 cache. Replace `CACHE_ENTRY` in the conversion command with the printed entry
 path after preparation completes:
 
 ```sh
 .venv/bin/ignition export glm-5.3-flash --ranks 2 \
-  --rendezvous 10.200.0.12:29630 --gpus 0 --max-concurrency 8 --verbose
+  --rendezvous 10.200.0.12:29630 --gpus 0 --max-concurrency 8
 .venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/glm53-spark-tp2.safetensors
 ```
 
@@ -282,7 +283,7 @@ admits each peer once, serves checkpoint metadata and selected byte ranges,
 and coordinates preparation. Peers do not create full checkpoint shards.
 Keep checkpoint source files unchanged during loading.
 
-For a physical ring, add `--roce-ring` to rank zero's export or serve command;
+For a physical ring, add `--roce-ring` to rank zero's `export` or `debug-serve` command;
 for hosts cabled as a chain with no link between the first and last rank, add
 `--roce-chain` instead. The peers' `--rank` values define physical order. Preparation does not
 require Orbit agents, pairing, a cluster file, or controller keys. Every rank
@@ -335,7 +336,7 @@ From the controller:
 
 ```sh
 flare orbit run maxwell:/data/flare-runtime/glm53-spark-tp2.safetensors \
-  --cluster sparks --name glm53 --gpus 0 --host 0.0.0.0 --port 8000
+  --cluster sparks --name glm53 --gpus 0 --host 0.0.0.0
 ```
 
 `--dry-run` prints placement without starting ranks or saving a persistent group.
@@ -421,7 +422,7 @@ To save a configuration for later manual restart:
 ```sh
 flare orbit run maxwell:/data/flare-runtime/glm53-spark-tp2.safetensors \
   --cluster sparks --name glm53 --persistent --detach \
-  --gpus 0 --host 0.0.0.0 --port 8000
+  --gpus 0 --host 0.0.0.0
 flare orbit stop glm53 --cluster sparks
 flare orbit run --name glm53 --detach
 ```

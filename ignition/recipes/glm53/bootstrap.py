@@ -69,6 +69,7 @@ class PreparationConfig:
     prompt_logprobs: bool = False
     compile_workers: int | None = None
     native_dense_activations: bool = False
+    lock_gpu_clocks: bool = False
     autotune_effort: str = "default"
     tuning_replica: TuningReplica | None = None
     devices: tuple[int, ...] = (0, 1)
@@ -356,7 +357,7 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
             "contract": "glm5next.graph-inputs.v3", "vision": not config.language_model_only}, sort_keys=True).encode()).hexdigest()
         session = RecordedPreparationSession(
             compile_workers=config.compile_workers, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
-            native_dense_activations=config.native_dense_activations,
+            native_dense_activations=config.native_dense_activations, lock_gpu_clocks=config.lock_gpu_clocks,
             device=device, checkpoint=identity, workload_schema="glm-text-stack-tp-v1",
             numerical_policy="default", coordinator=coordinator,
             headroom_bytes=config.headroom_bytes, benchmark_storage=package_storage)
