@@ -87,8 +87,8 @@ pub(crate) fn run_bounded(mut command: Command, tool: &str, limit: usize) -> Res
     Ok(output)
 }
 
-/// The first stream of `kind` (`v` or `a`) as ffprobe's JSON object.
-pub(crate) fn probe_stream(path: &std::path::Path, kind: &str, entries: &str) -> Result<serde_json::Value> {
+/// Runs `ffprobe` over one stream of `kind` with the given `-show_entries` selection.
+fn probe(path: &std::path::Path, kind: &str, entries: &str) -> Result<serde_json::Value> {
     let mut command = Command::new("ffprobe");
     command
         .arg("-v")
@@ -96,17 +96,36 @@ pub(crate) fn probe_stream(path: &std::path::Path, kind: &str, entries: &str) ->
         .arg("-select_streams")
         .arg(format!("{kind}:0"))
         .arg("-show_entries")
-        .arg(format!("stream={entries}"))
+        .arg(entries)
         .arg("-of")
         .arg("json")
         .arg(path);
     let output = run_bounded(command, "ffprobe", 1 << 20)?;
-    let value: serde_json::Value =
-        serde_json::from_slice(&output).map_err(|error| failure(format!("invalid ffprobe output: {error}")))?;
+    serde_json::from_slice(&output).map_err(|error| failure(format!("invalid ffprobe output: {error}")))
+}
+
+fn first_stream(value: &serde_json::Value, kind: &str) -> Result<serde_json::Value> {
     value["streams"]
         .get(0)
         .cloned()
         .ok_or_else(|| failure(format!("the media contains no {} stream", if kind == "v" { "video" } else { "audio" })))
+}
+
+/// The first stream of `kind` (`v` or `a`) as ffprobe's JSON object.
+pub(crate) fn probe_stream(path: &std::path::Path, kind: &str, entries: &str) -> Result<serde_json::Value> {
+    first_stream(&probe(path, kind, &format!("stream={entries}"))?, kind)
+}
+
+/// The first stream of `kind` and the container's own fields. Some muxers, Matroska among
+/// them, keep the duration in the container while leaving it out of the stream.
+pub(crate) fn probe_stream_and_format(
+    path: &std::path::Path,
+    kind: &str,
+    stream_entries: &str,
+    format_entries: &str,
+) -> Result<(serde_json::Value, serde_json::Value)> {
+    let value = probe(path, kind, &format!("stream={stream_entries}:format={format_entries}"))?;
+    Ok((first_stream(&value, kind)?, value["format"].clone()))
 }
 
 /// Parses an ffprobe rational such as `30000/1001`.

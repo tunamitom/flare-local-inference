@@ -19,6 +19,7 @@ mod format;
 #[cfg(any(windows, test))]
 mod host;
 mod limits;
+mod media;
 mod metadata;
 pub use metadata::{unverified_metadata, unverified_metadata_selected};
 mod memory;
