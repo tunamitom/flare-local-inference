@@ -1,6 +1,6 @@
 --- a/b12x/comm/pcie/_oneshot_cute.py
 +++ b/b12x/comm/pcie/_oneshot_cute.py
-@@ -1508,6 +1508,10 @@
+@@ -1508,6 +1508,10 @@ class _FusedOneshotLaunch(_PackedMath):
          group_weights_ptr: cute.Pointer,
          group_ids_ptr: cute.Pointer,
      ) -> None:
@@ -11,7 +11,7 @@
          tidx, _, _ = cute.arch.thread_idx()
          bidx, _, _ = cute.arch.block_idx()
          gdim, _, _ = cute.arch.grid_dim()
-@@ -2281,7 +2285,7 @@
+@@ -2281,7 +2285,7 @@ def get_fused_oneshot_launcher(
          _dummy(cutlass.Uint32, 4),
          current_cuda_stream(),
          compile_spec=KernelCompileSpec.from_key(
@@ -22,7 +22,7 @@
  
 --- a/b12x/gemm/blockscaled/_block_fp8_gemv.py
 +++ b/b12x/gemm/blockscaled/_block_fp8_gemv.py
-@@ -13,6 +13,11 @@
+@@ -13,6 +13,11 @@ is deterministic.
  Within a 128-block, K is permuted identically for both operands so that each
  thread's fragments come from 32 contiguous bytes (two 16-byte loads); every
  block sum still covers the same products.
@@ -34,7 +34,16 @@
  """
  
  import cuda.bindings.driver as cuda
-@@ -35,6 +40,8 @@
+@@ -23,7 +28,7 @@ from cutlass import BFloat16, Float32, Int32, Int64, Uint8, Uint32
+ 
+ from b12x._lib.compile_plan import attach_programs
+ from b12x._lib.compiler import KernelCompileSpec, compile as b12x_compile, run_compiled
+-from b12x._lib.intrinsics.memory import get_ptr_as_int64, ld_global_nc_v4_u32
++from b12x._lib.intrinsics.memory import get_ptr_as_int64, ld_global_nc_v4_u32, ld_global_v4_u32
+ from b12x._lib.intrinsics.mma import mxfp8_mma_m16n8k32_f32_e4m3
+ from b12x._lib.program_cache import program_cache
+ from b12x._lib.utils.device import cuda_stream_from_int_or_current, current_cuda_stream
+@@ -35,6 +40,8 @@ MAX_ROWS = 8
  # faster than the dense GEMM up to 4096 output features for K in 1536..7168;
  # from 8192 both stream weights at the same rate and the dense GEMM keeps them.
  MAX_OUT_FEATURES = 4096
@@ -43,7 +52,7 @@
  _WARPS = 8
  _LANES = 32
  _UNIT_E8M0 = 0x7F7F7F7F  # four E8M0 exponents of 2^0
-@@ -55,12 +62,15 @@
+@@ -55,12 +62,15 @@ def supports(rows: int, out_features: int, in_features: int) -> bool:
  class BlockFP8Gemv:
      """``out[m, n] = sum_kb (lhs[m, kb] . rhs[n, kb]) * lhs_scale[m, kb] * rhs_scale[n // 128, kb]``."""
  
@@ -60,7 +69,7 @@
  
      def _shared_storage_cls(self):
          class SharedStorage:
-@@ -95,6 +105,7 @@
+@@ -95,6 +105,7 @@ class BlockFP8Gemv:
              grid=((self.n + 15) // 16, 1, 1),
              block=(_WARPS * _LANES, 1, 1),
              stream=stream,
@@ -68,7 +77,7 @@
          )
  
      @cute.kernel
-@@ -126,6 +137,24 @@
+@@ -126,6 +137,24 @@ class BlockFP8Gemv:
          # 16 features never straddle a 128-row scale block.
          scale_row = Int64(first // 128) * self.blocks
          unit = Uint32(_UNIT_E8M0)
@@ -93,7 +102,7 @@
          acc0 = Float32(0.0)
          acc1 = Float32(0.0)
          acc2 = Float32(0.0)
-@@ -134,17 +163,21 @@
+@@ -134,17 +163,27 @@ class BlockFP8Gemv:
              kb = warp * self.blocks_per_warp + step
              if kb < self.blocks:
                  offset = Int64(kb * 128 + quad * 32)
@@ -104,6 +113,10 @@
 -                wa4, wa5, wa6, wa7 = ld_global_nc_v4_u32(pa + Int64(16))
 -                wb0, wb1, wb2, wb3 = ld_global_nc_v4_u32(pb)
 -                wb4, wb5, wb6, wb7 = ld_global_nc_v4_u32(pb + Int64(16))
+-                x0, x1, x2, x3 = ld_global_nc_v4_u32(px)
+-                x4, x5, x6, x7 = ld_global_nc_v4_u32(px + Int64(16))
+-                wa = (wa0, wa1, wa2, wa3, wa4, wa5, wa6, wa7)
+-                wb = (wb0, wb1, wb2, wb3, wb4, wb5, wb6, wb7)
 +                if cutlass.const_expr(self.preload):
 +                    wa, wb, weight_scale = preloaded[step]
 +                else:
@@ -116,14 +129,18 @@
 +                    wa = (wa0, wa1, wa2, wa3, wa4, wa5, wa6, wa7)
 +                    wb = (wb0, wb1, wb2, wb3, wb4, wb5, wb6, wb7)
 +                    weight_scale = rhs_scale[scale_row + Int64(kb)]
-                 x0, x1, x2, x3 = ld_global_nc_v4_u32(px)
-                 x4, x5, x6, x7 = ld_global_nc_v4_u32(px + Int64(16))
--                wa = (wa0, wa1, wa2, wa3, wa4, wa5, wa6, wa7)
--                wb = (wb0, wb1, wb2, wb3, wb4, wb5, wb6, wb7)
++                if cutlass.const_expr(self.dependent):
++                    # A programmatic dependent is resident while its producer writes the rows, so the
++                    # non-coherent read-only path may return stale lines even after the grid wait.
++                    x0, x1, x2, x3 = ld_global_v4_u32(px)
++                    x4, x5, x6, x7 = ld_global_v4_u32(px + Int64(16))
++                else:
++                    x0, x1, x2, x3 = ld_global_nc_v4_u32(px)
++                    x4, x5, x6, x7 = ld_global_nc_v4_u32(px + Int64(16))
                  xs = (x0, x1, x2, x3, x4, x5, x6, x7)
                  d0 = Float32(0.0)
                  d1 = Float32(0.0)
-@@ -165,7 +198,6 @@
+@@ -165,7 +204,6 @@ class BlockFP8Gemv:
                          unit,
                          unit,
                      )
@@ -131,7 +148,7 @@
                  s0 = weight_scale * lhs_scale[Int64(col0) * self.blocks + Int64(kb)]
                  s1 = weight_scale * lhs_scale[Int64(col1) * self.blocks + Int64(kb)]
                  acc0 = acc0 + d0 * s0
-@@ -193,18 +225,20 @@
+@@ -193,18 +231,20 @@ class BlockFP8Gemv:
  
  
  @program_cache(scope="preparation")
@@ -155,6 +172,7 @@
          )
  
      def run(lhs, lhs_scale, rhs, rhs_scale, output, stream=None):
+new file mode 100644
 --- /dev/null
 +++ b/b12x/gemm/blockscaled/_block_fp8_row_quant.py
 @@ -0,0 +1,153 @@

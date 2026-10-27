@@ -13,6 +13,8 @@ mod engram;
 mod event_tests;
 #[cfg(test)]
 mod programmatic_edge_tests;
+#[cfg(test)]
+mod family_edge_tests;
 mod format;
 #[cfg(any(windows, test))]
 mod host;
