@@ -419,7 +419,7 @@ class PreparedAudioGeneration:
         valid = current & (frames > 0) & (frames <= capacity) & (offset >= 0)
         valid &= (offset == 0) | ((s.generation[slot] == i.audio_generation) & (s.count[slot] == offset))
         valid &= (s.feature_slot >= 0) & (s.feature_slot < s.arena.shape[0])
-        live = e.rows < frames.reshape(())
+        live = e.mel_rows < frames.reshape(())
         valid &= (~live[:, None] | torch.isfinite(i.audio_features[:capacity])).all()
         self.errors.copy_(~valid)
         # A rejected segment stores no features: the publication kernel is gated on this error flag.
