@@ -219,6 +219,10 @@ class PreparationConfig:
         return max(self.speculative_widths) - 1 if self.dflash else 0
 
 
+# Switch bodies are continuations: target verification graphs that must compile like any round.
+COMPILED_KINDS = ("prefill", "scored_prefill", "decode", "resume", "speculative", "continuation", "vision")
+
+
 def _prepare_switch(config, speculation, *, add, buffers, forward_inputs, package_storage, device):
     """One-request rounds that choose their verification width on device (local divergence).
 
@@ -659,7 +663,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         retain_graphs=config.retain_graphs,
         materialize=materialize_cache,
         warmup_storage=package_storage,
-        compile_kinds=("prefill", "scored_prefill", "decode", "resume", "speculative", "vision"),
+        compile_kinds=COMPILED_KINDS,
     )
     session.freeze()
     pool.clear_for_preparation()

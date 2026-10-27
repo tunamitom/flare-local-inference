@@ -232,3 +232,10 @@ def test_csf_experts_load_gate_first_with_one_shared_scratch(monkeypatch, world)
         scratch = compressed.scale_scratch
         compressed.load_layer(1)
         assert prepared[-1]["scale_scratch"] is scratch
+
+
+def test_switch_continuations_compile_like_speculative_rounds():
+    from ignition.recipes.mimo_v2.bootstrap import COMPILED_KINDS
+
+    # An uncompiled continuation captures its target verification eagerly, thousands of extra kernels.
+    assert {"speculative", "continuation"} <= set(COMPILED_KINDS)
