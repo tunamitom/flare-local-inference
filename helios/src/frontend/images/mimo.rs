@@ -16,7 +16,7 @@ pub(super) fn load(
     {
         return Err("invalid prepared MiMo image settings".into());
     }
-    Ok(patches::PatchProcessor {
+    patches::PatchProcessor {
         limits,
         patch_size: PATCH,
         min_pixels: settings.min_pixels,
@@ -26,5 +26,6 @@ pub(super) fn load(
             mean: settings.image_mean,
             std: settings.image_std,
         },
-    })
+    }
+    .bound_by_capacity()
 }

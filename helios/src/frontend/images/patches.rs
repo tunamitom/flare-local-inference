@@ -20,6 +20,23 @@ pub(super) struct PatchProcessor {
 }
 
 impl PatchProcessor {
+    /// Binds the packaged resize area to the prepared per-image patch capacity. An image
+    /// whose aligned area exceeds the bound is downscaled to fit one vision graph, as the
+    /// checkpoint processor downscales to its own maximum area, instead of being rejected
+    /// after normalization. The capacity must still hold the profile's minimum area.
+    pub(super) fn bound_by_capacity(self) -> Result<Self> {
+        let capacity = self
+            .limits
+            .max_patches_per_image
+            .saturating_mul(self.patch_size * self.patch_size);
+        if capacity < self.min_pixels {
+            return Err(
+                "prepared image patch capacity is below the profile's minimum resize area".into(),
+            );
+        }
+        Ok(Self { max_pixels: self.max_pixels.min(capacity), ..self })
+    }
+
     pub fn geometry(&self, width: usize, height: usize) -> Result<ImageGeometry> {
         check_input_extent(self.limits, width, height)?;
         if width.max(height) as f64 / width.min(height) as f64 > 200.0 {

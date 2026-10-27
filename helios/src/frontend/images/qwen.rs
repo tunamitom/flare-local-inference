@@ -27,7 +27,8 @@ impl QwenProcessor {
                 max_pixels: settings.max_pixels,
                 normalization: patches::Normalization::Symmetric,
                 resize: resize::resize,
-            },
+            }
+            .bound_by_capacity()?,
             position_side: settings.position_side,
             image_token_id: settings.image_token_id,
             video_token_id: settings.video_token_id,

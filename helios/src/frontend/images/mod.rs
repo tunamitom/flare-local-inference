@@ -810,20 +810,80 @@ mod tests {
     }
 
     #[test]
-    fn admission_checks_processed_capacity_without_changing_resize() {
-        let processor = processor(ImageLimits::default());
-        assert_eq!(processor.geometry(2033, 2033).unwrap().patches, 16_384);
+    fn oversized_images_are_downscaled_to_the_prepared_patch_capacity() {
+        // The packaged area is 16,777,216 pixels; the default limits hold 16,384 patches
+        // (4,194,304 pixels), so the capacity binds. Expected grids are the checkpoint
+        // processor's `smart_resize` with that area: `factor=32, max_pixels=4194304`.
+        let bounded = processor(ImageLimits::default());
+        for (width, height, resized_width, resized_height, patches) in [
+            (2033, 2033, 2048, 2048, 16_384),
+            (2080, 2080, 2048, 2048, 16_384),
+            (3000, 2000, 2496, 1664, 16_224),
+            (4000, 3000, 2336, 1760, 16_060),
+            (8000, 8000, 2048, 2048, 16_384),
+            (6000, 30, 6016, 32, 752),
+            (1600, 1200, 1600, 1216, 7_600),
+        ] {
+            let geometry = bounded.geometry(width, height).unwrap();
+            assert_eq!(
+                (geometry.width, geometry.height, geometry.patches, geometry.tokens),
+                (resized_width, resized_height, patches, patches / 4),
+                "{width}x{height}"
+            );
+            assert_eq!(geometry.grid_thw, [1, (resized_height / 16) as i64, (resized_width / 16) as i64]);
+        }
+        assert!(bounded.geometry(200, 1).is_ok());
         assert!(matches!(
-            processor.geometry(2080, 2080).unwrap_err(),
+            bounded.geometry(201, 1).unwrap_err(),
             Error::Frontend(FrontendError::Input(_))
         ));
-        assert!(processor.geometry(200, 1).is_ok());
-        assert!(matches!(
-            processor.geometry(201, 1).unwrap_err(),
-            Error::Frontend(FrontendError::Input(_))
-        ));
-        assert!(processor.geometry(usize::MAX, 2).is_err());
-        assert!(processor.geometry(0, 256).is_err());
+        assert!(bounded.geometry(usize::MAX, 2).is_err());
+        assert!(bounded.geometry(0, 256).is_err());
+
+        // A capacity above the packaged area leaves the packaged resize in effect.
+        let roomy = processor(ImageLimits { max_patches_per_image: 65_536, ..ImageLimits::default() });
+        let geometry = roomy.geometry(8000, 8000).unwrap();
+        assert_eq!((geometry.width, geometry.height, geometry.patches), (4096, 4096, 65_536));
+
+        // A capacity below the packaged minimum area cannot be loaded.
+        assert!(ImageProcessor::load(
+            ImageSettings::Qwen(QwenImageSettings {
+                min_pixels: 65_536,
+                max_pixels: 16_777_216,
+                position_side: 48,
+                image_token_id: 248056,
+                video_token_id: 248057,
+            }),
+            ImageLimits { max_patches_per_image: 255, ..ImageLimits::default() },
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn mimo_downscales_to_its_prepared_patch_capacity() {
+        // MiMo packages an 8,388,608-pixel area (32,768 patches) above its 16,384-patch
+        // top capacity: a 3000x2000 image now fits 4,056 tokens instead of being rejected,
+        // and an image within the capacity keeps the packaged resize.
+        let processor = ImageProcessor::load(
+            ImageSettings::Mimo(MimoImageSettings {
+                min_pixels: 8192,
+                max_pixels: 8_388_608,
+                image_mean: [0.485, 0.456, 0.406],
+                image_std: [0.229, 0.224, 0.225],
+            }),
+            ImageLimits { patches_per_feature: 4, ..ImageLimits::default() },
+        )
+        .unwrap();
+        let geometry = processor.geometry(3000, 2000).unwrap();
+        assert_eq!((geometry.width, geometry.height, geometry.patches, geometry.tokens), (2496, 1664, 16_224, 4056));
+        let geometry = processor.geometry(1600, 1200).unwrap();
+        assert_eq!((geometry.width, geometry.height, geometry.patches, geometry.tokens), (1600, 1216, 7_600, 1900));
+        assert_eq!(processor.geometry(1, 1).unwrap().patches, 36);
+        let image = RgbImage::new(3000, 2000, vec![127; 3000 * 2000 * 3]).unwrap();
+        let processed = processor.process(&[image]).unwrap();
+        assert_eq!(processed.geometry[0].patches, 16_224);
+        assert_eq!(processed.pixel_values.len(), 16_224 * FEATURES);
+        assert_eq!(processed.cu_seqlens, [0, 16_224]);
     }
 
     #[test]

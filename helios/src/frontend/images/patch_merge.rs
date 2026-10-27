@@ -44,7 +44,8 @@ impl Processor {
                     std: settings.image_std,
                 },
                 resize: resize::resize,
-            },
+            }
+            .bound_by_capacity()?,
             image_token: settings.image_token,
             start_token: settings.start_token,
             end_token: settings.end_token,

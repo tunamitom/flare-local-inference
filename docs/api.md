@@ -458,11 +458,16 @@ token. Admission costs every image before rejecting, so a budget rejection
 (HTTP 400) states the whole request's image tokens against
 `max_image_tokens_per_prompt`, with the patch counts in parentheses, and names
 the first image that crossed the budget with its position, pixel size, and
-tokens. Oversized single images are rejected against
-`max_image_tokens_per_image` or `max_image_pixels` with the observed size.
-Each profile applies its packaged resizing rules independently to each image.
-Flare does not reduce image resolution as conversation history grows or to fit
-a feature window. Chat templates add fixed framing tokens around each image that
+tokens. Profiles with a packaged resize area (Qwen, MiMo, and temporal
+patch-merge) bound that area by `max_image_tokens_per_image`, so an image
+larger than one prepared vision graph is downscaled to fit it with the
+checkpoint processor's own aligned, aspect-preserving resize. Profiles with
+fixed geometry reject an image whose normalized grid exceeds
+`max_image_tokens_per_image`, and every profile rejects a decoded image larger
+than `max_image_pixels`, with the observed size. Each profile applies its
+resizing rules independently to each image. Flare does not reduce image
+resolution as conversation history grows or to fit more images into a feature
+window. Chat templates add fixed framing tokens around each image that
 count toward `prompt_tokens` but not toward the image budget or
 `multimodal_tokens.image`.
 
