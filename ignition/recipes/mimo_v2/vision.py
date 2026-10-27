@@ -11,7 +11,7 @@ from ignition.components.mlp import MLPScratch, PreparedMLP
 from ignition.components.rms_norm import PreparedRMSNorm
 from ignition.components.varlen_attention import PreparedVarlenAttention
 
-PATCH_CAPACITIES = (256, 1024, 4096, 16384)
+PATCH_CAPACITIES = (256, 1024, 4096, 16384, 32768)
 FEATURES = 16384
 HIDDEN = 6144
 
