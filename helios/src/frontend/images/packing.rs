@@ -208,12 +208,22 @@ fn mimo(
     let end = start + geometry.patches;
     let h = usize::try_from(geometry.grid_thw[1]).map_err(|_| "invalid vision height")?;
     let w = usize::try_from(geometry.grid_thw[2]).map_err(|_| "invalid vision width")?;
+    // The largest rung the package captured, capped by what one request can publish. A literal
+    // here rejected every image the ladder was raised to admit and turned a bad request into a
+    // fatal server fault, so the bound has to come from the contract the frontend resized against.
+    let vision = &config.contract.vision;
+    let max_patches = vision
+        .patch_capacities
+        .last()
+        .copied()
+        .unwrap_or(0)
+        .min(vision.features_per_request.saturating_mul(vision.patches_per_feature));
     if h == 0
         || w == 0
         || h % 2 != 0
         || w % 2 != 0
         || geometry.grid_thw[0] != 1
-        || geometry.patches > 16384
+        || geometry.patches > max_patches
         || h.checked_mul(w) != Some(geometry.patches)
         || geometry.tokens != geometry.patches / 4
         || end / 4 > config.contract.vision.features_per_request
