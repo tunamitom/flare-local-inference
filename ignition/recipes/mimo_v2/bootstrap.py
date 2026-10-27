@@ -716,7 +716,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         "page_tokens": PAGE_TOKENS,
         "frontend": prepare_frontend(snapshot,
             eos_token_ids=json.loads((snapshot / "generation_config.json").read_text())["eos_token_id"],
-            image_profile="mimo", audio_profile="mimo"),
+            image_profile="mimo", audio_profile="mimo", video_profile="mimo"),
         "sampling_defaults": RECIPE.sampling_defaults.as_dict(),
         "assets": assets,
         "model_contract": prepare_contract({name: signature for name, signature in signatures.items()

@@ -162,6 +162,23 @@ def audio_settings(config, model, profile):
         kernel_size=3, stride=2, pooling=2, group_size=4, max_seconds=config["max_audio_seconds"])}
 
 
+def video_settings(image, profile):
+    """Frame sampling and per-frame resize areas for video, which reuses the image resize range.
+
+    The clip budget, frame count and frame ceiling are the reference processor's own constants:
+    thirty-two uniform frames per clip, each frame capped so the whole clip stays inside
+    total_max_pixels, and the same 0..255 RGB standardization the image path applies.
+    """
+    if profile != "mimo":
+        raise ValueError("unsupported video preprocessing profile")
+    # The video frontend divides u8 pixels directly by pixel_std, so it takes the CLIP constants
+    # in 0..255 scale; the image path's 0..1 mean/std are the same numbers divided by 255.
+    return {"mimo": dict(min_pixels=image["min_pixels"], max_pixels=image["max_pixels"],
+        total_max_pixels=268435456, num_frames=32, max_frames=3600,
+        pixel_mean=[value * 255.0 for value in image["image_mean"]],
+        pixel_std=[value * 255.0 for value in image["image_std"]])}
+
+
 def _native_image_placeholder(snapshot, model, encoder):
     from tokenizers import Tokenizer
 
@@ -180,7 +197,7 @@ def _native_image_placeholder(snapshot, model, encoder):
 
 
 def prepare_frontend(snapshot, *, eos_token_ids, image_profile=None, preprocessor=None,
-                     prompt_encoder=PromptEncoder.PROMPT_JINJA, audio_profile=None):
+                     prompt_encoder=PromptEncoder.PROMPT_JINJA, audio_profile=None, video_profile=None):
     """Resolve checkpoint structure during preparation; sampling is recipe-owned."""
     if not isinstance(prompt_encoder, PromptEncoder):
         raise ValueError("prompt_encoder must be a PromptEncoder")
@@ -209,4 +226,8 @@ def prepare_frontend(snapshot, *, eos_token_ids, image_profile=None, preprocesso
     if audio_profile is not None:
         result["audio"] = audio_settings(json.loads((snapshot / "audio_tokenizer" / "config.json").read_text()),
             json.loads((snapshot / "config.json").read_text()), audio_profile)
+    if video_profile is not None:
+        if image_profile is None:
+            raise ValueError("video settings reuse the image resize range and need an image profile")
+        result["video"] = video_settings(result["image"][image_profile], video_profile)
     return result

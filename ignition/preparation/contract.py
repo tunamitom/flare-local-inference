@@ -89,7 +89,7 @@ def graph_contracts(signatures, inputs, *, continuation, pending, cursor=None, r
 def frontend(*, tools, assistant_marker, message_end_markers, prefix_boundary, wrapping_newlines=0,
              tag_separator="", terminal_markers=(), image_preparation=None, image_layout=None,
              position_dimensions=0, rejected_tokens=(), image_tokens=None, audio_preparation=None,
-             audio_tokens=None, video=None, video_tokens=None):
+             audio_tokens=None, video_tokens=None):
     return dict(tools=dict(kind=tools, wrapping_newlines=wrapping_newlines, tag_separator=tag_separator),
         reasoning=dict(kind=p.THINK_TAGS, open="<think>", close="</think>",
                        wrapping_newlines=wrapping_newlines, terminal_markers=list(terminal_markers)),
@@ -100,9 +100,9 @@ def frontend(*, tools, assistant_marker, message_end_markers, prefix_boundary, w
         # the contract's defaulted audio fields accept.
         **({"audio_preparation": audio_preparation, "audio_tokens": audio_tokens}
            if audio_preparation is not None else {}),
-        # Video is a frontend-only modality: its frames reuse the vision graphs, so a recipe that
-        # serves video declares the sampling settings and the token layout with no new graph kind.
-        **({"video": video, "video_tokens": video_tokens} if video is not None else {}))
+        # Video needs no graph of its own (its frames are vision patches), but a package that
+        # serves video still declares the token layout the prompt builder splices with.
+        **({"video_tokens": video_tokens} if video_tokens is not None else {}))
 
 
 def prefix_boundary(roles, *, append_role=None, minimum_messages=1, required_start="", required_end="", required_marker=""):
