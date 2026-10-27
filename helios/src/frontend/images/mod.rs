@@ -326,6 +326,19 @@ enum Profile {
     Glm,
 }
 
+impl Profile {
+    /// The patch and merge sizes of the profile's vision layout, when it packs `patch x patch`
+    /// RGB patches and merges them in `merge x merge` groups. Video frame pairs reuse that
+    /// packing, so only such a layout can host one.
+    fn patch_layout(&self) -> Option<(usize, usize)> {
+        match self {
+            Profile::MiMo(processor) => Some((processor.patch_size, MERGE)),
+            Profile::PatchMerge(processor) => Some((processor.patches.patch_size, MERGE)),
+            _ => None,
+        }
+    }
+}
+
 impl ImageProcessor {
     pub fn load(settings: ImageSettings, limits: ImageLimits) -> Result<Self> {
         if [
@@ -365,10 +378,13 @@ impl ImageProcessor {
         Ok(Self { limits, profile, identity_domain, counts: Default::default(), decoded_budget, video: None, audio: None })
     }
 
-    /// Prepares video frame pairs through this processor's vision limits.
+    /// Prepares video frame pairs through this processor's vision limits. A video reuses the
+    /// image layout's packing, so the profile must declare the same patch and merge geometry the
+    /// pair packing assumes: one vision feature per `patch_size x patch_size` block, merged in
+    /// `merge_size x merge_size` groups, which is also the factor every frame is aligned to.
     pub fn with_video(mut self, settings: &video::VideoSettings) -> Result<Self> {
-        if !matches!(self.profile, Profile::MiMo(_)) {
-            return Err("video preprocessing requires the MiMo image profile".into());
+        if self.profile.patch_layout() != Some((PATCH, MERGE)) {
+            return Err("video preprocessing requires a vision layout that packs 16x16 patches merged in 2x2 groups".into());
         }
         self.video = Some(std::sync::Arc::new(video::VideoProfile::load(settings, self.limits)?));
         Ok(self)

@@ -209,6 +209,20 @@ pub(super) fn describe_index(
     Ok(value)
 }
 
+/// A media profile as the inspection reports it: every packaged setting under the profile's
+/// name, plus the feature token the prepared contract accepts for it.
+fn media_profile(
+    profile: Option<(&'static str, serde_json::Map<String, Value>)>,
+    feature_token: Option<u32>,
+) -> Value {
+    let Some((name, mut fields)) = profile else {
+        return Value::Null;
+    };
+    fields.insert("profile".into(), json!(name));
+    fields.insert("feature_token".into(), json!(feature_token));
+    Value::Object(fields)
+}
+
 pub(super) fn frontend_json(
     settings: &wire::FrontendSettings,
     contract: Option<&wire::FrontendContract>,
@@ -243,22 +257,14 @@ pub(super) fn frontend_json(
             "wrapping_newlines": r.wrapping_newlines,
             "terminal_markers": r.terminal_markers,
         })),
-        "audio": settings.audio.as_ref().and_then(|audio| audio.profile.as_ref()).map(|profile| {
-            use wire::audio_settings::Profile;
-            match profile {
-                Profile::Mimo(c) => json!({"profile": "mimo", "sampling_rate": c.sampling_rate, "n_mels": c.n_mels,
-                    "segment_frames": c.segment_frames, "max_seconds": c.max_seconds,
-                    "feature_token": contract.and_then(|c| c.audio_tokens.as_ref()).map(|t| t.feature_token)}),
-            }
-        }),
-        "video": settings.video.as_ref().and_then(|video| video.profile.as_ref()).map(|profile| {
-            use wire::video_settings::Profile;
-            match profile {
-                Profile::Mimo(c) => json!({"profile": "mimo", "min_pixels": c.min_pixels, "max_pixels": c.max_pixels,
-                    "total_max_pixels": c.total_max_pixels, "num_frames": c.num_frames, "max_frames": c.max_frames,
-                    "feature_token": contract.and_then(|c| c.video_tokens.as_ref()).map(|t| t.feature_token)}),
-            }
-        }),
+        "audio": media_profile(
+            settings.audio.as_ref().and_then(|audio| super::media::audio(audio).ok()),
+            contract.and_then(|c| c.audio_tokens.as_ref()).map(|t| t.feature_token),
+        ),
+        "video": media_profile(
+            settings.video.as_ref().and_then(|video| super::media::video(video).ok()),
+            contract.and_then(|c| c.video_tokens.as_ref()).map(|t| t.feature_token),
+        ),
         "assistant_marker": contract.map(|c| c.assistant_marker.clone()),
         "message_end_markers": contract.map(|c| c.message_end_markers.clone()),
         "rejected_tokens": contract.map_or(0, |c| c.rejected_tokens.len()),
@@ -748,5 +754,50 @@ mod tests {
         assert_eq!(frontend["prompt_encoder"], "DEEPSEEK_V41");
         assert_eq!(frontend["image_placeholder_token_id"], 7);
         assert!(frontend["tools"].is_null());
+    }
+
+    #[test]
+    #[cfg(feature = "images")]
+    fn media_descriptions_report_every_setting_the_payload_carries() {
+        let settings = wire::FrontendSettings {
+            tokenizer: Some(wire::TokenizerSettings::default()),
+            eos_token_ids: vec![1],
+            audio: Some(wire::AudioSettings {
+                profile: Some(wire::audio_settings::Profile::Mimo(wire::MimoAudioSettings {
+                    sampling_rate: 24_000, n_fft: 960, hop_length: 240, window_length: 960, n_mels: 128,
+                    f_min: 0., f_max: None, segment_frames: 6_000, kernel_size: 3, stride: 2, pooling: 2,
+                    group_size: 4, max_seconds: 3_600,
+                })),
+            }),
+            video: Some(wire::VideoSettings {
+                profile: Some(wire::video_settings::Profile::Mimo(wire::MimoVideoSettings {
+                    min_pixels: 8_192, max_pixels: 8_388_608, total_max_pixels: 268_435_456,
+                    num_frames: 32, max_frames: 3_600,
+                    pixel_mean: vec![123.675, 116.28, 103.53], pixel_std: vec![58.395, 57.12, 57.375],
+                })),
+            }),
+            ..Default::default()
+        };
+        let contract = wire::FrontendContract {
+            audio_tokens: Some(wire::AudioTokenLayout { feature_token: 151_669 }),
+            video_tokens: Some(wire::VideoTokenLayout { feature_token: 151_656, start_token: 151_670, end_token: 151_671 }),
+            ..Default::default()
+        };
+        let described = frontend_json(&settings, Some(&contract));
+        let payload = super::super::protobuf::frontend_settings(settings.clone()).unwrap();
+        // Nothing the frontend is asked to apply may be missing from the description, and the
+        // values must be the payload's own.
+        for (section, feature_token) in [("audio", 151_669), ("video", 151_656)] {
+            let described = described[section].as_object().expect("described profile");
+            assert_eq!(described["profile"], "mimo");
+            assert_eq!(described["feature_token"], feature_token);
+            let payload = payload[section]["mimo"].as_object().expect("payload profile");
+            assert!(!payload.is_empty());
+            for (name, value) in payload {
+                assert_eq!(&described[name], value, "{section}.{name}");
+            }
+            assert_eq!(described.len(), payload.len() + 2);
+        }
+        assert!(frontend_json(&wire::FrontendSettings::default(), None)["audio"].is_null());
     }
 }

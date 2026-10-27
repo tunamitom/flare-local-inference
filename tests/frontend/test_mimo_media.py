@@ -109,6 +109,11 @@ def test_video_sampling_pairs_and_patches_match_the_oracle(tool, tmp_path, total
     assert len(actual['pairs']) == grid[0]
     assert all(pair['grid_thw'] == [1, grid[1], grid[2]] for pair in actual['pairs'])
     assert actual['tokens'] == ids.count(151656)
+    # The block replaces the template's whole vision envelope, so the processor's ids are the
+    # block itself: video_start, one timestamped vision envelope per grid, video_end.
+    assert actual['grid_thw'] == grid
+    assert actual['second_per_grid_ts'] == 2.0
+    assert actual['prompt_tokens'] == len(ids)
     # The oracle's prompt carries "MM:SS" before each pair's vision envelope.
     rendered = processor.tokenizer.decode(ids)
     timestamps = [part.split('<|vision_start|>')[0] for part in rendered.split('<|mimo_video_start|>')[1].split('<|vision_end|>')[:-1]]

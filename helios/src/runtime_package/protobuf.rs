@@ -126,9 +126,10 @@ pub(super) fn frontend_settings(value: wire::FrontendSettings) -> Result<serde_j
     });
     let image = value
         .image
+        .as_ref()
         .map(|image| -> Result<serde_json::Value> {
             use wire::image_settings::Profile;
-            Ok(match required(image.profile, "image profile")? {
+            Ok(match image.profile.as_ref().ok_or_else(|| invalid("missing protobuf image profile"))? {
                 Profile::Qwen(config) => serde_json::json!({"qwen": {
                     "min_pixels": config.min_pixels, "max_pixels": config.max_pixels,
                     "position_side": config.position_side, "image_token_id": config.image_token_id,
@@ -155,41 +156,35 @@ pub(super) fn frontend_settings(value: wire::FrontendSettings) -> Result<serde_j
             })
         })
         .transpose()?;
-    let audio = value
-        .audio
-        .map(|audio| -> Result<serde_json::Value> {
-            use wire::audio_settings::Profile;
-            Ok(match required(audio.profile, "audio profile")? {
-                Profile::Mimo(config) => serde_json::json!({"mimo": {
-                    "sampling_rate": config.sampling_rate, "n_fft": config.n_fft, "hop_length": config.hop_length,
-                    "window_length": config.window_length, "n_mels": config.n_mels, "f_min": config.f_min,
-                    "f_max": config.f_max, "segment_frames": config.segment_frames, "kernel_size": config.kernel_size,
-                    "stride": config.stride, "pooling": config.pooling, "group_size": config.group_size,
-                    "max_seconds": config.max_seconds,
-                }}),
-            })
-        })
-        .transpose()?;
-    let video = value
-        .video
-        .map(|video| -> Result<serde_json::Value> {
-            use wire::video_settings::Profile;
-            Ok(match required(video.profile, "video profile")? {
-                Profile::Mimo(config) => serde_json::json!({"mimo": {
-                    "min_pixels": config.min_pixels, "max_pixels": config.max_pixels,
-                    "total_max_pixels": config.total_max_pixels, "num_frames": config.num_frames,
-                    "max_frames": config.max_frames, "pixel_mean": config.pixel_mean, "pixel_std": config.pixel_std,
-                }}),
-            })
-        })
-        .transpose()?;
-    Ok(
-        serde_json::json!({"tokenizer": tokenizer, "image": image, "audio": audio, "video": video,
-                          "eos_token_ids": value.eos_token_ids,
-                          "template_encoding": value.template_encoding,
-                          "prompt_encoder": value.prompt_encoder,
-                          "image_placeholder_token_id": value.image_placeholder_token_id}),
-    )
+    // A profile's settings travel as one JSON object under the profile's name; the inspection
+    // description reads the same fields from `media`.
+    let profile = |profile: Option<(&'static str, serde_json::Map<String, serde_json::Value>)>| match profile {
+        None => serde_json::Value::Null,
+        Some((name, fields)) => {
+            let mut object = serde_json::Map::new();
+            object.insert(name.to_owned(), serde_json::Value::Object(fields));
+            serde_json::Value::Object(object)
+        }
+    };
+    let audio = profile(value.audio.as_ref().map(super::media::audio).transpose()?);
+    let video = profile(value.video.as_ref().map(super::media::video).transpose()?);
+    let mut settings = serde_json::Map::new();
+    settings.insert("tokenizer".into(), tokenizer);
+    settings.insert("eos_token_ids".into(), serde_json::json!(value.eos_token_ids));
+    settings.insert("template_encoding".into(), serde_json::json!(value.template_encoding));
+    settings.insert("prompt_encoder".into(), serde_json::json!(value.prompt_encoder));
+    settings.insert("image_placeholder_token_id".into(), serde_json::json!(value.image_placeholder_token_id));
+    // The frontend carries media profiles only with the images feature, so the payload carries
+    // those keys exactly when the settings type that reads it can hold them.
+    #[cfg(feature = "images")]
+    {
+        settings.insert("image".into(), image.unwrap_or(serde_json::Value::Null));
+        settings.insert("audio".into(), audio);
+        settings.insert("video".into(), video);
+    }
+    #[cfg(not(feature = "images"))]
+    drop((image, audio, video));
+    Ok(serde_json::Value::Object(settings))
 }
 fn required<T>(value: Option<T>, name: &str) -> Result<T> {
     value.ok_or_else(|| invalid(format!("missing protobuf {name}")))
@@ -348,6 +343,33 @@ pub(super) fn edge(value: wire::Edge) -> Result<Edge> {
 mod tests {
     use super::*;
     use prost::Message;
+
+    #[test]
+    #[cfg(not(feature = "images"))]
+    fn media_settings_are_absent_without_the_images_feature() {
+        // The frontend settings type has no media fields without the images feature, so the
+        // payload carries no keys its deserializer would reject.
+        let mut value = wire::FrontendSettings {
+            tokenizer: Some(wire::TokenizerSettings::default()),
+            eos_token_ids: vec![1],
+            ..Default::default()
+        };
+        value.video = Some(wire::VideoSettings {
+            profile: Some(wire::video_settings::Profile::Mimo(wire::MimoVideoSettings {
+                min_pixels: 8_192,
+                max_pixels: 8_388_608,
+                total_max_pixels: 268_435_456,
+                num_frames: 32,
+                max_frames: 3_600,
+                pixel_mean: vec![123.675, 116.28, 103.53],
+                pixel_std: vec![58.395, 57.12, 57.375],
+            })),
+        });
+        let json = frontend_settings(value).unwrap();
+        for key in ["image", "audio", "video"] {
+            assert!(json.get(key).is_none(), "{key}");
+        }
+    }
 
     #[test]
     fn rebuild_catalogs_do_not_change_native_bundle_loading() {
@@ -556,10 +578,14 @@ mod tests {
             assert_eq!(json["eos_token_ids"], serde_json::json!([1]));
             assert_eq!(json["prompt_encoder"], 0);
             assert!(json["image_placeholder_token_id"].is_null());
-            if image {
-                assert_eq!(json["image"], serde_json::json!({"deepseek4": {}}));
+            if cfg!(feature = "images") {
+                if image {
+                    assert_eq!(json["image"], serde_json::json!({"deepseek4": {}}));
+                } else {
+                    assert!(json["image"].is_null());
+                }
             } else {
-                assert!(json["image"].is_null());
+                assert!(json.get("image").is_none());
             }
             #[cfg(feature = "server")]
             {
@@ -586,7 +612,11 @@ mod tests {
         let bytes = &[0x0a, 0x00, 0x12, 0x02, 0x42, 0x00, 0x1a, 0x01, 0x01][..];
         let decoded = wire::FrontendSettings::decode(bytes).unwrap();
         let json = frontend_settings(decoded).unwrap();
-        assert_eq!(json["image"], serde_json::json!({"glm": {}}));
+        if cfg!(feature = "images") {
+            assert_eq!(json["image"], serde_json::json!({"glm": {}}));
+        } else {
+            assert!(json.get("image").is_none());
+        }
         assert_eq!(json["prompt_encoder"], 0);
         #[cfg(feature = "server")]
         {
@@ -648,7 +678,11 @@ mod tests {
             video: None,
         };
         let json = frontend_settings(value).unwrap();
-        assert_eq!(json["image"], serde_json::json!({"deepseek4": {}}));
+        if cfg!(feature = "images") {
+            assert_eq!(json["image"], serde_json::json!({"deepseek4": {}}));
+        } else {
+            assert!(json.get("image").is_none());
+        }
         #[cfg(feature = "server")]
         {
             let frontend: crate::frontend::FrontendSettings = serde_json::from_value(json).unwrap();

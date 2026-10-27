@@ -72,7 +72,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "height": pair.geometry.height, "positions": processed.position_ids}));
         }
         fs::write(output.join("pixels.f32"), pixels)?;
-        metadata["video"] = json!({"sampled_indices": indices, "pairs": pairs, "tokens": description.tokens()});
+        metadata["video"] = json!({"sampled_indices": indices, "pairs": pairs, "tokens": description.tokens(),
+            "grid_thw": description.grid_thw, "second_per_grid_ts": description.second_per_grid_ts(),
+            // MM:SS labels are five tokens with the checkpoint tokenizer.
+            "prompt_tokens": description.prompt_tokens(5)});
     }
     fs::write(output.join("metadata.json"), serde_json::to_vec(&metadata)?)?;
     Ok(())
