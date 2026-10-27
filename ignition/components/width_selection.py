@@ -215,6 +215,10 @@ class PreparedSelectedVerification:
         t.active.copy_(s.active)
         t.verify(s.active)
         commit = t.operations[3]
+        if commit.survival is not None and getattr(commit, "_survival", None) is None:
+            # A width-one body observes no prefix, and its commit publishes no survival rows; the host reads
+            # every switched round's frame, so mark it unobserved instead of leaving an older round's rows.
+            commit.survival.index_fill_(0, commit.frame.long(), -1.)
         if t.width != s.width:
             # The host planned one round of the switch's full width: every record it completes reports
             # that width, whichever body ran (field 15 is the verification width).
