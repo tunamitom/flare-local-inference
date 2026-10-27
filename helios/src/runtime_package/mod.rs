@@ -865,6 +865,8 @@ impl NativeResources {
                     self.templates.push(handle);
                 }
                 let mut nodes = Vec::with_capacity(graph.node_count);
+                let mut symbols: Vec<&str> = Vec::with_capacity(graph.node_count);
+                let mut pairs: std::collections::BTreeMap<(String, String, [u8; 8]), usize> = Default::default();
                 let mut records = files.records(package, &graph.resource)?;
                 for _ in 0..graph.node_count {
                     let node = protobuf::node(records.read()?)?;
@@ -877,6 +879,11 @@ impl NativeResources {
                         }
                     }
                     let node = &node;
+                    symbols.push(match node {
+                        Node::Kernel { function, .. } => package.functions.iter().find(|entry| entry.id == *function)
+                            .map_or("unknown", |entry| entry.symbol.as_str()),
+                        _ => "non-kernel",
+                    });
                     let mut result = null_mut();
                     match node {
                         Node::Kernel {
@@ -1085,6 +1092,11 @@ impl NativeResources {
                         incoming[edge.destination] = true;
                         if edge.data != [0; 8] {
                             annotated += 1;
+                            if edge_mode.contains("pairs") {
+                                let short = |name: &str| name.chars().take(70).collect::<String>();
+                                *pairs.entry((short(symbols[edge.source]), short(symbols[edge.destination]), edge.data))
+                                    .or_default() += 1;
+                            }
                             if serialize {
                                 edge.data = [0; 8];
                             }
@@ -1108,6 +1120,9 @@ impl NativeResources {
                     if !edge_mode.is_empty() {
                         eprintln!("programmatic edges: {} {annotated}{}", graph.name,
                             if serialize { " serialized" } else { "" });
+                        for ((source, destination, data), count) in &pairs {
+                            eprintln!("programmatic pair: {} {count} {source} -> {destination} {data:?}", graph.name);
+                        }
                     }
                 }
                 if target.is_some() {
