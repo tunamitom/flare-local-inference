@@ -237,7 +237,7 @@ pub(super) fn prepare_inference_cached(
                 text: frontend.decode(&token_ids, false)?,
                 token_ids,
                 image_sources: Vec::new(),
-                image_checkpoint_hints: Vec::new(),
+                image_checkpoint_hints: Vec::new(), audio_sources: Vec::new(), video_sources: Vec::new(),
             },
             echo,
         )
@@ -245,6 +245,10 @@ pub(super) fn prepare_inference_cached(
         (frontend.render_chat(&normalized, &options)?, String::new())
     };
     let images = describe_images(&rendered.image_sources, processor, input_store)?;
+    // Audio and video placeholders are one token until their clips are decoded, so the media is
+    // described here, before the prompt is expanded, and rides into the layout already described.
+    let audio = crate::model::media::describe_audio(config, processor, &rendered.audio_sources)?;
+    let video = crate::model::media::describe_video(config, processor, &rendered.video_sources)?;
     let output = if raw.is_some() {
         None
     } else {
@@ -281,7 +285,10 @@ pub(super) fn prepare_inference_cached(
         data,
         conditioning,
         conditioned_inputs,
-    } = crate::model::prepare_image_inputs(config, frontend, processor, &rendered, images)?;
+        audio_inputs,
+    } = crate::model::prepare_media_inputs(
+        config, frontend, processor, &rendered, images, audio, video,
+    )?;
     let mut expansions = token_expansions.iter().peekable();
     let mut additional = 0;
     for boundary in &mut message_boundaries {
@@ -349,6 +356,7 @@ pub(super) fn prepare_inference_cached(
             message_boundaries,
             data,
             conditioned_inputs,
+            audio_inputs,
             conditioning,
             sampling,
             max_new_tokens,

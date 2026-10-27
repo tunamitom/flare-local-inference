@@ -128,6 +128,7 @@ fn scheduler_with_geometry(active: usize, pages: u32, snapshots: u32, page_token
                 patches_per_feature: 4,
                 patch_capacities: vec![256, 1024, 4096, 16384],
             },
+            audio: Default::default(),
             draft_pages_per_request: 1,
             completion_inputs: vec![],
             speculative_allocations: vec![],
@@ -242,6 +243,108 @@ fn init(scheduler: &mut RequestScheduler, fence: u64) {
     scheduler
         .complete(Fence(fence), &completions, Default::default())
         .unwrap();
+}
+
+/// A scheduler whose package declares one audio graph of 6000 mel frames and the vision arena the
+/// audio publication writes into.
+fn audio_scheduler() -> RequestScheduler {
+    let mut scheduler = RequestScheduler::new(
+        [9; 32],
+        SchedulerLimits {
+            request_slots: 1,
+            max_active: 1,
+            max_sequence_tokens: 2048,
+            prefill_chunk_size: 512,
+            pages: 8,
+            snapshots: 2,
+        },
+        SchedulerCapabilities {
+            vocabulary: 248320,
+            page_tokens: 64,
+            vision: crate::model::VisionCapabilities {
+                feature_slots: 2,
+                features_per_request: 32768,
+                max_images: 4,
+                patches_per_feature: 4,
+                patch_capacities: vec![256, 1024, 4096, 16384, 32768],
+            },
+            audio: crate::model::AudioCapabilities { frame_capacities: vec![6000] },
+            draft_pages_per_request: 1,
+            completion_inputs: vec![],
+            speculative_allocations: vec![],
+            state_rows_per_request: None,
+        },
+    )
+    .unwrap();
+    let mut graphs = duration_graphs(1);
+    graphs.push(crate::execution::GraphDescriptor {
+        confidence_width: 0,
+        draft_tokens: 0,
+        packed_token_capacity: 0,
+        name: "Audio-1-6000".into(),
+        kind: GraphKind::Audio,
+        sampling_mode: crate::execution::SamplingMode::General,
+        handle: 1,
+        batch_capacity: 1,
+        token_capacity: 6000,
+        prefill_capacity: 0,
+        estimated_duration_ns: 1000,
+        input_bindings: vec![],
+    });
+    scheduler.measured_graph_durations(&graphs).unwrap();
+    scheduler
+}
+
+#[test]
+fn audio_segments_run_their_own_graph_between_admission_and_prefill() {
+    let mut scheduler = audio_scheduler();
+    let handle = scheduler.admit(spec(8, 4)).unwrap();
+    // A one-second clip at 24 kHz: 101 mel frames in one segment that publishes seven features.
+    let segment = ConditionedInput {
+        token_span: 1..8,
+        feature_range: 0..7,
+        work: ConditionedWork::Audio { frames: 101, capacity: 6000 },
+    };
+    scheduler.set_conditioned_inputs(handle, &[segment.clone()]).unwrap();
+    init(&mut scheduler, 1);
+    let step = scheduler.plan().unwrap();
+    assert_eq!((step.kind, step.token_capacity), (GraphKind::Audio, 6000));
+    assert_eq!(step.lanes.len(), 1);
+    scheduler.commit(&step, Fence(2)).unwrap();
+    assert!(scheduler.plan().is_none());
+    scheduler
+        .complete(Fence(2), &records(handle, 2, 0, 0, -1, 1), Default::default())
+        .unwrap();
+    // The segment is consumed once; the request resumes with the prompt it now owns.
+    assert_eq!(scheduler.request(handle).unwrap().phase, RequestPhase::Prefill);
+    let step = scheduler.plan().unwrap();
+    assert_eq!(step.kind, GraphKind::Prefill);
+}
+
+#[test]
+fn audio_work_is_admitted_against_the_declared_frame_capacities() {
+    let mut scheduler = audio_scheduler();
+    let handle = scheduler.admit(spec(8, 4)).unwrap();
+    let with = |frames: usize, capacity: usize| ConditionedInput {
+        token_span: 1..8,
+        feature_range: 0..7,
+        work: ConditionedWork::Audio { frames, capacity },
+    };
+    // A segment longer than the declared graph, or a capacity the package never captured, is
+    // rejected before any GPU work is planned.
+    for work in [with(6001, 6000), with(101, 4096), with(0, 6000)] {
+        let error = scheduler
+            .set_conditioned_inputs(handle, &[work])
+            .err()
+            .expect("an inadmissible audio segment is rejected");
+        assert!(
+            error.to_string().contains("conditioned inputs violate prompt or prepared media geometry"),
+            "{error}"
+        );
+    }
+    scheduler.set_conditioned_inputs(handle, &[with(6000, 6000)]).unwrap();
+    init(&mut scheduler, 1);
+    assert_eq!(scheduler.plan().unwrap().kind, GraphKind::Audio);
 }
 
 #[test]
@@ -500,6 +603,7 @@ fn configured_prefill_chunks_and_tails_preserve_alignment_and_live_page_extents(
                     patches_per_feature: 4,
                     patch_capacities: vec![256, 1024, 4096, 16384],
                 },
+                audio: Default::default(),
                 draft_pages_per_request: 1,
                 completion_inputs: vec![],
             speculative_allocations: vec![],
@@ -579,6 +683,7 @@ fn invalid_prefill_limits_reject_before_request_resources_are_created() {
                     patches_per_feature: 4,
                     patch_capacities: vec![256, 1024, 4096, 16384],
                 },
+                audio: Default::default(),
                 draft_pages_per_request: 1,
                 completion_inputs: vec![],
             speculative_allocations: vec![],
@@ -1987,6 +2092,7 @@ fn declared_model_capabilities_drive_state_slots_vision_buckets_and_copy_validat
             patches_per_feature: 2,
             patch_capacities: vec![8, 32],
         },
+        audio: Default::default(),
         draft_pages_per_request: 1,
         completion_inputs: vec![],
             speculative_allocations: vec![],

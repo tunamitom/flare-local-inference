@@ -168,6 +168,7 @@ impl Fixture {
                     message_boundaries: vec![],
                     data,
                     conditioned_inputs: vec![],
+                    audio_inputs: vec![],
                     conditioning: vec![],
                     sampling: SamplingParameters::default(),
                     max_new_tokens: limit,

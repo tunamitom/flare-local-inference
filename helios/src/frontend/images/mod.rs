@@ -400,8 +400,9 @@ impl ImageProcessor {
         self.video.as_deref()
     }
 
-    pub fn audio(&self) -> Option<&super::audio::AudioProfile> {
-        self.audio.as_deref()
+    /// The prepared audio profile, shared with the prompt inputs its clips were described by.
+    pub fn audio(&self) -> Option<&std::sync::Arc<super::audio::AudioProfile>> {
+        self.audio.as_ref()
     }
 
     /// Identity of the decoded representation consumed by this preparation profile.

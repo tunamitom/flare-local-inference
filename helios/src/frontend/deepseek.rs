@@ -483,7 +483,7 @@ pub(super) fn render(
         text: rendered.prompt,
         token_ids,
         image_sources,
-        image_checkpoint_hints: Vec::new(),
+        image_checkpoint_hints: Vec::new(), audio_sources: Vec::new(), video_sources: Vec::new(),
         message_boundaries,
     })
 }

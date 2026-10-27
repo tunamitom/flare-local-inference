@@ -34,6 +34,24 @@ pub fn prepare_image_inputs(
     rendered: &RenderedPrompt,
     inputs: Vec<crate::frontend::images::ImageInput>,
 ) -> Result<PreparedInput> {
+    prepare_media_inputs(config, frontend, processor, rendered, inputs, vec![], vec![])
+}
+
+/// Expands every media placeholder in the rendered prompt into the features its frontend
+/// described, and admits the result against the prepared arena and graph capacities.
+///
+/// Audio and video clips arrive already decoded: their placeholder counts follow from the decoded
+/// media, so they were described while the prompt was prepared. Video grids ride the vision
+/// layout — a pair is one vision graph run — while audio segments keep their own graph kind.
+pub fn prepare_media_inputs(
+    config: &ModelConfig,
+    frontend: &Frontend,
+    processor: Option<&ImageProcessor>,
+    rendered: &RenderedPrompt,
+    inputs: Vec<crate::frontend::images::ImageInput>,
+    audio: Vec<crate::model::media::DescribedAudio>,
+    video: Vec<crate::model::media::DescribedVideo>,
+) -> Result<PreparedInput> {
     let images = inputs.iter().map(|i| i.description.clone()).collect::<Vec<_>>();
     if rendered
         .token_ids
@@ -41,6 +59,27 @@ pub fn prepare_image_inputs(
         .any(|token| config.contract.frontend.rejected_tokens.contains(token))
     {
         return Err("prompt contains an input token outside the prepared frontend contract".into());
+    }
+    if config.contract.frontend.image_layout == Some(ImageLayoutKind::Mimo) {
+        let prepared = crate::frontend::images::layouts::mimo::prepare_media_input(
+            config, frontend, processor, rendered, &inputs, &audio, &video,
+        )?;
+        super::validate_prompt_data(config, &prepared.tokens, &prepared.data)?;
+        validate_conditioned_inputs(
+            config,
+            &prepared.tokens,
+            &prepared.data,
+            &prepared.conditioned_inputs,
+            &prepared.audio_inputs,
+        )?;
+        return Ok(prepared);
+    }
+    if !audio.is_empty() || !video.is_empty() {
+        return Err(format!(
+            "prepared {:?} layout serves images only",
+            config.contract.frontend.image_layout
+        )
+        .into());
     }
     let mut prepared = match config.contract.frontend.image_layout {
         Some(ImageLayoutKind::Bracketed) => crate::frontend::images::layouts::bracketed::prepare_input(
@@ -61,9 +100,7 @@ pub fn prepare_image_inputs(
         Some(ImageLayoutKind::Step) => crate::frontend::images::layouts::step::prepare_input(
             frontend, processor, rendered, &images,
         )?,
-        Some(ImageLayoutKind::Mimo) => crate::frontend::images::layouts::mimo::prepare_input(
-            frontend, processor, rendered, &images,
-        )?,
+        Some(ImageLayoutKind::Mimo) => unreachable!("MiMo media is prepared above"),
         Some(ImageLayoutKind::DeepseekRowMajor) => {
             crate::frontend::images::layouts::deepseek::prepare_row_major_input(
                 config.contract.vocabulary,
@@ -101,6 +138,7 @@ pub fn prepare_image_inputs(
                 },
                 conditioning: vec![],
                 conditioned_inputs: vec![],
+                audio_inputs: vec![],
             }
         }
     };
@@ -124,34 +162,81 @@ pub fn prepare_image_inputs(
         }
     }
     super::validate_prompt_data(config, &prepared.tokens, &prepared.data)?;
-    validate_conditioned_inputs(config, &prepared.tokens, &prepared.data, &prepared.conditioned_inputs)?;
+    validate_conditioned_inputs(
+        config,
+        &prepared.tokens,
+        &prepared.data,
+        &prepared.conditioned_inputs,
+        &[],
+    )?;
     Ok(prepared)
 }
 
+/// Every conditioned input, of either kind, owns a disjoint token span and a disjoint slice of the
+/// one feature arena; together they tile the arena from zero so the prompt's feature indices and
+/// the published features agree position by position.
 pub(crate) fn validate_conditioned_inputs(
-    config: &ModelConfig, tokens: &[u32], data: &PromptData,
+    config: &ModelConfig,
+    tokens: &[u32],
+    data: &PromptData,
     inputs: &[crate::frontend::images::PreparedImageInput],
+    audio: &[crate::frontend::audio::PreparedAudioInput],
 ) -> Result<()> {
-    let mut token_end = 0;
-    let mut feature_end = 0;
     let vision = &config.contract.vision;
+    let mut spans: Vec<(std::ops::Range<usize>, std::ops::Range<usize>)> = Vec::new();
     for input in inputs {
-        if input.token_span.start < token_end || input.token_span.start >= input.token_span.end
-            || input.token_span.end > tokens.len() || input.feature_range.start != feature_end
-            || input.feature_range.end.checked_sub(feature_end) != Some(input.geometry.tokens)
-            || input.geometry.tokens == 0 || input.geometry.tokens > vision.features_per_request
+        if input.token_span.start >= input.token_span.end
+            || input.token_span.end > tokens.len()
+            || input.geometry.tokens == 0
+            || input.geometry.tokens > vision.features_per_request
             || input.geometry.patches > vision.patch_capacities.last().copied().unwrap_or(0)
-            || input.geometry.tokens.checked_mul(vision.patches_per_feature) != Some(input.geometry.patches)
-            || input.feature_range.end > tokens.len() || input.feature_range.end > i32::MAX as usize
+            || input.geometry.tokens.checked_mul(vision.patches_per_feature)
+                != Some(input.geometry.patches)
+            || input.feature_range.len() != input.geometry.tokens
+            || input.feature_range.end > i32::MAX as usize
         {
             return Err("conditioned input spans or features violate prompt geometry".into());
         }
-        let indices = data.vision_token_indices.get(input.token_span.clone())
+        spans.push((input.token_span.clone(), input.feature_range.clone()));
+    }
+    for input in audio {
+        if input.token_span.start >= input.token_span.end
+            || input.token_span.end > tokens.len()
+            || input.feature_range.len() != input.tokens()
+            || input.tokens() == 0
+            || input.feature_range.end > i32::MAX as usize
+            || input.capacities.len() != input.segments().len()
+            || input
+                .capacities
+                .iter()
+                .zip(input.segments())
+                .any(|(capacity, segment)| *capacity < segment.frames)
+        {
+            return Err("audio input spans or features violate prompt geometry".into());
+        }
+        spans.push((input.token_span.clone(), input.feature_range.clone()));
+    }
+    spans.sort_by_key(|(span, _)| span.start);
+    let (mut token_end, mut feature_end) = (0, 0);
+    for (span, features) in &spans {
+        if span.start < token_end
+            || features.start < feature_end
+            || features.start >= features.end
+        {
+            return Err("conditioned inputs overlap in the prompt or the feature arena".into());
+        }
+        token_end = span.end;
+        feature_end = features.end;
+        let indices = data
+            .vision_token_indices
+            .get(span.clone())
             .ok_or("conditioned input has no prompt feature indices")?;
-        let mut seen = vec![false; input.geometry.tokens];
+        let mut seen = vec![false; features.len()];
         for index in indices.iter().copied().filter(|index| *index >= 0) {
-            let local = (index as usize).checked_sub(feature_end)
-                .filter(|local| *local < seen.len()).ok_or("conditioned feature belongs to another input")?;
+            let local = (index as usize)
+                .checked_sub(features.start)
+                .filter(|local| *local < seen.len())
+                .ok_or("conditioned feature belongs to another input")?;
             if std::mem::replace(&mut seen[local], true) {
                 return Err("conditioned feature appears more than once in the prompt".into());
             }
@@ -159,10 +244,17 @@ pub(crate) fn validate_conditioned_inputs(
         if seen.iter().any(|seen| !seen) {
             return Err("conditioned input features are absent from its prompt span".into());
         }
-        token_end = input.token_span.end;
-        feature_end = input.feature_range.end;
     }
-    if data.vision_token_indices.iter().filter(|index| **index >= 0).count() != feature_end {
+    let mut ranges: Vec<_> = spans.iter().map(|(_, features)| features.clone()).collect();
+    ranges.sort_by_key(|range| range.start);
+    let mut cursor = 0;
+    for range in &ranges {
+        if range.start != cursor {
+            return Err("prompt features are not owned by conditioned input spans".into());
+        }
+        cursor = range.end;
+    }
+    if data.vision_token_indices.iter().filter(|index| **index >= 0).count() != cursor {
         return Err("prompt features are not owned by conditioned input spans".into());
     }
     Ok(())
@@ -411,7 +503,8 @@ mod tests {
             let processor = ImageProcessor::load(settings, limits).unwrap();
             let text = format!("a{placeholder}b{placeholder}c{placeholder}d");
             let rendered = RenderedPrompt { message_boundaries: Vec::new(), token_ids: frontend.encode(&text, false).unwrap(),
-                text, image_sources: vec![], image_checkpoint_hints: vec![] };
+                text, image_sources: vec![], image_checkpoint_hints: vec![],
+                audio_sources: vec![], video_sources: vec![] };
             let images = (0..3).map(|i| RgbImage::new(64, 64, vec![i; 64 * 64 * 3]).unwrap()).collect();
             let prepared = prepare_input(&config, &frontend, Some(&processor), &rendered, images).unwrap();
             assert_eq!(prepared.conditioned_inputs.len(), 3, "{layout:?}");
@@ -426,11 +519,11 @@ mod tests {
             let first = malformed.vision_token_indices.iter_mut().find(|index| **index >= 0).unwrap();
             *first = geometry.tokens as i32;
             assert!(validate_conditioned_inputs(&config, &prepared.tokens, &malformed,
-                &prepared.conditioned_inputs).is_err());
+                &prepared.conditioned_inputs, &[]).is_err());
             let mut oversized = config.clone();
             oversized.contract.vision.features_per_request -= 1;
             assert!(validate_conditioned_inputs(&oversized, &prepared.tokens, &prepared.data,
-                &prepared.conditioned_inputs).is_err());
+                &prepared.conditioned_inputs, &[]).is_err());
         }
     }
 
@@ -513,7 +606,7 @@ mod tests {
             let mut token_ids = frontend.encode(&prefix, false).unwrap();
             token_ids.extend(literal.bytes().map(u32::from));
             let rendered = RenderedPrompt { message_boundaries: Vec::new(),
-                image_sources: vec![], image_checkpoint_hints: vec![],
+                image_sources: vec![], image_checkpoint_hints: vec![], audio_sources: vec![], video_sources: vec![],
                 text: prefix + literal,
                 token_ids,
             };
@@ -606,7 +699,7 @@ mod tests {
         let rendered = RenderedPrompt {
             message_boundaries: Vec::new(),
             image_sources: vec![],
-            image_checkpoint_hints: vec![],
+            image_checkpoint_hints: vec![], audio_sources: vec![], video_sources: vec![],
             text: format!("{}<think>\n", config.contract.frontend.assistant_marker),
             token_ids: vec![],
         };
@@ -714,7 +807,7 @@ mod tests {
                 .find(|case| case["name"] == name)
                 .unwrap();
             let rendered = RenderedPrompt { message_boundaries: Vec::new(),
-                image_sources: vec![], image_checkpoint_hints: vec![],
+                image_sources: vec![], image_checkpoint_hints: vec![], audio_sources: vec![], video_sources: vec![],
                 text: case["rendered"].as_str().unwrap().into(),
                 token_ids: vec![],
             };
@@ -750,7 +843,7 @@ mod tests {
                 ),
             ] {
                 let rendered = RenderedPrompt { message_boundaries: Vec::new(),
-                    image_sources: vec![], image_checkpoint_hints: vec![],
+                    image_sources: vec![], image_checkpoint_hints: vec![], audio_sources: vec![], video_sources: vec![],
                     text: format!("<|im_start|>{role}\nliteral <think><|im_end|>\n{suffix}"),
                     token_ids: vec![],
                 };
@@ -774,7 +867,7 @@ mod tests {
         }
         let messages = vec![json!({"role":"user","content":"<think>"})];
         let rendered = RenderedPrompt { message_boundaries: Vec::new(),
-            image_sources: vec![], image_checkpoint_hints: vec![],
+            image_sources: vec![], image_checkpoint_hints: vec![], audio_sources: vec![], video_sources: vec![],
             text: "<|im_start|>user\n<think>".into(),
             token_ids: vec![],
         };
@@ -825,7 +918,7 @@ mod tests {
                 ("</think>".into(), OutputStart::Content),
             ] {
                 let rendered = RenderedPrompt { message_boundaries: Vec::new(),
-                    image_sources: vec![], image_checkpoint_hints: vec![],
+                    image_sources: vec![], image_checkpoint_hints: vec![], audio_sources: vec![], video_sources: vec![],
                     text: format!("<｜User｜>Hello<｜Assistant｜>{suffix}"),
                     token_ids: vec![],
                 };
@@ -886,7 +979,7 @@ mod tests {
             let rendered = RenderedPrompt {
                 message_boundaries: Vec::new(),
                 image_sources: vec![],
-                image_checkpoint_hints: vec![],
+                image_checkpoint_hints: vec![], audio_sources: vec![], video_sources: vec![],
                 text: text.clone(),
                 token_ids: vec![],
             };

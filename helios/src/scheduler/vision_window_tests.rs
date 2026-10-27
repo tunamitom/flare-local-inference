@@ -35,6 +35,7 @@ fn scheduler_with_resources(
                 patches_per_feature: 4,
                 patch_capacities: vec![256, 1024, 4096, 16_384],
             },
+            audio: Default::default(),
             draft_pages_per_request: 1,
             completion_inputs: vec![],
             speculative_allocations: vec![],
@@ -53,7 +54,7 @@ fn inputs(count: usize) -> Vec<ConditionedInput> {
         .map(|image| ConditionedInput {
             token_span: 17 + image * 4096..17 + (image + 1) * 4096,
             feature_range: image * 4096..(image + 1) * 4096,
-            patches: 16_384,
+            work: crate::scheduler::ConditionedWork::Vision { patches: 16_384 },
         })
         .collect()
 }

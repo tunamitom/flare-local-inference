@@ -69,6 +69,48 @@ fn arguments(v: &Value) -> Result<Value> {
 fn qualified(name: &str, namespace: Option<&str>) -> String {
     namespace.map_or_else(|| name.to_owned(), |ns| format!("{ns}__{name}"))
 }
+
+/// Largest base64 payload one media part may carry. The prepared audio and video profiles keep
+/// their own encoded byte limit; this ceiling rejects an absurd part before it is decoded, and the
+/// HTTP body limit normally binds first. Oversized parts are never truncated.
+const MAX_MEDIA_BASE64: usize = 32 * 1024 * 1024 / 3 * 4 + 4;
+
+fn media_payload<'a>(v: &'a Value, key: &str) -> Result<&'a str> {
+    let data = field(v, key)?;
+    if data.is_empty() {
+        return Err(format!("{key} must not be empty").into());
+    }
+    if data.len() > MAX_MEDIA_BASE64 {
+        return Err(format!(
+            "{key} is {} bytes of base64; the maximum is {MAX_MEDIA_BASE64}",
+            data.len()
+        )
+        .into());
+    }
+    Ok(data)
+}
+
+/// `{"type":"input_audio","input_audio":{"data":"<base64>","format":"wav"}}`.
+fn audio_part(part: &Value) -> Result<Part> {
+    let audio = crate::frontend::audio::AudioSource::from_part(part)?;
+    media_payload(&part["input_audio"], "data")?;
+    Ok(Part::Audio {
+        format: audio.format,
+        data: audio.data,
+    })
+}
+
+/// `{"type":"video_url","video_url":{"url":"data:video/mp4;base64,..."}}`, with optional
+/// `num_frames`, `fps`, and `max_pixels` sampling controls beside the URL.
+fn video_part(part: &Value) -> Result<Part> {
+    let video = crate::frontend::images::video::VideoSource::from_part(part)?;
+    media_payload(&part["video_url"], "url")?;
+    Ok(Part::Video {
+        url: video.url,
+        options: video.options,
+    })
+}
+
 fn plain_parts(value: &Value, protocol: Protocol) -> Result<Vec<Part>> {
     if value.is_null() {
         return Ok(vec![]);
@@ -88,6 +130,8 @@ fn plain_parts(value: &Value, protocol: Protocol) -> Result<Vec<Part>> {
             "text" | "input_text" | "output_text" => Ok(Part::Text(field(part, "text")?.into())),
             "image_url" => Ok(Part::Image(field(&part["image_url"], "url")?.into())),
             "input_image" => Ok(Part::Image(field(part, "image_url")?.into())),
+            "input_audio" => audio_part(part),
+            "video_url" => video_part(part),
             "image" if protocol == Protocol::Messages => {
                 let source = &part["source"];
                 if field(source, "type")? != "base64" {
@@ -813,6 +857,133 @@ pub(crate) fn decode(protocol: Protocol, body: Value, count: bool) -> Result<Dec
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn decoded_parts(content: Value) -> Result<Vec<Part>> {
+        let decoded = decode(
+            Protocol::Chat,
+            json!({"messages":[{"role":"user","content":content}]}),
+            false,
+        )?;
+        let Input::Conversation(messages) = decoded.request.input else {
+            panic!("chat input is a conversation")
+        };
+        Ok(messages.into_iter().next().unwrap().parts)
+    }
+
+    #[test]
+    fn audio_parts_accept_every_documented_format() {
+        for format in ["wav", "mp3", "m4a", "ogg", "flac", "webm"] {
+            let parts = decoded_parts(json!([{"type":"text","text":"transcribe"},
+                {"type":"input_audio","input_audio":{"data":"UklGRg==","format":format}}]))
+                .unwrap();
+            assert_eq!(
+                parts[1],
+                Part::Audio { format: format.into(), data: "UklGRg==".into() },
+                "{format}"
+            );
+        }
+        // A format name is case insensitive, as the reference API treats it.
+        assert_eq!(
+            decoded_parts(json!([{"type":"input_audio","input_audio":{"data":"AA==","format":"WAV"}}]))
+                .unwrap()[0],
+            Part::Audio { format: "wav".into(), data: "AA==".into() }
+        );
+    }
+
+    #[test]
+    fn audio_parts_reject_unknown_formats_missing_payloads_and_oversize_clips() {
+        for (part, expected) in [
+            (
+                json!({"type":"input_audio","input_audio":{"data":"AA==","format":"aiff"}}),
+                "input_audio format must be one of",
+            ),
+            (
+                json!({"type":"input_audio","input_audio":{"format":"wav"}}),
+                "input_audio.data must be a nonempty base64 string",
+            ),
+            (
+                json!({"type":"input_audio","input_audio":{"data":"","format":"wav"}}),
+                "must be a nonempty base64 string",
+            ),
+            (json!({"type":"input_audio","input_audio":"AA=="}), "input_audio must be an object"),
+            (json!({"type":"input_audio"}), "input_audio must be an object"),
+        ] {
+            let error = decoded_parts(json!([part.clone()])).err().unwrap().to_string();
+            assert!(error.contains(expected), "{part}: {error}");
+        }
+        let oversize = "A".repeat(MAX_MEDIA_BASE64 + 4);
+        let error = decoded_parts(json!([{"type":"input_audio",
+            "input_audio":{"data":oversize,"format":"mp3"}}]))
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.contains("the maximum is"), "{error}");
+    }
+
+    #[test]
+    fn video_parts_accept_a_data_url_with_sampling_controls() {
+        let parts = decoded_parts(json!([{"type":"video_url","video_url":{
+            "url":"data:video/mp4;base64,AAAAIGZ0eXA=","num_frames":8,"fps":2.0,"max_pixels":65536}}]))
+            .unwrap();
+        assert_eq!(
+            parts[0],
+            Part::Video {
+                url: "data:video/mp4;base64,AAAAIGZ0eXA=".into(),
+                options: crate::frontend::images::video::VideoOptions {
+                    num_frames: Some(8),
+                    fps: Some(2.0),
+                    max_pixels: Some(65536),
+                },
+            }
+        );
+        // Absent controls keep the packaged defaults.
+        assert_eq!(
+            decoded_parts(json!([{"type":"video_url","video_url":{
+                "url":"data:video/webm;base64,AAAA"}}]))
+                .unwrap()[0]
+                .clone(),
+            Part::Video {
+                url: "data:video/webm;base64,AAAA".into(),
+                options: Default::default(),
+            }
+        );
+    }
+
+    #[test]
+    fn video_parts_reject_remote_urls_and_malformed_controls() {
+        for (part, expected) in [
+            (
+                json!({"type":"video_url","video_url":{"url":"https://example.test/a.mp4"}}),
+                "remote video URLs are not fetched",
+            ),
+            (
+                json!({"type":"video_url","video_url":{"url":"data:video/mp4,AAAA"}}),
+                "must be base64 encoded",
+            ),
+            (
+                json!({"type":"video_url","video_url":{"url":"data:image/png;base64,AAAA"}}),
+                "must carry a video media type",
+            ),
+            (
+                json!({"type":"video_url","video_url":{"url":"data:video/mp4;base64,"}}),
+                "carries no payload",
+            ),
+            (
+                json!({"type":"video_url","video_url":{
+                    "url":"data:video/mp4;base64,AAAA","num_frames":0}}),
+                "num_frames must be a positive integer",
+            ),
+            (
+                json!({"type":"video_url","video_url":{
+                    "url":"data:video/mp4;base64,AAAA","fps":-1}}),
+                "fps must be a positive number",
+            ),
+            (json!({"type":"video_url"}), "video_url.url must be a string"),
+        ] {
+            let error = decoded_parts(json!([part.clone()])).err().unwrap().to_string();
+            assert!(error.contains(expected), "{part}: {error}");
+        }
+    }
+
     fn string_stops(value: Option<&Value>) -> Result<Vec<String>> {
         let decoded = decode(
             Protocol::Chat,
@@ -933,6 +1104,11 @@ mod native_prompt_tests {
                     "<|media_begin|>",
                     "<|media_content|>",
                     "<|media_end|>",
+                    "<|audio_pad|>",
+                    "<|mimo_audio_start|>",
+                    "<|mimo_audio_end|>",
+                    "<|video_start|>",
+                    "<|video_end|>",
                 ]
                 .map(|s| AddedToken::from(s, true)),
             )
@@ -1414,6 +1590,202 @@ mod native_prompt_tests {
                 assert!(prepared.prompt.grammar.is_none());
             }
         }
+    }
+
+    /// A MiMo frontend whose template renders each media part as the packaged envelope, beside a
+    /// processor that can describe audio clips and video frame pairs.
+    fn mimo_media(
+        template: &str,
+    ) -> (
+        Frontend,
+        GrammarCompiler,
+        crate::model::ModelConfig,
+        crate::frontend::images::ImageProcessor,
+    ) {
+        use crate::frontend::audio::AudioSettings;
+        use crate::frontend::images::{ImageLimits, ImageProcessor, ImageSettings, MimoImageSettings};
+        use crate::model::contract::{AudioTokenLayout, ImageLayoutKind, ImageTokenLayout, VideoTokenLayout};
+        let (frontend, compiler, mut config) =
+            renderer(PromptEncoder::Jinja, Some(template), TemplateEncoding::Text);
+        let token = |text: &str| frontend.encode(text, false).unwrap()[0];
+        config.contract.frontend.image_layout = Some(ImageLayoutKind::Mimo);
+        config.contract.frontend.position_dimensions = 0;
+        config.contract.frontend.image_tokens = Some(ImageTokenLayout {
+            feature_token: token("<|image_pad|>"),
+            span: None,
+        });
+        config.contract.frontend.audio_tokens = Some(AudioTokenLayout {
+            feature_token: token("<|audio_pad|>"),
+        });
+        config.contract.frontend.video_tokens = Some(VideoTokenLayout {
+            feature_token: token("<|video_pad|>"),
+            start_token: token("<|video_start|>"),
+            end_token: token("<|video_end|>"),
+        });
+        config.contract.frontend.rejected_tokens.clear();
+        config.contract.vision = crate::model::VisionCapabilities {
+            feature_slots: 2,
+            features_per_request: 32_768,
+            max_images: 4,
+            patches_per_feature: 4,
+            patch_capacities: vec![256, 1024, 4096, 16_384, 32_768],
+        };
+        config.contract.audio = Some(crate::model::AudioCapabilities {
+            frame_capacities: vec![6000],
+        });
+        let processor = ImageProcessor::load(
+            ImageSettings::Mimo(MimoImageSettings {
+                min_pixels: 4096,
+                max_pixels: 65_536,
+                image_mean: [123.675, 116.28, 103.53],
+                image_std: [58.395, 57.12, 57.375],
+            }),
+            ImageLimits::default(),
+        )
+        .unwrap()
+        .with_audio(&AudioSettings::Mimo(
+            match crate::frontend::audio::test_settings() {
+                AudioSettings::Mimo(settings) => settings,
+            },
+        ))
+        .unwrap()
+        .with_video(&crate::frontend::images::video::test_settings())
+        .unwrap();
+        (frontend, compiler, config, processor)
+    }
+
+    const MEDIA_TEMPLATE: &str = concat!(
+        "{% for m in messages %}<{{ m.role }}>",
+        "{% for block in m.content %}",
+        "{% if block.type == 'audio' %}<|mimo_audio_start|><|audio_pad|><|mimo_audio_end|>",
+        "{% elif block.type == 'video' %}<|vision_start|><|video_pad|><|vision_end|>",
+        "{% elif block.type == 'image' %}<|vision_start|><|image_pad|><|vision_end|>",
+        "{% elif block.text %}{{ block.text }}{% endif %}",
+        "{% endfor %}</{{ m.role }}>{% mark %}{% endfor %}<assistant>"
+    );
+
+    #[test]
+    fn an_audio_part_expands_to_one_placeholder_per_encoded_feature() {
+        use base64::Engine;
+        let (frontend, compiler, config, processor) = mimo_media(MEDIA_TEMPLATE);
+        let wav = crate::frontend::audio::test_wav(24_000, 1.0);
+        let body = json!({"max_tokens":4,"messages":[{"role":"user","content":[
+            {"type":"text","text":"transcribe"},
+            {"type":"input_audio","input_audio":{
+                "data": base64::engine::general_purpose::STANDARD.encode(&wav),
+                "format":"wav"}}]}]});
+        let decoded = decode(Protocol::Chat, body, false).unwrap();
+        let prepared = crate::server::request::prepare_inference(
+            &frontend,
+            Some(&processor),
+            &compiler,
+            &config,
+            &decoded.request,
+            0,
+            false,
+        )
+        .unwrap();
+        let prompt = &prepared.prompt;
+        let pad = frontend.encode("<|audio_pad|>", false).unwrap()[0];
+        let placeholders = prompt.tokens.iter().filter(|token| **token == pad).count();
+        assert_eq!(prompt.audio_inputs.len(), 1);
+        let clip = &prompt.audio_inputs[0];
+        // One mel frame per hop of a second at 24 kHz: 101 frames, one segment of 7 features.
+        assert_eq!(clip.description.frames, 101);
+        assert_eq!(clip.segments().len(), 1);
+        assert_eq!(clip.tokens(), 7);
+        assert_eq!(placeholders, clip.tokens());
+        assert_eq!(placeholders, clip.feature_range.len());
+        assert_eq!(clip.feature_range, 0..7);
+        assert_eq!(clip.token_span.len(), 7);
+        assert_eq!(clip.capacities, vec![6000]);
+        // The envelope the template emitted stays around the expanded run.
+        assert_eq!(
+            &prompt.tokens[clip.token_span.start - 1..clip.token_span.end + 1],
+            &[
+                frontend.encode("<|mimo_audio_start|>", false).unwrap()[0],
+                pad, pad, pad, pad, pad, pad, pad,
+                frontend.encode("<|mimo_audio_end|>", false).unwrap()[0]
+            ]
+        );
+        // The pad positions are feature positions, so prefill samples no token there.
+        assert_eq!(
+            &prompt.data.vision_token_indices[clip.token_span.clone()],
+            &[0, 1, 2, 3, 4, 5, 6]
+        );
+    }
+
+    #[test]
+    fn a_video_part_expands_to_timestamped_grids_of_patches() {
+        use base64::Engine;
+        let (frontend, compiler, config, processor) = mimo_media(MEDIA_TEMPLATE);
+        let dir = std::env::temp_dir().join(format!("flare-video-request-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = dir.join("frames.rgb");
+        let clip = dir.join("clip.mp4");
+        let (width, height, frames) = (64usize, 48usize, 5usize);
+        let mut pixels = Vec::new();
+        for frame in 0..frames {
+            for _ in 0..width * height {
+                pixels.extend_from_slice(&[frame as u8 * 40, 5, 6]);
+            }
+        }
+        std::fs::write(&raw, &pixels).unwrap();
+        let encoded = std::process::Command::new("ffmpeg")
+            .args(["-nostdin", "-v", "error", "-f", "rawvideo", "-pix_fmt", "rgb24"])
+            .args(["-s", &format!("{width}x{height}"), "-r", "10", "-i"])
+            .arg(&raw)
+            .args(["-c:v", "libx264rgb", "-qp", "0", "-pix_fmt", "rgb24", "-y"])
+            .arg(&clip)
+            .status();
+        if !encoded.map(|status| status.success()).unwrap_or(false) {
+            eprintln!("skipping video request check: ffmpeg cannot encode a test clip");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let bytes = std::fs::read(&clip).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let body = json!({"max_tokens":4,"messages":[{"role":"user","content":[
+            {"type":"text","text":"describe"},
+            {"type":"video_url","video_url":{"url":format!(
+                "data:video/mp4;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(&bytes))}}]}]});
+        let decoded = decode(Protocol::Chat, body, false).unwrap();
+        let prepared = crate::server::request::prepare_inference(
+            &frontend,
+            Some(&processor),
+            &compiler,
+            &config,
+            &decoded.request,
+            0,
+            false,
+        )
+        .unwrap();
+        let prompt = &prepared.prompt;
+        let pad = frontend.encode("<|video_pad|>", false).unwrap()[0];
+        let placeholders = prompt.tokens.iter().filter(|token| **token == pad).count();
+        // Five frames pad to three temporal grids of 6x8 patches, 12 features each.
+        assert_eq!(prompt.conditioned_inputs.len(), 3);
+        assert_eq!(placeholders, 36);
+        assert_eq!(
+            prompt
+                .conditioned_inputs
+                .iter()
+                .map(|input| input.geometry.tokens)
+                .sum::<usize>(),
+            placeholders
+        );
+        for (index, input) in prompt.conditioned_inputs.iter().enumerate() {
+            assert_eq!(input.token_span.len(), 12, "grid {index}");
+            assert_eq!(input.feature_range, index * 12..(index + 1) * 12);
+        }
+        // Each grid is labelled with its nominal time and kept inside the vision envelope.
+        let text = frontend.decode(&prompt.tokens, false).unwrap();
+        assert!(text.contains("00:00"), "{text}");
+        assert!(text.contains("00:02"), "{text}");
+        assert!(text.contains("00:04"), "{text}");
+        assert_eq!(text.matches("<|video_start|>").count(), 1);
+        assert_eq!(text.matches("<|video_end|>").count(), 1);
     }
 
     #[test]

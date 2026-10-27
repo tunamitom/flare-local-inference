@@ -76,6 +76,6 @@ pub(crate) fn prepare_input(
         token_expansions,
         data,
         conditioning,
-        conditioned_inputs: vec![],
+        conditioned_inputs: vec![], audio_inputs: vec![],
     })
 }

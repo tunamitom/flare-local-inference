@@ -148,6 +148,8 @@ pub struct SchedulerCapabilities {
     /// Recurrent state and sliding windows occupy separately reserved continuation rows.
     pub page_tokens: usize,
     pub vision: crate::model::VisionCapabilities,
+    /// Captured audio encoder capacities; audio features share the vision feature arena.
+    pub audio: crate::model::AudioCapabilities,
     pub draft_pages_per_request: usize,
     /// Host completion inputs keyed by kind, batch, draft depth, width, packed rows and prefill rows.
     /// Graphs requiring these values drain before another generation round.
@@ -206,6 +208,7 @@ pub enum RequestPhase {
     Inbound,
     Restore,
     Vision,
+    Audio,
     Prefill,
     Resume,
     Decode,
@@ -227,11 +230,36 @@ struct BoundaryCapture {
     resume: RequestPhase,
 }
 
+/// The graph work one conditioned input needs: a vision batch of patches, or one audio segment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConditionedWork {
+    Vision { patches: usize },
+    /// `frames` mel frames at `capacity`, the captured graph capacity that covers them.
+    Audio { frames: usize, capacity: usize },
+}
+
+impl ConditionedWork {
+    pub(crate) fn phase(self) -> RequestPhase {
+        match self {
+            Self::Vision { .. } => RequestPhase::Vision,
+            Self::Audio { .. } => RequestPhase::Audio,
+        }
+    }
+
+    /// Graph capacity this work occupies.
+    fn capacity(self) -> Option<usize> {
+        match self {
+            Self::Vision { patches } => Some(patches),
+            Self::Audio { capacity, .. } => Some(capacity),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ConditionedInput {
     pub token_span: std::ops::Range<usize>,
     pub feature_range: std::ops::Range<usize>,
-    pub patches: usize,
+    pub work: ConditionedWork,
 }
 
 #[derive(Clone, Debug)]
@@ -240,7 +268,7 @@ struct ConditionedWindow {
     token_start: usize,
     prefill_end: usize,
     features: Vec<std::ops::Range<usize>>,
-    patches: VecDeque<usize>,
+    work: VecDeque<ConditionedWork>,
 }
 
 pub struct LiveRequest {
@@ -285,7 +313,7 @@ pub struct LiveRequest {
     last_use: Fence,
     pending: usize,
     terminal_snapshot_ready: bool,
-    vision_patches: VecDeque<usize>,
+    conditioned_steps: VecDeque<ConditionedWork>,
     prefill_spans: Vec<std::ops::Range<usize>>,
     copy_proposal: Option<speculation::CopyProposal>,
     pub(crate) decoded_sequence: decoded_history::DecodedSequence,
@@ -346,7 +374,7 @@ impl LiveRequest {
     }
     fn following_conditioned_window(&self) -> Option<&ConditionedWindow> {
         let window = self.conditioned_windows.front()?;
-        (self.vision_patches.is_empty() && self.consumed_tokens as usize == window.prefill_end)
+        (self.conditioned_steps.is_empty() && self.consumed_tokens as usize == window.prefill_end)
             .then(|| self.conditioned_windows.get(1))
             .flatten()
     }
@@ -359,8 +387,8 @@ impl LiveRequest {
             .map_or(self.prompt_tokens, |window| window.prefill_end)
     }
     fn prompt_phase(&self) -> RequestPhase {
-        if !self.vision_patches.is_empty() {
-            RequestPhase::Vision
+        if let Some(work) = self.conditioned_steps.front() {
+            work.phase()
         } else if self.consumed_tokens == self.prompt_tokens as u64 {
             RequestPhase::Resume
         } else {
@@ -1599,7 +1627,7 @@ impl RequestScheduler {
             last_use: Fence(0),
             pending: 0,
             terminal_snapshot_ready: false,
-            vision_patches: VecDeque::new(),
+            conditioned_steps: VecDeque::new(),
             prefill_spans: Vec::new(),
             growable_output: spec.growable_output,
             preempted: false,
@@ -1837,6 +1865,13 @@ impl RequestScheduler {
             .unwrap_or(0);
         let capacity = self.capabilities.vision.features_per_request;
         let merge = self.capabilities.vision.patches_per_feature;
+        let audio_maximum = self
+            .capabilities
+            .audio
+            .frame_capacities
+            .last()
+            .copied()
+            .unwrap_or(0);
         let request = self.request(handle)?;
         if request.last_use != Fence(0)
             || request.conditioned_features.is_some()
@@ -1850,14 +1885,28 @@ impl RequestScheduler {
                     || input.token_span.end <= request.consumed_tokens as usize
                     || input.feature_range.is_empty()
                     || input.feature_range.len() > capacity
-                    || input.patches == 0
-                    || input.patches > maximum
-                    || merge == 0
-                    || input.patches % merge != 0
-                    || input.feature_range.len() != input.patches / merge
+                    || match input.work {
+                        ConditionedWork::Vision { patches } => {
+                            patches == 0
+                                || patches > maximum
+                                || merge == 0
+                                || patches % merge != 0
+                                || input.feature_range.len() != patches / merge
+                        }
+                        ConditionedWork::Audio { frames, capacity } => {
+                            frames == 0
+                                || frames > capacity
+                                || capacity > audio_maximum
+                                || !self
+                                    .capabilities
+                                    .audio
+                                    .frame_capacities
+                                    .contains(&capacity)
+                        }
+                    }
             })
         {
-            return Err("conditioned inputs violate prompt or prepared vision geometry".into());
+            return Err("conditioned inputs violate prompt or prepared media geometry".into());
         }
         let mut windows: VecDeque<ConditionedWindow> = VecDeque::new();
         let mut features = 0usize;
@@ -1871,14 +1920,14 @@ impl RequestScheduler {
                     token_start: input.token_span.start,
                     prefill_end: request.prompt_tokens,
                     features: vec![],
-                    patches: VecDeque::new(),
+                    work: VecDeque::new(),
                 });
                 features = 0;
             }
             let window = windows.back_mut().unwrap();
             window.inputs.end = index + 1;
             window.features.push(input.feature_range.clone());
-            window.patches.push_back(input.patches);
+            window.work.push_back(input.work);
             features += input.feature_range.len();
         }
         if windows.iter().any(|window| request.prefill_spans.iter().any(|span| {
@@ -1895,7 +1944,7 @@ impl RequestScheduler {
             return Err("request generation cannot cover its conditioned input windows".into());
         }
         if let Some(window) = windows.front() {
-            self.set_vision_images(handle, &window.patches.iter().copied().collect::<Vec<_>>())?;
+            self.set_conditioned_work(handle, &window.work.iter().copied().collect::<Vec<_>>())?;
         }
         if windows.len() > 1 {
             // Unsubmitted page reservations may be rebound around the snapshot's backing pages.
@@ -1950,7 +1999,11 @@ impl RequestScheduler {
                 .front()
                 .map_or_else(Vec::new, |window| window.features.clone()),
         );
-        request.conditioned_inputs_ready = inputs.is_empty();
+        // Vision inputs are materialized on the preparation worker; audio segments are already
+        // decoded with the prompt, so a request whose window holds only audio is ready at once.
+        request.conditioned_inputs_ready = !inputs
+            .iter()
+            .any(|input| matches!(input.work, ConditionedWork::Vision { .. }));
         request.conditioned_windows = windows;
         Ok(())
     }
@@ -1985,7 +2038,7 @@ impl RequestScheduler {
         request.conditioned_windows.pop_front();
         let window = request.conditioned_windows.front().unwrap();
         request.conditioned_features = Some(window.features.clone());
-        request.vision_patches = window.patches.clone();
+        request.conditioned_steps = window.work.clone();
         request.conditioned_inputs_ready = false;
         request.window_snapshot_ready = false;
         request.window_restore = true;
@@ -1993,7 +2046,12 @@ impl RequestScheduler {
         Ok(next_handle)
     }
 
-    pub fn set_vision_images(&mut self, handle: RequestHandle, patches: &[usize]) -> Result<()> {
+    /// Reserves the shared feature slot and queues the window's conditioned graph runs.
+    pub(crate) fn set_conditioned_work(
+        &mut self,
+        handle: RequestHandle,
+        work: &[ConditionedWork],
+    ) -> Result<()> {
         let vision = &self.capabilities.vision;
         let maximum = *vision
             .patch_capacities
@@ -2001,28 +2059,71 @@ impl RequestScheduler {
             .ok_or("vision is unsupported")?;
         let maximum_features = vision.features_per_request;
         let merge = vision.patches_per_feature;
-        if patches.iter().try_fold(0usize, |total, count| total.checked_add(count / merge))
-            .is_none_or(|total| total > maximum_features)
-        {
-            return Err("images exceed prepared feature storage".into());
+        let audio_maximum = self
+            .capabilities
+            .audio
+            .frame_capacities
+            .last()
+            .copied()
+            .unwrap_or(0);
+        if work.is_empty() {
+            return Err("conditioned work must be assigned before request initialization".into());
+        }
+        // The window is admitted by the features it publishes, not by the shapes it runs.
+        let mut features = 0usize;
+        for item in work {
+            let count = match *item {
+                ConditionedWork::Vision { patches } => {
+                    if patches == 0 || patches > maximum || patches % merge != 0 {
+                        return Err("vision patches do not fit the prepared graphs".into());
+                    }
+                    patches / merge
+                }
+                ConditionedWork::Audio { frames, capacity } => {
+                    if frames == 0
+                        || frames > capacity
+                        || capacity > audio_maximum
+                        || !self.capabilities.audio.frame_capacities.contains(&capacity)
+                    {
+                        return Err("audio segment does not fit the prepared graphs".into());
+                    }
+                    // The encoder's own count is only known graph-side; the prompt already
+                    // carries it, and one feature is the smallest any segment can publish.
+                    1
+                }
+            };
+            features = features
+                .checked_add(count)
+                .filter(|total| *total <= maximum_features)
+                .ok_or("conditioned inputs exceed prepared feature storage")?;
         }
         let request = self.request_mut(handle)?;
         if request.last_use != Fence(0)
-            || !request.vision_patches.is_empty()
+            || !request.conditioned_steps.is_empty()
             || request.image_slot.is_some()
-            || patches.is_empty()
-            || patches
-                .iter()
-                .any(|count| *count == 0 || *count > maximum || *count % merge != 0)
         {
-            return Err("vision images must be assigned once before request initialization".into());
+            return Err("conditioned work must be assigned before request initialization".into());
         }
-        let slot = self.free_image_slots.pop_first().ok_or_else(|| crate::Error::admission(
-            crate::AdmissionError::Capacity, "image feature slots are occupied or awaiting GPU retirement"))?;
+        let slot = self.free_image_slots.pop_first().ok_or_else(|| {
+            crate::Error::admission(
+                crate::AdmissionError::Capacity,
+                "feature slots are occupied or awaiting GPU retirement",
+            )
+        })?;
         let request = self.request_mut(handle)?;
         request.image_slot = Some(slot);
-        request.vision_patches.extend(patches.iter().copied());
+        request.conditioned_steps.extend(work.iter().copied());
         Ok(())
+    }
+
+    /// Queues vision work only; audio segments reach `set_conditioned_work` directly.
+    #[cfg(test)]
+    pub fn set_vision_images(&mut self, handle: RequestHandle, patches: &[usize]) -> Result<()> {
+        let work: Vec<_> = patches
+            .iter()
+            .map(|patches| ConditionedWork::Vision { patches: *patches })
+            .collect();
+        self.set_conditioned_work(handle, &work)
     }
 
     /// Plans one operation without submitting GPU work or reserving new pages.
@@ -2422,8 +2523,8 @@ impl RequestScheduler {
                         request.phase = RequestPhase::Finishing;
                     }
                 } else {
-                    if kind == GraphKind::Vision {
-                        request.vision_patches.pop_front();
+                    if matches!(kind, GraphKind::Vision | GraphKind::Audio) {
+                        request.conditioned_steps.pop_front();
                     }
                     if kind == GraphKind::Restore && request.window_restore {
                         request.window_restore = false;
@@ -2502,7 +2603,7 @@ impl RequestScheduler {
                 let endpoint = request.consumed_tokens;
                 if !finished
                     && request.conditioned_windows.len() > 1
-                    && request.vision_patches.is_empty()
+                    && request.conditioned_steps.is_empty()
                     && request.conditioned_windows.front().is_some_and(|window| endpoint as usize == window.prefill_end)
                 {
                     captures.push((

@@ -43,7 +43,7 @@ fn prompt_prefill_gpu_and_native_costs() {
                         tokens, message_boundaries: vec![],
                         data: crate::model::PromptData { positions: (0..length).map(|i| [i as i64; 3]).collect(),
                             vision_token_indices: vec![-1; length], spans: vec![] },
-                        conditioned_inputs: vec![], conditioning: vec![], sampling: crate::model::SamplingParameters {
+                        conditioned_inputs: vec![], audio_inputs: vec![], conditioning: vec![], sampling: crate::model::SamplingParameters {
                             top_k: 1, ..Default::default()
                         }, max_new_tokens: budget, stop_sequences: vec![], stop_strings: vec![],
                         grammar: None, ignore_eos: false, logprobs: false,

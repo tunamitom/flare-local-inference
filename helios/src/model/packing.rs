@@ -83,6 +83,14 @@ impl Inputs {
                                 );
                             }
                         }
+                        #[cfg(feature = "images")]
+                        if binding.source == ValueSource::AudioTensor {
+                            let dtype = crate::frontend::audio::packing::tensor_dtype(&binding.tensor)
+                                .ok_or("audio graph requires a tensor the audio preparation does not produce")?;
+                            if buffer.dtype != dtype {
+                                return Err("audio tensor type differs from its preparation output".into());
+                            }
+                        }
                         let width = match binding.indexing {
                             InputIndexing::Scalar => elements,
                             _ => buffer.shape.get(1..).unwrap_or(&[]).iter().product(),
@@ -119,7 +127,10 @@ impl Inputs {
                             | ImageRightContext => binding.indexing == PackedToken,
                             PendingToken => matches!(binding.indexing, SubmissionRow | PackedToken),
                             Constant => binding.indexing != PackedToken,
-                            RequestSlot | RequestGeneration if graph.kind == GraphKind::Vision => {
+                            // One prerequisite graph runs for exactly one request lane.
+                            RequestSlot | RequestGeneration
+                                if matches!(graph.kind, GraphKind::Vision | GraphKind::Audio) =>
+                            {
                                 binding.indexing == Scalar
                             }
                             _ => matches!(binding.indexing, SubmissionRow | RequestRow | ActiveRow),
@@ -329,6 +340,68 @@ impl Inputs {
                     );
                 }
                 _ => return Err("invalid image graph value source".into()),
+            }
+        }
+        Ok(())
+    }
+
+    /// Uploads one audio segment and binds the arena slot its publication writes through.
+    #[cfg(feature = "images")]
+    pub fn pack_audio(
+        &mut self,
+        step: &crate::scheduler::ScheduledStep,
+        config: &ModelConfig,
+        handle: crate::scheduler::RequestHandle,
+        audio_slot: usize,
+        audio: &crate::frontend::audio::ProcessedAudio,
+        destination_feature_offset: usize,
+    ) -> Result<()> {
+        let graph = self
+            .contract
+            .graphs
+            .iter()
+            .find(|g| g.kind == GraphKind::Audio && g.tokens == step.token_capacity)
+            .ok_or("audio submission lacks a prepared packing plan")?;
+        let tensors = crate::frontend::audio::packing::prepare(
+            config,
+            handle,
+            audio_slot,
+            audio,
+            destination_feature_offset,
+        )?;
+        let tensors = tensors.uploads();
+        self.staging.clear();
+        self.unconstrained_masks.retain(|(name, _, _)|
+            graph.inputs.iter().any(|input| input.cache_mask && input.binding.buffer == *name));
+        for input in &graph.inputs {
+            match input.binding.source {
+                ValueSource::RequestSlot => {
+                    write_integers(&mut self.staging, input, 0, &[handle.slot as i64])?
+                }
+                ValueSource::RequestGeneration => {
+                    write_integers(&mut self.staging, input, 0, &[handle.generation as i64])?
+                }
+                ValueSource::ImageFeatureSlot => {
+                    if audio_slot >= config.contract.vision.feature_slots {
+                        return Err("audio feature slot exceeds the prepared arena".into());
+                    }
+                    write_integers(&mut self.staging, input, 0, &[audio_slot as i64])?
+                }
+                ValueSource::AudioTensor => {
+                    let tensor = tensors
+                        .iter()
+                        .find(|t| t.buffer == input.binding.tensor)
+                        .ok_or("audio preparation did not produce a required tensor")?;
+                    if tensor.offset + tensor.bytes.len() > input.elements * input.dtype.size() {
+                        return Err("audio tensor exceeds prepared graph capacity".into());
+                    }
+                    self.staging.put(
+                        &input.binding.buffer,
+                        tensor.offset,
+                        tensor.bytes.iter().copied(),
+                    );
+                }
+                _ => return Err("invalid audio graph value source".into()),
             }
         }
         Ok(())

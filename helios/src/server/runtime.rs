@@ -26,6 +26,7 @@ pub struct Prompt {
     pub message_boundaries: Vec<usize>,
     pub data: crate::model::PromptData,
     pub conditioned_inputs: Vec<crate::frontend::images::PreparedImageInput>,
+    pub audio_inputs: Vec<crate::frontend::audio::PreparedAudioInput>,
     pub conditioning: Vec<ConditioningEvent>,
     pub sampling: SamplingParameters,
     pub max_new_tokens: u32,
@@ -223,12 +224,20 @@ impl Incoming {
     }
 }
 
+/// One audio graph run of a prepared clip: its clip and the segment within it.
+struct AudioStep {
+    input: crate::frontend::audio::PreparedAudioInput,
+    segment: usize,
+}
+
 struct Active<'a> {
     request: RequestHandle,
     incoming: Incoming,
     last_token: Option<u32>,
     next_image: usize,
     selected_images: Vec<crate::frontend::images::PreparedImageInput>,
+    next_audio: usize,
+    selected_audio: Vec<AudioStep>,
     prepared_image: Option<crate::frontend::images::ProcessedImages>,
     stops: super::stops::TokenStops,
     text_stops: Option<super::stops::TextStops<'a>>,
@@ -1169,14 +1178,45 @@ impl<'a> Worker<'a> {
                 .filter(|input| input.token_span.end > consumed)
                 .cloned()
                 .collect();
-            let inputs = selected_images
+            let selected_audio: Vec<AudioStep> = incoming
+                .prompt
+                .audio_inputs
+                .iter()
+                .filter(|clip| clip.token_span.end > consumed)
+                .flat_map(|clip| {
+                    (0..clip.segments().len()).map(move |segment| AudioStep {
+                        input: clip.clone(),
+                        segment,
+                    })
+                })
+                .collect();
+            let mut inputs = selected_images
                 .iter()
                 .map(|image| crate::scheduler::ConditionedInput {
                     token_span: image.token_span.clone(),
                     feature_range: image.feature_range.clone(),
-                    patches: image.geometry.patches,
+                    work: crate::scheduler::ConditionedWork::Vision {
+                        patches: image.geometry.patches,
+                    },
                 })
                 .collect::<Vec<_>>();
+            for step in &selected_audio {
+                let token_span = step.input.segment_span(step.segment)?;
+                if token_span.end <= consumed {
+                    continue;
+                }
+                inputs.push(crate::scheduler::ConditionedInput {
+                    token_span,
+                    feature_range: step.input.segment_features(step.segment)?,
+                    work: crate::scheduler::ConditionedWork::Audio {
+                        frames: step.input.segments()[step.segment].frames,
+                        capacity: step.input.capacity(step.segment)?,
+                    },
+                });
+            }
+            // One ordered queue: conditioned graph runs follow their prompt positions, whichever
+            // kind they are, because they publish into one arena in that order.
+            inputs.sort_by_key(|input| input.token_span.start);
             if let Err(error) = self.scheduler.set_conditioned_inputs(handle, &inputs) {
                 self.scheduler.cancel(handle)?;
                 if matches!(error, Error::Admission(AdmissionError::Capacity(_))) {
@@ -1230,6 +1270,8 @@ impl<'a> Worker<'a> {
                 last_token: parked.last_token,
                 next_image: 0,
                 selected_images,
+                next_audio: 0,
+                selected_audio,
                 prepared_image: None,
                 carried: parked.carried,
                 held_logprobs: parked.held_logprobs,
@@ -1795,8 +1837,34 @@ impl<'a> Worker<'a> {
             request.prepared_image = None;
             request.next_image += 1;
             self.preparing_image = None;
-            self.scheduler
-                .conditioned_inputs_ready(request.request, false)?;
+            let handle = request.request;
+            // The next vision input, when there is one, needs its own preparation; a following
+            // audio segment was decoded with the prompt and never gates the request.
+            let pending = request.next_image < request.selected_images.len();
+            self.scheduler.conditioned_inputs_ready(handle, !pending)?;
+        } else if step.kind == GraphKind::Audio {
+            let request = self.active[step.lanes[0].request.slot as usize]
+                .as_mut()
+                .ok_or("missing active audio request")?;
+            let pending = request
+                .selected_audio
+                .get(request.next_audio)
+                .ok_or("audio submission has no prepared segment")?;
+            let handle = request.request;
+            let slot = self
+                .scheduler
+                .request(handle)?
+                .image_slot
+                .ok_or("audio request lacks a feature slot")?;
+            let start = i32::try_from(pending.input.segment_features(pending.segment)?.start)
+                .map_err(|_| "audio feature index exceeds integer range")?;
+            let destination = usize::try_from(
+                self.scheduler.request(handle)?.feature_index(start)?,
+            )
+            .map_err(|_| "audio feature destination is negative")?;
+            let audio = pending.input.segment(pending.segment)?;
+            inputs.pack_audio(step, self.config, handle, slot, &audio, destination)?;
+            request.next_audio += 1;
         } else {
             crate::model::pack_inputs(
                 inputs,
@@ -2412,7 +2480,7 @@ mod tests {
                     patches_per_feature: 4,
                     patch_capacities: vec![256, 1024, 4096, 16384],
                 },
-
+                audio: Default::default(),
                 draft_pages_per_request: 1,
                 completion_inputs: vec![],
 
@@ -2504,6 +2572,7 @@ mod tests {
                     ..Default::default()
                 },
                 conditioned_inputs: vec![],
+                audio_inputs: vec![],
                 conditioning: vec![],
                 sampling: SamplingParameters::default(),
                 max_new_tokens: 10,
@@ -2640,7 +2709,7 @@ mod tests {
                 vocabulary: 6,
                 page_tokens: 64,
                 vision: crate::model::testing::metadata().vision,
-
+                audio: Default::default(),
                 draft_pages_per_request: 0,
                 completion_inputs: vec![],
 
@@ -2800,6 +2869,8 @@ mod tests {
             last_token: None,
             next_image: 0,
             selected_images: vec![],
+            next_audio: 0,
+            selected_audio: vec![],
             prepared_image: None,
             stops: super::super::stops::TokenStops::new(vec![], 6).unwrap(),
             text_stops: None,
@@ -2988,6 +3059,8 @@ mod tests {
             last_token: None,
             next_image: 0,
             selected_images: vec![],
+            next_audio: 0,
+            selected_audio: vec![],
             prepared_image: None,
             stops: super::super::stops::TokenStops::new(vec![], 248320).unwrap(),
             held_logprobs: VecDeque::new(),
@@ -3168,7 +3241,7 @@ mod tests {
                     patches_per_feature: 4,
                     patch_capacities: vec![256, 1024, 4096, 16384],
                 },
-
+                audio: Default::default(),
                 draft_pages_per_request: 1,
                 completion_inputs: vec![],
 

@@ -8,6 +8,8 @@
 //! feature count follows the encoder's convolution, pooling, and grouping arithmetic.
 
 mod fft;
+#[cfg(feature = "server")]
+pub mod packing;
 mod resample;
 mod wav;
 
@@ -39,6 +41,53 @@ pub struct MimoAudioSettings {
     pub group_size: u32,
     /// Longest clip admitted, in seconds of audio.
     pub max_seconds: u32,
+}
+
+/// Container formats an `input_audio` part may name. WAV decodes natively; every other container
+/// is staged and decoded by the host's ffmpeg, which reports its own failure for a mislabelled
+/// payload.
+pub const AUDIO_FORMATS: [&str; 8] = ["wav", "mp3", "m4a", "ogg", "flac", "webm", "aac", "opus"];
+
+/// One `input_audio` content part: its container format and base64 payload. The base64 is decoded
+/// once, at the model boundary, so the frontend keeps no decoded media.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AudioSource {
+    pub format: String,
+    pub data: String,
+}
+
+impl AudioSource {
+    /// Reads an OpenAI `input_audio` part.
+    pub fn from_part(part: &serde_json::Value) -> Result<Self> {
+        let audio = part
+            .get("input_audio")
+            .filter(|value| value.is_object())
+            .ok_or_else(|| input("input_audio must be an object"))?;
+        let format = audio
+            .get("format")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| input("input_audio.format must be a string"))?
+            .to_ascii_lowercase();
+        if !AUDIO_FORMATS.contains(&format.as_str()) {
+            return Err(input(format!(
+                "input_audio format must be one of {}",
+                AUDIO_FORMATS.join(", ")
+            )));
+        }
+        let data = audio
+            .get("data")
+            .and_then(serde_json::Value::as_str)
+            .filter(|data| !data.is_empty())
+            .ok_or_else(|| input("input_audio.data must be a nonempty base64 string"))?;
+        Ok(Self {
+            format,
+            data: data.into(),
+        })
+    }
+
+    pub fn media_type(&self) -> &str {
+        &self.format
+    }
 }
 
 /// One encoder segment of a described clip.
@@ -335,6 +384,128 @@ impl AudioProfile {
         }
         Ok(ProcessedAudio { frames: segment.frames, mels: mel.mels, values: values.to_vec() })
     }
+}
+
+/// One described clip whose features the audio graph publishes segment by segment.
+///
+/// The clip's log-mel frames are computed while the prompt is prepared, because the placeholder
+/// count depends on the frame count; the frames stay resident until the last segment is packed.
+/// The arena bounds that residency: the clip's feature count is admitted against
+/// `features_per_request`, and one graph encodes at most `frame_capacities.last()` frames.
+#[cfg(feature = "server")]
+#[derive(Clone)]
+pub struct PreparedAudioInput {
+    /// The clip's whole pad run, one token per feature.
+    pub token_span: std::ops::Range<usize>,
+    /// The clip's features in the shared arena.
+    pub feature_range: std::ops::Range<usize>,
+    pub description: AudioDescription,
+    /// Graph capacity of each segment: the smallest captured frame capacity that covers it.
+    pub capacities: Vec<usize>,
+    mel: std::sync::Arc<Mel>,
+    profile: std::sync::Arc<AudioProfile>,
+}
+
+#[cfg(feature = "server")]
+impl std::fmt::Debug for PreparedAudioInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedAudioInput")
+            .field("token_span", &self.token_span)
+            .field("feature_range", &self.feature_range)
+            .field("description", &self.description)
+            .finish()
+    }
+}
+
+#[cfg(feature = "server")]
+impl PreparedAudioInput {
+    pub fn new(
+        token_span: std::ops::Range<usize>,
+        feature_range: std::ops::Range<usize>,
+        description: AudioDescription,
+        capacities: Vec<usize>,
+        mel: std::sync::Arc<Mel>,
+        profile: std::sync::Arc<AudioProfile>,
+    ) -> Self {
+        Self {
+            token_span,
+            feature_range,
+            description,
+            capacities,
+            mel,
+            profile,
+        }
+    }
+
+    /// Features the clip contributes: the sum over its encoder segments.
+    pub fn tokens(&self) -> usize {
+        self.description.tokens()
+    }
+
+    pub fn segments(&self) -> &[AudioSegmentDescription] {
+        &self.description.segments
+    }
+
+    /// Graph capacity one segment runs at.
+    pub fn capacity(&self, segment: usize) -> Result<usize> {
+        self.capacities
+            .get(segment)
+            .copied()
+            .ok_or_else(|| input("audio segment is absent from its description"))
+    }
+
+    /// One segment's graph input, checked against its description.
+    pub fn segment(&self, segment: usize) -> Result<ProcessedAudio> {
+        let description = self
+            .segments()
+            .get(segment)
+            .ok_or_else(|| input("audio segment is absent from its description"))?;
+        self.profile.segment(&self.mel, description)
+    }
+
+    /// The arena features one segment publishes into.
+    pub fn segment_features(&self, segment: usize) -> Result<std::ops::Range<usize>> {
+        let start = self
+            .segments()
+            .iter()
+            .take(segment)
+            .map(|segment| segment.tokens)
+            .sum::<usize>();
+        let tokens = self
+            .segments()
+            .get(segment)
+            .ok_or_else(|| input("audio segment is absent from its description"))?
+            .tokens;
+        Ok(self.feature_range.start + start..self.feature_range.start + start + tokens)
+    }
+
+    /// The pad run one segment occupies inside the clip's span.
+    pub fn segment_span(&self, segment: usize) -> Result<std::ops::Range<usize>> {
+        let start = self
+            .segments()
+            .iter()
+            .take(segment)
+            .map(|segment| segment.tokens)
+            .sum::<usize>();
+        let tokens = self
+            .segments()
+            .get(segment)
+            .ok_or_else(|| input("audio segment is absent from its description"))?
+            .tokens;
+        Ok(self.token_span.start + start..self.token_span.start + start + tokens)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_wav(sample_rate: u32, seconds: f64) -> Vec<u8> {
+    let count = (f64::from(sample_rate) * seconds) as usize;
+    let tone: Vec<i16> = (0..count)
+        .map(|i| {
+            ((2.0 * std::f64::consts::PI * 440.0 * i as f64 / f64::from(sample_rate)).sin() * 12_000.0)
+                as i16
+        })
+        .collect();
+    wav::encode_pcm16(sample_rate, &[tone])
 }
 
 #[cfg(test)]
