@@ -28,7 +28,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 FROM debian:trixie-slim
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libgcc-s1 \
+    && apt-get install -y --no-install-recommends libgcc-s1 ffmpeg \
     && if [ "$(dpkg --print-architecture)" = arm64 ]; then \
         apt-get install -y --no-install-recommends libibverbs1 ibverbs-providers; \
     fi \

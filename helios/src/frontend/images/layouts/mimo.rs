@@ -118,10 +118,17 @@ pub(crate) fn prepare_media_input(
     }
     let tokens = Tokens::resolve(frontend, config, images.len(), audio.len(), video.len())?;
     if images.is_empty() && audio.is_empty() && video.is_empty() {
+        // A prompt with no media still owes the contract one index per token: the validator
+        // requires the index list to line up with the prompt whenever the model declares an
+        // image layout, and "no feature here" is -1. Returning a default (empty) list made every
+        // text-only request fail admission with a conditioned-feature mismatch.
         return Ok(PreparedInput {
             tokens: rendered.token_ids.clone(),
             token_expansions: vec![],
-            data: PromptData::default(),
+            data: PromptData {
+                vision_token_indices: vec![-1; rendered.token_ids.len()],
+                ..Default::default()
+            },
             conditioning: vec![],
             conditioned_inputs: vec![],
             audio_inputs: vec![],
