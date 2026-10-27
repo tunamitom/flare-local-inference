@@ -66,7 +66,15 @@ def test_contract_declares_the_audio_capacity_and_feature_token():
     graph = next(graph for graph in model['graphs'] if graph['graph'] == 'audio6000')
     assert graph['kind'] == proto.GraphOperation.Value('AUDIO') == 14
     assert graph['state'] == [] and graph['pending_token'] is None
-    assert {binding['source'] for binding in graph['inputs']} == {proto.AUDIO_TENSOR}
+    # The request slot and generation are the scheduler's, not the frontend's: binding them to the
+    # audio preparation made every segment look like it belonged to an inactive request.
+    assert {binding['tensor']: binding['source'] for binding in graph['inputs']} == {
+        'audio_features': proto.AUDIO_TENSOR,
+        'audio_frames': proto.AUDIO_TENSOR,
+        'audio_slot': proto.REQUEST_SLOT,
+        'audio_generation': proto.REQUEST_GENERATION,
+        'audio_feature_offset': proto.AUDIO_TENSOR,
+    }
     assert {binding['indexing'] for binding in graph['inputs']} == {proto.SCALAR}
     assert {binding['tensor'] for binding in graph['inputs']} == set(AudioInputs.allocate('cpu').buffers())
 
