@@ -127,8 +127,17 @@ def vision_inputs(fields):
 
 
 def audio_inputs(fields):
-    """Every audio graph input is a named output of the frontend's audio preparation."""
-    return {name: binding(name, p.AUDIO_TENSOR, p.SCALAR, tensor=name) for name in fields}
+    """Audio graph inputs: the request slot and generation, the arena slot, and the preparation's tensors.
+
+    `audio_slot` and `audio_generation` identify the request the segment belongs to, and
+    `vision_feature_slot` the arena slot its features publish into, exactly as the vision graphs
+    bind them; the publication kernel validates against and completes the request through them.
+    Every other field is a named output of the frontend's audio preparation.
+    """
+    return {name: binding(name, p.REQUEST_SLOT if name == "audio_slot" else
+                         p.REQUEST_GENERATION if name == "audio_generation" else
+                         p.IMAGE_FEATURE_SLOT if name == "vision_feature_slot" else p.AUDIO_TENSOR,
+                         p.SCALAR, tensor=name) for name in fields}
 
 
 def history_region(buffers, name, tensor, kind, *, tokens_per_record=1, window_tokens=0):

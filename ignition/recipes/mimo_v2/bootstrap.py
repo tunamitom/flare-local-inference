@@ -30,7 +30,7 @@ from ignition.components.parallel import TensorParallelShard
 from ignition.components.sampling import AdmissionBuffers, DeviceRequestState
 from ignition.components.state_transfer import StateCommands
 from ignition.preparation.capture import capture_forwards
-from .contract import prepare as prepare_contract
+from .contract import FEATURE_TOKENS, prepare as prepare_contract
 from ignition.preparation.contract import history_region
 from ignition.preparation.rebuild_manifest import declare_weights
 from ignition.preparation import runtime_package_pb2 as contract_proto
@@ -410,8 +410,11 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         vision_inputs = VisionInputs.allocate(device)
         audio_inputs = AudioInputs.allocate(device)
         vision_prefill = PrefillVisionInputs.allocate(config.prefill_chunk_size, device)
-        vision_state = VisionState(inputs, vision_prefill, requests, image_slots=config.image_concurrency, image_token=weights.config.text["image_token_id"],
-                                   features=FEATURES, hidden=HIDDEN)
+        # The frontend layout rewrites image, video and audio placeholders into the tokens the
+        # contract declares, and publishes their features into one arena in prompt order; the
+        # prefill injects at all of them.
+        vision_state = VisionState(inputs, vision_prefill, requests, image_slots=config.image_concurrency,
+                                   image_token=FEATURE_TOKENS, features=FEATURES, hidden=HIDDEN)
         vision_storage = {}
         audio_storage = {}
         environment = DecoderEnvironment.load(snapshot, vision_state)
@@ -584,14 +587,15 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             forward = PreparedVisionGeneration(encoder, vision_state, completion, frame, sequence, buffers=cursor)
             add(name, forward, "vision", 1, capacity, (*vision_inputs.buffers(), "vision_feature_slot"))
         for capacity in reversed(AUDIO_CAPACITIES):
-            # Audio features publish into the vision arena; the graph owns no per-request state.
+            # Audio features publish into the vision arena through the same `vision_feature_slot`
+            # the vision graphs bind; the graph owns no per-request state.
             name = f"audio{capacity}"
             cursor = graph_buffers.cursor()
             audio_storage[capacity] = AudioScratch.allocate(capacity, device, buffers=cursor)
             encoder = PreparedAudio(weights.audio, audio_storage[capacity], audio_inputs, session=session,
                                     workspace=arena, name=name, buffers=cursor)
             forward = PreparedAudioGeneration(encoder, vision_state, completion, frame, sequence, buffers=cursor)
-            add(name, forward, "audio", 1, capacity, (*audio_inputs.buffers(),))
+            add(name, forward, "audio", 1, capacity, (*audio_inputs.buffers(), "vision_feature_slot"))
         row_inputs = ("request_state_rows", "row_slot_ids", "row_generations", "live_rows")
         for enabled in modes:
             suffix = "-no-mtp" if config.dflash and not enabled else ""

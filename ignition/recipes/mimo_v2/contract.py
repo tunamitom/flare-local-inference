@@ -17,11 +17,15 @@ AUDIO_FEATURE_TOKEN = 151669
 # settings live in the package's frontend block (preparation/frontend.py video_settings); here
 # the recipe only names the tokens the prompt builder splices around them.
 VIDEO_TOKENS = dict(feature_token=151656, start_token=151670, end_token=151671)
+IMAGE_FEATURE_TOKEN = 151655
+# Every token the frontend layout replaces with published features. Image, video and audio
+# features share one arena in prompt order, so the prefill injects at all three.
+FEATURE_TOKENS = (IMAGE_FEATURE_TOKEN, VIDEO_TOKENS["feature_token"], AUDIO_FEATURE_TOKEN)
 FRONTEND = c.frontend(tools=p.QWEN_CODER, terminal_markers=["<tool_call>"],
     assistant_marker="<|im_start|>assistant\n", message_end_markers=["<|im_end|>"], rejected_tokens=[],
     prefix_boundary=c.prefix_boundary(["system", "developer"], append_role="user", minimum_messages=0,
         required_start="<|im_start|>system\n", required_marker="<|im_end|>"),
-    image_tokens=dict(feature_token=151655, span=None),
+    image_tokens=dict(feature_token=IMAGE_FEATURE_TOKEN, span=None),
     image_preparation=p.MIMO_IMAGE_PREPARATION, image_layout=p.MIMO_IMAGE_LAYOUT,
     audio_preparation=p.MIMO_AUDIO_PREPARATION, audio_tokens=dict(feature_token=AUDIO_FEATURE_TOKEN),
     video_tokens=VIDEO_TOKENS)

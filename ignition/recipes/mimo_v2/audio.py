@@ -76,7 +76,11 @@ def encoded_tokens(mel_frames, kernel=3, stride=2, pooling=2, group=GROUP):
 
 @dataclass(frozen=True)
 class AudioInputs:
-    """Named outputs of the audio preparation, uploaded for one segment."""
+    """One segment's graph inputs: the preparation's tensors plus the request slot and generation.
+
+    `audio_slot` and `audio_generation` are bound to the request the scheduler runs the segment
+    for; the publication reads the arena slot from the prefill's shared `vision_feature_slot`.
+    """
 
     audio_features: torch.Tensor
     audio_frames: torch.Tensor
