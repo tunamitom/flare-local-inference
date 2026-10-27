@@ -162,3 +162,10 @@
     accepts 0.4 code agreement and 0.9 mean cosine against the reference. Check
     transcription quality on real clips through `flare run` before accepting
     that noise floor.
+
+[ ] An out-of-range image turns into a fatal fault. media packing returns
+    Err("invalid MiMo vision graph extent") from request preparation, and the
+    scheduler reports it as a device failure, so the served model exits instead
+    of answering 400. The frontend should reject the request before it reaches
+    the execution path (or the packer's error should be classified as client
+    input). Found when a 19,170-patch page exceeded the old 16,384 literal.
