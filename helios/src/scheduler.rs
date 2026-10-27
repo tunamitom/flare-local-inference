@@ -265,10 +265,22 @@ pub(crate) struct ConditionedInput {
 #[derive(Clone, Debug)]
 struct ConditionedWindow {
     inputs: std::ops::Range<usize>,
+    /// Vision inputs at or before this window's end, counted over every window: the runtime
+    /// prepares images in that order and stops at this count while the window runs.
+    vision_end: usize,
     token_start: usize,
     prefill_end: usize,
     features: Vec<std::ops::Range<usize>>,
     work: VecDeque<ConditionedWork>,
+}
+
+impl ConditionedWindow {
+    /// Whether a vision run in this window awaits the runtime's image preparation.
+    fn awaits_vision(&self) -> bool {
+        self.work
+            .iter()
+            .any(|work| matches!(work, ConditionedWork::Vision { .. }))
+    }
 }
 
 pub struct LiveRequest {
@@ -364,10 +376,12 @@ impl LiveRequest {
             self.prefix_snapshot
         }
     }
-    pub(crate) fn conditioned_input_end(&self) -> usize {
+    /// Vision inputs the runtime may prepare now: those at or before the current window's end,
+    /// in prompt order over every window.
+    pub(crate) fn conditioned_vision_end(&self) -> usize {
         self.conditioned_windows
             .front()
-            .map_or(usize::MAX, |window| window.inputs.end)
+            .map_or(usize::MAX, |window| window.vision_end)
     }
     pub(crate) fn conditioned_window_ready(&self) -> bool {
         self.window_snapshot_ready
@@ -1910,6 +1924,7 @@ impl RequestScheduler {
         }
         let mut windows: VecDeque<ConditionedWindow> = VecDeque::new();
         let mut features = 0usize;
+        let mut vision_inputs = 0usize;
         for (index, input) in inputs.iter().enumerate() {
             if windows.is_empty() || features + input.feature_range.len() > capacity {
                 if let Some(previous) = windows.back_mut() {
@@ -1917,6 +1932,7 @@ impl RequestScheduler {
                 }
                 windows.push_back(ConditionedWindow {
                     inputs: index..index,
+                    vision_end: vision_inputs,
                     token_start: input.token_span.start,
                     prefill_end: request.prompt_tokens,
                     features: vec![],
@@ -1929,6 +1945,8 @@ impl RequestScheduler {
             window.features.push(input.feature_range.clone());
             window.work.push_back(input.work);
             features += input.feature_range.len();
+            vision_inputs += usize::from(matches!(input.work, ConditionedWork::Vision { .. }));
+            window.vision_end = vision_inputs;
         }
         if windows.iter().any(|window| request.prefill_spans.iter().any(|span| {
             (span.start < window.token_start && window.token_start < span.end)
@@ -2000,10 +2018,10 @@ impl RequestScheduler {
                 .map_or_else(Vec::new, |window| window.features.clone()),
         );
         // Vision inputs are materialized on the preparation worker; audio segments are already
-        // decoded with the prompt, so a request whose window holds only audio is ready at once.
-        request.conditioned_inputs_ready = !inputs
-            .iter()
-            .any(|input| matches!(input.work, ConditionedWork::Vision { .. }));
+        // decoded with the prompt, so a first window that holds only audio is ready at once.
+        request.conditioned_inputs_ready = windows
+            .front()
+            .is_none_or(|window| !window.awaits_vision());
         request.conditioned_windows = windows;
         Ok(())
     }
@@ -2039,7 +2057,8 @@ impl RequestScheduler {
         let window = request.conditioned_windows.front().unwrap();
         request.conditioned_features = Some(window.features.clone());
         request.conditioned_steps = window.work.clone();
-        request.conditioned_inputs_ready = false;
+        // The runtime prepares this window's images from here on; audio needs none.
+        request.conditioned_inputs_ready = !window.awaits_vision();
         request.window_snapshot_ready = false;
         request.window_restore = true;
         request.phase = RequestPhase::Restore;
@@ -2508,6 +2527,7 @@ impl RequestScheduler {
                     | GraphKind::Restore
                     | GraphKind::Snapshot
                     | GraphKind::Vision
+                    | GraphKind::Audio
             ) {
                 let record = records[lane.request.slot as usize];
                 if record.status == 3 {

@@ -197,17 +197,18 @@ fn content(parts: &[Part]) -> Result<Value> {
                 "type":"input_audio","input_audio":{"data":data,"format":format}
             })),
             Part::Video { url, options } => {
-                let mut value = json!({"type":"video_url","video_url":{"url":url}});
+                // The sampling controls sit beside the URL, where requests carry them.
+                let mut video = json!({"url":url});
                 if let Some(frames) = options.num_frames {
-                    value["num_frames"] = json!(frames);
+                    video["num_frames"] = json!(frames);
                 }
                 if let Some(fps) = options.fps {
-                    value["fps"] = json!(fps);
+                    video["fps"] = json!(fps);
                 }
                 if let Some(pixels) = options.max_pixels {
-                    value["max_pixels"] = json!(pixels);
+                    video["max_pixels"] = json!(pixels);
                 }
-                values.push(value);
+                values.push(json!({"type":"video_url","video_url":video}));
             }
             _ => return Err("tool result content must contain text, images, audio, or video".into()),
         }
@@ -436,6 +437,33 @@ pub(super) fn append_system_instruction(
         messages.insert(0, json!({"role":"system","content":instruction}));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tool_result_content_tests {
+    use super::*;
+
+    #[test]
+    fn video_parts_render_their_sampling_controls_where_requests_carry_them() {
+        let options = crate::frontend::images::video::VideoOptions {
+            num_frames: Some(8),
+            fps: Some(2.0),
+            max_pixels: Some(65_536),
+        };
+        let rendered = content(&[Part::Video {
+            url: "data:video/mp4;base64,AAAAIGZ0eXA=".into(),
+            options: options.clone(),
+        }])
+        .unwrap();
+        let part = &rendered.as_array().unwrap()[0];
+        assert_eq!(part["video_url"]["url"], "data:video/mp4;base64,AAAAIGZ0eXA=");
+        assert_eq!(
+            crate::frontend::images::video::VideoSource::from_part(part)
+                .unwrap()
+                .options,
+            options
+        );
+    }
 }
 
 #[cfg(test)]

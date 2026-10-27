@@ -282,6 +282,17 @@ pub fn format_timestamp(seconds: f64) -> String {
     format!("{minutes:02}:{rest:02}")
 }
 
+/// The stream's display rotation in whole counter-clockwise degrees within `0..360`, from the
+/// display matrix ffprobe reports as side data; `0` when the stream carries none.
+fn display_rotation(stream: &serde_json::Value) -> u32 {
+    stream["side_data_list"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find_map(|side| super::super::ffmpeg::float(&side["rotation"]))
+        .map_or(0, |degrees| degrees.round().rem_euclid(360.0) as u32)
+}
+
 /// The reference loader's uniform frame selection: `numpy.linspace(0, total - 1, count, dtype=int)`.
 pub fn sample_indices(total_frames: usize, count: usize) -> Vec<usize> {
     if count >= total_frames {
@@ -482,10 +493,12 @@ impl VideoProfile {
     /// The frame count comes from the container: its own count when it states one, otherwise
     /// its duration at the stream's average rate. A clip whose stated timing disagrees with the
     /// frames it holds fails the decoded-length check rather than sampling the wrong ones.
-    /// Rotation metadata is ignored, as the reference's OpenCV loader ignores it, so frames keep
-    /// the extent the probe reports. Colour conversion is ffmpeg's rather than OpenCV's, so YUV
-    /// sources can differ from the reference loader by codec and matrix rounding; the bilinear
-    /// resize and standardization damp but do not remove that difference.
+    /// Frames are turned to their display orientation the way the reference's OpenCV loader
+    /// turns them: quarter and half turns from the stream's display matrix are applied, so a
+    /// portrait phone clip yields portrait frames, and any other angle is left alone. Colour
+    /// conversion is ffmpeg's rather than OpenCV's, so YUV sources can differ from the reference
+    /// loader by codec and matrix rounding; the bilinear resize and standardization damp but do
+    /// not remove that difference.
     pub fn decode(&self, bytes: &[u8], options: &VideoOptions) -> Result<(VideoFrames, usize)> {
         if bytes.len() > self.limits.max_encoded_bytes {
             return Err(input("encoded video exceeds the configured byte limit"));
@@ -495,14 +508,22 @@ impl VideoProfile {
             &staged.path,
             "v",
             "nb_frames,avg_frame_rate,r_frame_rate,duration,width,height",
+            "rotation",
             "duration",
         )?;
-        let width = super::super::ffmpeg::integer(&stream["width"])
+        let coded_width = super::super::ffmpeg::integer(&stream["width"])
             .filter(|width| *width > 0)
             .ok_or_else(|| input("video stream has no extent"))? as usize;
-        let height = super::super::ffmpeg::integer(&stream["height"])
+        let coded_height = super::super::ffmpeg::integer(&stream["height"])
             .filter(|height| *height > 0)
             .ok_or_else(|| input("video stream has no extent"))? as usize;
+        // ffmpeg's transpose filters name the turn they make; a quarter turn swaps the extent.
+        let (turn, width, height) = match display_rotation(&stream) {
+            90 => ("transpose=cclock,", coded_height, coded_width),
+            180 => ("hflip,vflip,", coded_width, coded_height),
+            270 => ("transpose=clock,", coded_height, coded_width),
+            _ => ("", coded_width, coded_height),
+        };
         check_input_extent(self.limits, width, height)?;
         let fps = super::super::ffmpeg::rational(&stream["avg_frame_rate"])
             .filter(|fps| *fps > 0.0)
@@ -533,11 +554,12 @@ impl VideoProfile {
         let select = indices.iter().map(|index| format!("eq(n\\,{index})")).collect::<Vec<_>>().join("+");
         let mut command = std::process::Command::new("ffmpeg");
         command
-            // Rotation metadata would transpose the frames away from the probed extent.
+            // The explicit turn above replaces ffmpeg's own autorotation, which would also
+            // rotate by angles the reference loader ignores.
             .args(["-nostdin", "-v", "error", "-threads", "4", "-noautorotate", "-i"])
             .arg(&staged.path)
             .args(["-map", "0:v:0", "-an", "-sn", "-dn", "-vf"])
-            .arg(format!("select='{select}'"))
+            .arg(format!("{turn}select='{select}'"))
             .args(["-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]);
         let rgb = super::super::ffmpeg::run_bounded(command, "ffmpeg", limit)?;
         drop(staged);
@@ -897,13 +919,13 @@ mod tests {
             Clip { path, dir }
         }
 
-        /// Copies `clip` with a 90-degree display rotation, or nothing when this ffmpeg cannot
-        /// write one.
-        pub(super) fn rotate(clip: &Clip) -> Option<Clip> {
-            let dir = scratch("rotated");
+        /// Copies `clip` with a display rotation of `degrees` (counter-clockwise, as ffmpeg
+        /// states it), or nothing when this ffmpeg cannot write one.
+        pub(super) fn rotate(clip: &Clip, degrees: &str) -> Option<Clip> {
+            let dir = scratch(&format!("rotated{}", degrees.replace('-', "m")));
             let path = dir.join("rotated.mp4");
             let status = Command::new("ffmpeg")
-                .args(["-nostdin", "-v", "error", "-display_rotation", "90", "-i"])
+                .args(["-nostdin", "-v", "error", "-display_rotation", degrees, "-i"])
                 .arg(&clip.path)
                 .args(["-c", "copy", "-y"])
                 .arg(&path)
@@ -972,19 +994,34 @@ mod tests {
     }
 
     #[test]
-    fn decode_keeps_coded_extents_when_a_clip_carries_rotation() {
+    fn decode_rotates_frames_to_their_display_orientation() {
         let profile = profile(ImageLimits::default());
-        // A red top-left pixel names the coded layout: ffmpeg's autorotation would transpose
-        // the frame and move it.
+        // A red top-left pixel names the coded layout. The reference loader, OpenCV's FFmpeg
+        // backend, rotates frames by their display matrix: on this 64x32 clip it yields a
+        // 32x64 frame with the red pixel at the bottom left for a 90-degree rotation, at the
+        // top right for -90, and a 64x32 frame with it at the bottom right for 180 (observed
+        // with opencv-python-headless 5.0.0 on these clips).
         let clip = clip::mp4("rotated", 64, 32, 10, 3, |_, x, y| if (x, y) == (0, 0) { [255, 0, 0] } else { [0, 0, 255] });
-        let Some(rotated) = clip::rotate(&clip) else {
-            eprintln!("skipping rotation check: this ffmpeg cannot write display rotation");
-            return;
-        };
-        let (frames, _) = profile.decode(&std::fs::read(&rotated.path).unwrap(), &VideoOptions::default()).unwrap();
-        for frame in &frames.frames {
-            assert_eq!((frame.width(), frame.height()), (64, 32));
-            assert_eq!(&frame.pixels()[..3], &[255, 0, 0]);
+        for (degrees, extent, red, grid) in [
+            ("90", (32, 64), (0, 63), [8, 4]),
+            ("-90", (32, 64), (31, 0), [8, 4]),
+            ("180", (64, 32), (63, 31), [4, 8]),
+        ] {
+            let Some(rotated) = clip::rotate(&clip, degrees) else {
+                eprintln!("skipping rotation check: this ffmpeg cannot write display rotation");
+                return;
+            };
+            let (frames, total) = profile.decode(&std::fs::read(&rotated.path).unwrap(), &VideoOptions::default()).unwrap();
+            assert_eq!((total, frames.frames.len()), (3, 3));
+            for frame in &frames.frames {
+                assert_eq!((frame.width(), frame.height()), extent, "{degrees} degrees");
+                let offset = (red.1 * frame.width() + red.0) * 3;
+                assert_eq!(&frame.pixels()[offset..offset + 3], &[255, 0, 0], "{degrees} degrees");
+                assert_eq!(frame.pixels().chunks_exact(3).filter(|pixel| *pixel == [255, 0, 0]).count(), 1, "{degrees} degrees");
+            }
+            // The described grid follows the rotated extent, scaled up to the minimum pixels.
+            let description = profile.describe(&frames, total, &VideoOptions::default()).unwrap();
+            assert_eq!(&description.grid_thw[1..], &grid, "{degrees} degrees");
         }
     }
 

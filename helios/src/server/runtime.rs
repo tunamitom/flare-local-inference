@@ -1178,18 +1178,24 @@ impl<'a> Worker<'a> {
                 .filter(|input| input.token_span.end > consumed)
                 .cloned()
                 .collect();
-            let selected_audio: Vec<AudioStep> = incoming
+            // Segments the cached prefix covers are neither encoded nor admitted, so these steps
+            // and the scheduler's inputs below stay one-to-one.
+            let mut selected_audio: Vec<AudioStep> = Vec::new();
+            for clip in incoming
                 .prompt
                 .audio_inputs
                 .iter()
                 .filter(|clip| clip.token_span.end > consumed)
-                .flat_map(|clip| {
-                    (0..clip.segments().len()).map(move |segment| AudioStep {
-                        input: clip.clone(),
-                        segment,
-                    })
-                })
-                .collect();
+            {
+                for segment in 0..clip.segments().len() {
+                    if clip.segment_span(segment)?.end > consumed {
+                        selected_audio.push(AudioStep {
+                            input: clip.clone(),
+                            segment,
+                        });
+                    }
+                }
+            }
             let mut inputs = selected_images
                 .iter()
                 .map(|image| crate::scheduler::ConditionedInput {
@@ -1201,12 +1207,8 @@ impl<'a> Worker<'a> {
                 })
                 .collect::<Vec<_>>();
             for step in &selected_audio {
-                let token_span = step.input.segment_span(step.segment)?;
-                if token_span.end <= consumed {
-                    continue;
-                }
                 inputs.push(crate::scheduler::ConditionedInput {
-                    token_span,
+                    token_span: step.input.segment_span(step.segment)?,
                     feature_range: step.input.segment_features(step.segment)?,
                     work: crate::scheduler::ConditionedWork::Audio {
                         frames: step.input.segments()[step.segment].frames,
@@ -1292,7 +1294,7 @@ impl<'a> Worker<'a> {
                         >= self
                             .scheduler
                             .request(active.request)?
-                            .conditioned_input_end()
+                            .conditioned_vision_end()
                     {
                         continue;
                     }
@@ -1838,9 +1840,11 @@ impl<'a> Worker<'a> {
             request.next_image += 1;
             self.preparing_image = None;
             let handle = request.request;
-            // The next vision input, when there is one, needs its own preparation; a following
-            // audio segment was decoded with the prompt and never gates the request.
-            let pending = request.next_image < request.selected_images.len();
+            // The next vision input of this window, when there is one, needs its own
+            // preparation; a following audio segment was decoded with the prompt and never
+            // gates the request, and images in later windows wait for their window.
+            let pending = request.next_image
+                < self.scheduler.request(handle)?.conditioned_vision_end();
             self.scheduler.conditioned_inputs_ready(handle, !pending)?;
         } else if step.kind == GraphKind::Audio {
             let request = self.active[step.lanes[0].request.slot as usize]

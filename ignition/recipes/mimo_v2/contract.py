@@ -16,9 +16,9 @@ AUDIO_FEATURE_TOKEN = 151669
 # Video needs no graph of its own: its frames are vision patches. The sampling and resize
 # settings live in the package's frontend block (preparation/frontend.py video_settings); here
 # the recipe only names the tokens the prompt builder splices around them.
-VIDEO_TOKENS = dict(feature_token=151656, start_token=151652, end_token=151653)
+VIDEO_TOKENS = dict(feature_token=151656, start_token=151670, end_token=151671)
 FRONTEND = c.frontend(tools=p.QWEN_CODER, terminal_markers=["<tool_call>"],
-    assistant_marker="<|im_start|>assistant\n", message_end_markers=["<|im_end|>"], rejected_tokens=[151656],
+    assistant_marker="<|im_start|>assistant\n", message_end_markers=["<|im_end|>"], rejected_tokens=[],
     prefix_boundary=c.prefix_boundary(["system", "developer"], append_role="user", minimum_messages=0,
         required_start="<|im_start|>system\n", required_marker="<|im_end|>"),
     image_tokens=dict(feature_token=151655, span=None),

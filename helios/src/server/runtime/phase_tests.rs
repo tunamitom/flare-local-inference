@@ -2607,6 +2607,95 @@ fn host_prefix_selects_whole_required_images_and_compacts_feature_indices() {
     }
 }
 
+/// A described clip of `frames` log-mel frames whose encoder segments hold 100 frames each.
+fn described_audio(
+    span: std::ops::Range<usize>,
+    features: std::ops::Range<usize>,
+    frames: usize,
+) -> crate::frontend::audio::PreparedAudioInput {
+    use crate::frontend::audio::{AudioProfile, AudioSettings, Mel, PreparedAudioInput};
+    let AudioSettings::Mimo(mut settings) = crate::frontend::audio::test_settings();
+    settings.segment_frames = 100;
+    let profile = Arc::new(AudioProfile::load(&AudioSettings::Mimo(settings), 1 << 20).unwrap());
+    let mel = Mel {
+        frames,
+        mels: 128,
+        values: vec![-1.0; frames * 128],
+    };
+    let description = profile.describe(&mel, 24_000, frames * 240).unwrap();
+    let capacities = vec![100; description.segments.len()];
+    PreparedAudioInput::new(span, features, description, capacities, Arc::new(mel), profile)
+}
+
+#[test]
+fn host_prefix_selects_only_audio_segments_past_the_hit_and_keeps_them_packable() {
+    // A 150-frame clip spans tokens 10..21: its 100-frame segment owns 10..17 (features 0..7)
+    // and the 50-frame remainder owns 17..21 (features 7..11). Whatever part of the clip the
+    // host prefix covers, the selected audio steps and the scheduler's inputs must stay
+    // one-to-one, or the first audio submission packs a segment the window never admitted.
+    for (consumed, expected) in [
+        (12usize, vec![0usize, 1]),
+        (17, vec![1]),
+        (18, vec![1]),
+        (21, vec![]),
+    ] {
+        let mut fixture = Fixture::new();
+        fixture.config.contract.vision = crate::model::VisionCapabilities {
+            feature_slots: 1,
+            features_per_request: 64,
+            max_images: 4,
+            patches_per_feature: 4,
+            patch_capacities: vec![256],
+        };
+        fixture.config.contract.audio = Some(crate::model::AudioCapabilities {
+            frame_capacities: vec![100],
+        });
+        {
+            use crate::model::contract::{
+                AudioPreparationKind, AudioTokenLayout, ImageLayoutKind, ImagePreparationKind,
+                ImageTokenLayout,
+            };
+            let syntax = &mut fixture.config.contract.frontend;
+            syntax.image_preparation = Some(ImagePreparationKind::Mimo);
+            syntax.image_layout = Some(ImageLayoutKind::Mimo);
+            syntax.image_tokens = Some(ImageTokenLayout { feature_token: 100, span: None });
+            syntax.audio_preparation = Some(AudioPreparationKind::Mimo);
+            syntax.audio_tokens = Some(AudioTokenLayout { feature_token: 101 });
+        }
+        let (sender, receiver) = mpsc::channel();
+        let (mut incoming, _generation) = fixture.incoming(vec![0; 100], 4);
+        incoming.prompt.audio_inputs = vec![described_audio(10..21, 0..11, 150)];
+        let mut history = crate::cache::PrefixHistory::new(fixture.config.identity);
+        history.append(&incoming.prompt.tokens, &[]).unwrap();
+        sender.send(vec![incoming]).unwrap();
+        let mut worker = fixture.worker(receiver);
+        worker.attach_store(Some(Box::new(FakeStore::new(Some(host_hit(
+            &history,
+            consumed as u64,
+        ))))));
+        assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+        let active = worker.active.iter().flatten().next().unwrap();
+        let live = worker.scheduler.request(active.request).unwrap();
+        assert_eq!(live.consumed_tokens, consumed as u64);
+        let selected: Vec<_> = active.selected_audio.iter().map(|step| step.segment).collect();
+        assert_eq!(selected, expected, "hit at {consumed}");
+        assert_eq!(live.image_slot.is_some(), !expected.is_empty());
+        for step in &active.selected_audio {
+            // The segment the first audio step packs publishes into admitted features.
+            let start = step.input.segment_features(step.segment).unwrap().start as i32;
+            assert!(
+                live.feature_index(start).is_ok(),
+                "segment {} is not admitted after a hit at {consumed}",
+                step.segment
+            );
+        }
+        if expected == [1] {
+            assert_eq!(live.feature_index(7).unwrap(), 0);
+            assert!(live.feature_index(0).is_err());
+        }
+    }
+}
+
 #[test]
 fn failed_host_restore_replans_all_images_from_the_shallower_prefix() {
     let mut fixture = Fixture::new();

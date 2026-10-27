@@ -116,15 +116,21 @@ pub(crate) fn probe_stream(path: &std::path::Path, kind: &str, entries: &str) ->
     first_stream(&probe(path, kind, &format!("stream={entries}"))?, kind)
 }
 
-/// The first stream of `kind` and the container's own fields. Some muxers, Matroska among
-/// them, keep the duration in the container while leaving it out of the stream.
+/// The first stream of `kind`, with its side data under `side_data_list`, and the container's
+/// own fields. Some muxers, Matroska among them, keep the duration in the container while
+/// leaving it out of the stream.
 pub(crate) fn probe_stream_and_format(
     path: &std::path::Path,
     kind: &str,
     stream_entries: &str,
+    side_data_entries: &str,
     format_entries: &str,
 ) -> Result<(serde_json::Value, serde_json::Value)> {
-    let value = probe(path, kind, &format!("stream={stream_entries}:format={format_entries}"))?;
+    let value = probe(
+        path,
+        kind,
+        &format!("stream={stream_entries}:stream_side_data={side_data_entries}:format={format_entries}"),
+    )?;
     Ok((first_stream(&value, kind)?, value["format"].clone()))
 }
 

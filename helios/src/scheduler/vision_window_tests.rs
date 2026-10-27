@@ -517,6 +517,108 @@ fn vision_windows_make_progress_while_another_request_keeps_decoding() {
     ));
 }
 
+/// A scheduler whose package also captured one audio graph of 6000 mel frames.
+fn audio_scheduler(page_tokens: usize, rows: usize) -> RequestScheduler {
+    let mut scheduler = scheduler(page_tokens, rows);
+    scheduler.capabilities.audio = crate::model::AudioCapabilities {
+        frame_capacities: vec![6000],
+    };
+    let mut graphs = tests::duration_graphs(1);
+    graphs.push(crate::execution::GraphDescriptor {
+        confidence_width: 0,
+        draft_tokens: 0,
+        packed_token_capacity: 0,
+        name: "Audio-1-6000".into(),
+        kind: GraphKind::Audio,
+        sampling_mode: crate::execution::SamplingMode::General,
+        handle: 1,
+        batch_capacity: 1,
+        token_capacity: 6000,
+        prefill_capacity: 0,
+        estimated_duration_ns: 1000,
+        input_bindings: vec![],
+    });
+    scheduler.measured_graph_durations(&graphs).unwrap();
+    scheduler
+}
+
+fn audio(token_start: usize, feature_start: usize, features: usize) -> ConditionedInput {
+    ConditionedInput {
+        token_span: token_start..token_start + features,
+        feature_range: feature_start..feature_start + features,
+        work: crate::scheduler::ConditionedWork::Audio {
+            frames: 6000,
+            capacity: 6000,
+        },
+    }
+}
+
+/// Drives `handle` to its terminal phase the way the runtime does: vision steps are marked
+/// ready by `commit_step`, audio steps are never touched, and private window checkpoints are
+/// resumed as they complete. Returns the window renewals and the vision and audio runs.
+fn run_conditioned(
+    scheduler: &mut RequestScheduler,
+    mut handle: RequestHandle,
+) -> (usize, usize, usize, RequestHandle) {
+    let (mut renewals, mut vision_jobs, mut audio_jobs) = (0, 0, 0);
+    for _ in 0..300 {
+        let request = scheduler.request(handle).unwrap();
+        if request.phase == RequestPhase::Finishing {
+            break;
+        }
+        if request.conditioned_window_ready() {
+            handle = scheduler.resume_conditioned_window(handle).unwrap();
+            renewals += 1;
+        }
+        let executed = step(scheduler, handle);
+        vision_jobs += usize::from(executed.kind == GraphKind::Vision);
+        audio_jobs += usize::from(executed.kind == GraphKind::Audio);
+    }
+    (renewals, vision_jobs, audio_jobs, handle)
+}
+
+#[test]
+fn audio_only_windows_are_ready_without_a_vision_preparation() {
+    // Four arena-filling images push a trailing clip into a window of its own. The runtime
+    // prepares nothing for that window, so the scheduler itself must find it ready.
+    let mut scheduler = audio_scheduler(64, 1);
+    let mut inputs = inputs(4);
+    let last = inputs.last().unwrap();
+    inputs.push(audio(last.token_span.end, last.feature_range.end, 7));
+    let handle = admit(&mut scheduler, &inputs);
+    let (renewals, vision_jobs, audio_jobs, handle) = run_conditioned(&mut scheduler, handle);
+    assert_eq!((renewals, vision_jobs, audio_jobs), (1, 4, 1));
+    assert_eq!(
+        scheduler.request(handle).unwrap().phase,
+        RequestPhase::Finishing
+    );
+
+    // A clip that fills the arena ahead of the images holds the first window alone: its graph
+    // must be planned at once, before any image is prepared for the window that follows.
+    let mut scheduler = audio_scheduler(64, 1);
+    let mut inputs = vec![audio(17, 0, 16_384)];
+    for image in 0..4 {
+        inputs.push(ConditionedInput {
+            token_span: 16_401 + image * 4096..16_401 + (image + 1) * 4096,
+            feature_range: 16_384 + image * 4096..16_384 + (image + 1) * 4096,
+            work: crate::scheduler::ConditionedWork::Vision { patches: 16_384 },
+        });
+    }
+    let handle = admit(&mut scheduler, &inputs);
+    assert_eq!(step(&mut scheduler, handle).kind, GraphKind::Init);
+    assert_eq!(
+        scheduler.plan().map(|plan| plan.kind),
+        Some(GraphKind::Audio),
+        "an audio-only window is ready as soon as the request is initialized"
+    );
+    let (renewals, vision_jobs, audio_jobs, handle) = run_conditioned(&mut scheduler, handle);
+    assert_eq!((renewals, vision_jobs, audio_jobs), (1, 4, 1));
+    assert_eq!(
+        scheduler.request(handle).unwrap().phase,
+        RequestPhase::Finishing
+    );
+}
+
 #[test]
 fn unavailable_cold_window_row_is_rejected_without_leaking_page_reservations() {
     let mut scheduler = scheduler_with_resources(64, 1, 1, 0);

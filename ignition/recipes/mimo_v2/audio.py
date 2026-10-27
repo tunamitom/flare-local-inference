@@ -1,9 +1,10 @@
 """MiMo audio tower: causal log-mel tokenizer, residual VQ codes, and the grouped local transformer.
 
 One captured graph encodes one frontend segment of at most `AUDIO_CAPACITIES[-1]` log-mel frames.
-Shorter segments stay inside the same capacity: the mel buffer is zero-padded, and because the
-tokenizer encoder is causal (a 128-frame window on even layers, the whole prefix on odd ones) every
-row in the real prefix is exactly what a shorter input produces. The pooling and grouping
+Shorter segments stay inside the same capacity: the graph zeroes the mel rows past the segment
+(the upload writes only the segment's rows), and because the tokenizer encoder is causal (a
+128-frame window on even layers, the whole prefix on odd ones) every row in the real prefix is
+exactly what a shorter input produces. The pooling and grouping
 arithmetic is then derived on device from the segment's own frame count, so the number of produced
 features matches the processor's placeholder count without a device-to-host read, which is what
 makes the graph capturable.
@@ -298,10 +299,15 @@ class PreparedAudio:
         w, s = self.weights, self.scratch
         frames = self.inputs.audio_frames
         s.mel_time.copy_(self.inputs.audio_features.bfloat16().t())
+        # The upload covers only the segment's rows: whatever an earlier, longer segment left at
+        # and past `frames` must read as the implicit zero padding of the reference's shorter
+        # tensor, since conv1's last window reaches row `frames`.
+        past = (self.mel_rows >= frames.reshape(()))[None, :]
+        s.mel_time.masked_fill_(past, 0.0)
         convolved = F.gelu(F.conv1d(s.mel_time[None], w.conv1, w.conv1_bias, padding=1))
         # A shorter segment's conv1 ends at `frames`; zero the extension so conv2's last window
         # sees the same implicit zero padding the reference's shorter tensor produces.
-        convolved = convolved.masked_fill((self.mel_rows >= frames.reshape(()))[None, None, :], 0.0)
+        convolved = convolved.masked_fill(past[None], 0.0)
         convolved = F.gelu(F.conv1d(convolved, w.conv2, w.conv2_bias, stride=2, padding=1))
         s.residual.copy_(convolved[0].t())
         self.cu[1].copy_(self.segment_lengths(frames)[0].reshape(()))
@@ -417,6 +423,8 @@ class PreparedAudioGeneration:
         current = (i.audio_slot >= 0) & (i.audio_slot < r.capacity)
         current &= (i.audio_generation == r.generation[slot]) & (r.status[slot] == 1)
         valid = current & (frames > 0) & (frames <= capacity) & (offset >= 0)
+        # The segment's features must end inside its request's arena rows.
+        valid &= offset + e.segment_lengths(frames)[2] <= s.arena.shape[1]
         valid &= (offset == 0) | ((s.generation[slot] == i.audio_generation) & (s.count[slot] == offset))
         valid &= (s.feature_slot >= 0) & (s.feature_slot < s.arena.shape[0])
         live = e.mel_rows < frames.reshape(())
@@ -424,4 +432,6 @@ class PreparedAudioGeneration:
         self.errors.copy_(~valid)
         # A rejected segment stores no features: the publication kernel is gated on this error flag.
         output = e()
+        token_live = torch.arange(output.shape[0], device=output.device) < e.count
+        self.errors.copy_(self.errors | (~((~token_live[:, None]) | torch.isfinite(output)).all()).int() * 64)
         self.publish(output, e.count, self.errors)

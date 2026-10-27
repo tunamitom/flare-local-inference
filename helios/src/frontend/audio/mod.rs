@@ -265,7 +265,9 @@ impl AudioProfile {
         command
             .args(["-nostdin", "-v", "error", "-threads", "2", "-i"])
             .arg(&staged.path)
-            .args(["-vn", "-sn", "-dn", "-f", "f32le", "-acodec", "pcm_f32le", "pipe:1"]);
+            // The probe described the first audio stream; ffmpeg's own choice prefers the track
+            // flagged default, then the one with the most channels.
+            .args(["-map", "0:a:0", "-vn", "-sn", "-dn", "-f", "f32le", "-acodec", "pcm_f32le", "pipe:1"]);
         let pcm = super::ffmpeg::run_bounded(command, "ffmpeg", limit)?;
         drop(staged);
         let frames = pcm.len() / (4 * channels);
@@ -560,5 +562,37 @@ mod tests {
         altered.identity[0] ^= 1;
         assert!(profile.segment(&mel, &altered).is_err());
         assert!(profile.log_mel(&samples[..400], decoded_rate).is_err());
+    }
+
+    #[test]
+    fn ffmpeg_decode_reads_the_stream_the_probe_described() {
+        // Two audio tracks: a mono tone first, a stereo one second and flagged as the default
+        // track. ffmpeg's own stream selection takes the default track (and otherwise the one
+        // with the most channels), which is not the track whose channel count de-interleaves
+        // the PCM.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        let dir = std::env::temp_dir().join(format!("flare-audio-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tracks.mka");
+        let output = std::process::Command::new("ffmpeg")
+            .args(["-nostdin", "-v", "error", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=16000:duration=1"])
+            .args(["-f", "lavfi", "-i", "sine=frequency=880:sample_rate=16000:duration=1"])
+            .args(["-filter_complex", "[1:a]aformat=channel_layouts=stereo[wide]", "-map", "0:a", "-map", "[wide]"])
+            .args(["-disposition:a:0", "0", "-disposition:a:1", "default", "-c:a", "pcm_s16le", "-y"])
+            .arg(&path)
+            .output()
+            .unwrap_or_else(|error| panic!("cannot run ffmpeg to write a test clip: {error}"));
+        assert!(output.status.success(), "ffmpeg could not write a test clip: {}", String::from_utf8_lossy(&output.stderr));
+        let bytes = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let profile = AudioProfile::load(&test_settings(), 1 << 24).unwrap();
+        let (samples, rate) = profile.decode("x-matroska", &bytes).unwrap();
+        assert_eq!(rate, 16_000);
+        assert_eq!(samples.len(), 16_000);
+        // 440 Hz crosses zero 880 times a second; the second track would cross twice as often.
+        let crossings = samples.windows(2).filter(|pair| (pair[0] < 0.0) != (pair[1] < 0.0)).count();
+        assert!((860..=900).contains(&crossings), "{crossings} zero crossings");
     }
 }

@@ -71,6 +71,46 @@ def test_contract_declares_the_audio_capacity_and_feature_token():
     assert {binding['tensor'] for binding in graph['inputs']} == set(AudioInputs.allocate('cpu').buffers())
 
 
+def test_convolutions_ignore_mel_rows_past_the_segment():
+    """The upload is partial, so rows at and past `frames` hold whatever the previous, longer
+    segment left there. conv1's row `frames - 1` reads mel row `frames`, and that row reaches the
+    last code frame, so the graph must zero the rows itself rather than trust the buffer."""
+    from types import SimpleNamespace
+
+    torch.manual_seed(0)
+    capacity, frames = 64, 33
+    weights = SimpleNamespace(
+        conv1=(torch.randn(1024, 128, 3) * 0.05).bfloat16(), conv1_bias=(torch.randn(1024) * 0.05).bfloat16(),
+        conv2=(torch.randn(1024, 1024, 3) * 0.02).bfloat16(), conv2_bias=(torch.randn(1024) * 0.05).bfloat16())
+    inputs = AudioInputs.allocate('cpu', capacity)
+    scratch = AudioScratch.allocate(capacity, 'cpu')
+    # Only the convolution stage runs here, on the tensors it reads; the projections and
+    # attention of the full tower need a preparation session.
+    tower = PreparedAudio.__new__(PreparedAudio)
+    tower.weights, tower.scratch, tower.inputs = weights, scratch, inputs
+    tower.mel_rows = torch.arange(0, capacity)
+    tower.cu = torch.zeros(2, dtype=torch.int32)
+    mel = torch.randn(frames, 128) * 1.5 - 1.0
+    reference = F.gelu(F.conv1d(F.gelu(F.conv1d(mel.T[None].bfloat16(), weights.conv1, weights.conv1_bias, padding=1)),
+                                weights.conv2, weights.conv2_bias, stride=2, padding=1))[0].T
+    code = int(tower.segment_lengths(torch.tensor([frames]))[0])
+    assert reference.shape[0] == code
+
+    def convolve(stale):
+        inputs.audio_features.copy_(stale)
+        inputs.audio_frames.fill_(capacity)
+        tower.convolve()
+        inputs.audio_features[:frames].copy_(mel)
+        inputs.audio_frames.fill_(frames)
+        tower.convolve()
+        produced = scratch.residual[:code].float()
+        return (produced - reference.float()).norm(dim=1) / reference.float().norm(dim=1).clamp_min(1e-6)
+
+    # A full-capacity segment's rows, then a rejected segment's non-finite rows.
+    assert convolve(torch.randn(capacity, 128) * 1.5 - 1.0).max() < 1e-2
+    assert convolve(torch.full((capacity, 128), float('nan'))).max() < 1e-2
+
+
 def test_frontend_audio_settings_follow_the_checkpoint():
     if not (SNAPSHOT / 'audio_tokenizer' / 'config.json').is_file():
         pytest.skip('MiMo audio tokenizer checkpoint is unavailable')
@@ -162,9 +202,11 @@ def test_audio_tower_matches_the_reference_on_the_checkpoint():
         tower = PreparedAudio(weights, scratch, inputs, session=session, workspace=arena, name='audio6000')
 
         # Ten seconds is a sub-capacity segment: the graph must zero-extend the mel and still match.
+        # The runtime uploads only the segment's rows, so the rest of the buffer keeps what a
+        # previous, longer segment left there.
         frames = 1001
         mel = torch.randn(frames, 128, device=device) * 1.5 - 1.0
-        inputs.audio_features.zero_()
+        inputs.audio_features.copy_(torch.randn_like(inputs.audio_features) * 1.5 - 1.0)
         inputs.audio_features[:frames].copy_(mel)
         inputs.audio_frames.fill_(frames)
         code_length, pooled_length, token_length = (int(value) for value in tower.segment_lengths(inputs.audio_frames))

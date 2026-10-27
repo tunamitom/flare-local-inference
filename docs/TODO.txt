@@ -136,3 +136,29 @@
     tests/server/test_nemotron.py::test_image_cache_identity: native serving of
     NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB reports 281 cached tokens for a repeated
     287-token prompt; image answers and token identity assertions pass.
+
+[ ] MiMo video prefix identity hashes only a clip's first frame pair, so two
+    clips with the same first two frames, frame count, and geometry share cached
+    KV for their later grids. Push one conditioning event per pair or fold every
+    sampled frame into the clip identity (helios/src/frontend/images/layouts/mimo.rs).
+
+[ ] MiMo audio remainder segments (clips over 60 s) zero conv2's last window and
+    the pooling pad, where the reference zero-pads the segment to 6000 mel frames
+    and replicates the last pooled row; only the remainder's last token differs.
+    Decide which to follow and document it in ignition/recipes/mimo_v2/audio.py.
+
+[ ] MiMo video decode rejects clips whose container overstates the frame count
+    (edit-list trims, truncated files) where the reference loader corrects the
+    count by an end-of-stream seek and skips unreadable frames. Probe
+    nb_read_frames or resample over the frames actually decoded
+    (helios/src/frontend/images/video.rs).
+
+[ ] Verify MiMo's local-transformer RoPE rounding: the audio graph rounds the
+    inverse frequencies to BF16 like the bf16 tokenizer, while vLLM's serving
+    encoder keeps them in FP32; the parity reference is cast to bf16, so the test
+    cannot see the difference. Measure on the checkpoint before changing it.
+
+[ ] Raise the MiMo end-to-end audio parity bar: tests/recipes/test_mimo_v2_audio.py
+    accepts 0.4 code agreement and 0.9 mean cosine against the reference. Check
+    transcription quality on real clips through `flare run` before accepting
+    that noise floor.

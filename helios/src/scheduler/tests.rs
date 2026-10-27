@@ -298,24 +298,29 @@ fn audio_scheduler() -> RequestScheduler {
 #[test]
 fn audio_segments_run_their_own_graph_between_admission_and_prefill() {
     let mut scheduler = audio_scheduler();
-    let handle = scheduler.admit(spec(8, 4)).unwrap();
-    // A one-second clip at 24 kHz: 101 mel frames in one segment that publishes seven features.
-    let segment = ConditionedInput {
-        token_span: 1..8,
-        feature_range: 0..7,
+    let handle = scheduler.admit(spec(15, 4)).unwrap();
+    // A clip of two one-second segments at 24 kHz: 101 mel frames and seven features each.
+    // Each segment runs its own graph, in prompt order, and each completion consumes exactly
+    // one segment before the request resumes with the prompt it now owns.
+    let segment = |token_start: usize, feature_start: usize| ConditionedInput {
+        token_span: token_start..token_start + 7,
+        feature_range: feature_start..feature_start + 7,
         work: ConditionedWork::Audio { frames: 101, capacity: 6000 },
     };
-    scheduler.set_conditioned_inputs(handle, &[segment.clone()]).unwrap();
-    init(&mut scheduler, 1);
-    let step = scheduler.plan().unwrap();
-    assert_eq!((step.kind, step.token_capacity), (GraphKind::Audio, 6000));
-    assert_eq!(step.lanes.len(), 1);
-    scheduler.commit(&step, Fence(2)).unwrap();
-    assert!(scheduler.plan().is_none());
     scheduler
-        .complete(Fence(2), &records(handle, 2, 0, 0, -1, 1), Default::default())
+        .set_conditioned_inputs(handle, &[segment(1, 0), segment(8, 7)])
         .unwrap();
-    // The segment is consumed once; the request resumes with the prompt it now owns.
+    init(&mut scheduler, 1);
+    for fence in [2, 3] {
+        let step = scheduler.plan().unwrap();
+        assert_eq!((step.kind, step.token_capacity), (GraphKind::Audio, 6000), "fence {fence}");
+        assert_eq!(step.lanes.len(), 1);
+        scheduler.commit(&step, Fence(fence)).unwrap();
+        assert!(scheduler.plan().is_none());
+        scheduler
+            .complete(Fence(fence), &records(handle, fence, 0, 0, -1, 1), Default::default())
+            .unwrap();
+    }
     assert_eq!(scheduler.request(handle).unwrap().phase, RequestPhase::Prefill);
     let step = scheduler.plan().unwrap();
     assert_eq!(step.kind, GraphKind::Prefill);
