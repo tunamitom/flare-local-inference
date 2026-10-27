@@ -803,7 +803,10 @@ impl NativeResources {
             // Local divergence: FLARE_GRAPH_PROGRAMMATIC_EDGES=off loads every programmatic edge as
             // a full-completion edge (the effective schedule before #104) for packages whose
             // programmatic dependents are not yet qualified under real overlap.
-            let serialize = std::env::var("FLARE_GRAPH_PROGRAMMATIC_EDGES").is_ok_and(|value| value == "off");
+            // only:<prefix>[,<prefix>...] keeps programmatic edges in graphs so named and serializes the rest.
+            let edge_mode = std::env::var("FLARE_GRAPH_PROGRAMMATIC_EDGES").unwrap_or_default();
+            let kept: Option<Vec<&str>> = edge_mode.strip_prefix("only:").map(|list| list.split(',').collect());
+            let serialize_all = edge_mode == "off";
             let mut programmatic: Vec<(usize, &str)> = Vec::new();
             // Inline composition populates a switch's prefix into the composed graph and each body
             // into its conditional branch, so no member executes as a cloned child graph.
@@ -1066,6 +1069,8 @@ impl NativeResources {
                     data.clear();
                     Ok(())
                 };
+                let serialize = serialize_all
+                    || kept.as_ref().is_some_and(|kept| !kept.iter().any(|prefix| graph.name.starts_with(prefix)));
                 let mut annotated = 0;
                 let mut outgoing = vec![false; graph.node_count];
                 let mut incoming = vec![false; graph.node_count];
@@ -1100,6 +1105,10 @@ impl NativeResources {
                 records.finish()?;
                 if annotated > 0 {
                     programmatic.push((annotated, &graph.name));
+                    if !edge_mode.is_empty() {
+                        eprintln!("programmatic edges: {} {annotated}{}", graph.name,
+                            if serialize { " serialized" } else { "" });
+                    }
                 }
                 if target.is_some() {
                     if let Some((_, _, composition)) =
@@ -1173,7 +1182,7 @@ impl NativeResources {
                     "programmatic edges: {total} in {} graphs ({}){}",
                     programmatic.len(),
                     largest.join(", "),
-                    if serialize { ", loaded as full dependencies" } else { "" }
+                    if serialize_all { ", loaded as full dependencies" } else { "" }
                 );
             }
             for unused in scratch {
