@@ -187,7 +187,7 @@ class QuantizedProjection:
             from b12x.gemm.blockscaled._a16 import _weight_parts as parts
 
             query = sm103_projection.query_for(
-                source, weight, output, workspace_form="owned" if workspace is None else "provided")
+                source, weight, output, workspace_form="provided")
             if native and query.mode != "quantized":
                 raise ValueError(f"{name}: native dense activations are unsupported for this SM103 projection")
             self.plan = sm103_projection.plan(query,
@@ -195,7 +195,7 @@ class QuantizedProjection:
         else:
             query = blockscaled.query_from_call(source, weight, out=output, activation_mode=activation_mode,
                                                workspace=None if isinstance(workspace, ScratchArena) else workspace)
-            if isinstance(workspace, ScratchArena):
+            if workspace is None or isinstance(workspace, ScratchArena):
                 query = replace(query, workspace_form="provided", workspace_nbytes=None)
             self.plan = blockscaled.plan(query)
         values, scales, gain, _ = _weight_parts(weight)
@@ -213,8 +213,6 @@ class QuantizedProjection:
                 record_numeric_tensor(tensor)
 
         def selected_workspace(nbytes=None):
-            if workspace is None:
-                return None
             if nbytes is None:
                 nbytes = self.plan.memory_requirements().scratch_nbytes
             return scratch_storage(workspace, nbytes=nbytes, device=source.device)
@@ -239,11 +237,8 @@ class QuantizedProjection:
     def __call__(self, source: torch.Tensor) -> torch.Tensor:
         if self.sm103:
             values, scales, gain = self.parts
-            if self.workspace is None:
-                torch.ops.flare.sm103_packed_out_owned(source, values, scales, gain, self.output, self.plan.handle)
-            else:
-                torch.ops.flare.sm103_packed_out(source, values, scales, gain, self.output, self.workspace,
-                                                 self.plan.handle)
+            torch.ops.flare.sm103_packed_out(source, values, scales, gain, self.output, self.workspace,
+                                             self.plan.handle)
         else:
             blockscaled.mm(source, self.weight, out=self.output, plan=self.plan, workspace=self.workspace)
         if self.bias is not None:

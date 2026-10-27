@@ -175,7 +175,8 @@ class PreparedVerificationState:
         self._metadata()
 
     def finish(self):
-        self.sample.copy_(self.hidden)
+        if self.sample is not self.hidden:
+            self.sample.copy_(self.hidden)
 
     def prepare_commit(self, emitted_count, consumed_before, residual, hidden):
         pool, slots = self.pool, self.inputs.row_slot_ids

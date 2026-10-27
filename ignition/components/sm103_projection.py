@@ -510,7 +510,6 @@ def run(source, values, scales, global_scale, out, workspace, plan_handle):
     state.run(source, values, scales, global_scale, out=out, workspace=workspace)
 
 
-# Separate caller-workspace and owned-workspace operators keep every mutated argument a tensor.
 @torch.library.custom_op("flare::sm103_packed_out", mutates_args=("out", "workspace"))
 def _packed_out(source: torch.Tensor, values: torch.Tensor, scales: torch.Tensor,
                 global_scale: torch.Tensor | None, out: torch.Tensor, workspace: torch.Tensor,
@@ -520,17 +519,6 @@ def _packed_out(source: torch.Tensor, values: torch.Tensor, scales: torch.Tensor
 
 @_packed_out.register_fake
 def _fake_packed_out(source, values, scales, global_scale, out, workspace, plan_handle):
-    pass
-
-
-@torch.library.custom_op("flare::sm103_packed_out_owned", mutates_args=("out",))
-def _packed_out_owned(source: torch.Tensor, values: torch.Tensor, scales: torch.Tensor,
-                      global_scale: torch.Tensor | None, out: torch.Tensor, plan_handle: int) -> None:
-    run(source, values, scales, global_scale, out, None, plan_handle)
-
-
-@_packed_out_owned.register_fake
-def _fake_packed_out_owned(source, values, scales, global_scale, out, plan_handle):
     pass
 
 

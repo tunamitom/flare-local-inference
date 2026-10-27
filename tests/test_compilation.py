@@ -343,6 +343,80 @@ def _fake_fill_output(out, value):
     pass
 
 
+class StorageMutationForward:
+    def __init__(self, offset):
+        self.storage = torch.empty(1 << 19, dtype=torch.int32, device="cuda")
+        self.source = self.storage[:8]
+        self.destination = self.storage[offset:offset + 8]
+        self.output = torch.empty((3, 8), dtype=torch.int64, device="cuda")
+
+    def __call__(self):
+        first = self.source.long()
+        _fill_output(self.destination, 7.)
+        second = self.source.long()
+        _fill_output(self.destination, 11.)
+        self.output[0].copy_(first + 3)
+        self.output[1].copy_(second + 5)
+        self.output[2].copy_(self.source)
+        return self.output
+
+
+@pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="explicit CUDA assignment required")
+@pytest.mark.parametrize("backend", ["fx", "aot"])
+@pytest.mark.parametrize("offset", [0, 16])
+@torch.no_grad()
+def test_live_values_do_not_clone_backing_storage(backend, offset, tmp_path, monkeypatch):
+    from ignition.preparation.aot import aot_forward
+    from ignition.preparation.compilation import _Invocation
+
+    monkeypatch.setattr("ignition.preparation.compilation.DEFAULT_CACHE_ROOT", tmp_path)
+
+    forward = StorageMutationForward(offset)
+    compiled = compile_forward(forward) if backend == "fx" else aot_forward(forward)
+    if backend == "aot":
+        path = tmp_path / "mutations.bin"
+        compiled.save_compiled_function(str(path))
+        with path.open("rb") as file:
+            compiled = torch.compiler.load_compiled_function(file)
+
+    def run():
+        return compiled() if backend == "fx" else compiled(forward)
+
+    addresses, sizes = [], []
+    original = _Invocation.run
+
+    def observe(invocation, reads, writes, integers=()):
+        if invocation.target == torch.ops.test_compilation.fill_output.default:
+            _, _, index, descriptor = invocation.operands[0]
+            offset = 0 if descriptor is None else descriptor[3] * descriptor[0].itemsize
+            addresses.append(writes[index].data_ptr() + offset)
+            sizes.append(writes[index].nbytes)
+        return original(invocation, reads, writes, integers)
+
+    monkeypatch.setattr(_Invocation, "run", observe)
+    run()
+    assert addresses == [forward.destination.data_ptr()] * 2
+    assert sizes == [forward.destination.nbytes] * 2
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for initial in (2, -17, 101):
+        forward.storage.fill_(initial)
+        forward.output.fill_(-1)
+        allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
+        expected = torch.tensor([initial + 3, (7 if offset == 0 else initial) + 5,
+                                 11 if offset == 0 else initial], device="cuda").view(3, 1).expand(3, 8)
+        torch.testing.assert_close(forward.output, expected, rtol=0, atol=0, check_dtype=False)
+        assert (forward.destination == 11).all()
+        assert (forward.storage[offset + 8:] == initial).all()
+        if offset:
+            assert (forward.storage[:offset] == initial).all()
+    graph.reset()
+
+
 @pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="explicit CUDA assignment required")
 @torch.no_grad()
 def test_cloned_value_survives_scratch_overwrite():

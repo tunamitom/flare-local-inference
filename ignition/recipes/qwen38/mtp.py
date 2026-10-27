@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 from b12x.preparation import PreparedCall
@@ -181,7 +181,8 @@ class PreparedMTP:
             priming_state=scratch.residual, session=session, name=f"{name}.mlp_hc")
         self.moe = PreparedQwenMoe(source, weights.moe, session=session, name=f"{name}.moe",
             scratch=scratch.moe, workspace=workspace, projection_workspace=workspace)
-        self.final_mixer = PreparedHyperconnection(weights.module.hyper_connection_mixer, scratch.hyperconnection,
+        self.final_mixer = PreparedHyperconnection(weights.module.hyper_connection_mixer,
+            replace(scratch.hyperconnection, block_input=scratch.hidden),
             priming_state=scratch.residual, session=session, name=f"{name}.final_mixer")
         self.attn_hc.prepare_combine_norm(self.mlp_hc, priming_state=scratch.residual,
             session=session, name=f"{name}.attn_combine_norm")
@@ -194,7 +195,7 @@ class PreparedMTP:
                 for label, value in (("attention", scratch.qsa.output), ("moe", self.moe.output)))
         if vocabulary_runtime is None and weights.draft_head is not None:
             self.lm_head = QuantizedProjection(scratch.selected_hidden, weights.draft_head, scratch.logits,
-                                               session=session, name=f"{name}.lm_head", activation_mode="a16")
+                                               session=session, name=f"{name}.lm_head", activation_mode="a16", workspace=workspace)
         elif vocabulary_runtime is None:
             self.lm_head = UnquantizedProjection(scratch.selected_hidden, weights.lm_head, scratch.logits,
                                          session=session, name=f"{name}.lm_head")
@@ -204,7 +205,7 @@ class PreparedMTP:
             head = weights.draft_head if weights.draft_head is not None else weights.lm_head
             self.lm_head = PreparedVocabularyProjection(scratch.selected_hidden, head,
                 scratch.local_logits, scratch.logits, runtime=vocabulary_runtime, session=session,
-                coordinator=coordinator, name=f"{name}.lm_head")
+                coordinator=coordinator, name=f"{name}.lm_head", workspace=workspace)
 
     def rebind_pages_for_preparation(self, state):
         self.attention.rebind_pages_for_preparation(state)
@@ -228,9 +229,9 @@ class PreparedMTP:
         block = self.moe(mixed)
         if self.reductions:
             block = self.reductions[1](block)
-        s.residual.copy_(self.mlp_hc.combine(s.residual, block))
+        self.mlp_hc.combine(s.residual, block)
         s.residual.masked_fill_(~active[:, None], 0)
-        s.hidden.copy_(self.final_mixer.mix(s.residual))
+        self.final_mixer.mix(s.residual)
         torch.index_select(s.hidden, 0, self.output_indices, out=s.selected_hidden)
         self.lm_head(s.selected_hidden)
         return self.output

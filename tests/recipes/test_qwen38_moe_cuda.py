@@ -78,7 +78,8 @@ def _quant_scale_math(experts):
 
 @torch.no_grad()
 @pytest.mark.parametrize("combine_routed", [False, True])
-def test_compiled_shared_gate_preserves_bf16_rounding(combine_routed):
+@pytest.mark.parametrize("pooled", [False, True])
+def test_compiled_shared_gate_preserves_bf16_rounding(combine_routed, pooled):
     from ignition.preparation.compilation import compile_forward
 
     gates = torch.arange(65536, device="cuda", dtype=torch.int32).to(torch.int16).view(torch.bfloat16)
@@ -89,6 +90,15 @@ def test_compiled_shared_gate_preserves_bf16_rounding(combine_routed):
     shared = SimpleNamespace(gate_logits=gates, projected=projected, output=output)
     routed = torch.randn_like(projected) if combine_routed else None
     combined = torch.empty_like(projected)
+    if pooled:
+        from ignition.preparation.scratch import GraphBufferPool
+
+        buffers = GraphBufferPool("cuda:0", chunk_bytes=8 << 20).cursor()
+        def store(value):
+            return buffers.zeros(value.shape, value.dtype).copy_(value)
+        shared.projected, shared.gate_logits, shared.output = map(store, (projected, gates, output))
+        combined = store(combined)
+        routed = None if routed is None else store(routed)
 
     def finish():
         return PreparedSharedExpert.finish(shared, routed, out=combined)

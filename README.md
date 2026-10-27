@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/images/flare-logo.png" alt="Flare — ASCII wordmark above a solar flare" width="912">
+  <img src="docs/images/flare-wordmark.png" alt="Flare — ASCII wordmark above a solar flare" width="912">
 </p>
 
 > **Coding agents:** skip this README and read [AGENTS.md](AGENTS.md) directly.

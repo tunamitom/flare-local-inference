@@ -62,6 +62,8 @@ def benchmark_call(state, *, arguments, inputs, workspace):
     inputs = inputs()
     arguments = {**arguments, **{key: getattr(inputs, key)
                                   for key in ("q", "k", "v", "cu_seqlens_q")}}
+    if "out" in arguments:
+        arguments = {**arguments, "out": torch.empty_like(arguments["out"])}
     scratch = planned_scratch(state.scratch_plan.scratch_specs(), workspace)
     binding = state.bind(scratch=scratch, **arguments)
     return PreparedCall(run=lambda: state.run(binding), produce=inputs.produce,

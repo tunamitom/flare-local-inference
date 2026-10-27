@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 
@@ -218,6 +218,10 @@ class PreparedDecoder:
         from .moe import PreparedQwenMoe
         from .ple import PreparedPLE
 
+        if verification:
+            if scratch.sample_hidden.shape != scratch.hidden.shape:
+                raise ValueError("verification requires one sample row per hidden row")
+            scratch = replace(scratch, sample_hidden=scratch.hidden)
         self.weights, self.scratch, self.state = weights, scratch, state
         self.verification = verification
         if residual_output is not None and (
@@ -275,7 +279,7 @@ class PreparedDecoder:
             mode=state.mode, session=session, name=f"{name}.ple", workspace=workspaces,
             partitions=getattr(state, "ple_partitions", None), runtime=runtime, coordinator=coordinator)
         self.final_mixer = PreparedHyperconnection(language.hyper_connection_mixer,
-            scratch.hyperconnection, priming_state=scratch.residual,
+            replace(scratch.hyperconnection, block_input=scratch.hidden), priming_state=scratch.residual,
             session=session, name=f"{name}.final_mixer")
         for index, (attn_hc, _, mlp_hc, _) in enumerate(self.layers):
             attn_hc.prepare_combine_norm(mlp_hc, priming_state=scratch.residual,
@@ -359,7 +363,7 @@ class PreparedDecoder:
                 self.stage_outputs["moe_shared"].copy_(moe.shared.finish())
                 self.stage_outputs["moe_routed"].copy_(moe.routed_output)
             if index == 0:
-                s.residual.copy_(mlp_hc.combine(s.residual, block))
+                mlp_hc.combine(s.residual, block)
             else:
                 mlp_hc.combine_norm(s.residual, block)
             if index == 0 and self.stage_outputs:
@@ -368,7 +372,7 @@ class PreparedDecoder:
                 self.layer_outputs[index].copy_(s.residual)
         if self.residual_output is not None:
             self.residual_output.copy_(s.residual)
-        s.hidden.copy_(self.final_mixer.mix(s.residual, pre_normalized=True))
+        self.final_mixer.mix(s.residual, pre_normalized=True)
         if self.scoring is not None:
             self.scoring()
         self.state.finish()

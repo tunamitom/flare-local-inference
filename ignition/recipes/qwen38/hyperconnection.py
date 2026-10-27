@@ -125,7 +125,7 @@ class PreparedHyperconnection:
             "scaled_silu": {},
         }
         if module.block_inject_weight is not None:
-            invocations["combine"] = {}
+            invocations["combine"] = {"output_mode": "provided"}
         for operation, options in invocations.items():
             plan = hc.plan(caps, invocation=FrozenMapping({"operation": operation, **options}))
             arguments = priming_arguments[operation]
@@ -191,11 +191,11 @@ class PreparedHyperconnection:
         return values
 
     def combine(self, residual: torch.Tensor, block_output: torch.Tensor) -> torch.Tensor:
-        """Inject in FP32 and return a BF16 intermediate inside the captured graph."""
+        """Inject in FP32 and update the BF16 residual in place."""
         if self.injection is None:
             raise ValueError("the final hyperconnection mixer has no residual injection")
         return hc.run_combine(residual, block_output, self.scratch.injection_logits,
-                              plan=self.plans["combine"])
+                              plan=self.plans["combine"], out=residual)
 
     def combine_norm(self, residual: torch.Tensor, block_output: torch.Tensor) -> torch.Tensor:
         """Update the residual in place and prepare the following mixer's input."""

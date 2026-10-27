@@ -62,7 +62,8 @@ def qualify(snapshot: Path) -> list[dict]:
 
             def run_unfused():
                 prepared.mix(source)
-                unfused_combined.copy_(prepared.combine(source, block))
+                unfused_combined.copy_(source)
+                prepared.combine(unfused_combined, block)
                 unfused_following.copy_(following.mix(unfused_combined))
                 unfused_normalized.copy_(scratch.normalized)
 

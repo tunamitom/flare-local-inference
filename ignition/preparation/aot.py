@@ -26,7 +26,7 @@ from torch._higher_order_ops.triton_kernel_wrap import kernel_side_table
 from torch.utils._pytree import tree_flatten, tree_unflatten, treespec_dumps, treespec_loads
 
 from .compilation import (DEFAULT_CACHE_ROOT, _INVOCATIONS, _OPTIONS, _Invocation, _artifact_kernel_table,
-                          _byte_storage, _lower_storage, _compiler_recursion)
+                          _byte_storage, _storage_region, _lower_storage, _compiler_recursion)
 from .device_binding import bind_device, relocate_inductor, restore_device, restore_prepared_device
 from .host_memory import release_unused
 
@@ -180,12 +180,14 @@ def _signature(inputs):
 class _Input:
     index: int
     view: tuple | None = None
+    region: tuple[int, int] | None = None
 
     def bind(self, args):
         value = args[self.index]
         if self.view is not None:
             dtype, shape, stride, offset = self.view
-            value = _byte_storage(value).view(dtype).as_strided(shape, stride, offset)
+            storage = _byte_storage(value) if self.region is None else _storage_region(value, *self.region)
+            value = storage.view(dtype).as_strided(shape, stride, offset)
         return value
 
 
@@ -269,12 +271,14 @@ class StorageBackend(SerializableCallable):
             value = operator.attrgetter(node.target)(module)
             if not isinstance(value, torch.Tensor):
                 raise TypeError(f'compiled constant must be a tensor: {node.target}')
-            index = storages[value.untyped_storage()._cdata]
+            origin = node.meta.get('storage_origin')
+            index = storages[value.untyped_storage()._cdata if origin is None else origin[0]]
             with graph.inserting_before(next(iter(graph.nodes))):
                 argument = graph.placeholder(f'buffer_{len(bindings)}')
             argument.meta['val'] = value
             bindings[argument] = _Input(index, (value.dtype, tuple(map(int, value.shape)),
-                                              tuple(map(int, value.stride())), int(value.storage_offset())))
+                                              tuple(map(int, value.stride())), int(value.storage_offset())),
+                                        None if origin is None else origin[1:])
             node.replace_all_uses_with(argument)
             graph.erase_node(node)
         graph.eliminate_dead_code()

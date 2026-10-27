@@ -214,7 +214,7 @@ def test_combine_norm_fixture_retains_fp32_gain_and_owns_both_outputs():
     assert not source.count_nonzero()
 
 
-def test_combine_uses_public_prepared_plan_and_functional_output(monkeypatch):
+def test_combine_uses_public_prepared_plan_and_residual_output(monkeypatch):
     operator = hyperconnection.PreparedHyperconnection.__new__(hyperconnection.PreparedHyperconnection)
     operator.scratch = HyperconnectionScratch.allocate(4, torch.device("cpu"))
     operator.injection = object()
@@ -222,17 +222,17 @@ def test_combine_uses_public_prepared_plan_and_functional_output(monkeypatch):
     operator.plans = {"combine": plan}
     residual = torch.zeros(4, 10240, dtype=torch.bfloat16)
     block = torch.zeros(4, 2560, dtype=torch.bfloat16)
-    output = torch.ones_like(residual)
     calls = []
 
-    def combine(state, block_output, logits, *, plan):
+    def combine(state, block_output, logits, *, plan, out):
         calls.append((state, block_output, logits, plan, plan.selection))
-        return output
+        assert out is state
+        return out
 
     monkeypatch.setattr(hyperconnection.hc, "run_combine", combine)
     for selection in ("default", "tuned"):
         plan.selection = selection
-        assert operator.combine(residual, block) is output
+        assert operator.combine(residual, block) is residual
         state, actual_block, logits, selected_plan, selected_config = calls[-1]
         assert state is residual and actual_block is block
         assert logits is operator.scratch.injection_logits

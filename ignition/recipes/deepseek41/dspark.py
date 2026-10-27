@@ -31,7 +31,7 @@ class PreparedDraft:
         self.head_hidden = scratch.buffers.zeros(scratch.hidden.shape, scratch.hidden.dtype)
         head = weights.head if weights.draft.draft_head is None else weights.draft.draft_head
         self.head = PreparedVocabularyProjection(scratch.hidden, head, scratch.local_logits, scratch.logits,
-            runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head")
+            runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head", workspace=workspace)
 
     def __call__(self):
         s = self.scratch

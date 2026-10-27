@@ -12,6 +12,11 @@ from ignition.preparation.scratch import planned_scratch, prime_owners
 from ignition.preparation.tuning import declare, register_finalizer
 
 
+# Local divergence: caller-output varlen attention needs b12x 370d4de8, which the FlashInfer pin does not
+# carry. Without it, attend through the previous custom op that copies the result into ``out``.
+CALLER_OUTPUT = hasattr(varlen, "run_out")
+
+
 @torch.library.custom_op("flare::varlen_attention", mutates_args=("out", "scratch"))
 def _attention(
     q: torch.Tensor,
@@ -59,6 +64,7 @@ class PreparedVarlenAttention:
         self.plan = varlen.plan(q, k, v, cu, max_seqlen_q=self.max_seqlen, max_seqlen_k=self.max_seqlen,
                                causal=False, window_size=window, attention_sink_bias=sink, **arithmetic)
         arguments = {
+            **({"out": out} if CALLER_OUTPUT else {}),
             "q": q,
             "k": k,
             "v": v,
@@ -94,5 +100,11 @@ class PreparedVarlenAttention:
         self.scratch = planned_scratch(self.plan.scratch_specs(), self.workspace)
 
     def __call__(self):
-        _attention(self.q, self.k, self.v, self.cu, self.out, self.scratch, self.sink, self.plan.handle, self.max_seqlen)
+        if CALLER_OUTPUT:
+            varlen.run_out(self.q, self.k, self.v, self.cu, out=self.out,
+                scratch=self.scratch, plan=self.plan, attention_sink_bias=self.sink,
+                max_seqlen_q=self.max_seqlen, max_seqlen_k=self.max_seqlen)
+        else:
+            _attention(self.q, self.k, self.v, self.cu, self.out, self.scratch, self.sink, self.plan.handle,
+                       self.max_seqlen)
         return self.out

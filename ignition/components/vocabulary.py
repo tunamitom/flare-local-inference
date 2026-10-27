@@ -6,12 +6,13 @@ from .collectives import PreparedAllGather
 from .linear import QuantizedProjection, UnquantizedProjection
 
 
-def vocabulary_shard_projection(source, weight, local_output, *, session, name, activation_mode="a16"):
+def vocabulary_shard_projection(source, weight, local_output, *, session, name, activation_mode="a16",
+                                 workspace=None):
     """Project replicated hidden rows into this rank's contiguous vocabulary shard only."""
     if isinstance(weight, torch.Tensor):
         return UnquantizedProjection(source, weight, local_output, session=session, name=name)
     return QuantizedProjection(source, weight, local_output, session=session, name=name,
-                               activation_mode=activation_mode)
+                               activation_mode=activation_mode, workspace=workspace)
 
 
 class PreparedVocabularyProjection:
@@ -27,7 +28,8 @@ class PreparedVocabularyProjection:
     """
 
     def __init__(self, source, weight, local_output, output, *, runtime, session,
-                 coordinator, name, activation_mode="a16", buffers=None, row_indices=None, projection=None):
+                 coordinator, name, activation_mode="a16", buffers=None, row_indices=None, projection=None,
+                 workspace=None):
         rows = source.shape[0]
         if row_indices is None and output.shape[0] != rows:
             raise ValueError("vocabulary output rows must match projected rows without row indices")
@@ -38,7 +40,7 @@ class PreparedVocabularyProjection:
         self.row_indices = row_indices
         # A caller-prepared ``projection`` into ``local_output`` replaces the shard projection.
         self.projection = projection or vocabulary_shard_projection(source, weight, local_output, session=session,
-            name=f"{name}.projection", activation_mode=activation_mode)
+            name=f"{name}.projection", activation_mode=activation_mode, workspace=workspace)
         world = 1 if runtime is None else runtime.world_size
         columns = local_output.shape[1] * world
         if columns < output.shape[1]:

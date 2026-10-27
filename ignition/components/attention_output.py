@@ -12,6 +12,11 @@ from ignition.preparation.tensor_metadata import record_numeric_tensor
 from ignition.preparation.tuning import declare, register_finalizer
 
 
+# Local divergence: the caller-output WO API needs b12x 370d4de8, which the FlashInfer pin does not carry.
+# Without it, project through the previous custom op that restrides the binding's output.
+CALLER_OUTPUT = hasattr(wo_projection, "run_out")
+
+
 @torch.library.custom_op("flare::grouped_attention_output", mutates_args=("out", "scratch"))
 def _project(source: torch.Tensor, weights: list[torch.Tensor], out: torch.Tensor,
              scratch: torch.Tensor, handle: int) -> None:
@@ -48,9 +53,12 @@ class PreparedGroupedOutputProjection:
 
         def call(state, values, out, *, produce=None, owners=()):
             scratch = planned_scratch(state._scratch_state.scratch_specs(), workspace)
-            binding = state.bind(source_tgd=values, weights=weights, scratch=scratch)
-            binding = replace(binding, output=out.as_strided((values.shape[0], weights.hidden, 1),
-                (weights.hidden, 1, values.shape[0] * weights.hidden)))
+            if CALLER_OUTPUT:
+                binding = state.bind(source_tgd=values, weights=weights, scratch=scratch, out=out)
+            else:
+                binding = replace(state.bind(source_tgd=values, weights=weights, scratch=scratch),
+                    output=out.as_strided((values.shape[0], weights.hidden, 1),
+                                          (weights.hidden, 1, values.shape[0] * weights.hidden)))
             return PreparedCall(run=lambda: state.run(binding), output=out, produce=produce,
                 owners=(*owners, weights, *prime_owners(workspace, scratch, binding)))
 
@@ -68,5 +76,8 @@ class PreparedGroupedOutputProjection:
         self.scratch = planned_scratch(self.plan.scratch_specs(), self.workspace)
 
     def __call__(self, source):
-        _project(source, self.operands, self.output, self.scratch, self.plan.handle)
+        if CALLER_OUTPUT:
+            wo_projection.run_out(source, self.weights, out=self.output, scratch=self.scratch, plan=self.plan)
+        else:
+            _project(source, self.operands, self.output, self.scratch, self.plan.handle)
         return self.output

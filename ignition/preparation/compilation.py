@@ -160,6 +160,44 @@ def _byte_storage(tensor):
     return tensor.new_empty(0, dtype=torch.uint8).set_(storage, 0, (storage.nbytes(),), (1,))
 
 
+def _storage_region(tensor, begin, end):
+    if tensor.untyped_storage().device.type == 'meta':
+        return tensor.new_empty((end - begin,), dtype=torch.uint8)
+    storage = tensor.untyped_storage()[begin:end]
+    return tensor.new_empty(0, dtype=torch.uint8).set_(storage, 0, (end - begin,), (1,))
+
+
+def _storage_regions(nodes, keys):
+    """Partition persistent storage only where every traced tensor view is disjoint."""
+    persistent = {keys[node] for node in nodes if node.op == 'get_attr' and node in keys}
+    ranges = {}
+    for node, key in keys.items():
+        if key not in persistent:
+            continue
+        value = node.meta['val']
+        begin = int(value.storage_offset()) * value.element_size()
+        span = 0 if not value.numel() else 1 + sum(
+            (int(size) - 1) * int(stride) for size, stride in zip(value.shape, value.stride()))
+        ranges.setdefault(key, []).append((begin, begin + span * value.element_size(), node))
+    regions = {}
+    for key, spans in ranges.items():
+        alignment = max(node.meta['val'].element_size() for _, _, node in spans)
+        groups = []
+        for begin, end, node in sorted(spans, key=lambda item: (item[0], item[1])):
+            begin, end = begin // alignment * alignment, (end + alignment - 1) // alignment * alignment
+            if groups and begin < groups[-1][1]:
+                groups[-1][1] = max(groups[-1][1], end)
+                groups[-1][2].append(node)
+            else:
+                groups.append([begin, end, [node]])
+        for index, (begin, end, members) in enumerate(groups):
+            region = (key, index)
+            regions[region] = (begin, end)
+            for node in members:
+                keys[node] = region
+    return regions
+
+
 @contextmanager
 def _artifact_kernel_table():
     # Native launches are runtime bindings; artifacts must not restore their IDs.
@@ -408,37 +446,40 @@ def _lower_storage(module):
                                     **torch.fx.map_arg(node.kwargs, lambda arg: arg.meta['val']))
                             break
     mutations = {node: _mutated_tensors(node) for node in originals if node.op == 'call_function'}
+    regions = _storage_regions(originals, keys)
     materialize = _reads_across_mutations(originals, keys, mutations)
-    dtypes, storage_references = {}, {}
+    dtypes = {}
     for node, key in keys.items():
         dtypes.setdefault(key, set()).add(node.meta['val'].dtype)
-        storage_references.setdefault(key, set()).add(node)
 
     for node in originals:
         if node.op != 'get_attr' or not isinstance(node.meta.get('val'), torch.Tensor):
             continue
         key = keys[node]
-        if len(dtypes[key]) <= 1 and len(storage_references[key]) <= 1:
-            continue
         if key not in bases:
             tensor = operator.attrgetter(node.target)(module)
             name = '_storage_' + str(len(bases))
-            storage = _byte_storage(tensor)
+            begin, end = regions[key]
+            storage = _storage_region(tensor, begin, end)
             if len(dtypes[key]) == 1:
                 storage = storage.view(tensor.dtype)
             module.register_buffer(name, storage)
             with graph.inserting_before(originals[0]):
                 bases[key] = graph.get_attr(name)
-
-    def tensor_nodes(value):
-        leaves, _ = tree_flatten(value)
-        return [node for node in leaves if isinstance(node, torch.fx.Node)
-                and isinstance(node.meta.get('val'), torch.Tensor)]
+                bases[key].meta['storage_origin'] = (key[0], begin, end)
 
     def key_for(node):
         return keys[node]
 
-    calls = []
+    accesses = {}
+    for node in originals:
+        if node in keys and keys[node] in regions:
+            accesses[node] = {keys[node]}
+        else:
+            accesses[node] = set().union(*(accesses[arg] for arg in node.all_input_nodes))
+    positions = {node: index for index, node in enumerate(originals)}
+    last_write = {keys[arg]: positions[node] for node in originals for arg in mutations.get(node, ())}
+    calls, mutation_calls = [], {}
     for node in originals:
         if node.op != 'call_function':
             continue
@@ -446,15 +487,23 @@ def _lower_storage(module):
         mutated = mutations[node]
         if not mutated:
             continue
-        # Keep pointwise tensor work visible unless its operands alias shared storage.
-        is_external = target is torch.ops.higher_order.triton_kernel_wrapper_mutation or (
-            isinstance(target, torch._ops.OpOverload) and target.namespace != 'aten')
-        operand_nodes = tensor_nodes((node.args, node.kwargs))
-        if not is_external and all(arg.meta['val'].is_contiguous() for arg in mutated) and not any(
-            key_for(arg) in bases
-            for arg in operand_nodes):
-            continue
+        # Complete writes to a disjoint region can fuse into their destination.
+        def complete_write(arg):
+            value = arg.meta['val']
+            if not value.is_contiguous():
+                return False
+            if key_for(arg) not in bases:
+                return True
+            begin, end = regions[key_for(arg)]
+            return (int(value.storage_offset()) * value.element_size() == begin
+                    and value.numel() * value.element_size() == end - begin)
+
         mutable_keys = {key_for(arg) for arg in mutated}
+        # Inductor can recompute the source when writing inputs back after the graph.
+        if (target is torch.ops.aten.copy_.default
+                and not any(last_write.get(key, -1) > positions[node] for key in accesses[node.args[1]])
+                and all(complete_write(arg) for arg in mutated)):
+            continue
         reads, writes, read_indices, write_indices = [], [], {}, {}
         leaves, tree = tree_flatten((node.args, node.kwargs))
         operands, integers, integer_positions = [], [], []
@@ -478,7 +527,7 @@ def _lower_storage(module):
                 indices[identity] = len(array)
                 array.append(base if base is not None else arg)
             descriptor = (value.dtype, tuple(map(int, value.shape)), tuple(map(int, value.stride())),
-                          int(value.storage_offset())) if base is not None else None
+                          int(value.storage_offset()) - regions[key][0] // value.element_size()) if base is not None else None
             operands.append((position, mutable, indices[identity], descriptor))
             leaves[position] = None
         invocation = _Invocation(target, leaves, tree, operands, integer_positions)
@@ -486,7 +535,7 @@ def _lower_storage(module):
         calls.append(invocation)
         with graph.inserting_before(node):
             arguments = (reads, writes, handle, integers) if integers else (reads, writes, handle)
-            graph.call_function(torch.ops.flare.storage_call.default, arguments)
+            mutation_calls[node] = graph.call_function(torch.ops.flare.storage_call.default, arguments)
         if node.users:
             schema = getattr(target, '_schema', None)
             aliases = [] if schema is None else [
@@ -509,7 +558,7 @@ def _lower_storage(module):
         value = node.meta['val']
         shape = tuple(map(int, value.shape))
         stride = tuple(map(int, value.stride()))
-        offset = int(value.storage_offset())
+        offset = int(value.storage_offset()) - regions[key_for(node)][0] // value.element_size()
         with graph.inserting_before(node):
             typed = graph.call_function(torch.ops.aten.view.dtype, (bases[key_for(node)], value.dtype))
             if value.is_contiguous():
@@ -521,12 +570,17 @@ def _lower_storage(module):
                     (typed, shape, stride, offset))
         node.replace_all_uses_with(view)
         graph.erase_node(node)
-    for node in materialize:
+    for node, consumers in materialize.items():
         with graph.inserting_after(node):
             value = graph.call_function(torch.ops.flare.snapshot.default, (node,))
             value.meta = node.meta.copy()
         node.replace_all_uses_with(value)
         value.args = (node,)
+        for consumer in consumers:
+            if consumer in mutation_calls:
+                call = mutation_calls[consumer]
+                # Materialize live values before mutation so functionalization need not clone their backing storage.
+                call.args = ([*call.args[0], value], *call.args[1:])
     graph.eliminate_dead_code()
     graph.lint()
     return calls
@@ -563,7 +617,7 @@ def _reads_across_mutations(nodes, keys, mutations):
     mutations = {node: {keys[operand] for operand in operands}
                  for node, operands in mutations.items() if operands}
     mutable = set().union(*mutations.values()) if mutations else set()
-    live, fresh, required = {}, set(), set()
+    live, fresh, required = {}, set(), {}
     for index, node in enumerate(nodes):
         operands = node.all_input_nodes
         reads = set().union(*(live.get(arg, set()) for arg in operands)) if operands else set()
@@ -571,7 +625,7 @@ def _reads_across_mutations(nodes, keys, mutations):
         if node in mutations:
             for previous, pending in live.items():
                 if previous in fresh and last_use[previous] > index and pending & mutations[node]:
-                    required.add(previous)
+                    required.setdefault(previous, []).append(node)
                     pending.clear()
         live = {value: pending for value, pending in live.items() if pending and last_use[value] > index}
         if (node in keys and node.op == 'call_function'
@@ -581,4 +635,4 @@ def _reads_across_mutations(nodes, keys, mutations):
             live[node] = reads
         elif node in keys and keys[node] in mutable:
             live[node] = {keys[node]}
-    return [node for node in nodes if node in required]
+    return {node: required[node] for node in nodes if node in required}
