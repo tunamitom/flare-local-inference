@@ -76,6 +76,13 @@ struct Composition {
     bodies: Vec<Handle>,
 }
 
+fn composition_graph(compositions: &[(String, u64, Composition)], prefix: &str) -> Handle {
+    compositions
+        .iter()
+        .find(|(name, _, _)| name == prefix)
+        .map_or(null_mut(), |(_, _, composition)| composition.graph)
+}
+
 const SELECT_CONDITIONAL_FATBIN: &[u8] = include_bytes!("../../native/select_conditional.fatbin");
 use format::{Blob, Memory, Node, Package, Reference, Relocation, RelocationKind, invalid};
 
@@ -801,7 +808,12 @@ impl NativeResources {
             // Inline composition populates a switch's prefix into the composed graph and each body
             // into its conditional branch, so no member executes as a cloned child graph.
             // FLARE_SWITCH_COMPOSITION=child keeps the cloned-child composition.
-            let inline = std::env::var("FLARE_SWITCH_COMPOSITION").map_or(true, |value| value != "child");
+            // FLARE_SWITCH_COMPOSITION=fixed-N (diagnostic) composes the prefix followed by body N
+            // with no conditional node.
+            let composition_mode = std::env::var("FLARE_SWITCH_COMPOSITION").unwrap_or_default();
+            let inline = composition_mode != "child";
+            let fixed = composition_mode.strip_prefix("fixed-").and_then(|n| n.parse::<usize>().ok());
+            let mut scratch: Vec<Handle> = Vec::new();
             let mut compositions: Vec<(String, u64, Composition)> = Vec::new();
             let mut targets: HashMap<String, Handle> = HashMap::new();
             if inline {
@@ -811,7 +823,28 @@ impl NativeResources {
                         continue;
                     };
                     let selector = self.execution_buffer(&switch.selector_buffer, 4)?;
-                    let composition = self.begin_switch(switch.bodies.len(), selector)?;
+                    let composition = match fixed {
+                        Some(index) => {
+                            let mut graph = null_mut();
+                            driver.check("cuGraphCreate", (driver.graph_create)(&mut graph, 0))?;
+                            self.templates.push(graph);
+                            let mut join = null_mut();
+                            driver.check("cuGraphAddEmptyNode", (driver.graph_empty)(&mut join, graph, null(), 0))?;
+                            let bodies = (0..switch.bodies.len())
+                                .map(|body| {
+                                    if body == index {
+                                        return Ok(graph);
+                                    }
+                                    let mut unused = null_mut();
+                                    driver.check("cuGraphCreate", (driver.graph_create)(&mut unused, 0))?;
+                                    scratch.push(unused);
+                                    Ok(unused)
+                                })
+                                .collect::<Result<Vec<_>>>()?;
+                            Composition { graph, select: join, bodies }
+                        }
+                        None => self.begin_switch(switch.bodies.len(), selector)?,
+                    };
                     targets.insert(switch.graph.clone(), composition.graph);
                     for (name, &body) in switch.bodies.iter().zip(&composition.bodies) {
                         targets.insert(name.clone(), body);
@@ -1035,6 +1068,7 @@ impl NativeResources {
                 };
                 let mut annotated = 0;
                 let mut outgoing = vec![false; graph.node_count];
+                let mut incoming = vec![false; graph.node_count];
                 for begin in (0..graph.edge_count).step_by(4096) {
                     let mut sources = Vec::new();
                     let mut destinations = Vec::new();
@@ -1043,6 +1077,7 @@ impl NativeResources {
                         let mut edge = protobuf::edge(records.read()?)?;
                         dependencies.add(&edge)?;
                         outgoing[edge.source] = true;
+                        incoming[edge.destination] = true;
                         if edge.data != [0; 8] {
                             annotated += 1;
                             if serialize {
@@ -1089,6 +1124,22 @@ impl NativeResources {
                             ),
                         )?;
                     }
+                    if let Some((_, _, composition)) = compositions.iter().find(|(prefix, _, _)| {
+                        fixed.is_some() && prefix != &graph.name && handle == composition_graph(&compositions, prefix)
+                    }) {
+                        let sources: Vec<Handle> = nodes
+                            .iter()
+                            .zip(&incoming)
+                            .filter(|(_, incoming)| !**incoming)
+                            .map(|(node, _)| *node)
+                            .collect();
+                        let joins = vec![composition.select; sources.len()];
+                        let data = vec![[0u8; 8]; sources.len()];
+                        driver.check(
+                            "cuGraphAddDependencies_v2",
+                            (driver.graph_edges)(handle, joins.as_ptr(), sources.as_ptr(), data.as_ptr(), data.len()),
+                        )?;
+                    }
                     phase.advance(1);
                     continue;
                 }
@@ -1124,6 +1175,9 @@ impl NativeResources {
                     largest.join(", "),
                     if serialize { ", loaded as full dependencies" } else { "" }
                 );
+            }
+            for unused in scratch {
+                driver.check("cuGraphDestroy", (driver.graph_destroy)(unused))?;
             }
             for (name, flags, composition) in compositions {
                 let executable = self.finish_switch(composition.graph, flags)?;
