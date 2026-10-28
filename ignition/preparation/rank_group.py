@@ -206,7 +206,10 @@ class PreparedRankGroup:
         if self._closed:
             return
         try:
-            self.supervisor.begin_shutdown(60000)
+            # TP4+ checkpoints release hundreds of GiB of weights and the
+            # engram tables during drain; the engine's own cap is 300 s and a
+            # 60 s window aborts the export after all payloads are written.
+            self.supervisor.begin_shutdown(300000)
             if not self._started:
                 for control in self.controls:
                     control.send("close")
@@ -297,7 +300,7 @@ def prepare_group(snapshot, config, prepare, *, progress=None, package_storage=N
         return PreparedRankGroup(model, processes, connections, controls, supervisor, rendezvous, reports,
                                  progress=progress)
     except TuningComplete:
-        supervisor.begin_shutdown(60000)
+        supervisor.begin_shutdown(300000)
         for control in controls:
             if control.recv() != "tuning_complete":
                 supervisor.abort("tuning replica did not confirm completion")
