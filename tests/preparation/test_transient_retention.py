@@ -12,13 +12,30 @@ from ignition.preparation import capture
 
 
 @pytest.mark.parametrize('fail', [False, True])
-def test_retention_scope_completion_and_exception(fail):
-    events = []
+def test_retention_scope_shares_one_pool_and_releases_it_before_finish(monkeypatch, fail):
+    import torch
+
+    events, pools = [], []
     def operation(name):
         events.append(name)
         return 0
+    class Pool:
+        def __init__(self, allocator):
+            self.id, self.allocator = (len(pools) + 1, 0), allocator
+            pools.append(self)
+    @contextmanager
+    def use_mem_pool(pool, device):
+        events.append(('use', pool.id))
+        yield
+    monkeypatch.setattr(torch.cuda, 'MemPool', Pool)
+    monkeypatch.setattr(torch.cuda, 'use_mem_pool', use_mem_pool)
+    monkeypatch.setattr(torch.cuda, 'synchronize', lambda device: events.append('synchronize'))
+    monkeypatch.setattr(torch.cuda, 'empty_cache', lambda: events.append('empty_cache'))
     storage = PackageStorage.__new__(PackageStorage)
-    storage._retention_scope = False
+    storage._retention_scope, storage._retained_pool = False, None
+    storage.device, storage.integrated, storage._preparation_pools = 0, False, set()
+    storage._allocator = SimpleNamespace(allocator=lambda: 'free')
+    storage._transient_allocator = SimpleNamespace(allocator=lambda: 'transient_free')
     storage.library = SimpleNamespace(
         flare_package_retention_begin=lambda: operation('begin'),
         flare_package_retention_finish=lambda: operation('finish'),
@@ -30,13 +47,25 @@ def test_retention_scope_completion_and_exception(fail):
             with pytest.raises(RuntimeError, match='nested'):
                 with storage.retain_transient_backing():
                     pass
-            events.append('body')
+            for _ in range(3):
+                with storage.transient():
+                    events.append('warm')
             if fail:
                 raise ValueError('preparation failed')
     except ValueError:
         assert fail
-    assert not storage._retention_scope
-    assert events == ['begin', 'body', 'abort' if fail else 'finish']
+    assert not storage._retention_scope and storage._retained_pool is None
+    # Every warmup reused the scope's one transient-free pool; none released backing on exit.
+    shared, = pools
+    assert shared.allocator == 'transient_free' and storage._preparation_pools == {shared.id}
+    warmups = [('use', shared.id), 'warm', 'synchronize'] * 3
+    # A failed scope abandons its backing without driver calls around possibly stranded work.
+    release = ['abort'] if fail else ['synchronize', 'empty_cache', 'finish']
+    assert events == ['begin', *warmups, *release]
+    with storage.transient():
+        pass
+    assert pools[1].allocator == 'free'
+    assert events[-3:] == [('use', pools[1].id), 'synchronize', 'empty_cache']
 
 
 def test_capture_drains_after_prepare_and_sync_before_capture(monkeypatch):

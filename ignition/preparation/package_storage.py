@@ -51,6 +51,7 @@ class PackageStorage:
         properties = torch.cuda.get_device_properties(device)
         self.integrated = properties.is_integrated
         self._retention_scope = False
+        self._retained_pool = None
         self.DEVICE_BASE += rank * self.RESERVATION_BYTES
         self.cuda = _Cuda()
         from flare_heliopause import flare_heliopause as native
@@ -175,7 +176,15 @@ class PackageStorage:
 
     @contextmanager
     def retain_transient_backing(self):
-        """Keep transient physical allocations alive across compiled-forward warming."""
+        """Keep transient physical allocations alive across compiled-forward warming.
+
+        Transient scopes opened inside share one pool that lives until this scope ends. Each
+        warmup reuses the segments earlier warmups cached, so no transient segment is unmapped
+        or released during warming and residency stays at the largest warmup's need instead of
+        accumulating retired backing for every warmup in the catalog.
+        """
+        import torch
+
         if self._retention_scope:
             raise RuntimeError("nested transient physical retention scope")
         self._retention_scope = True
@@ -183,7 +192,16 @@ class PackageStorage:
             if self.library.flare_package_retention_begin():
                 raise self.error or RuntimeError("cannot begin transient physical retention")
             try:
+                pool = torch.cuda.MemPool(self._transient_allocator.allocator())
+                self._preparation_pools.add(pool.id)
+                self._retained_pool = pool
                 yield
+                self._retained_pool = None
+                torch.cuda.synchronize(self.device)
+                del pool
+                torch.cuda.empty_cache()
+                # Returned segments may reopen low addresses that later library allocations would take.
+                self.seal_low_window()
                 if self.error is not None:
                     raise self.error
                 if self.library.flare_package_retention_finish():
@@ -192,6 +210,7 @@ class PackageStorage:
                 self.library.flare_package_retention_abort()
                 raise
         finally:
+            self._retained_pool = None
             self._retention_scope = False
 
     @contextmanager
@@ -201,13 +220,20 @@ class PackageStorage:
         A live pool never releases cached segments, so work that frees most of
         what it allocates, such as kernel tuning, would otherwise strand that
         memory for the rest of preparation. Allocations still live on exit
-        stay valid, package-backed, and exported.
+        stay valid, package-backed, and exported. Inside a physical retention
+        scope, allocations use the scope's pool, whose segments return when
+        the retention scope ends.
         """
         import torch
 
-        allocator = (self._transient_allocator if self._retention_scope
-                     else self._allocator)
-        pool = torch.cuda.MemPool(allocator.allocator())
+        if self._retained_pool is not None:
+            try:
+                with torch.cuda.use_mem_pool(self._retained_pool, device=self.device):
+                    yield
+            finally:
+                torch.cuda.synchronize(self.device)
+            return
+        pool = torch.cuda.MemPool(self._allocator.allocator())
         self._preparation_pools.add(pool.id)
         try:
             with torch.cuda.use_mem_pool(pool, device=self.device):
