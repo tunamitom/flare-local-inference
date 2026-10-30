@@ -229,27 +229,20 @@ class InductorSelections:
             if variant in variants and variants[variant] != identities:
                 raise RuntimeError(f"equivalent compiled forward variant {variant!r} has different Inductor kernels")
             variants[variant] = identities
-        failure = None
-        try:
-            with warmup(), self._tuning(bindings, frozen=self.forwards[id(bound)][0]._tuning_frozen):
-                if before_run is not None:
-                    before_run()
-                bound()
-            torch.cuda.current_stream(self.device).synchronize()
-        except Exception as error:
-            failure = f"{type(error).__name__}: {error}"
-        self._check(failure)
+        # Execution failures propagate instead of reaching a failure gather. Peers that enqueued
+        # this forward wait on the GPU for collectives this rank never launches, so they cannot
+        # gather; the rank group terminates every rank when one raises.
+        with warmup(), self._tuning(bindings, frozen=self.forwards[id(bound)][0]._tuning_frozen):
+            if before_run is not None:
+                before_run()
+            bound()
+        torch.cuda.current_stream(self.device).synchronize()
         self._reconcile(bindings)
-        failure = None
-        try:
-            with warmup(), self._tuning(bindings, frozen=True):
-                if before_run is not None:
-                    before_run()
-                bound()
-            torch.cuda.current_stream(self.device).synchronize()
-        except Exception as error:
-            failure = f"{type(error).__name__}: {error}"
-        self._check(failure)
+        with warmup(), self._tuning(bindings, frozen=True):
+            if before_run is not None:
+                before_run()
+            bound()
+        torch.cuda.current_stream(self.device).synchronize()
         actual, failure = {}, None
         try:
             for identity, _, tuner in bindings.values():
