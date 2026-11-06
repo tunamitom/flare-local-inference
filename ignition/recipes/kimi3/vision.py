@@ -50,11 +50,6 @@ class VisionWeights:
             tensors = dict(zip(names, loader.load_tensors(names), strict=True))
         return cls(tensors)
 
-    def to_host(self, host_allocate):
-        """Move the encoder to pinned host memory: image requests read weights over PCIe, and VRAM holds KV pages."""
-        self.tensors.update(host_tensors(self.tensors, host_allocate, "vision"))
-        return self
-
 
 @dataclass(frozen=True)
 class VisionInputs:

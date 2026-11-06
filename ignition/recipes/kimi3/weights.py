@@ -55,8 +55,6 @@ class ModelWeights:
         if vision:
             from .vision import VisionWeights
             vision = VisionWeights.load(manifest, device, progress=progress)
-            if host_allocate is not None:
-                vision = vision.to_host(host_allocate)
         else:
             vision = None
         draft = None
