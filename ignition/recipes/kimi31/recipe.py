@@ -26,12 +26,14 @@ RECIPE = replace(KIMI3, name="kimi31", served_model_name="Kimi-K3.1-Pro", prepar
         revision="6d0a0202956796543364d666ab19c6ad1a494ee1", architecture="KimiK31ForConditionalGeneration",
         stored_bytes=1_561_217_377_280, device_bytes=1_496_756_986_630, draft_bytes=5_569_631_720),),
     online_mxfp8=True, language_model_only=True,
+    # RadixArk's configured block: the pending token and four drafts, with a small packed catalog per batch.
+    speculation=replace(KIMI3.speculation, draft_tokens=4, graph_budget=9),
     # Gather threads are tuned independently; the attention components declare LSE's 512-thread geometry.
     b12x_environment=MappingProxyType({**KIMI3.b12x_environment, "B12X_PCIE_DCP_THREADS": "0"}),
     # DFlash2 keeps its window rings in continuation rows and adds no page regions.
-    ranks=MappingProxyType({8: RankCosts(state_row_bytes=65_761_536, page_bytes=2_174_976,
+    ranks=MappingProxyType({8: RankCosts(state_row_bytes=63_853_824, page_bytes=2_174_976,
                                        graph_bytes=9 << 29, page_tokens=128 * 8),
-                           16: RankCosts(state_row_bytes=35_450_112, page_bytes=2_174_976,
+                           16: RankCosts(state_row_bytes=34_496_256, page_bytes=2_174_976,
                                         graph_bytes=9 << 29, page_tokens=128 * 16)}),
     plain_ranks=MappingProxyType({8: RankCosts(state_row_bytes=58_361_088, page_bytes=2_174_976,
                                              graph_bytes=9 << 29, page_tokens=128 * 8),

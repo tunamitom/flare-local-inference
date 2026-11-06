@@ -125,7 +125,7 @@ def test_dflash2_costs_keep_rings_in_continuation_rows(raw):
     assert draft.noise_token == 163824
     draft.validate_shard(TensorParallelShard(0, 16))
     config = replace(config, draft=draft)
-    layout = continuation_layout(config, 16, speculative_tokens=7)
+    layout = continuation_layout(config, 16, speculative_tokens=RECIPE.speculation.draft_tokens)
     assert layout.row_bytes == RECIPE.ranks[16].state_row_bytes
     assert page_bytes(config) == RECIPE.ranks[16].page_bytes == RECIPE.plain_ranks[16].page_bytes
     assert layout.region("draft4.ring").shape == (1024, 576)
@@ -138,7 +138,7 @@ def test_tp8_costs_match_complete_history_layout(raw):
     assert page_bytes(config) == RECIPE.plain_ranks[8].page_bytes
     draft = DSparkConfig.from_dict(json.loads((FIXTURES / "draft-dflash2-config.json").read_text()), config.text)
     config = replace(config, draft=draft)
-    assert continuation_layout(config, 8, speculative_tokens=7).row_bytes == RECIPE.ranks[8].state_row_bytes
+    assert continuation_layout(config, 8, speculative_tokens=RECIPE.speculation.draft_tokens).row_bytes == RECIPE.ranks[8].state_row_bytes
     assert page_bytes(config) == RECIPE.ranks[8].page_bytes
 
 

@@ -35,7 +35,7 @@ class ModelWeights:
     draft: object = None
 
     @classmethod
-    def load(cls, manifest, device, *, shard, progress=None, draft_checkpoint=None, online_mxfp8=False,
+    def load(cls, manifest, device, *, shard, progress=None, draft_checkpoint=None, online_mxfp8=False, host_allocate=None,
              peers=None, vision=True):
         """``peers``, a host's Gloo group and peer storage, reads column-sharded projections once per host.
 
@@ -55,6 +55,8 @@ class ModelWeights:
         if vision:
             from .vision import VisionWeights
             vision = VisionWeights.load(manifest, device, progress=progress)
+            if host_allocate is not None:
+                vision = vision.to_host(host_allocate)
         else:
             vision = None
         draft = None
@@ -70,7 +72,7 @@ class ModelWeights:
             elif isinstance(config.draft, MLADFlash2Config):
                 from .mla_dflash2 import DraftWeights
 
-                extra["target_embedding"] = embedding
+                extra.update(target_embedding=embedding, host_allocate=host_allocate)
             draft = DraftWeights.load(draft_checkpoint, config, device, shard, target_head=head, progress=progress,
                                       online_mxfp8=online_mxfp8, **extra)
         return cls(config, shard, embedding, norm, head, score_weight(res_norm, res_proj), layers,
