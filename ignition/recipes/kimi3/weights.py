@@ -12,7 +12,7 @@ import torch
 from ignition.components.weights import (DirectWeightLoader, SharedColumnReads, fp4_down_staging_bytes,
                                          quantize_bf16_linear_as_mxfp8)
 
-from .config import DSparkConfig, LatentDSparkConfig, ModelConfig
+from .config import DSparkConfig, LatentDSparkConfig, MLADFlash2Config, ModelConfig
 from .residual import score_weight
 
 PREFIX = "language_model.model"
