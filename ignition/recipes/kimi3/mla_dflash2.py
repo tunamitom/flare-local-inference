@@ -150,7 +150,8 @@ class DraftScratch:
                            else getattr(self, name)[:tokens] for name in self.__dataclass_fields__))
 
     def scratch_tensors(self):
-        return (self,)
+        tensors = tuple(getattr(self, name) for name in self.__dataclass_fields__ if name != "selectors")
+        return (*tensors, *((s.projected, s.unary, s.ids) for s in self.selectors.values()))
 
 
 class WindowStage:
