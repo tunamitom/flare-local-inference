@@ -356,6 +356,12 @@ class SpeculativePreparation:
 
         # The anchor predicts the first draft, so a block holds one position per draft.
         self.block_size, self.logit_offset = max(1, draft_tokens), 0
+        from .config import MLADFlash2Config
+
+        selected = isinstance(weights.config.draft, MLADFlash2Config)
+        if selected:
+            # Position zero holds the pending token, and each later position predicts its own draft.
+            self.block_size, self.logit_offset = draft_tokens + 1, 1
         self.context_buffers = {}
         from .config import LatentDSparkConfig
 
@@ -365,12 +371,19 @@ class SpeculativePreparation:
 
             context_options = dict(context=collectives.get("context"))
             draft_options = dict(latent_runtimes=collectives.get("latent_runtimes", ()), **context_options)
+        draft_forward, markov_forward = PreparedDraft, PreparedMarkov
+        if selected:
+            from .mla_dflash2 import DraftScratch as scratch_type, PreparedContext as context_forward
+            from .mla_dflash2 import PreparedDraft as draft_forward
+
+            markov_forward = None
+            draft_options = dict(latent_runtimes=collectives.get("latent_runtimes", ()))
         self.forwards = DraftForwards(decoder,
             partial(context_forward, runtime=context_runtime, coordinator=coordinator, buffers=self.context_buffers,
                     **context_options),
-            partial(PreparedDraft, block=self.block_size, embedding_runtime=collectives["embedding_runtime"],
+            partial(draft_forward, block=self.block_size, embedding_runtime=collectives["embedding_runtime"],
                     **draft_options),
-            PreparedMarkov)
+            markov_forward)
         self.rng = SpeculativeRngState.allocate(pool.backing.device, capacity=requests.capacity)
         self.generation, self.offset = torch.zeros_like(requests.generation), torch.zeros_like(requests.generation)
         self.draft_scratch = scratch_type.allocate(weights.config, weights.shard,

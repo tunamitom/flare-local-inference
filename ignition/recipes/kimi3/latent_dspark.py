@@ -207,19 +207,26 @@ class PreparedContext:
         self.slots = buffer("slots", 1, torch.int64).view(-1)
         self.rotary = YarnRotary(weights.config, device)
 
+    def record_slots(self, counts):
+        m = self.metadata
+        live = (m.positions >= 0) & (m.positions - m.starts[m.requests] < counts[m.requests])
+        return torch.where(live, self.shards.token_slots(m.positions, m.token_page_table), -1)
+
+    def records(self, index):
+        return self.pool.draft_attention(index)
+
     def __call__(self, auxiliary, counts):
         m, w = self.metadata, self.weights.draft
         self.gather(self.project(auxiliary))
         rms_norm_columns(self.projected, w.hidden_norm, self.normalized, self.eps)
         self.project_kv(self.normalized)
-        live = (m.positions >= 0) & (m.positions - m.starts[m.requests] < counts[m.requests])
-        self.slots.copy_(torch.where(live, self.shards.token_slots(m.positions, m.token_page_table), -1))
+        self.slots.copy_(self.record_slots(counts))
         for index, layer in enumerate(w.layers):
             value = self.kv[:, index * RECORD_BYTES:(index + 1) * RECORD_BYTES]
             rms_norm_columns(value[:, :512], layer.attention["kv_norm"], self.latent[:, :512], self.eps)
             self.latent[:, 512:].copy_(value[:, 512:])
             self.rotary.apply(self.latent, m.positions)
-            write_records(self.latent, self.slots, self.pool.draft_attention(index))
+            write_records(self.latent, self.slots, self.records(index))
 
     def scratch_tensors(self):
         return (self.local, self.projected, self.normalized, self.kv, self.latent, self.slots)

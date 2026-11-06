@@ -67,6 +67,10 @@ class ModelWeights:
                 from .latent_dspark import DraftWeights
 
                 extra["target_embedding"] = embedding
+            elif isinstance(config.draft, MLADFlash2Config):
+                from .mla_dflash2 import DraftWeights
+
+                extra["target_embedding"] = embedding
             draft = DraftWeights.load(draft_checkpoint, config, device, shard, target_head=head, progress=progress,
                                       online_mxfp8=online_mxfp8, **extra)
         return cls(config, shard, embedding, norm, head, score_weight(res_norm, res_proj), layers,

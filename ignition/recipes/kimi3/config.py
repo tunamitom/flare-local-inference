@@ -18,6 +18,8 @@ DSPARK_REPOSITORY = "RedHatAI/Kimi-K3-speculator.dspark"
 DSPARK_REVISION = "38a88101e0d46bb22134b9da340f381b954d40d4"
 LATENT_DSPARK_REPOSITORY = "Inferact/Kimi-K3.1-Pro-DSpark-preview"
 LATENT_DSPARK_REVISION = "5e654fbe920278f228a89519b06b2680aa56480f"
+MLA_DFLASH2_REPOSITORY = "RadixArk/Kimi-K3.1-Dflash2-Preview"
+MLA_DFLASH2_REVISION = "d0d8bc2e3c6d0a195d2e00a49017e71ca8d881f1"
 
 
 @dataclass(frozen=True)
@@ -39,6 +41,8 @@ class DSparkConfig:
     def from_dict(cls, raw, target):
         if raw.get("model_type") == "k3_dspark":
             return LatentDSparkConfig.from_dict(raw, target)
+        if raw.get("architectures") == ["DFlash2DraftModel"]:
+            return MLADFlash2Config.from_dict(raw, target)
         layer = raw.get("transformer_layer_config", {})
         aux = raw.get("aux_hidden_state_layer_ids", ())
         rope = layer.get("rope_parameters", {})
@@ -183,10 +187,84 @@ class LatentDSparkConfig:
 
 
 @dataclass(frozen=True)
+class MLADFlash2Config:
+    """Block-causal sliding-window MLA DFlash2 with a selector and the target's embedding and head."""
+
+    raw: dict
+
+    @classmethod
+    def from_dict(cls, raw, target):
+        options = raw.get("dflash_config", {})
+        for name, expected in dict(attention_mode="mla", aux_hidden_stream="attn_res", conv_kernel_size=2,
+                conv_group_size=16).items():
+            if options.get(name) != expected:
+                raise ValueError(f"unsupported MLA DFlash2 {name}: {options.get(name)!r}")
+        for name, expected in dict(hidden_act="silu", attention_bias=False, is_causal=True, use_sliding_window=True,
+                rope_interleave=True, mla_use_nope=False, kv_lora_rank=512, q_lora_rank=1536, qk_nope_head_dim=128,
+                qk_rope_head_dim=64, v_head_dim=128, tie_word_embeddings=False).items():
+            if raw.get(name) != expected:
+                raise ValueError(f"unsupported MLA DFlash2 {name}: {raw.get(name)!r}")
+        taps = options.get("target_layer_ids", ())
+        if (raw.get("hidden_size") != target["hidden_size"] or raw.get("vocab_size") != target["vocab_size"]
+                or raw.get("num_target_layers") != target["num_hidden_layers"]
+                or raw.get("num_attention_heads") != target["num_attention_heads"]
+                or raw.get("max_position_embeddings") != target["max_position_embeddings"]
+                or not taps or list(taps) != sorted(set(taps))
+                # A tap names a layer's output, read as the following layer's AttnRes mixture.
+                or any(type(i) is not int or not 0 <= i < target["num_hidden_layers"] - 1 for i in taps)
+                or type(raw.get("num_hidden_layers")) is not int or raw["num_hidden_layers"] <= 0
+                or raw.get("layer_types") != ["sliding_attention"] * raw["num_hidden_layers"]
+                or type(raw.get("sliding_window")) is not int or raw["sliding_window"] <= 0
+                or not 0 <= options.get("mask_token_id", -1) < target["vocab_size"]
+                or not 0 < options.get("selector_top_k", 0) <= 64):
+            raise ValueError("MLA DFlash2 geometry or target feature mapping is incompatible")
+        rope = raw.get("rope_parameters", {})
+        if (rope.get("rope_type") != "yarn" or rope.get("factor", 0) <= 0 or rope.get("rope_theta", 0) <= 0
+                or rope.get("original_max_position_embeddings", 0) <= 0
+                or rope.get("mscale") != 1. or rope.get("mscale_all_dim") != 1.):
+            raise ValueError("MLA DFlash2 requires a complete DeepSeek YaRN rotary configuration")
+        return cls(raw)
+
+    @property
+    def text(self):
+        return self.raw
+
+    @property
+    def auxiliary_layers(self):
+        return tuple(i + 1 for i in self.raw["dflash_config"]["target_layer_ids"])
+
+    @property
+    def auxiliary_source(self):
+        return "attention_input"
+
+    @property
+    def noise_token(self):
+        return self.raw["dflash_config"]["mask_token_id"]
+
+    @property
+    def layers(self):
+        return self.raw["num_hidden_layers"]
+
+    @property
+    def heads(self):
+        return self.raw["num_attention_heads"]
+
+    @property
+    def window(self):
+        return self.raw["sliding_window"]
+
+    def validate_shard(self, shard):
+        for extent, alignment in ((self.heads, 1), (self.raw["hidden_size"], 64),
+                (self.raw["intermediate_size"], 32), (self.raw["q_lora_rank"], 1),
+                (self.raw["kv_lora_rank"] + self.raw["qk_rope_head_dim"], 1)):
+            shard.partition(extent, alignment=alignment)
+
+
+@dataclass(frozen=True)
 class ModelConfig:
     text: dict
     vision: dict
-    draft: DSparkConfig | LatentDSparkConfig | None = None
+    draft: DSparkConfig | LatentDSparkConfig | MLADFlash2Config | None = None
     model_type: str = "kimi_k3"
 
     @classmethod

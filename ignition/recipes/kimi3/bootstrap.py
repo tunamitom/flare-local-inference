@@ -43,7 +43,7 @@ from ignition.preparation.tuning import RecordedPreparationSession, with_autotun
 from ignition.preparation.tuning_replicas import TuningReplica
 from ignition.progress import phase
 
-from .config import PAGE_TOKENS, LatentDSparkConfig
+from .config import PAGE_TOKENS, LatentDSparkConfig, MLADFlash2Config
 from .contract import prepare as prepare_contract
 from .decoder import DecoderStorage, PreparedDecoder, Scratch
 from .pool import ContinuationPool, continuation_layout, page_bytes
@@ -215,14 +215,15 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning, max_tokens=channel_rows,
             hidden_size=weights.config.hidden, ipc=package_storage.peer_storage)
         vocabulary_collective = create_all_gather_runtime(group, device,
-            max_rows=max(config.decode_samples, slots * (config.draft_tokens or 1)),
+            max_rows=max(config.decode_samples, slots * (config.draft_tokens + 1)),
             columns=weights.config.vocabulary, ipc=package_storage.peer_storage)
         context_collective = markov_collective = None
         if drafting:
             context_collective = create_all_gather_runtime(group, device, max_rows=channel_rows,
                 columns=weights.config.hidden, ipc=package_storage.peer_storage)
-            markov_collective = create_all_gather_runtime(group, device, max_rows=slots,
-                columns=2 * weights.config.vocabulary, ipc=package_storage.peer_storage)
+            if not isinstance(weights.config.draft, MLADFlash2Config):
+                markov_collective = create_all_gather_runtime(group, device, max_rows=slots,
+                    columns=2 * weights.config.vocabulary, ipc=package_storage.peer_storage)
         # Prefill rows beyond a channel's capacity gather in chunks, as they reduce.
         embedding_collective = create_all_gather_runtime(group, device, max_rows=channel_rows,
             columns=weights.config.hidden, ipc=package_storage.peer_storage)

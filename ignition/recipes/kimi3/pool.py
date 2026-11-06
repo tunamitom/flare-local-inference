@@ -10,7 +10,7 @@ from ignition.components.paged_state import PagedStateStorage
 from ignition.components.recurrent import DeltaState
 from ignition.components.state import StateLayout
 
-from .config import PAGE_TOKENS, LatentDSparkConfig
+from .config import PAGE_TOKENS, LatentDSparkConfig, MLADFlash2Config
 from .dcp import RECORD_BYTES
 
 
@@ -43,7 +43,11 @@ def continuation_layout(config, world_size, *, speculative_tokens=0):
             regions.extend(((f"layer{index}.convolution", (3 * heads * 128, 3 + speculative_tokens), torch.bfloat16),
                             (f"layer{index}.recurrent", (heads, 128, 128), torch.float32)))
     regions.extend((name, shape, torch.uint8) for name, shape in page_specs(config))
-    if speculative_tokens and config.draft is not None and not isinstance(config.draft, LatentDSparkConfig):
+    if speculative_tokens and isinstance(config.draft, MLADFlash2Config):
+        # E4M3 latent records of the draft's sliding window; targets write them, and restored rows resume drafting.
+        for layer in range(config.draft.layers):
+            regions.append((f"draft{layer}.ring", (config.draft.window, RECORD_BYTES), torch.uint8))
+    elif speculative_tokens and config.draft is not None and not isinstance(config.draft, LatentDSparkConfig):
         d = config.draft
         for layer in range(d.layers):
             for kind in ("key", "value"):
@@ -70,6 +74,9 @@ class ContinuationPool(PagedStateStorage):
 
     def draft_attention(self, layer):
         return self.pages[f"draft{layer}.latent"].view(torch.float8_e4m3fn).view(-1, PAGE_TOKENS, RECORD_BYTES)
+
+    def draft_ring(self, layer):
+        return self.reserved_region(f"draft{layer}.ring")
 
     def share_pages(self, storage, group):
         """Every rank's address of each MLA layer's page pool, {layer: [world] int64}, mapped through CUDA IPC.

@@ -42,8 +42,6 @@ def test_layer_mapping_and_cache_accounting(raw):
     assert draft.auxiliary_layers == (75, 79, 83, 87, 91)
     assert draft.auxiliary_source == "residual_output"
     layout = continuation_layout(config, 16, speculative_tokens=7)
-    assert layout.row_bytes == RECIPE.ranks[16].state_row_bytes
-    assert page_bytes(config) == RECIPE.ranks[16].page_bytes
     assert len([name for name, _ in page_specs(config) if name.startswith("draft")]) == 5
     for name, shape in page_specs(config):
         assert layout.region(name).shape == shape
@@ -119,12 +117,26 @@ def test_exl3_rejects_undeclared_retained_storage(raw, fields):
         ModelConfig.from_dict(raw)
 
 
+def test_dflash2_costs_keep_rings_in_continuation_rows(raw):
+    config = ModelConfig.from_dict(raw)
+    draft = DSparkConfig.from_dict(json.loads((FIXTURES / "draft-dflash2-config.json").read_text()), config.text)
+    assert draft.auxiliary_layers == (8, 24, 52, 68, 84, 92)
+    assert draft.auxiliary_source == "attention_input"
+    assert draft.noise_token == 163824
+    draft.validate_shard(TensorParallelShard(0, 16))
+    config = replace(config, draft=draft)
+    layout = continuation_layout(config, 16, speculative_tokens=7)
+    assert layout.row_bytes == RECIPE.ranks[16].state_row_bytes
+    assert page_bytes(config) == RECIPE.ranks[16].page_bytes == RECIPE.plain_ranks[16].page_bytes
+    assert layout.region("draft4.ring").shape == (1024, 576)
+
+
 def test_tp8_costs_match_complete_history_layout(raw):
     config = ModelConfig.from_dict(raw)
     config.validate_shard(TensorParallelShard(0, 8))
     assert continuation_layout(config, 8).row_bytes == RECIPE.plain_ranks[8].state_row_bytes
     assert page_bytes(config) == RECIPE.plain_ranks[8].page_bytes
-    draft = DSparkConfig.from_dict(json.loads((FIXTURES / "draft-config.json").read_text()), config.text)
+    draft = DSparkConfig.from_dict(json.loads((FIXTURES / "draft-dflash2-config.json").read_text()), config.text)
     config = replace(config, draft=draft)
     assert continuation_layout(config, 8, speculative_tokens=7).row_bytes == RECIPE.ranks[8].state_row_bytes
     assert page_bytes(config) == RECIPE.ranks[8].page_bytes

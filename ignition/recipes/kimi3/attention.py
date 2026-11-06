@@ -30,7 +30,7 @@ FP8 = torch.float8_e4m3fn
 class PreparedMLA:
     def __init__(self, weights, source, metadata, cache, *, mode, session, name, workspace, buffers, latents=None,
                  coordinator=None, context=None, peers=None, allocator=None, index_cache=None,
-                 eps=1e-6, rotary=None, gated=True, partial_budget_bytes=None):
+                 eps=1e-6, rotary=None, gated=True, partial_budget_bytes=None, window=None, records=None):
         tokens, hidden = source.shape
         heads = weights["key"].shape[0]
         device = source.device
@@ -54,6 +54,8 @@ class PreparedMLA:
         self.expanded = buffer("expanded", heads * 128)
         self.weights, self.metadata, self.mode, self.cache = weights, metadata, mode, cache
         self.eps, self.rotary, self.gated = eps, rotary, gated
+        # A sliding window stages its own query records instead of writing them into context pages.
+        self.records = records
         # Each rank projects only its query and KV latent rows beside its output gate, and the ranks gather the
         # latents, as vLLM's VLLM_KIMI_SHARD_QKV_A does: every rank keeps and reads a sixteenth of the latent
         # projection. A single rank (``latents`` None) projects every latent row itself.
@@ -92,6 +94,8 @@ class PreparedMLA:
             # The tuner still chooses the split count; every choice reads the full context.
             common["budget"] = dense_mla.Budget(
                 max_partial_rows=partial_budget_bytes // (heads * world * (512 + 1) * 4))
+        if window is not None:
+            common["window_size"] = window
         scale = 192 ** -.5
         self.sparse = None
         if index_cache is not None:
@@ -161,8 +165,11 @@ class PreparedMLA:
         self.absorbed[:, :, :512].copy_(torch.bmm(self.query[:, :, :128].transpose(0, 1), self.weights["key"]).transpose(0, 1))
         self.absorbed[:, :, 512:].copy_(self.query[:, :, 128:])
         # Each rank stores the positions it owns; every position is owned when no ranks share the context.
-        self.slots.copy_(shards.token_slots(m.positions, m.token_page_table))
-        write_records(self.latent, self.slots, self.cache.view(-1, RECORD_BYTES))
+        if self.records is not None:
+            self.records(self.latent)
+        else:
+            self.slots.copy_(shards.token_slots(m.positions, m.token_page_table))
+            write_records(self.latent, self.slots, self.cache.view(-1, RECORD_BYTES))
         if self.sparse is not None:
             self.sparse()
         elif shards.world == 1:
