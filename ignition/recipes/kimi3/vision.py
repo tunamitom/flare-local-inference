@@ -15,7 +15,8 @@ from ignition.components.rotary import apply_cached_rotary, prepare_cached_rotar
 from ignition.components.varlen_attention import PreparedVarlenAttention
 from ignition.components.weights import DirectWeightLoader
 
-PATCH_CAPACITIES = (256, 1024, 4096, 16384, 65536)
+# The checkpoint's per-frame limit: a 65536-patch graph's scratch does not fit beside BF16 weights and drafts.
+PATCH_CAPACITIES = (256, 1024, 4096, 16384)
 FEATURES = 16384
 HIDDEN = 7168
 

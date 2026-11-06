@@ -21,7 +21,7 @@ CHECKPOINT = Path('/data/models/Kimi-K3-MXFP4-CSF')
 
 
 @torch.no_grad()
-@pytest.mark.parametrize('n,h,w', [(256, 16, 16), (65536, 256, 256)])
+@pytest.mark.parametrize('n,h,w', [(256, 16, 16), (16384, 128, 128)])
 def test_checkpoint_vision(monkeypatch, tmp_path, n, h, w):
     pytest.importorskip('fla')
     pytest.importorskip('flash_attn')
@@ -166,7 +166,7 @@ def test_checkpoint_vision(monkeypatch, tmp_path, n, h, w):
         graph.replay()
         torch.cuda.synchronize()
         torch.testing.assert_close(state.arena[1,:n//4], actual[:,448:896], atol=0, rtol=0)
-        if n < 65536:
+        if n < 16384:
             inputs.vision_feature_offset.fill_(n//4)
             graph.replay()
             torch.cuda.synchronize()

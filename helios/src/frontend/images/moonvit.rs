@@ -10,10 +10,23 @@ use super::{
 };
 use crate::Result;
 
-fn extent(width: usize, height: usize) -> (usize, usize) {
+/// Scale into the prepared graph's patch limit; rounding up to whole merged patches must stay within it.
+fn extent(limits: ImageLimits, width: usize, height: usize) -> (usize, usize) {
+    let (mut w, mut h) = scaled_extent(limits.max_patches_per_image.min(65536), width, height);
+    while w.div_ceil(28) * h.div_ceil(28) * 4 > limits.max_patches_per_image && w.max(h) > 28 {
+        if w >= h {
+            w -= 28;
+        } else {
+            h -= 28;
+        }
+    }
+    (w, h)
+}
+
+fn scaled_extent(patches: usize, width: usize, height: usize) -> (usize, usize) {
     let area = (width / 14).max(1) as f64 * (height / 14).max(1) as f64;
     let scale = 1.0f64
-        .min((65536.0 / area).sqrt())
+        .min((patches as f64 / area).sqrt())
         .min(7168.0 / width as f64)
         .min(7168.0 / height as f64);
     (
@@ -24,7 +37,7 @@ fn extent(width: usize, height: usize) -> (usize, usize) {
 
 pub(super) fn geometry(limits: ImageLimits, width: usize, height: usize) -> Result<ImageGeometry> {
     check_input_extent(limits, width, height)?;
-    let (w, h) = extent(width, height);
+    let (w, h) = extent(limits, width, height);
     let (width, height) = (w.div_ceil(28) * 28, h.div_ceil(28) * 28);
     let patches = width / 14 * (height / 14);
     check_image_patches(limits, patches)?;
@@ -42,7 +55,7 @@ pub(super) fn resized_rgb(
     image: &RgbImage,
 ) -> Result<(ImageGeometry, Vec<u8>)> {
     let geometry = geometry(limits, image.width, image.height)?;
-    let (width, height) = extent(image.width, image.height);
+    let (width, height) = extent(limits, image.width, image.height);
     let (mut pixels, alpha) = if let Some(cmyk) = &image.cmyk {
         let colors = RgbImage::new(
             image.width,
