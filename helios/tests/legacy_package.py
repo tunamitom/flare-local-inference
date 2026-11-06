@@ -24,7 +24,7 @@ from ignition.preparation import runtime_package_pb2 as proto
 
 ALIGNMENT = 4096
 MAX_HEADER_BYTES = 64 << 10
-MAX_INDEX_BYTES = 128 << 20
+MAX_INDEX_BYTES = 512 << 20
 DEFAULT_SHARD_SIZE = 64 << 30
 COPY_BLOCK = 16 << 20
 COPY_THREADS = 16

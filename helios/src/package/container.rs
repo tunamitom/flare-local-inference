@@ -38,7 +38,7 @@ pub const ALIGNMENT_PREFIX: &str = "align.";
 /// Payload bases and container data starts are aligned to this boundary.
 pub const ALIGNMENT: u64 = 4096;
 /// Metadata bytes are bounded; bulk payload bytes are not.
-pub const MAX_HEADER: u64 = 128 << 20;
+pub const MAX_HEADER: u64 = 512 << 20;
 /// Bound on header tensor entries, including alignment tensors.
 pub const MAX_TENSORS: usize = 1 << 20;
 /// Bounded streaming buffer for payload copies and digests.

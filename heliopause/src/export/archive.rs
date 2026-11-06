@@ -20,7 +20,7 @@ use std::{
     },
 };
 
-pub(crate) const MAX_INDEX: u64 = 128 << 20;
+pub(crate) const MAX_INDEX: u64 = 512 << 20;
 const MAX_HEADER: u64 = 64 << 10;
 const MAX_PAYLOAD: u64 = (64u64 << 30) - 4096;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);

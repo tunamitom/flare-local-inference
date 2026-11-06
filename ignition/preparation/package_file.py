@@ -11,7 +11,7 @@ from . import runtime_package_pb2 as proto
 
 ALIGNMENT = 4096
 MAX_HEADER_BYTES = 64 << 10
-MAX_INDEX_BYTES = 128 << 20
+MAX_INDEX_BYTES = 512 << 20
 
 
 def align(value):

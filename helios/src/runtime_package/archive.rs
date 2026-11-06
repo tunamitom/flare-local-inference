@@ -24,7 +24,7 @@ use std::{
 };
 
 const MAX_HEADER: usize = 64 << 10;
-const MAX_INDEX: usize = 128 << 20;
+const MAX_INDEX: usize = 512 << 20;
 const MAX_RECORD: usize = 1 << 20;
 
 #[derive(Deserialize)]

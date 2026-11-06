@@ -151,7 +151,7 @@ Header metadata identifies the format version; it is an untrusted dispatch hint
 checked against the authenticated format version. Parsers reject duplicate
 entries, invalid extents, overlapping tensor storage, unsupported types, integer
 overflow, and metadata beyond explicit limits before allocating from them.
-Metadata retains a 128 MiB per-tensor limit; bulk payloads do not share that limit.
+Metadata retains a 512 MiB per-tensor limit; bulk payloads do not share that limit.
 
 | File | Tensor | Contents |
 | --- | --- | --- |

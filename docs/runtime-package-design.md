@@ -389,7 +389,7 @@ from the agent blob cache, which survives package-directory eviction. A peer nee
 before sending any files; monolithic transfer retains protocol 1/2 compatibility.
 Resource classification follows actual consumers in the signed index. Missing,
 overlapping, unclassified, or incorrectly classified spans fail loading. The
-128 MiB metadata limit applies to the complete signed envelope. The package
+512 MiB metadata limit applies to the complete signed envelope. The package
 contains the signing-key fingerprint, not the verification key. Keys come from
 Helios's embedded publisher profiles or explicitly supplied profile files.
 

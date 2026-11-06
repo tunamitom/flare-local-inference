@@ -25,9 +25,9 @@ pub mod wire {
 /// Envelope and body format version this build understands.
 pub const FORMAT_VERSION: u32 = 2;
 /// Bound on one serialized signed body, matching the metadata tensor limit.
-pub const MAX_BODY: usize = 128 << 20;
+pub const MAX_BODY: usize = 512 << 20;
 /// Bound on the complete serialized envelope.
-pub const MAX_ENVELOPE: usize = 128 << 20;
+pub const MAX_ENVELOPE: usize = 512 << 20;
 /// Executable compressed chunk size. Authentication covers chunks of exactly this size.
 pub const MAX_CHUNK: usize = 4 << 20;
 /// Bound on compressed chunks for one executable resource (4 TiB at the fixed chunk size).

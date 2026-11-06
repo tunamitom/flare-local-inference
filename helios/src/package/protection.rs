@@ -31,7 +31,7 @@ use std::io::{self, BufRead, Read, Write};
 pub const CHUNK: usize = schema::MAX_CHUNK;
 /// Bound on the in-memory convenience compression/open helpers. Streaming paths are bounded by
 /// their buffers instead.
-pub const MAX_IN_MEMORY: usize = 128 << 20;
+pub const MAX_IN_MEMORY: usize = 512 << 20;
 /// Bound on compressed chunks accepted for one resource (4 TiB at the fixed chunk size).
 const MAX_CHUNKS: u64 = 1 << 20;
 /// Bound on compressed and decoded resource bytes.
