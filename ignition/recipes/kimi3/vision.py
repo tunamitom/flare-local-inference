@@ -21,24 +21,6 @@ FEATURES = 16384
 HIDDEN = 7168
 
 
-def host_tensors(tensors, host_allocate, name):
-    """Copy same-dtype tensors into one mapped host region, each aligned to 64 elements."""
-    dtypes = {tensor.dtype for tensor in tensors.values()}
-    if len(dtypes) != 1:
-        raise ValueError("a mapped host weight region holds one dtype")
-    offsets, total = {}, 0
-    for key, tensor in tensors.items():
-        offsets[key] = total
-        total += -(-tensor.numel() // 64) * 64
-    region = host_allocate(name, (total,), dtypes.pop())
-    result = {}
-    for key, tensor in tensors.items():
-        first, last = offsets[key], offsets[key] + tensor.numel()
-        region.host_view[first:last].copy_(tensor.flatten().cpu())
-        result[key] = region.device_view[first:last].view(tensor.shape)
-    return result
-
-
 @dataclass(frozen=True)
 class VisionWeights:
     tensors: dict[str, torch.Tensor]

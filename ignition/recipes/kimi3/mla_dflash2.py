@@ -57,7 +57,7 @@ class DraftWeights:
 
     @classmethod
     def load(cls, snapshot, config, device, shard, *, target_embedding, target_head, progress=None,
-             online_mxfp8=False, host_allocate=None):
+             online_mxfp8=False):
         if online_mxfp8:
             raise ValueError("the MLA DFlash2 package keeps its projections in BF16")
         d, hidden = config.draft, config.hidden
@@ -104,12 +104,6 @@ class DraftWeights:
             selector = loader.load_tensors(("candidate_selector.hidden_projection.weight",
                 "candidate_selector.predecessor_codebook", "candidate_selector.successor_codebook"))
         selector = dict(zip(("projection", "predecessor", "successor"), selector, strict=True))
-        if host_allocate is not None:
-            # Each round reads a few rows of the vocabulary-sized codebooks, so they need not occupy VRAM.
-            from .vision import host_tensors
-
-            codebooks = {key: selector[key] for key in ("predecessor", "successor")}
-            selector.update(host_tensors(codebooks, host_allocate, "selector"))
         return cls(project, hidden_norm, torch.cat(context), norm, target_embedding, None, selector, tuple(layers))
 
 

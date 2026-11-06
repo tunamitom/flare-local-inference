@@ -35,7 +35,7 @@ class ModelWeights:
     draft: object = None
 
     @classmethod
-    def load(cls, manifest, device, *, shard, progress=None, draft_checkpoint=None, online_mxfp8=False, host_allocate=None,
+    def load(cls, manifest, device, *, shard, progress=None, draft_checkpoint=None, online_mxfp8=False,
              peers=None, vision=True):
         """``peers``, a host's Gloo group and peer storage, reads column-sharded projections once per host.
 
@@ -70,7 +70,7 @@ class ModelWeights:
             elif isinstance(config.draft, MLADFlash2Config):
                 from .mla_dflash2 import DraftWeights
 
-                extra.update(target_embedding=embedding, host_allocate=host_allocate)
+                extra["target_embedding"] = embedding
             draft = DraftWeights.load(draft_checkpoint, config, device, shard, target_head=head, progress=progress,
                                       online_mxfp8=online_mxfp8, **extra)
         return cls(config, shard, embedding, norm, head, score_weight(res_norm, res_proj), layers,

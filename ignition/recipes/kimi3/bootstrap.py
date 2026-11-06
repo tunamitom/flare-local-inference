@@ -177,7 +177,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     with package_storage.transient():
         peers = None if group is None or package_storage.peer_storage is None else (group, package_storage.peer_storage)
         weights = ModelWeights.load(manifest, device, shard=shard, progress=progress, online_mxfp8=config.online_mxfp8,
-                                    draft_checkpoint=config.draft_checkpoint, peers=peers, host_allocate=package_storage.host_allocate,
+                                    draft_checkpoint=config.draft_checkpoint, peers=peers,
                                     vision=config.vision)
         if weights.config.model_type == "kimi_k31":
             from ignition.recipes.kimi31.recipe import RECIPE
