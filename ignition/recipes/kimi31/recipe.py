@@ -25,7 +25,15 @@ def prepare(snapshot, plan, **kwargs):
 
 
 RECIPE = replace(KIMI3, name="kimi31", served_model_name="Kimi-K3.1-Pro", prepare=prepare,
-    context=262144,
+    # The engine and both checkpoint configs cap positions at 1,048,576
+    # (kimi3/bootstrap.py validates context in [page_tokens, 1048576];
+    # max_position_embeddings is 1048576 in the target and dflash2 configs).
+    # This value is baked into the package as max_sequence_tokens and the
+    # page-table width (bootstrap.py server_config), so the earlier 262144
+    # capped every request well below the model's range. The TP16 serve of the
+    # same model shipped 1,048,576. Boot KV must hold one full 1M request
+    # (1,048,576 tokens); the scheduler admits only what the pool holds.
+    context=1048576,
     # https://huggingface.co/moonshotai/Kimi-K3.1-Pro#3-evaluation-results
     sampling_defaults=SamplingDefaults(temperature=1., top_p=.95, top_k=-1,
                                       ranges={"top_p": SamplingRange(.95, 1.)}),
