@@ -71,8 +71,9 @@ class ModelWeights:
                 from .mla_dflash2 import DraftWeights
 
                 extra["target_embedding"] = embedding
+            # The MLA DFlash2 draft keeps BF16 projections while the target's may be MXFP8.
             draft = DraftWeights.load(draft_checkpoint, config, device, shard, target_head=head, progress=progress,
-                                      online_mxfp8=online_mxfp8, **extra)
+                                      online_mxfp8=online_mxfp8 and not isinstance(config.draft, MLADFlash2Config), **extra)
         return cls(config, shard, embedding, norm, head, score_weight(res_norm, res_proj), layers,
                    loader.scale_scratch, torch.cuda.memory_allocated(device) - before, vision=vision, draft=draft)
 
