@@ -1,0 +1,272 @@
+--- a/_runtime_gather_cute.py
++++ b/_runtime_gather_cute.py
+@@ -221,6 +221,10 @@
+         from ._ring_gather_cute import RingGather
+ 
+         operation = RingGather(world, rank, row_words, threads, blocks, chunks)
++    elif transport == "tiered":
++        from ._tiered_gather_cute import TieredGather
++
++        operation = TieredGather(world, rank, row_words, threads, blocks, chunks)
+     elif transport in ("phased_barrier", "phased_push"):
+         from ._phased_gather_cute import PhasedGather
+ 
+@@ -257,7 +261,7 @@
+         current_cuda_stream(),
+         compile_spec=KernelCompileSpec.from_key(
+             "comm.pcie.selected_gather",
+-            11,
++            12,
+             (world, rank, row_words, threads, blocks, chunks, transport),
+         ),
+     )
+@@ -266,7 +270,7 @@
+         if len(stages) != world or len(signals) != world:
+             raise ValueError("gather requires one staging and signal address per rank")
+         if rows <= 0 or (
+-            transport not in ("barrier", "phased_barrier", "phased_push", "ring")
++            transport not in ("barrier", "phased_barrier", "phased_push", "ring", "tiered")
+             and rows * row_words > chunks * 64
+         ):
+             raise ValueError("gather exceeds its declared word exchange capacity")
+--- a/_gather_preparation.py
++++ b/_gather_preparation.py
+@@ -18,6 +18,7 @@
+     "selected_phased_push": ("barrier",),
+     "selected_word_exchange": ("word_exchange",),
+     "selected_ring": ("barrier",),
++    "selected_tiered": ("barrier",),
+ }
+ 
+ 
+@@ -34,7 +35,7 @@
+         blocks != 8 or active != 8
+     ):
+         raise ValueError("phased gather requires one complete eight-CTA cluster")
+-    if transport == "selected_ring" and (blocks != 8 or active != 8):
++    if transport in ("selected_ring", "selected_tiered") and (blocks != 8 or active != 8):
+         raise ValueError("ring gather requires eight active and physical CTAs")
+     return (int(mode == "word_exchange") << 16) | active
+ 
+@@ -66,7 +67,7 @@
+     selected_gather_profile(
+         transport, call["block_limit"], call["submode"], call["active_blocks"]
+     )
+-    if transport == "selected_ring" and (
++    if transport in ("selected_ring", "selected_tiered") and (
+         query.world_size != 16 or call["threads"] != 128
+     ):
+         raise ValueError("ring gather requires TP16 with 128 threads per CTA")
+@@ -90,6 +91,7 @@
+         "selected_phased_barrier",
+         "selected_phased_push",
+         "selected_ring",
++        "selected_tiered",
+     ):
+         chunks = query.setup["exchange_chunks"]
+         if (
+--- a/_preparation.py
++++ b/_preparation.py
+@@ -120,6 +120,7 @@
+         for name, transport, threads in (
+             ("dcp_phased", "selected_phased_barrier", (128, 256, 512)),
+             ("dcp_ring", "selected_ring", (128,)),
++            ("dcp_tiered", "selected_tiered", (128,)),
+         ):
+             selected = _selected_gather_query(query, transport, threads)
+             if selected is not None:
+--- a/_collective_tuning.py
++++ b/_collective_tuning.py
+@@ -41,7 +41,7 @@
+         call = payload["call"]
+         blocks = int(call.get("blocks", call.get("block_limit", 16)))
+         threads = int(call["threads"])
+-        if name in ("dcp_phased", "dcp_ring"):
++        if name in ("dcp_phased", "dcp_ring", "dcp_tiered"):
+             # Automatic admission covers the qualified TP16 hardware. Phased
+             # kernels also have to pass the native cluster occupancy check.
+             if (
+@@ -54,7 +54,7 @@
+             counts = (
+                 (threads,)
+                 if payload["setup"].get("threads_override", 0)
+-                else ((128,) if name == "dcp_ring" else (128, 256, 512))
++                else ((128,) if name in ("dcp_ring", "dcp_tiered") else (128, 256, 512))
+             )
+             for count in counts:
+                 yield CollectiveConfig(
+@@ -284,12 +284,12 @@
+         NATIVE.validate_query(native, device)
+         if (native.world_size, native.rank) != (query.world_size, query.rank):
+             raise ValueError("native alternatives must use the same rank group")
+-        if name in ("dcp_phased", "dcp_ring") and (
++        if name in ("dcp_phased", "dcp_ring", "dcp_tiered") and (
+             query.operation != "all_gather_heads"
+             or query.world_size != 16
+             or not native.surface.endswith(".all_gather_heads")
+             or native.call.get("gather_transport")
+-            != ("selected_ring" if name == "dcp_ring" else "selected_phased_barrier")
++            != {"dcp_ring": "selected_ring", "dcp_tiered": "selected_tiered"}.get(name, "selected_phased_barrier")
+         ):
+             raise ValueError("selected gather tuning requires its TP16 barrier profile")
+ 
+@@ -474,6 +474,7 @@
+             if config.implementation in JOINT_FAMILIES or config.implementation in (
+                 "dcp_phased",
+                 "dcp_ring",
++                "dcp_tiered",
+             ):
+                 call.update(submode=config.submode, active_blocks=config.active_blocks)
+             q = replace(q, call=FrozenMapping(call))
+--- /dev/null
++++ b/_tiered_gather_cute.py
+@@ -0,0 +1,149 @@
++"""Two-tier TP16 byte gather where every uplink has one destination switch at a time.
++
++Ranks are ordered switch by switch, so rank // 4 names a switch and rank % 4 a column.
++Three sub-phases shift every switch to one other switch: an uplink then carries its four
++ranks' rows to a single destination, which it sustains, unlike concurrent flows to
++several switches. Three in-switch sub-phases then relay the four rows each rank holds.
++Six hops replace the ring's fifteen. Peers of a sub-phase publish to each other and wait,
++which keeps a pair at most one value ahead, so a flag slot cannot be reused under its
++reader. Every receive slot has one writer.
++"""
++
++import cutlass
++import cutlass.cute as cute
++from cutlass import Int32, Int64, Uint32
++
++from b12x._lib.intrinsics.memory import ld_global_v4_u32, st_global_v4_u32
++from ._cute_intrinsics import ld_relaxed_gpu_u32
++from ._dcp_a2a_cute import (
++    _GRAPH_ARRIVED_INDEX,
++    _GRAPH_EPOCH_INDEX,
++    _a2a_graph_epoch_arrive,
++    _copy_16b,
++)
++from ._dcp_cute_common import (
++    _load_relaxed_sys_u32,
++    _membar_sys,
++    _store_relaxed_sys_u32,
++)
++from ._joint_cluster_cute import _threadfence_sys
++from ._runtime_gather_cute import SelectedGather
++
++
++class TieredGather(SelectedGather):
++    def __init__(self, world, rank, row_words, threads, blocks, chunks):
++        super().__init__(world, rank, row_words, threads, blocks, chunks, "barrier")
++        if world != 16 or threads != 128 or blocks != 8:
++            raise ValueError("tiered gather requires TP16 with eight 128-thread CTAs")
++        self.switch, self.column = rank // 4, rank % 4
++
++    @cute.jit
++    def _handshake(self, signals, tid, block, pair):
++        if Int32(tid) < Int32(2):
++            peer = Int32(pair[0])
++            peer_signal = Int64(signals[pair[0]].toint())
++            if Int32(tid) == Int32(1):
++                peer = Int32(pair[1])
++                peer_signal = Int64(signals[pair[1]].toint())
++            # A swap partner holds one pair counter, so its second lane stays out.
++            if Int32(tid) == Int32(0) or peer != Int32(pair[0]):
++                peer_pointer = cute.make_ptr(Uint32, peer_signal, cute.AddressSpace.gmem, assumed_align=4)
++                own = signals[self._rank]
++                count = own + Int64(block) * Int64(16) + Int64(peer)
++                value = Uint32(cute.arch.load(count, Uint32)) + Uint32(1)
++                cute.arch.store(count, value)
++                common = Int64(64 * 16) + ((Int64(value % Uint32(2)) * Int64(64) + Int64(block)) * Int64(16 * 32))
++                _store_relaxed_sys_u32(peer_pointer + common + Int64(self._rank * 32), value)
++                ready = own + common + Int64(peer) * Int64(32)
++                observed = _load_relaxed_sys_u32(ready)
++                while observed != value:
++                    observed = _load_relaxed_sys_u32(ready)
++
++    @cute.kernel
++    def selected(self, source, output, selector, stages, signals, rows, stride, offset, counter):
++        tid, _, _ = cute.arch.thread_idx()
++        block, _, _ = cute.arch.block_idx()
++        profile = Uint32(cute.arch.load(selector, Uint32))
++        if profile == Uint32(8):
++            generation = ld_relaxed_gpu_u32((signals[self._rank] + Int64(_GRAPH_EPOCH_INDEX)).toint())
++            bank = Int64(generation % Uint32(2)) * stride
++            local = self._staging_words(stages[self._rank] + bank)
++            lane = Int32(tid) % Int32(32)
++            first = Int32(block) * Int32(self._warps_per_block) + Int32(tid) // Int32(32)
++            step = Int32(8 * self._warps_per_block)
++            packs = Int32(self.row_words // 4)
++            row_tiles = (packs + Int32(31)) // Int32(32)
++            tiles = rows * row_tiles
++            world = self._world_size
++            per_row = Int64(world - 1)
++            for shift in cutlass.range_constexpr(1, 4):
++                target = (self.switch + shift) % 4 * 4 + self.column
++                origin = (self.switch - shift) % 4 * 4 + self.column
++                slot = self._rank if self._rank < target else self._rank - 1
++                remote = self._staging_words(stages[target] + bank)
++                tile = first
++                while tile < tiles:
++                    row = tile // row_tiles
++                    pack = (tile - row * row_tiles) * Int32(32) + lane
++                    if pack < packs:
++                        _copy_16b(
++                            source + (Int64(row) * Int64(packs) + Int64(pack)) * Int64(4),
++                            remote + ((Int64(row) * per_row + Int64(slot)) * Int64(packs) + Int64(pack)) * Int64(4),
++                        )
++                    tile += step
++                _threadfence_sys()
++                cute.arch.sync_threads()
++                self._handshake(signals, tid, block, (target, origin))
++                cute.arch.sync_threads()
++            if Int32(tid) == Int32(0):
++                _membar_sys()
++            cute.arch.sync_threads()
++            for shift in cutlass.range_constexpr(1, 4):
++                target = self.switch * 4 + (self.column + shift) % 4
++                origin = self.switch * 4 + (self.column - shift) % 4
++                remote = self._staging_words(stages[target] + bank)
++                for held in cutlass.range_constexpr(4):
++                    sender = held * 4 + self.column
++                    slot = sender if sender < target else sender - 1
++                    own_slot = sender if sender < self._rank else sender - 1
++                    tile = first
++                    while tile < tiles:
++                        row = tile // row_tiles
++                        pack = (tile - row * row_tiles) * Int32(32) + lane
++                        if pack < packs:
++                            if cutlass.const_expr(sender == self._rank):
++                                address = source + (Int64(row) * Int64(packs) + Int64(pack)) * Int64(4)
++                            else:
++                                address = local + ((Int64(row) * per_row + Int64(own_slot)) * Int64(packs) + Int64(pack)) * Int64(4)
++                            _copy_16b(
++                                address,
++                                remote + ((Int64(row) * per_row + Int64(slot)) * Int64(packs) + Int64(pack)) * Int64(4),
++                            )
++                        tile += step
++                _threadfence_sys()
++                cute.arch.sync_threads()
++                self._handshake(signals, tid, block, (target, origin))
++                cute.arch.sync_threads()
++            if Int32(tid) == Int32(0):
++                _membar_sys()
++            cute.arch.sync_threads()
++            for sender in cutlass.range_constexpr(world):
++                own_slot = sender if sender < self._rank else sender - 1
++                tile = first
++                while tile < tiles:
++                    row = tile // row_tiles
++                    pack = (tile - row * row_tiles) * Int32(32) + lane
++                    if pack < packs:
++                        out = (Int64(row) * Int64(world) + Int64(sender)) * Int64(packs) + Int64(pack)
++                        if cutlass.const_expr(sender == self._rank):
++                            address = source + (Int64(row) * Int64(packs) + Int64(pack)) * Int64(4)
++                        else:
++                            address = local + ((Int64(row) * per_row + Int64(own_slot)) * Int64(packs) + Int64(pack)) * Int64(4)
++                        _copy_16b(address, output + out * Int64(4))
++                    tile += step
++            if Int32(tid) == Int32(0):
++                _a2a_graph_epoch_arrive(
++                    (signals[self._rank] + Int64(_GRAPH_EPOCH_INDEX)).toint(),
++                    (signals[self._rank] + Int64(_GRAPH_ARRIVED_INDEX)).toint(),
++                    Uint32(8),
++                )
