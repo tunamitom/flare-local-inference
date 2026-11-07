@@ -173,7 +173,8 @@ def speculation(args, model: ResolvedModel, configuration: Configuration | None 
         ("--no-mtp-adaptive-verification", args.no_mtp_adaptive_verification or None),
         ("--draft-head-quantization", getattr(args, "draft_head_quantization", None)),
         ("--markov-head-quantization", getattr(args, "markov_head_quantization", None)),
-        ("--vocabulary-parallel-sampling", getattr(args, "vocabulary_parallel_sampling", False) or None)) if value is not None]
+        ("--vocabulary-parallel-sampling", getattr(args, "vocabulary_parallel_sampling", False) or None),
+        ("--block-verification", getattr(args, "block_verification", False) or None)) if value is not None]
     if explicit_graph_budget:
         given.append("--speculative-graph-budget")
     if default is None:
@@ -215,7 +216,8 @@ def speculation(args, model: ResolvedModel, configuration: Configuration | None 
     return Speculation(drafts, adaptive, token_capacity=capacity, packed_verification=packed,
                        draft_prefix_selection=prefix_selection, graph_budget=budget,
                        draft_head_quantization=draft_head, markov_head_quantization=markov_head,
-                       vocabulary_parallel_sampling=getattr(args, "vocabulary_parallel_sampling", False), method=method)
+                       vocabulary_parallel_sampling=getattr(args, "vocabulary_parallel_sampling", False), method=method,
+                       block_verification=getattr(args, "block_verification", False))
 
 
 def fetch(model: ResolvedModel, hub_cache, *, progress_bars: bool = True) -> str:

@@ -33,7 +33,8 @@ def prepare_variant(snapshot, plan, *, bootstrap, draft_repository, draft_revisi
     if plan.speculation is not None:
         drafting = dict(speculative_widths=plan.speculation.widths, speculative_fixed_width=plan.speculation.fixed_width,
                         speculative_token_capacity=plan.speculative_token_capacity,
-                        speculative_graph_budget=plan.speculation.graph_budget or 64)
+                        speculative_graph_budget=plan.speculation.graph_budget or 64,
+                        block_verification=plan.speculation.block_verification)
         if (Path(snapshot) / DRAFT_DIRECTORY).is_dir():
             drafting["draft_checkpoint"] = str(Path(snapshot) / DRAFT_DIRECTORY)
         else:
