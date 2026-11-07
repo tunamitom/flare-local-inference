@@ -103,8 +103,9 @@ class PreparedDSA:
         self.offsets = torch.arange(capacity + 1, device=device, dtype=torch.int32)
         self.page_halves = torch.arange(2, device=device, dtype=torch.int32)
         self.stages = []
-        self.gather_stream = (workspace.auxiliary_stream.cuda_stream
-                              if context is not None and workspace is not None and workspace.overlap else None)
+        self.pipelined = context is not None and workspace is not None and workspace.overlap
+        if self.pipelined:
+            self.stream_handle = workspace.auxiliary_stream.cuda_stream
         # Sequential slices and layers reuse the same selection buffers; each operator owns its binding.
         from ignition.preparation.scratch import GraphBufferPool
         if "index_workspace" not in buffers:
@@ -147,8 +148,7 @@ class PreparedDSA:
                     coordinator=coordinator, session=session, name=stage_name + ".gather_heads")
                 combine = PreparedLseReduceScatter(attended, lse, output[begin:end], runtime=context.heads,
                     session=session, coordinator=coordinator, name=stage_name + ".combine", threads=512, block_limit=8)
-                if gather.roce:
-                    self.gather_stream = None
+                self.pipelined = self.pipelined and not gather.roce
             else:
                 quantized = lse = None
             caps = dense_mla.Caps(device=device, mode="decode", q_dtype=q.dtype, kv_dtype=cache.dtype,
@@ -173,10 +173,10 @@ class PreparedDSA:
             self.pages[:count].copy_(torch.where(pages[:, :, None] >= 0, expanded, -1).flatten(1))
             self.lengths[:count].copy_(shards.local_tokens((positions + 1).clamp_min(0)).to(torch.int32))
             self.active.copy_(self.lengths[:count].max().reshape(1))
-            concurrent = gather is not None and self.gather_stream is not None
+            concurrent = gather is not None and self.pipelined
             if concurrent:
                 quantized.copy_(self.query[begin:end].float().clamp(-448., 448.).to(torch.float8_e4m3fn))
-                _start_heads_gather(quantized.view(count, -1), gather.output, gather.handle, self.gather_stream)
+                _start_heads_gather(quantized.view(count, -1), gather.output, gather.handle, self.stream_handle)
             selector()
             selected = self.local[:count] if merge is None else merge()
             physical, lengths = selected_local_records(selected, positions, pages, world=shards.world,
@@ -184,15 +184,15 @@ class PreparedDSA:
             self.physical[:count].copy_(physical)
             self.counts[:count].copy_(lengths)
             if concurrent:
-                _join_slices(gather.output, self.gather_stream)
+                _join_slices(gather.output, self.stream_handle)
             elif gather is not None:
                 quantized.copy_(self.query[begin:end].float().clamp(-448., 448.).to(torch.float8_e4m3fn))
                 gather(quantized.view(count, -1))
             attention()
             if concurrent:
-                _start_slice_combine(attention.output, lse, combine.output, combine.handle, self.gather_stream)
+                _start_slice_combine(attention.output, lse, combine.output, combine.handle, self.stream_handle)
             elif combine is not None:
                 combine(attention.output, lse)
-        if self.gather_stream is not None:
-            _join_slices(self.output, self.gather_stream)
+        if self.pipelined:
+            _join_slices(self.output, self.stream_handle)
         return self.output
