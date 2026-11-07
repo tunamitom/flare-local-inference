@@ -6,7 +6,8 @@
 import torch
 from b12x.attention import dense_mla
 
-from ignition.components.collectives import PreparedAllGather, PreparedLseReduceScatter
+from ignition.components.collectives import (PreparedAllGather, PreparedLseReduceScatter, _gather_columns,
+                                             _lse_reduce_scatter)
 from ignition.components.dense_mla import PreparedDenseMLA
 from ignition.components.distributed_topk import PreparedDistributedTopK, selected_local_records
 from ignition.components.fp8_indexer import PreparedFP8Indexer
@@ -18,6 +19,50 @@ from .projections import prepare_projection
 # Slice selection and its cross-rank candidate exchange so prefill scratch is context-independent.
 SELECTION_ROWS = 128
 INDEX_HEADS, INDEX_DIM, TOPK = 32, 128, 2048
+
+
+# A slice's heads gather needs only its query and its combine only its attention's partials, so both run on the
+# auxiliary stream beside the main stream's selection and candidates gather, which own a separate channel. The
+# auxiliary order is combine(i) then gather(i+1), and attention(i+1) joins gather(i+1), so one combine buffer
+# serves every slice as long as selection's scratch stays out of it.
+@torch.library.custom_op("flare::kimi3_start_heads_gather", mutates_args=("output",))
+def _start_heads_gather(source: torch.Tensor, output: torch.Tensor, handle: int, auxiliary_stream: int) -> None:
+    main = torch.cuda.current_stream(source.device)
+    auxiliary = torch.cuda.ExternalStream(auxiliary_stream, device=source.device)
+    auxiliary.wait_stream(main)
+    with torch.cuda.stream(auxiliary):
+        _gather_columns(source, output, handle)
+
+
+@_start_heads_gather.register_fake
+def _fake_start_heads_gather(source, output, handle, auxiliary_stream) -> None:
+    pass
+
+
+@torch.library.custom_op("flare::kimi3_start_slice_combine", mutates_args=("output",))
+def _start_slice_combine(partial: torch.Tensor, lse: torch.Tensor, output: torch.Tensor, handle: int,
+                         auxiliary_stream: int) -> None:
+    main = torch.cuda.current_stream(partial.device)
+    auxiliary = torch.cuda.ExternalStream(auxiliary_stream, device=partial.device)
+    auxiliary.wait_stream(main)
+    with torch.cuda.stream(auxiliary):
+        _lse_reduce_scatter(partial, lse, output, handle)
+
+
+@_start_slice_combine.register_fake
+def _fake_start_slice_combine(partial, lse, output, handle, auxiliary_stream) -> None:
+    pass
+
+
+@torch.library.custom_op("flare::kimi3_join_slices", mutates_args=("output",))
+def _join_slices(output: torch.Tensor, auxiliary_stream: int) -> None:
+    main = torch.cuda.current_stream(output.device)
+    main.wait_stream(torch.cuda.ExternalStream(auxiliary_stream, device=output.device))
+
+
+@_join_slices.register_fake
+def _fake_join_slices(output, auxiliary_stream) -> None:
+    pass
 
 
 class PreparedDSA:
@@ -58,12 +103,15 @@ class PreparedDSA:
         self.offsets = torch.arange(capacity + 1, device=device, dtype=torch.int32)
         self.page_halves = torch.arange(2, device=device, dtype=torch.int32)
         self.stages = []
+        self.gather_stream = (workspace.auxiliary_stream.cuda_stream
+                              if context is not None and workspace is not None and workspace.overlap else None)
         # Sequential slices and layers reuse the same selection buffers; each operator owns its binding.
         from ignition.preparation.scratch import GraphBufferPool
         if "index_workspace" not in buffers:
             # Each slice has at most 32 rows. Large per-dtype chunks would reserve
             # hundreds of MiB for query scales and other small intermediates.
             buffers["index_workspace"] = GraphBufferPool(device, chunk_bytes=2 << 20)
+            buffers["index_combine"] = GraphBufferPool(device, chunk_bytes=2 << 20)
         pool = buffers["index_workspace"]
         cache_records = cache.view(-1, 1, RECORD_BYTES)
         selection_views = {}
@@ -92,12 +140,15 @@ class PreparedDSA:
             if context is not None:
                 quantized = cursor.zeros(q.shape, torch.float8_e4m3fn)
                 q = cursor.zeros((count, heads * self.shards.world, RECORD_BYTES), torch.float8_e4m3fn)
-                attended = cursor.zeros((count, heads * self.shards.world, 512), torch.bfloat16)
-                lse = cursor.zeros((count, heads * self.shards.world), torch.float32)
+                combining = buffers["index_combine"].cursor()
+                attended = combining.zeros((count, heads * self.shards.world, 512), torch.bfloat16)
+                lse = combining.zeros((count, heads * self.shards.world), torch.float32)
                 gather = PreparedAllGather(quantized.view(count, -1), q.view(count, -1), runtime=context.heads,
                     coordinator=coordinator, session=session, name=stage_name + ".gather_heads")
                 combine = PreparedLseReduceScatter(attended, lse, output[begin:end], runtime=context.heads,
                     session=session, coordinator=coordinator, name=stage_name + ".combine", threads=512, block_limit=8)
+                if gather.roce:
+                    self.gather_stream = None
             else:
                 quantized = lse = None
             caps = dense_mla.Caps(device=device, mode="decode", q_dtype=q.dtype, kv_dtype=cache.dtype,
@@ -122,16 +173,26 @@ class PreparedDSA:
             self.pages[:count].copy_(torch.where(pages[:, :, None] >= 0, expanded, -1).flatten(1))
             self.lengths[:count].copy_(shards.local_tokens((positions + 1).clamp_min(0)).to(torch.int32))
             self.active.copy_(self.lengths[:count].max().reshape(1))
+            concurrent = gather is not None and self.gather_stream is not None
+            if concurrent:
+                quantized.copy_(self.query[begin:end].float().clamp(-448., 448.).to(torch.float8_e4m3fn))
+                _start_heads_gather(quantized.view(count, -1), gather.output, gather.handle, self.gather_stream)
             selector()
             selected = self.local[:count] if merge is None else merge()
             physical, lengths = selected_local_records(selected, positions, pages, world=shards.world,
                 rank=shards.owner, page_size=PAGE_TOKENS)
             self.physical[:count].copy_(physical)
             self.counts[:count].copy_(lengths)
-            if gather is not None:
+            if concurrent:
+                _join_slices(gather.output, self.gather_stream)
+            elif gather is not None:
                 quantized.copy_(self.query[begin:end].float().clamp(-448., 448.).to(torch.float8_e4m3fn))
                 gather(quantized.view(count, -1))
             attention()
-            if combine is not None:
+            if concurrent:
+                _start_slice_combine(attention.output, lse, combine.output, combine.handle, self.gather_stream)
+            elif combine is not None:
                 combine(attention.output, lse)
+        if self.gather_stream is not None:
+            _join_slices(self.output, self.gather_stream)
         return self.output
