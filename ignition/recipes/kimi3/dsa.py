@@ -16,7 +16,7 @@ from .dcp import ContextShards, RECORD_BYTES
 from .projections import prepare_projection
 
 # Slice selection and its cross-rank candidate exchange so prefill scratch is context-independent.
-SELECTION_ROWS = 32
+SELECTION_ROWS = 128
 INDEX_HEADS, INDEX_DIM, TOPK = 32, 128, 2048
 
 

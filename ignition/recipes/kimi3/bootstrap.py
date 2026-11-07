@@ -26,7 +26,8 @@ from ignition.components.paged_resume import PreparedResume
 from ignition.components.sampling import AdmissionBuffers, DeviceRequestState
 from ignition.components.state_transfer import StateCommands
 from ignition.preparation.collectives import (CollectivePreparation, create_all_gather_runtime,
-                                              create_all_reduce_runtime, create_head_exchange)
+                                              create_all_reduce_runtime, create_dma_all_reduce_runtime,
+                                              create_head_exchange)
 from .routing import create_route_runtime
 from ignition.preparation.rank_group import minimum_across_ranks
 from ignition.preparation.capture import capture_forwards
@@ -55,6 +56,7 @@ from ignition.components.vision_state import PrefillVisionInputs, VisionState
 
 # Most rows of one all-reduce; larger prefill reductions run in chunks of this many rows.
 REDUCE_ROWS = 1024
+DMA_PREFILL_ROWS = 512
 
 
 @dataclass(frozen=True)
@@ -214,6 +216,11 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         channel_rows = max(min(max_tokens, REDUCE_ROWS), config.decode_tokens)
         collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning, max_tokens=channel_rows,
             hidden_size=weights.config.hidden, ipc=package_storage.peer_storage)
+        # A copy-engine ring beats the island kernel above about 230 full-width rows: 0.88 vs 1.89 ms at 1024.
+        prefill_collective = None
+        if shard.world_size > 1 and config.prefill_chunk_size >= DMA_PREFILL_ROWS:
+            prefill_collective = create_dma_all_reduce_runtime(group, device, max_tokens=config.prefill_chunk_size,
+                hidden_size=weights.config.hidden, ipc=package_storage.peer_storage)
         vocabulary_collective = create_all_gather_runtime(group, device,
             max_rows=max(config.decode_samples, slots * (config.draft_tokens + 1)),
             columns=weights.config.vocabulary, ipc=package_storage.peer_storage)
@@ -363,7 +370,9 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                     scratch = (prefill_storage if mode == "prefill" else decode_storage).rows(capacity, rows)
                     decoder = PreparedDecoder(mode_weights, scratch, m, pool, mode=mode,
                         scoring=scoring if kind == "scored_prefill" else None,
-                        session=session, name=name, workspace=arena, buffers=decoder_buffers, **collectives)
+                        session=session, name=name, workspace=arena, buffers=decoder_buffers,
+                        **{**collectives, **(dict(runtime=prefill_collective)
+                            if prefill_collective is not None and mode == "prefill" and capacity >= DMA_PREFILL_ROWS else {})})
                     batch = PreparedBatch(inputs, requests, m, mode=mode, shard=weights.shard, pool=pool,
                         validate_prefill=vision_state.validate_prefill if mode == "prefill" and patches else None,
                         page_tokens=config.page_tokens)
@@ -492,6 +501,6 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                                            decoder_buffers.scratch_tensors(), *draft_disposable]), *completion.zero_ranges()),
         resources=(scoring, weights, pool, requests, inputs, admission, commands, arena, forwards, prefill_storage, context,
                    decode_storage, metadata, compiled, stream, graph_pool, session, coordinator, collective,
-                   vocabulary_collective, embedding_collective, router_collective, route_collective,
+                   prefill_collective, vocabulary_collective, embedding_collective, router_collective, route_collective,
                    vision_inputs, vision_prefill, vision_state, vision_storage, scratch_pool, shared_scratch, graph_buffers,
                    speculation, context_collective, markov_collective, latent_runtimes))

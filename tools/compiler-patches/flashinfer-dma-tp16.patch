@@ -1,0 +1,39 @@
+Allow the BF16 copy-engine ring at world size 16.
+
+Lifts the reviewed-size whitelist only. On turin's four switches it measured 0.88 ms against the island
+kernel's 1.89 ms for 1024 x 7168 BF16, with byte-identical outputs across ranks. Compressed wire modes stay
+out of reach of this recipe. Apply with `patch --fuzz=0 -d <site-packages> -p1`.
+
+--- a/flashinfer/experimental/b12x/comm/pcie/pcie_dma.py
++++ b/flashinfer/experimental/b12x/comm/pcie/pcie_dma.py
+@@ -33,7 +33,7 @@
+     torch.float16: 1,
+     torch.float32: 2,
+ }
+-SUPPORTED_WORLD_SIZES = (2, 3, 4, 6, 8, 10)
++SUPPORTED_WORLD_SIZES = (2, 3, 4, 6, 8, 10, 16)
+ FLAG_STRIDE = 128
+ FLAG_SLOTS = 256
+ MAX_PIECES = 8
+--- a/flashinfer/experimental/b12x/comm/pcie/_tuning.py
++++ b/flashinfer/experimental/b12x/comm/pcie/_tuning.py
+@@ -18,7 +18,7 @@
+     "OneshotAllReduce.all_reduce_fused_add": (2, 3, 4, 6, 8, 10),
+     "OneshotAllReducePool.all_reduce": (2, 3, 4, 6, 8, 10),
+     "OneshotAllReducePool.all_reduce_fused_add_rms_norm": (2, 3, 4, 6, 8, 10),
+-    "DmaAllReduce.all_reduce": (2, 3, 4, 6, 8, 10),
++    "DmaAllReduce.all_reduce": (2, 3, 4, 6, 8, 10, 16),
+     "PCIeTwoShotBF16.all_reduce": (2, 3, 4, 6, 8, 10),
+     "PCIeTwoShotBF16.reduce_scatter": (2, 3, 4, 6, 8, 10),
+     "PCIeTwoShotBF16.all_gather": (2, 3, 4, 6, 8, 10),
+--- a/flashinfer/experimental/b12x/comm/pcie/_dma_kernels.py
++++ b/flashinfer/experimental/b12x/comm/pcie/_dma_kernels.py
+@@ -1434,7 +1434,7 @@
+ def compile_launchers(*, world_size: int, wire_mode: str) -> DmaLaunchers:
+     """Resolve the primitive programs reachable by declaration metadata."""
+ 
+-    if int(world_size) not in (2, 3, 4, 6, 8, 10):
++    if int(world_size) not in (2, 3, 4, 6, 8, 10, 16):
+         raise ValueError(f"unsupported DMA world size {world_size}")
+     mode = str(wire_mode)
+     codec = "i8" if mode.startswith("i8") else "mx" if mode.startswith("mx") else "e4m3"
