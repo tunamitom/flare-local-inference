@@ -258,7 +258,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                 coordinator=coordinator,
                 peers=pool.share_pages(package_storage, group) if "mla" in weights.config.layers else {}, slab=None,
                 candidates=(create_all_gather_runtime(group, device, max_rows=selection_rows,
-                    columns=4 * TOPK * shard.world_size, ipc=package_storage.peer_storage) if sparse else None))
+                    columns=2 * TOPK * shard.world_size, ipc=package_storage.peer_storage) if sparse else None))
         # Every MLA step gathers each rank's query and KV latent rows, padded to 16 bytes: one exchange for up to
         # eight rows, as vLLM's b12x latent transport carries, and one that prefill steps use in chunks.
         text = weights.config.text
