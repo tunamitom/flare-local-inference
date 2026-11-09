@@ -19,7 +19,14 @@ from ignition.components.weights import DirectWeightLoader, quantize_bf16_linear
 from ignition.preparation.scratch import ScratchArena
 from ignition.preparation.tuning import RecordedPreparationSession, declare, register_finalizer
 
-PATCH_CAPACITIES = (256, 1024, 4096, 16384, 65536)
+# K1/K2 delta (graph-only re-export): 65536 -> 16384 max patches. VisionInputs keeps
+# PATCH_CAPACITIES[-1] x 588 f32 pixels plus VisionScratch's projected and attention slabs;
+# dropping the 65,536-slot tier frees 320,274,432 B per rank (pixels 115.6 MB + projected
+# 100.7 MB + attention 100.7 MB + indices 3.3 MB) at zero decode/prefill cost. Images above
+# 16,384 patches (about 1,790 x 1,790 px before the processor's own resizing) are refused or
+# downscaled by the processor: an accepted owner-known tradeoff. Fallback tier is 32,768
+# (-0.15 GiB) if the owner's largest photo fails the describe-photo gate.
+PATCH_CAPACITIES = (256, 1024, 4096, 16384)
 FEATURES = 16384
 HIDDEN = 7168
 VISION_HEADS = 12
