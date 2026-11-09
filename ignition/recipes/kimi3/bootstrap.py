@@ -28,6 +28,7 @@ from ignition.components.sampling import AdmissionBuffers, DeviceRequestState
 from ignition.components.state_transfer import StateCommands
 from ignition.preparation.collectives import (CollectivePreparation, create_all_gather_runtime,
                                               create_all_reduce_runtime, create_single_round_all_reduce_runtime,
+                                              create_fp8_two_shot_all_reduce_runtime,
                                               create_head_exchange)
 from .routing import create_route_runtime
 from ignition.preparation.rank_group import minimum_across_ranks
@@ -59,6 +60,19 @@ from ignition.components.vision_state import PrefillVisionInputs, VisionState
 
 # Most rows of one all-reduce; larger prefill reductions run in chunks of this many rows.
 REDUCE_ROWS = 1024
+
+
+def prefill_all_reduce_runtime(config, group, device, *, max_tokens, hidden_size, ipc):
+    """The prefill reduction channel: exact BF16 owner sums, or the fp8 experiment.
+
+    `config.prefill_fp8_transport` (default off, the exact rollback) selects the
+    per-row E4M3 two-shot wire; the capacity envelope is identical either way.
+    """
+    if config.prefill_fp8_transport:
+        return create_fp8_two_shot_all_reduce_runtime(group, device,
+            max_tokens=max_tokens, hidden_size=hidden_size)
+    return create_single_round_all_reduce_runtime(group, device,
+        max_tokens=max_tokens, hidden_size=hidden_size, ipc=ipc)
 
 
 @dataclass(frozen=True)
@@ -97,6 +111,10 @@ class PreparationConfig:
     context_parallel: bool = True
     # The MoonViT encoder and its graphs prepare beside the text model unless the plan serves text only.
     vision: bool = True
+    # P3′ (REVIEW-J4): prefill reductions transport per-row E4M3 through the two-shot
+    # channel instead of complete FP32 owner sums over the original BF16 inputs.
+    # Default off keeps that exact path byte-identical as the rollback.
+    prefill_fp8_transport: bool = False
 
     def __post_init__(self):
         if self.draft_head_quantization not in (None, "mxfp8", "nvfp4"):
@@ -118,6 +136,8 @@ class PreparationConfig:
         if (len(self.devices) not in (8, 16) or len(set(self.devices)) != len(self.devices)
                 or any(d < 0 for d in self.devices)):
             raise ValueError("Kimi preparation requires eight or sixteen distinct GPUs")
+        if self.prefill_fp8_transport and len(self.devices) not in (2, 4, 8):
+            raise ValueError("fp8 prefill transport supports two, four or eight ranks")
         request_capacity(self.max_active)
         if self.drafting:
             if not self.speculative_widths or not set(self.speculative_widths) <= set(range(1, 9)):
@@ -236,7 +256,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         reduction_rows = config.decode_tokens if shard.world_size in SUPPORTED_WORLD_SIZES else channel_rows
         collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning,
             max_tokens=reduction_rows, hidden_size=weights.config.hidden, ipc=package_storage.peer_storage)
-        prefill_collective = (create_single_round_all_reduce_runtime(group, device,
+        prefill_collective = (prefill_all_reduce_runtime(config, group, device,
             max_tokens=config.prefill_chunk_size, hidden_size=weights.config.hidden,
             ipc=package_storage.peer_storage)
             if shard.world_size in SUPPORTED_WORLD_SIZES else None)
