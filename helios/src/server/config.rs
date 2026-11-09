@@ -484,13 +484,14 @@ mod tests {
             assert_eq!(limits.max_image_tokens_per_prompt(), features * 3);
             assert_eq!(limits.max_image_tokens_per_image(), graph_patches.min(total) / merge);
             let processor = ImageProcessor::load(ImageSettings::Moonvit {}, limits).unwrap();
-            let geometry = processor.geometry(3584, 3584);
+            let geometry = processor.geometry(3584, 3584).unwrap();
+            assert!(geometry.patches <= limits.max_patches_per_image);
             if graph_patches == 65536 {
-                let geometry = geometry.unwrap();
                 assert_eq!(geometry.patches, 65536);
                 assert_eq!(geometry.tokens, 16384);
-            } else {
-                assert!(geometry.is_err());
+            } else if graph_patches == 16384 && features == 16384 {
+                assert_eq!(geometry.patches, 16384);
+                assert_eq!(geometry.tokens, 4096);
             }
         }
     }
