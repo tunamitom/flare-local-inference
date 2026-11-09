@@ -162,7 +162,23 @@ class PreparedAllReduce:
                     submode=mode, active_blocks=initial_active))
                 if cluster_size > 1:
                     plan_options["joint_cluster_size"] = cluster_size
-            self.plan = runtime.plan(source, out=output, **plan_options)
+            try:
+                self.plan = runtime.plan(source, out=output, **plan_options)
+            except ValueError as error:
+                # Failure-only contract diagnostics: report both buffers' pack and
+                # alignment statistics beside the runtime's byte capacity.
+                def stats(tensor):
+                    return (f"shape={tuple(tensor.shape)} stride={tuple(tensor.stride())} dtype={tensor.dtype} "
+                            f"numel={tensor.numel()} element_size={tensor.element_size()} "
+                            f"bytes={tensor.numel() * tensor.element_size()} "
+                            f"data_ptr%16={tensor.data_ptr() % 16} "
+                            f"bytes%16={tensor.numel() * tensor.element_size() % 16} "
+                            f"contiguous={tensor.is_contiguous()}")
+                raise ValueError(
+                    f"all-reduce plan rejected for {name}: {error}; "
+                    f"source {stats(source)}; output {stats(output)}; "
+                    f"runtime_max_size={getattr(runtime, 'max_size', None)}"
+                ) from error
             group = runtime.exchange_group
 
             def prepare(state):
