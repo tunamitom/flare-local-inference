@@ -60,7 +60,81 @@ def _all_reduce(source: torch.Tensor, output: torch.Tensor, handle: int) -> None
     owner = _OWNERS[handle]
     from ignition.preparation.startup_tuning import record_consumer
     record_consumer(owner)
-    owner.runtime.all_reduce(source, out=output, plan=owner.plan)
+    owner.launch(source, output)
+
+
+class Fp8TwoShotAllReduce:
+    """Prefill reduction channel carrying per-row E4M3 payloads on the two-shot wire.
+
+    The experimental alternative to `create_single_round_all_reduce_runtime`
+    (P3′, REVIEW-J4): reduce-scatter and all-gather move FP8 bytes with per-row
+    FP32 scales, accumulate in FP32 and dequantize fused with the BF16 store,
+    halving the reduction wire at the cost of E4M3 quantization error. The exact
+    BF16 owner sums remain the rollback (`prefill_fp8_transport` defaults off).
+
+    Reductions on the channel serialize, so one set of quantization and
+    reduced-shard workspaces serves every prepared reduction; views of it are
+    bound per operation. `accepts` mirrors the BF16 twin's capacity envelope.
+    """
+
+    def __init__(self, runtime, *, max_rows, row_elems):
+        if runtime.world_size < 2 or max_rows % runtime.world_size:
+            raise ValueError("fp8 transport rows must divide the world size")
+        self.runtime, self.max_rows, self.row_elems = runtime, max_rows, row_elems
+        self.world_size, self.rank = runtime.world_size, runtime.rank
+        self.device, self.exchange_group = runtime.device, runtime.exchange_group
+        shards = max_rows // self.world_size
+        allocate = lambda shape, dtype: torch.zeros(shape, dtype=dtype, device=self.device)
+        # Transport payloads and scales sized for the largest reduction.
+        self.payload = allocate((max_rows, row_elems), torch.float8_e4m3fn)
+        self.scale = allocate((max_rows, 1), torch.float32)
+        self.shard = allocate((shards, row_elems), torch.bfloat16)
+        self.shard_payload = allocate((shards, row_elems), torch.float8_e4m3fn)
+        self.shard_scale = allocate((shards, 1), torch.float32)
+        # Quantization scratch reused by every serial reduction.
+        self._absolute = allocate((max_rows, row_elems), torch.bfloat16)
+        self._amplitude = allocate((max_rows, 1), torch.bfloat16)
+        self._dequantized = allocate((max_rows, row_elems), torch.float32)
+        self._plans = []
+
+    def accepts(self, source):
+        """True when the channel reduces this contiguous BF16 activation whole."""
+        rows = source.numel() // self.row_elems if source.numel() % self.row_elems == 0 else 0
+        return (source.dtype == torch.bfloat16 and source.is_contiguous()
+                and source.device == self.device and 0 < rows <= self.max_rows
+                and rows % self.world_size == 0)
+
+    def register(self, plan):
+        """Retain a prepared operation's plan for the capture context."""
+        self._plans.append(plan)
+
+    def quantize(self, values, payload, scale):
+        """Per-row E4M3 quantization into shared wire buffers.
+
+        Matches b12x's `quantize_per_row` reference exactly: scale is
+        max(row amplitude, 1e-12) / 448, the payload is the row divided by its
+        scale, clamped to ±448 and rounded to E4M3. Every step writes
+        preallocated storage, so captured graphs allocate nothing.
+        """
+        rows = values.shape[0]
+        absolute, amplitude = self._absolute[:rows], self._amplitude[:rows]
+        torch.abs(values, out=absolute)
+        torch.amax(absolute, dim=1, keepdim=True, out=amplitude)
+        scale.copy_(amplitude)
+        scale.clamp_(min=1e-12).div_(448.0)
+        dequantized = self._dequantized[:rows]
+        torch.div(values, scale, out=dequantized)
+        dequantized.clamp_(-448.0, 448.0)
+        payload.copy_(dequantized)
+
+    def capture(self):
+        """Serialize graph capture on the channel, as the BF16 twin does."""
+        if not self._plans:
+            raise RuntimeError("fp8 two-shot capture requires one prepared reduction")
+        return self.runtime.capture(plan=self._plans[0])
+
+    def close(self):
+        self.runtime.close()
 
 
 @_all_reduce.register_fake
@@ -82,6 +156,7 @@ class PreparedAllReduce:
         from b12x.comm import pcie
 
         self.runtime, self.output = runtime, output
+        self.fp8_launch = None
         startup_joint = False
         # Traced forwards test this flag, never the runtime: compile workers see a runtime that
         # owns RDMA or IPC resources only as a placeholder.
@@ -123,6 +198,54 @@ class PreparedAllReduce:
 
             def prepare(state):
                 return _twoshot_preparation.prepared_call(state, payload=source, out=output)
+        elif isinstance(runtime, Fp8TwoShotAllReduce):
+            # P3′ experiment (REVIEW-J4): fp8-transport two-shot. Per-row E4M3
+            # payloads and FP32 accumulation replace the exact BF16 owner sums
+            # only when the recipe asks for it; output shapes and the reduction
+            # contract are unchanged.
+            from b12x.comm.pcie import _twoshot_preparation
+
+            channel = runtime
+            if not channel.accepts(source) or (output.shape != source.shape or output.dtype != torch.bfloat16
+                                               or output.device != source.device or not output.is_contiguous()):
+                raise ValueError("fp8 two-shot reductions require matching contiguous BF16 activations"
+                                 " within the channel's capacity")
+            rows = source.numel() // channel.row_elems
+            payload, scale = channel.payload[:rows], channel.scale[:rows]
+            shard_rows = rows // channel.world_size
+            shard = channel.shard[:shard_rows]
+            shard_payload, shard_scale = channel.shard_payload[:shard_rows], channel.shard_scale[:shard_rows]
+            output_view = output.view(rows, channel.row_elems)
+            self.plan = _twoshot_preparation.plan(_twoshot_preparation.query_from_runtime(
+                channel.runtime, surface="TwoShotReduceScatter.reduce_scatter_fp8",
+                call=dict(payload=payload, scale=scale, out=shard)), runtime=channel.runtime)
+            self.ag_plan = _twoshot_preparation.plan(_twoshot_preparation.query_from_runtime(
+                channel.runtime, surface="TwoShotReduceScatter.all_gather_fp8",
+                call=dict(payload=shard_payload, scale=shard_scale, out=output_view)), runtime=channel.runtime)
+            channel.register(self.plan)
+            group = channel.runtime.exchange_group
+            ranks = tuple(dist.get_process_group_ranks(group))
+            requests = (
+                self.plan.request(name=name + ".fp8_reduce_scatter",
+                    prepare_call=lambda state: _twoshot_preparation.prepared_call(
+                        state, payload=payload, scale=scale, out=shard),
+                    collective=CollectiveRequirement(key=name + ".fp8_reduce_scatter", ranks=ranks)),
+                self.ag_plan.request(name=name + ".fp8_all_gather",
+                    prepare_call=lambda state: _twoshot_preparation.prepared_call(
+                        state, payload=shard_payload, scale=shard_scale, out=output_view),
+                    collective=CollectiveRequirement(key=name + ".fp8_all_gather", ranks=ranks)))
+
+            def reduce(source, output):
+                channel.quantize(source.view(rows, channel.row_elems), payload, scale)
+                channel.runtime.reduce_scatter_fp8(payload, scale, shard, plan=self.plan)
+                channel.quantize(shard, shard_payload, shard_scale)
+                channel.runtime.all_gather_fp8(shard_payload, shard_scale, output_view, plan=self.ag_plan)
+
+            self.fp8_launch = reduce
+            declare(session, requests, coordinator=coordinator)
+            self.handle = next(_HANDLES)
+            _OWNERS[self.handle] = self
+            return
         elif runtime.algorithm == "hierarchical":
             from b12x.comm.pcie._owner_preparation import prepared_call
 
@@ -200,6 +323,13 @@ class PreparedAllReduce:
         self.handle = next(_HANDLES)
         _OWNERS[self.handle] = self
 
+    def launch(self, source, output):
+        """Run the reduction into its output inside the captured forward."""
+        if self.fp8_launch is not None:
+            self.fp8_launch(source, output)
+        else:
+            self.runtime.all_reduce(source, out=output, plan=self.plan)
+
     def __call__(self, source):
         if self.single:
             self.output.copy_(source)
@@ -256,7 +386,12 @@ class PreparedChunkedAllReduce:
 
             # Two-shot owner order is defined by the complete tensor. The other
             # runtimes retain their existing row-chunking contract.
-            if isinstance(runtime, pcie.PCIeTwoShotBF16):
+            if isinstance(runtime, Fp8TwoShotAllReduce):
+                accepts = runtime.accepts
+                if not accepts(source):
+                    raise ValueError("fp8 two-shot reduction capacity must cover the full input"
+                                     " to preserve owner order")
+            elif isinstance(runtime, pcie.PCIeTwoShotBF16):
                 accepts = runtime.accepts
                 if not accepts(source):
                     raise ValueError("two-shot reduction capacity must cover the full input to preserve owner order")

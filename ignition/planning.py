@@ -199,6 +199,9 @@ class Plan:
     image_concurrency: int = 0
     # The recipe's eligible BF16 projections load as MXFP8 when the plan asks for it.
     online_mxfp8: bool = False
+    # P3′ (REVIEW-J4): prefill reductions transport per-row E4M3 through the two-shot
+    # channel instead of complete FP32 owner sums over the original BF16 inputs.
+    prefill_fp8_transport: bool = False
     # The plan prepares no vision encoder and serves text requests only.
     language_model_only: bool = False
     benchmark_selection: BenchmarkSelection | None = None
@@ -254,6 +257,8 @@ class Plan:
                 raise UsageError("--joint-tuning requires DeepSeek V4.1")
             if self.autotune_effort == "off":
                 raise UsageError("--joint-tuning requires --autotune-effort default or audit")
+        if self.prefill_fp8_transport and self.recipe.name not in ("kimi3", "kimi31"):
+            raise UsageError("--prefill-fp8-transport supports the Kimi K3/K3.1 recipes")
 
     @property
     def world_size(self) -> int:
@@ -370,6 +375,7 @@ class Plan:
             "tuning_gpus": [gpu.index for gpu in self.tuning_gpus],
             "speculative_token_capacity": self.speculative_token_capacity,
             "online_mxfp8": self.online_mxfp8, "language_model_only": self.language_model_only,
+            "prefill_fp8_transport": self.prefill_fp8_transport,
             "speculation": None if self.speculation is None else {
                 "draft_tokens": self.speculation.draft_tokens, "adaptive": self.speculation.adaptive,
                 **({} if self.speculation.method is None else {"method": self.speculation.method}),
@@ -404,6 +410,7 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
         expert_scale_compression: str | None = None, roce_ring: bool = False,
         roce_chain: bool = False,
         image_concurrency: int | None = None, online_mxfp8: bool = False,
+        prefill_fp8_transport: bool = False,
         language_model_only: bool = False, mla_compute_mode: str | None = None) -> Plan:
     """Size pages and the prefix cache to the supply; the result may not fit.
 
@@ -462,6 +469,7 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
                 # Language-only plans prepare no vision encoder, so no image feature slots.
                 image_concurrency=0 if language_model_only else (min(4, concurrency) if recipe.max_images else 0)
                     if image_concurrency is None else image_concurrency, online_mxfp8=online_mxfp8,
+                prefill_fp8_transport=prefill_fp8_transport,
                 language_model_only=language_model_only)
     available = plan.supply_bytes - plan.fixed_bytes
     target = min(CACHE_STATES_PER_REQUEST * concurrency, max(1, available // costs.state_row_bytes))
@@ -511,12 +519,13 @@ def host_shape_error(roce_ring: bool, roce_chain: bool, hosts: int | None) -> st
     return None
 
 def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selected: tuple[int, ...] | None,
-         concurrency: int, reserve_bytes: int, speculation: Speculation | None,
-         prefill_chunk: int | None = None, context_parallel: bool = True, stream_overlap: bool = True,
-         cache_states: int | None = None, mixed_prefill: bool = False, prompt_logprobs: bool = False,
-         expert_scale_compression: str | None = None, roce_ring: bool = False, roce_chain: bool = False,
-         image_concurrency: int | None = None, online_mxfp8: bool = False,
-         language_model_only: bool = False, mla_compute_mode: str | None = None) -> Plan:
+        concurrency: int, reserve_bytes: int, speculation: Speculation | None,
+        prefill_chunk: int | None = None, context_parallel: bool = True, stream_overlap: bool = True,
+        cache_states: int | None = None, mixed_prefill: bool = False, prompt_logprobs: bool = False,
+        expert_scale_compression: str | None = None, roce_ring: bool = False, roce_chain: bool = False,
+        image_concurrency: int | None = None, online_mxfp8: bool = False,
+        prefill_fp8_transport: bool = False,
+        language_model_only: bool = False, mla_compute_mode: str | None = None) -> Plan:
     """Select GPUs and size the plan, or raise a capacity error that lists working settings.
 
     Without `selected`, the plan uses the smallest supported tensor-parallel size
@@ -532,6 +541,8 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
         raise UsageError(f"--mixed-prefill: {checkpoint.alias} does not capture mixed prefill/decode graphs")
     if online_mxfp8 and not recipe.online_mxfp8:
         raise UsageError(f"--online-mxfp8: {checkpoint.alias} names no projections to store as MXFP8")
+    if prefill_fp8_transport and recipe.name not in ("kimi3", "kimi31"):
+        raise UsageError("--prefill-fp8-transport supports the Kimi K3/K3.1 recipes")
     if language_model_only and not recipe.language_model_only:
         raise UsageError(f"--language-model-only: {checkpoint.alias} prepares no separable vision encoder")
     if not 1 <= concurrency <= recipe.max_concurrency:
@@ -546,6 +557,11 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
         raise UsageError(f"--prefill-chunk-size for {checkpoint.alias} must be a multiple of 64"
                          f" from 64 through {recipe.context:,}")
     world_sizes = recipe.tensor_parallel
+    if prefill_fp8_transport:
+        # The E4M3 two-shot channel supports these tensor-parallel sizes.
+        world_sizes = tuple(size for size in world_sizes if size in (2, 4, 8))
+        if not world_sizes:
+            raise UsageError("--prefill-fp8-transport requires a tensor-parallel size of 2, 4 or 8")
     if speculation is not None and speculation.vocabulary_parallel_sampling:
         if recipe.name != "deepseek41":
             raise UsageError("--vocabulary-parallel-sampling requires DeepSeek V4.1")
@@ -578,7 +594,8 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
                    mixed_prefill=mixed_prefill, prompt_logprobs=prompt_logprobs,
                    expert_scale_compression=expert_scale_compression, roce_ring=roce_ring, roce_chain=roce_chain,
                    image_concurrency=None if image_concurrency is None else min(image_concurrency, concurrency),
-                   online_mxfp8=online_mxfp8, language_model_only=language_model_only,
+                   online_mxfp8=online_mxfp8, prefill_fp8_transport=prefill_fp8_transport,
+                   language_model_only=language_model_only,
                    mla_compute_mode=mla_compute_mode)
 
     def automatic(world_size, **settings):
