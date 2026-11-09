@@ -29,6 +29,7 @@ from ignition.components.state_transfer import StateCommands
 from ignition.preparation.collectives import (CollectivePreparation, create_all_gather_runtime,
                                               create_all_reduce_runtime, create_single_round_all_reduce_runtime,
                                               create_fp8_two_shot_all_reduce_runtime,
+                                              create_island_all_reduce_runtime,
                                               create_head_exchange)
 from .routing import create_route_runtime
 from ignition.preparation.rank_group import minimum_across_ranks
@@ -63,12 +64,19 @@ REDUCE_ROWS = 1024
 
 
 def prefill_all_reduce_runtime(config, group, device, *, max_tokens, hidden_size, ipc):
-    """The prefill reduction channel: exact BF16 owner sums, or the fp8 experiment.
+    """The prefill reduction channel: exact BF16 owner sums, the island wire, or fp8.
 
-    `config.prefill_fp8_transport` (default off, the exact rollback) selects the
-    per-row E4M3 two-shot wire; the capacity envelope is identical either way.
+    `config.prefill_island_reduce` (L1, REVIEW-J6; default off, the exact
+    rollback) selects the TP8 two-island BF16 wire at world 8 — TP2/TP4 fall
+    back to the exact path. `config.prefill_fp8_transport` (default off)
+    selects the per-row E4M3 two-shot wire. The capacity envelope is identical
+    either way.
     """
-    if config.prefill_fp8_transport:
+    if config.prefill_island_reduce:
+        if torch.distributed.get_world_size(group) == 8:
+            return create_island_all_reduce_runtime(group, device,
+                max_tokens=max_tokens, hidden_size=hidden_size, ipc=ipc)
+    elif config.prefill_fp8_transport:
         return create_fp8_two_shot_all_reduce_runtime(group, device,
             max_tokens=max_tokens, hidden_size=hidden_size)
     return create_single_round_all_reduce_runtime(group, device,
@@ -116,6 +124,11 @@ class PreparationConfig:
     # channel instead of complete FP32 owner sums over the original BF16 inputs.
     # Default off keeps that exact path byte-identical as the rollback.
     prefill_fp8_transport: bool = False
+    # L1 (REVIEW-J6): prefill reductions run the TP8 two-island BF16 wire
+    # (complete FP32 island sums, one extra BF16 rounding of the 4-way partial)
+    # instead of the exact single-rounding owner sums. Default off keeps that
+    # exact path byte-identical as the rollback.
+    prefill_island_reduce: bool = False
 
     def __post_init__(self):
         if self.draft_head_quantization not in (None, "mxfp8", "nvfp4"):
@@ -139,6 +152,11 @@ class PreparationConfig:
             raise ValueError("Kimi preparation requires eight or sixteen distinct GPUs")
         if self.prefill_fp8_transport and len(self.devices) not in (2, 4, 8):
             raise ValueError("fp8 prefill transport supports two, four or eight ranks")
+        if self.prefill_island_reduce:
+            if len(self.devices) not in (2, 4, 8):
+                raise ValueError("island prefill reductions support two, four or eight ranks")
+            if self.prefill_fp8_transport:
+                raise ValueError("prefill_island_reduce and prefill_fp8_transport are mutually exclusive")
         request_capacity(self.max_active)
         if self.drafting:
             if not self.speculative_widths or not set(self.speculative_widths) <= set(range(1, 9)):

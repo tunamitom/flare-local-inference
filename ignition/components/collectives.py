@@ -198,6 +198,24 @@ class PreparedAllReduce:
 
             def prepare(state):
                 return _twoshot_preparation.prepared_call(state, payload=source, out=output)
+        elif isinstance(runtime, pcie.PCIeIslandARAllReduce):
+            # L1 (REVIEW-J6): TP8 two-island prefill wire. Complete FP32 island
+            # sums with one extra BF16 rounding of the 4-way partial replace the
+            # exact single-rounding owner sums only when the recipe asks for it;
+            # output shapes and the reduction contract are unchanged.
+            if not runtime.accepts(source) or (output.shape != source.shape or output.dtype != torch.bfloat16
+                                               or output.device != source.device or not output.is_contiguous()):
+                raise ValueError("island reductions require matching contiguous BF16 activations"
+                                 " within the channel's capacity")
+            self.plan = pcie.plan(pcie.query_from_runtime(
+                runtime, surface="PCIeIslandARAllReduce.all_reduce",
+                call=dict(inp=source, out=output)), runtime=runtime)
+            group = runtime.exchange_group
+
+            def prepare(state):
+                from b12x.comm.pcie._owner_preparation import prepared_call
+
+                return prepared_call(state, inp=source, out=output)
         elif isinstance(runtime, Fp8TwoShotAllReduce):
             # P3′ experiment (REVIEW-J4): fp8-transport two-shot. Per-row E4M3
             # payloads and FP32 accumulation replace the exact BF16 owner sums
@@ -390,6 +408,11 @@ class PreparedChunkedAllReduce:
                 accepts = runtime.accepts
                 if not accepts(source):
                     raise ValueError("fp8 two-shot reduction capacity must cover the full input"
+                                     " to preserve owner order")
+            elif isinstance(runtime, pcie.PCIeIslandARAllReduce):
+                accepts = runtime.accepts
+                if not accepts(source):
+                    raise ValueError("island reduction capacity must cover the full input"
                                      " to preserve owner order")
             elif isinstance(runtime, pcie.PCIeTwoShotBF16):
                 accepts = runtime.accepts
