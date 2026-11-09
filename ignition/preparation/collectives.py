@@ -97,6 +97,24 @@ def create_single_round_all_reduce_runtime(group, device, *, max_tokens, hidden_
     return PCIeTwoShotBF16.from_exchange_group(exchange_group=group, device=device,
         max_rows=max_tokens, row_elems=hidden_size, ipc=ipc)
 
+def create_island_all_reduce_runtime(group, device, *, max_tokens, hidden_size, ipc=None):
+    """Own the TP8 two-island BF16 channel offered beside the exact owner sums.
+
+    L1 (REVIEW-J6): the composed island wire reduces each four-GPU switch
+    island in FP32 and rounds the 4-way partial to BF16 once before a two-way
+    FP32 combine across the uplink, quartering the cross-switch bytes at the
+    cost of that one extra BF16 rounding. Kimi's `prefill_island_reduce`
+    selects it at TP8 (default off keeps `create_single_round_all_reduce_runtime`,
+    the exact rollback). Capacities match that runtime's envelope: reductions
+    of up to `max_tokens` rows of `hidden_size` elements.
+    """
+    from b12x.comm.pcie import PCIeIslandARAllReduce
+
+    if any(type(value) is not int or value <= 0 for value in (max_tokens, hidden_size)):
+        raise ValueError("all-reduce capacities must be positive integers")
+    return PCIeIslandARAllReduce.from_exchange_group(exchange_group=group, device=device,
+        max_rows=max_tokens, row_elems=hidden_size, ipc=ipc)
+
 
 def create_fp8_two_shot_all_reduce_runtime(group, device, *, max_tokens, hidden_size):
     """Own the E4M3-transport two-shot channel offered beside the exact BF16 sums.

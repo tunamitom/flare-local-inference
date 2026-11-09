@@ -57,6 +57,7 @@ def prepare_variant(snapshot, plan, *, bootstrap, draft_repository, draft_revisi
         retain_graphs=retain_graphs, kernel_cache=kernel_cache, online_mxfp8=plan.online_mxfp8,
         stream_overlap=plan.stream_overlap, context_parallel=plan.context_parallel,
         prefill_fp8_transport=plan.prefill_fp8_transport,
+        prefill_island_reduce=plan.prefill_island_reduce,
         vision=not plan.language_model_only, **drafting)
     if plan.world_size == 1:
         return prepare_rank(snapshot, config, rank=0, group=None, progress=progress, package_storage=package_storage)
