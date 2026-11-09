@@ -94,6 +94,86 @@ def test_runtime_geometry_is_pinned_for_every_tuning_effort(monkeypatch, effort,
         assert registered == [operation]
 
 
+def _fp8_channel(rows=16, columns=64, world=2, calls=None):
+    runtime = SimpleNamespace(world_size=world, rank=0, device=torch.device("cpu"), exchange_group=object(),
+        max_rows=rows, row_elems=columns,
+        _pack_stride=256, _scale_offset=4096, _scale_stride=32, _slot_bytes=8192,
+        _signal_ptrs=tuple(range(8)), _staging_ptrs=(tuple(range(8)), tuple(range(8))))
+    calls = [] if calls is None else calls
+    runtime.reduce_scatter_fp8 = lambda payload, scale, out, plan=None: calls.append(
+        ("reduce_scatter_fp8", tuple(payload.shape), tuple(scale.shape), tuple(out.shape))) or out.zero_()
+    runtime.all_gather_fp8 = lambda payload, scale, out, plan=None: calls.append(
+        ("all_gather_fp8", tuple(payload.shape), tuple(scale.shape), tuple(out.shape))) or out.zero_()
+    from ignition.components.collectives import Fp8TwoShotAllReduce
+
+    return Fp8TwoShotAllReduce(runtime, max_rows=rows, row_elems=columns), calls
+
+
+def test_fp8_two_shot_composes_quantized_reduce_scatter_and_all_gather(monkeypatch):
+    from b12x.comm.pcie import _twoshot_preparation
+    from b12x.comm.pcie.pcie_twoshot import quantize_per_row
+    from b12x.preparation import PreparedCall
+    from ignition.components import collectives
+
+    rows, columns, world = 16, 64, 2
+    channel, calls = _fp8_channel(rows, columns, world)
+    requests, primed = [], []
+    monkeypatch.setattr(collectives, "declare", lambda session, values, **kwargs: requests.extend(values))
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda group: list(range(world)))
+
+    def two_call(state, *, payload, scale=None, out=None):
+        primed.append((payload, scale, out))
+        return PreparedCall(run=lambda: None, output=out, capture_safe=False)
+
+    monkeypatch.setattr(_twoshot_preparation, "prepared_call", two_call)
+    source = torch.randn(rows, columns).to(torch.bfloat16)
+    output = torch.empty_like(source)
+    operation = collectives.PreparedAllReduce(source, output, runtime=channel, session=object(),
+        coordinator=object(), name="layer.reduce")
+    # Both halves declare their own prepared surface against shared transport buffers.
+    assert (operation.plan.query.surface, operation.ag_plan.query.surface) == (
+        "TwoShotReduceScatter.reduce_scatter_fp8", "TwoShotReduceScatter.all_gather_fp8")
+    assert [request.name for request in requests] == ["layer.reduce.fp8_reduce_scatter", "layer.reduce.fp8_all_gather"]
+    assert channel._plans == [operation.plan]
+    for request in requests:
+        request.prepare_call(SimpleNamespace())
+    assert [(tuple(p.shape), tuple(s.shape), tuple(o.shape)) for p, s, o in primed] == [
+        ((rows, columns), (rows, 1), (rows // world, columns)),
+        ((rows // world, columns), (rows // world, 1), (rows, columns))]
+    # The captured launch quantizes exactly as b12x's reference, then runs
+    # quantize -> reduce-scatter -> requantize -> all-gather into the output.
+    operation.launch(source, output)
+    assert calls == [("reduce_scatter_fp8", (rows, columns), (rows, 1), (rows // world, columns)),
+                     ("all_gather_fp8", (rows // world, columns), (rows // world, 1), (rows, columns))]
+    expected_payload, expected_scale = quantize_per_row(source)
+    assert torch.equal(channel.scale[:rows], expected_scale.view(-1, 1))
+    assert torch.equal(channel.payload[:rows].view(torch.uint8), expected_payload.view(torch.uint8))
+    # A zero reduced shard quantizes to zero payloads on the all-gather wire.
+    assert not channel.shard_payload[:rows // world].view(torch.uint8).any()
+    assert operation.runtime is channel and operation.output is output
+
+
+def test_fp8_two_shot_capacity_matches_the_exact_twin_envelope(monkeypatch):
+    from ignition.components import collectives
+
+    channel, _ = _fp8_channel()
+    accept = torch.zeros(16, 64, dtype=torch.bfloat16)
+    assert channel.accepts(accept) and channel.accepts(torch.zeros(8, 128, dtype=torch.bfloat16))
+    assert not channel.accepts(torch.zeros(15, 64, dtype=torch.bfloat16))  # transport rows must divide the world
+    assert not channel.accepts(torch.zeros(32, 64, dtype=torch.bfloat16))  # beyond the twin's envelope
+    assert not channel.accepts(torch.zeros(16, 64)) and not channel.accepts(torch.zeros(16, 65)[:, :64])
+    with pytest.raises(ValueError, match="fp8 two-shot reductions"):
+        collectives.PreparedAllReduce(torch.zeros(16, 64), torch.empty(4, 4, dtype=torch.bfloat16),
+            runtime=channel, session=object(), coordinator=object(), name="bad")
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda group: [0, 1])
+    monkeypatch.setattr(collectives, "declare", lambda *args, **kwargs: None)
+    # The reduction contract is unchanged: matching contiguous BF16 source and output.
+    source, output = torch.zeros(16, 64, dtype=torch.bfloat16), torch.empty(16, 64, dtype=torch.bfloat16)
+    collectives.PreparedAllReduce(source, output, runtime=channel, session=object(),
+        coordinator=object(), name="good")
+    assert output.shape == source.shape and output.dtype == source.dtype
+
+
 def test_direct_collective_requires_joint_api_before_capability_lookup(monkeypatch):
     from importlib import import_module
     from ignition.components import collectives
