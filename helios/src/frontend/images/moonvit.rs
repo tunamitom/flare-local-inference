@@ -10,21 +10,36 @@ use super::{
 };
 use crate::Result;
 
-fn extent(width: usize, height: usize) -> (usize, usize) {
+fn extent(width: usize, height: usize, max_patches: usize) -> (usize, usize) {
     let area = (width / 14).max(1) as f64 * (height / 14).max(1) as f64;
     let scale = 1.0f64
-        .min((65536.0 / area).sqrt())
+        .min((max_patches as f64 / area).sqrt())
         .min(7168.0 / width as f64)
         .min(7168.0 / height as f64);
-    (
+    let (mut width, mut height) = (
         ((width as f64 * scale) as usize).clamp(1, 7168),
         ((height as f64 * scale) as usize).clamp(1, 7168),
-    )
+    );
+    let patches = |w, h| w / 14 * (h / 14);
+    if patches(width.div_ceil(28) * 28, height.div_ceil(28) * 28) > max_patches {
+        // Rounding the fitted extent up can cross the admission cap. In that case, resize
+        // directly to an aligned extent that fits, leaving already-admissible images untouched.
+        width = (width / 28 * 28).max(28);
+        height = (height / 28 * 28).max(28);
+        while patches(width, height) > max_patches && (width > 28 || height > 28) {
+            if width >= height && width > 28 {
+                width -= 28;
+            } else {
+                height -= 28;
+            }
+        }
+    }
+    (width, height)
 }
 
 pub(super) fn geometry(limits: ImageLimits, width: usize, height: usize) -> Result<ImageGeometry> {
     check_input_extent(limits, width, height)?;
-    let (w, h) = extent(width, height);
+    let (w, h) = extent(width, height, limits.max_patches_per_image);
     let (width, height) = (w.div_ceil(28) * 28, h.div_ceil(28) * 28);
     let patches = width / 14 * (height / 14);
     check_image_patches(limits, patches)?;
@@ -42,7 +57,11 @@ pub(super) fn resized_rgb(
     image: &RgbImage,
 ) -> Result<(ImageGeometry, Vec<u8>)> {
     let geometry = geometry(limits, image.width, image.height)?;
-    let (width, height) = extent(image.width, image.height);
+    let (width, height) = extent(
+        image.width,
+        image.height,
+        limits.max_patches_per_image,
+    );
     let (mut pixels, alpha) = if let Some(cmyk) = &image.cmyk {
         let colors = RgbImage::new(
             image.width,
@@ -212,4 +231,121 @@ fn position(index: usize, extent: usize) -> ([i64; 2], [f32; 2]) {
     let lo = source as i64;
     let fraction = source - lo as f32;
     ([lo, (lo + 1).min(63)], [1.0 - fraction, fraction])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CAP: usize = 16_384;
+
+    fn limits() -> ImageLimits {
+        ImageLimits {
+            max_images: 4,
+            max_patches_per_image: CAP,
+            max_total_patches: 4 * CAP,
+            patches_per_feature: 4,
+            ..ImageLimits::default()
+        }
+    }
+
+    #[test]
+    fn fit_uses_admission_cap_without_moving_native_geometry() {
+        for (width, height, patches) in [
+            (1024, 1024, 5_476),
+            (1700, 1700, 14_884),
+            (1792, 1792, CAP),
+        ] {
+            assert_eq!(extent(width, height, CAP), (width, height));
+            let geometry = geometry(limits(), width, height).unwrap();
+            assert_eq!(geometry.patches, patches);
+            assert_eq!(geometry.width, width.div_ceil(28) * 28);
+            assert_eq!(geometry.height, height.div_ceil(28) * 28);
+        }
+    }
+
+    #[test]
+    fn large_photo_and_over_cap_boundary_fit_after_alignment() {
+        let photo_extent = extent(1920, 2560, CAP);
+        assert_eq!(photo_extent, (1540, 2072));
+        let photo = geometry(limits(), 1920, 2560).unwrap();
+        assert_eq!((photo.width, photo.height), photo_extent);
+        assert_eq!(photo.grid_thw, [1, 148, 110]);
+        assert_eq!(photo.patches, 16_280);
+        assert_eq!(photo.tokens, 4_070);
+        assert!(photo.patches <= CAP);
+
+        let boundary = geometry(limits(), 2100, 2100).unwrap();
+        assert_eq!(extent(2100, 2100, CAP), (1792, 1792));
+        assert_eq!((boundary.width, boundary.height), (1792, 1792));
+        assert_eq!(boundary.patches, CAP);
+        assert_eq!(boundary.tokens, CAP / 4);
+    }
+
+    #[test]
+    fn fitted_geometry_never_exceeds_admission_cap() {
+        let dimensions = [
+            1, 2, 13, 14, 15, 27, 28, 29, 41, 42, 43, 55, 56, 57, 511, 512, 513,
+            1024, 1700, 1791, 1792, 1793, 1805, 1806, 1920, 2033, 2075, 2100, 2560,
+            3584, 7167, 7168, 7169, 8192,
+        ];
+        let mut cases = dimensions
+            .into_iter()
+            .flat_map(|width| dimensions.into_iter().map(move |height| (width, height)))
+            .collect::<Vec<_>>();
+        let mut state = 0x4d4f_4f4e_5649_5432u64;
+        for _ in 0..2048 {
+            state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            let width = (state >> 32) as usize % 8192 + 1;
+            state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            let height = (state >> 32) as usize % 8192 + 1;
+            cases.push((width, height));
+        }
+        for (width, height) in cases {
+            if width * height > limits().max_input_pixels {
+                continue;
+            }
+            if width <= 7168 && height <= 7168 {
+                let native_width = width.div_ceil(28) * 28;
+                let native_height = height.div_ceil(28) * 28;
+                if native_width / 14 * (native_height / 14) <= CAP {
+                    assert_eq!(
+                        extent(width, height, CAP),
+                        (width, height),
+                        "native {width}x{height} was unnecessarily downscaled",
+                    );
+                }
+            }
+            let fitted = geometry(limits(), width, height).unwrap_or_else(|error| {
+                panic!("admissible source {width}x{height} was refused: {error}")
+            });
+            assert_eq!(fitted.width % 28, 0);
+            assert_eq!(fitted.height % 28, 0);
+            assert!(fitted.width <= 7168 && fitted.height <= 7168);
+            assert!(
+                fitted.patches <= CAP,
+                "{width}x{height} produced {}x{} = {} patches",
+                fitted.width,
+                fitted.height,
+                fitted.patches,
+            );
+            assert_eq!(fitted.tokens, fitted.patches / 4);
+        }
+    }
+
+    #[test]
+    fn four_over_cap_photos_fit_one_request_without_reducing_image_slots() {
+        let source = RgbImage::new(1920, 2560, vec![127; 1920 * 2560 * 3]).unwrap();
+        let images = vec![source; 4];
+        let processed = process(limits(), &images).unwrap();
+        assert_eq!(processed.geometry.len(), 4);
+        assert_eq!(processed.cu_seqlens, [0, 16_280, 32_560, 48_840, 65_120]);
+        for geometry in &processed.geometry {
+            assert_eq!((geometry.width, geometry.height), (1540, 2072));
+            assert_eq!(geometry.patches, 16_280);
+            assert_eq!(geometry.tokens, 4_070);
+        }
+        assert_eq!(processed.position_ids.len(), 4 * 16_280);
+        assert_eq!(processed.pixel_values.len(), 4 * 16_280 * 588);
+    }
 }
