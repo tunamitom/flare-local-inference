@@ -183,6 +183,25 @@ def test_joint_tuning_is_opt_in_and_serialized_without_changing_shapes(monkeypat
         replace(joint, autotune_effort="off")
 
 
+def test_prefill_fp8_transport_is_gated_to_kimi_recipes_and_supported_tp():
+    kimi = replace(SOLO, name="kimi31")
+    exact = derive(model=kimi, gpus=[gpu(index, 95) for index in range(4)], selected=(0, 1, 2, 3))
+    assert exact.prefill_fp8_transport is False and exact.to_dict()["prefill_fp8_transport"] is False
+    wire = planning.plan(kimi, kimi.checkpoints[0], tuple(gpu(index, 95) for index in range(4)),
+                         selected=(0, 1, 2, 3), concurrency=4, reserve_bytes=0, speculation=kimi.speculation,
+                         prefill_fp8_transport=True)
+    assert wire.prefill_fp8_transport is True and wire.to_dict()["prefill_fp8_transport"] is True
+    assert replace(wire, prefill_fp8_transport=False) == exact
+    with pytest.raises(UsageError, match="--prefill-fp8-transport"):
+        planning.plan(SOLO, SOLO.checkpoints[0], (gpu(0, 95),), selected=(0,), concurrency=4, reserve_bytes=0,
+                      speculation=SOLO.speculation, prefill_fp8_transport=True)
+    sixteen = recipe("kimi31", 60, (16,))
+    with pytest.raises(UsageError, match="tensor-parallel size"):
+        planning.plan(sixteen, sixteen.checkpoints[0], tuple(gpu(index, 95) for index in range(16)),
+                      selected=tuple(range(16)), concurrency=4, reserve_bytes=0, speculation=None,
+                      prefill_fp8_transport=True)
+
+
 def test_image_concurrency_defaults_and_explicit_capacity():
     vision = replace(SOLO, max_images=4)
     settings = dict(concurrency=32, reserve_bytes=0, speculation=None, selected=None)
