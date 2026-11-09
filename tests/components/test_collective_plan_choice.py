@@ -174,6 +174,87 @@ def test_fp8_two_shot_capacity_matches_the_exact_twin_envelope(monkeypatch):
     assert output.shape == source.shape and output.dtype == source.dtype
 
 
+def _island_runtime(rows=32, columns=64):
+    """A real PCIeIslandARAllReduce shell with mocked launch side effects."""
+    from b12x.comm.pcie.pcie_island_ar import PCIeIslandARAllReduce
+
+    runtime = PCIeIslandARAllReduce.__new__(PCIeIslandARAllReduce)
+    runtime.group = runtime.exchange_group = object()
+    runtime.rank, runtime.world_size = 0, 8
+    runtime.device = torch.device("cpu")
+    runtime.max_rows, runtime.row_elems = rows, columns
+    runtime.max_elements = rows * columns
+    runtime.blocks = None
+    runtime.threads, runtime.wait_nanosleep_cycles = 512, 24
+    runtime.quarter_capacity = 256
+    runtime.stage_offset, runtime.part_offset, runtime.final_offset = 49664, 60000, 62000
+    runtime.slab_bytes = 128 * 1024
+    runtime._mapped_peers = (1, 2, 3, 4)
+    runtime._closed = False
+    calls = []
+    runtime.all_reduce = lambda source, out=None, plan=None: calls.append(
+        ("all_reduce", tuple(source.shape), tuple(out.shape), plan)) or out
+    return runtime, calls
+
+
+def test_island_channel_prepares_the_owner_surface_and_launches_all_reduce(monkeypatch):
+    """L1: the island channel prepares one owner-surface plan and launches unchanged shapes."""
+    import contextlib
+
+    from b12x.preparation import PreparedCall
+    from ignition.components import collectives
+
+    runtime, calls = _island_runtime()
+    requests, primed = [], []
+    monkeypatch.setattr(collectives, "_roce", lambda _: False)
+    monkeypatch.setattr(collectives, "declare", lambda session, values, **kwargs: requests.extend(values))
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda group: list(range(8)))
+    monkeypatch.setattr(torch.cuda, "device", lambda device: contextlib.nullcontext())
+
+    import b12x.comm.pcie._owner_preparation as owner
+
+    def owner_call(state, **actual):
+        primed.append(actual)
+        return PreparedCall(run=lambda: state.launcher(), output=actual.get("out"),
+                            capture_safe=True)
+
+    monkeypatch.setattr(owner, "prepared_call", owner_call)
+    source = torch.zeros(8, 64, dtype=torch.bfloat16)
+    output = torch.empty_like(source)
+    operation = collectives.PreparedAllReduce(source, output, runtime=runtime,
+        session=object(), coordinator=object(), name="layer.reduce")
+    assert operation.plan.query.surface == "PCIeIslandARAllReduce.all_reduce"
+    assert operation.plan.query.call["inp"]["shape"] == (8, 64)
+    assert [request.name for request in requests] == ["layer.reduce"]
+    assert requests[0].collective.key == "layer.reduce"
+    for request in requests:
+        request.prepare_call(SimpleNamespace())
+    assert [(call["inp"].shape, call["out"].shape) for call in primed] == [((8, 64), (8, 64))]
+    # The captured launch keeps the reduction contract: whole-tensor all_reduce.
+    operation.launch(source, output)
+    assert calls == [("all_reduce", (8, 64), (8, 64), operation.plan)]
+    assert operation.runtime is runtime and operation.output is output
+
+
+def test_island_capacity_matches_the_exact_twin_envelope(monkeypatch):
+    from ignition.components import collectives
+
+    runtime, _ = _island_runtime(rows=32, columns=64)
+    assert runtime.accepts(torch.zeros(32, 64, dtype=torch.bfloat16))
+    assert not runtime.accepts(torch.zeros(33, 64, dtype=torch.bfloat16))  # beyond the envelope
+    monkeypatch.setattr(collectives, "_roce", lambda _: False)
+    monkeypatch.setattr(collectives, "declare", lambda *args, **kwargs: None)
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda group: list(range(8)))
+    with pytest.raises(ValueError, match="island reductions require"):
+        collectives.PreparedAllReduce(torch.zeros(33, 64, dtype=torch.bfloat16),
+            torch.empty(4, 4, dtype=torch.bfloat16), runtime=runtime,
+            session=object(), coordinator=object(), name="bad")
+    with pytest.raises(ValueError, match="island reduction capacity must cover the full input"):
+        collectives.PreparedChunkedAllReduce(torch.zeros(64, 64, dtype=torch.bfloat16),
+            torch.empty(64, 64, dtype=torch.bfloat16), runtime=runtime,
+            session=object(), coordinator=object(), name="chunked.bad")
+
+
 def test_direct_collective_requires_joint_api_before_capability_lookup(monkeypatch):
     from importlib import import_module
     from ignition.components import collectives

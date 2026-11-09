@@ -183,3 +183,36 @@ def test_prefill_fp8_transport_flag_states_select_the_reduction_channel(monkeypa
     assert selected == [("exact", 256, 7168, "peer-storage"), ("fp8", 256, 7168)]
     with pytest.raises(ValueError, match="two, four or eight"):
         replace(config, devices=tuple(range(16)), prefill_fp8_transport=True)
+
+
+def test_prefill_island_reduce_flag_states_select_the_reduction_channel(monkeypatch):
+    """Both L1 flag states: off keeps the exact BF16 twin's call unchanged, on swaps only the channel at TP8."""
+    from ignition.recipes.kimi3 import bootstrap
+
+    selected = []
+    monkeypatch.setattr(bootstrap, "create_single_round_all_reduce_runtime",
+        lambda group, device, *, max_tokens, hidden_size, ipc: selected.append(
+            ("exact", max_tokens, hidden_size, ipc)) or "exact-channel")
+    monkeypatch.setattr(bootstrap, "create_island_all_reduce_runtime",
+        lambda group, device, *, max_tokens, hidden_size, ipc: selected.append(
+            ("island", max_tokens, hidden_size, ipc)) or "island-channel")
+    monkeypatch.setattr(bootstrap.torch.distributed, "get_world_size", lambda group: 8)
+    config = bootstrap.PreparationConfig(devices=tuple(range(8)), prefill_chunk_size=256,
+        max_active=1, vision=False, speculative_widths=())
+    assert config.prefill_island_reduce is False
+    assert bootstrap.prefill_all_reduce_runtime(config, object(), object(),
+        max_tokens=256, hidden_size=7168, ipc="peer-storage") == "exact-channel"
+    assert selected == [("exact", 256, 7168, "peer-storage")]
+    on = replace(config, prefill_island_reduce=True)
+    assert bootstrap.prefill_all_reduce_runtime(on, object(), object(),
+        max_tokens=256, hidden_size=7168, ipc="peer-storage") == "island-channel"
+    assert selected == [("exact", 256, 7168, "peer-storage"), ("island", 256, 7168, "peer-storage")]
+    # TP2/TP4 fall back to the exact path with the flag on (contract wording).
+    monkeypatch.setattr(bootstrap.torch.distributed, "get_world_size", lambda group: 4)
+    assert bootstrap.prefill_all_reduce_runtime(on, object(), object(),
+        max_tokens=256, hidden_size=7168, ipc="peer-storage") == "exact-channel"
+    assert selected[-1] == ("exact", 256, 7168, "peer-storage")
+    with pytest.raises(ValueError, match="two, four or eight"):
+        replace(config, devices=tuple(range(16)), prefill_island_reduce=True)
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        replace(config, prefill_island_reduce=True, prefill_fp8_transport=True)

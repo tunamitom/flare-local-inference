@@ -59,6 +59,7 @@ def test_preparation_preserves_declared_context_above_estimated_physical_capacit
         prefill_chunk=1024, snapshots=1, costs=SimpleNamespace(state_row_bytes=1),
         headroom_bytes=0, reserve_bytes=0, online_mxfp8=True, stream_overlap=True,
         prefill_fp8_transport=False,
+        prefill_island_reduce=False,
         context_parallel=True, language_model_only=True)
     bootstrap = SimpleNamespace(PreparationConfig=config_type,
         prepare_rank=lambda snapshot, config, **kwargs: config)
