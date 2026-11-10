@@ -25,15 +25,18 @@ def prepare(snapshot, plan, **kwargs):
 
 
 RECIPE = replace(KIMI3, name="kimi31", served_model_name="Kimi-K3.1-Pro", prepare=prepare,
+    # OWNER DIRECTIVE (W6, 2026-11-10): max context = about 1/3 of the KV pool, not 1M.
     # The engine and both checkpoint configs cap positions at 1,048,576
     # (kimi3/bootstrap.py validates context in [page_tokens, 1048576];
     # max_position_embeddings is 1048576 in the target and dflash2 configs).
     # This value is baked into the package as max_sequence_tokens and the
-    # page-table width (bootstrap.py server_config), so the earlier 262144
-    # capped every request well below the model's range. The TP16 serve of the
-    # same model shipped 1,048,576. Boot KV must hold one full 1M request
-    # (1,048,576 tokens); the scheduler admits only what the pool holds.
-    context=1048576,
+    # page-table width (bootstrap.py server_config). W6 export contract: the old
+    # max_model_len >= 1,048,576 gate is OBSOLETE; the gate is now
+    # max_model_len / actual Allocate-cache pool in [0.28, 0.36] (~1/3).
+    # 310,272 = 303 x 1,024 (page/1024 grid) = 931,840/3 rounded down to the
+    # grid; ratio 0.33297 against the predicted pool of 931,840 tokens.
+    # Standing directive for every future export/build/launch in this campaign.
+    context=310272,
     # https://huggingface.co/moonshotai/Kimi-K3.1-Pro#3-evaluation-results
     sampling_defaults=SamplingDefaults(temperature=1., top_p=.95, top_k=-1,
                                       ranges={"top_p": SamplingRange(.95, 1.)}),
