@@ -132,6 +132,8 @@ class PreparationConfig:
     # ring (b12x DmaAllReduce, BF16 hop sums; measured 1.44 vs 3.52 ms at 3072x7168 on B+D).
     # 0 keeps every prefill graph on the channel selected above.
     prefill_dma_ring_rows: int = 0
+    # True: BF16 hop sums on the ring (TP16-era wire); False: the exact FP32 owner-packet reduction.
+    prefill_dma_ring_bf16: bool = False
 
     def __post_init__(self):
         if self.draft_head_quantization not in (None, "mxfp8", "nvfp4"):
@@ -288,6 +290,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         prefill_dma = (create_dma_all_reduce_runtime(group, device, max_tokens=config.prefill_chunk_size,
             hidden_size=weights.config.hidden, ipc=package_storage.peer_storage)
             if dma_rows and dma_rows <= config.prefill_chunk_size else None)
+        if prefill_dma is not None:
+            prefill_dma.kimi_bf16_ring = config.prefill_dma_ring_bf16
         vocabulary_collective = create_all_gather_runtime(group, device,
             max_rows=max(config.decode_samples, slots * (config.draft_tokens or 1)),
             columns=weights.config.vocabulary, ipc=package_storage.peer_storage)
