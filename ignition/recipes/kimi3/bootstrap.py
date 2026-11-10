@@ -352,7 +352,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         context = None
         if config.context_parallel and shard.world_size > 1:
             from .dcp import RECORD_BYTES, ContextParallel, ContextShards
-            from .dsa import SELECTION_ROWS, TOPK
+            from .dsa import SELECTION_ROWS, TOPK, decode_exchange_merge
 
             # Decode and verification gather every rank's absorbed E4M3 query heads and combine latent outputs.
             heads = weights.config.text["num_attention_heads"]
@@ -367,7 +367,9 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                 coordinator=coordinator,
                 peers=pool.share_pages(package_storage, group), slab=None,
                 candidates=(create_all_gather_runtime(group, device, max_rows=selection_rows,
-                    columns=4 * TOPK * shard.world_size, ipc=package_storage.peer_storage) if sparse else None),
+                    columns=((8 * TOPK + (heads // shard.world_size) * RECORD_BYTES) * shard.world_size // 2)
+                             if decode_exchange_merge() else 4 * TOPK * shard.world_size,
+                    ipc=package_storage.peer_storage) if sparse else None),
                 prefill_layout="query_split" if sparse else "dcp",
                 index_peers=pool.share_pages(package_storage, group, suffix=".index") if sparse else None,
                 selections=(create_all_gather_runtime(group, device,
@@ -378,9 +380,16 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                    for layer in weights.layers):
                 from ignition.components.peer_rows import SharedPeerRows
 
-                context = replace(context,
-                    paired_queries=create_all_gather_runtime(group, device, max_rows=selection_rows,
-                        columns=(heads * RECORD_BYTES + 32 * 128 * 2)//2, ipc=package_storage.peer_storage),
+                # R6 merged exchange: the index-query shard travels alone before the indexer
+                # (4 KiB gathered per row); otherwise the paired query exchange carries it
+                # beside the attention query as before.
+                query_channels = (
+                    dict(index_queries=create_all_gather_runtime(group, device, max_rows=selection_rows,
+                        columns=(32 // shard.world_size * 128 * 2) * shard.world_size // 2,
+                        ipc=package_storage.peer_storage)) if decode_exchange_merge()
+                    else dict(paired_queries=create_all_gather_runtime(group, device, max_rows=selection_rows,
+                        columns=(heads * RECORD_BYTES + 32 * 128 * 2)//2, ipc=package_storage.peer_storage)))
+                context = replace(context, **query_channels,
                     index_exchange=SharedPeerRows(group, device, rows=config.prefill_chunk_size,
                         row_bytes=(32//shard.world_size)*132, ipc=package_storage.peer_storage))
         # Every MLA step gathers each rank's query and KV latent rows, padded to 16 bytes: one exchange for up to
@@ -690,7 +699,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                          *(() if prefill_collective is None else (prefill_collective,)),
                          *(() if prefill_dma is None else (prefill_dma,)),
                          *(() if context is None or context.index_exchange is None else
-                           (context.index_exchange, context.paired_queries))),
+                           tuple(resource for resource in (context.index_exchange, context.paired_queries,
+                                                           context.index_queries) if resource is not None))),
         export_zero_ranges=(*(() if scoring is None else scoring.zero_ranges()),
                            *storage_ranges([prefill_storage, decode_storage, graph_buffers.chunks,
             None if speculation is None else speculation.sampling_buffers.chunks, arena.tensor, metadata,
