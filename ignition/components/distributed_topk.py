@@ -24,10 +24,15 @@ class PreparedDistributedTopK:
     the separate query gather and the candidate gather (W4 R6). The piggybacked fields are
     packed rank-major beside each rank's candidates and split back out after the exchange,
     so the merged candidate layout is unchanged.
+
+    ``scratch`` (W10 R9) is a ``GlueScratch`` over the process-local temporary for the
+    decode glue: the exchange packing and aggregation views are carved at preparation and
+    the round loop allocates nothing (R9 threat T3/T4). Default ``None`` keeps the
+    original per-call allocation path bit for bit.
     """
 
     def __init__(self, indices, scores, output, *, world, rank, runtime, session, coordinator,
-                 name, buffers, workspace, piggyback=None):
+                 name, buffers, workspace, piggyback=None, scratch=None):
         if (indices.ndim != 2 or indices.dtype != torch.int32 or scores.shape != indices.shape
                 or scores.dtype != torch.float32 or output.shape != indices.shape or output.dtype != indices.dtype
                 or world < 2 or rank.shape != (1,) or rank.dtype != torch.int64):
@@ -37,6 +42,11 @@ class PreparedDistributedTopK:
         self.world, self.rank = world, rank
         self.local = buffers.zeros((rows, self.topk, 2), torch.float32)
         self.gathered = buffers.zeros((rows, world * self.topk, 2), torch.float32)
+        self._live = self._packed_ids = None
+        if scratch is not None:
+            # W10 R9: exchange + aggregation scratch from the process-local temporary.
+            self._live = scratch.zeros(name + ".live", (rows, self.topk), torch.bool)
+            self._packed_ids = scratch.zeros(name + ".packed_ids", (rows, self.topk), torch.int64)
         self.merge = PreparedCandidateMerge(self.gathered, output, session=session,
             workspace=workspace, name=name + ".merge")
         self.paired = self.collective = None
@@ -61,10 +71,21 @@ class PreparedDistributedTopK:
             self.piggyback_second = local_query
 
     def __call__(self):
-        live = self.indices >= 0
-        self.local[:, :, 0].copy_(torch.where(live, self.scores, -torch.inf))
-        self.local.view(torch.int32)[:, :, 1].copy_(
-            torch.where(live, self.indices.long() * self.world + self.rank, -1))
+        if self._live is None:
+            live = self.indices >= 0
+            self.local[:, :, 0].copy_(torch.where(live, self.scores, -torch.inf))
+            self.local.view(torch.int32)[:, :, 1].copy_(
+                torch.where(live, self.indices.long() * self.world + self.rank, -1))
+        else:
+            # W10 R9: the same values via the process-local scratch — zero per-call
+            # allocation, identical arithmetic (int64 chain, then the same casts).
+            torch.ge(self.indices, 0, out=self._live)
+            scores = self.local[:, :, 0]
+            scores.copy_(self.scores)
+            scores.masked_fill_(~self._live, -torch.inf)
+            self._packed_ids.copy_(self.indices)
+            self._packed_ids.mul_(self.world).add_(self.rank).masked_fill_(~self._live, -1)
+            self.local.view(torch.int32)[:, :, 1].copy_(self._packed_ids)
         if self.paired is not None:
             self.paired(self.piggyback_first, self.piggyback_second)
         else:
@@ -101,14 +122,29 @@ def _records(Selected, Positions, Pages, Rank, Output, Counts,
     tl.store(Counts + row, count)
 
 
-def selected_local_records(selected, positions, pages, *, world, rank, page_size):
+def selected_local_records(selected, positions, pages, *, world, rank, page_size, out=None, count_out=None):
     """Compact selected global positions into this rank's physical records.
 
     ``pages`` is a model-page table per query row. The selected positions are independently
     bounded by that row's causal position; negative positions denote inactive rows.
+
+    ``out``/``count_out`` (W10 R9 copy-count elimination) are the caller's retained
+    buffers: when given, the compaction kernel writes them directly and the caller's
+    follow-up copy disappears (one write per element instead of two). Default ``None``
+    allocates exactly as before.
     """
-    output = torch.empty_like(selected, memory_format=torch.contiguous_format)
-    count = torch.empty((selected.shape[0],), dtype=torch.int32, device=selected.device)
+    if out is None:
+        output = torch.empty_like(selected, memory_format=torch.contiguous_format)
+    else:
+        if out.shape != selected.shape or out.dtype != selected.dtype or not out.is_contiguous():
+            raise ValueError("out must be a contiguous buffer matching selected")
+        output = out
+    if count_out is None:
+        count = torch.empty((selected.shape[0],), dtype=torch.int32, device=selected.device)
+    else:
+        if count_out.shape != (selected.shape[0],) or count_out.dtype != torch.int32 or not count_out.is_contiguous():
+            raise ValueError("count_out must be a contiguous int32 buffer with one entry per row")
+        count = count_out
     tensor_rank = isinstance(rank, torch.Tensor)
     torch.library.wrap_triton(_records)[(selected.shape[0],)](
         selected, positions, pages, rank if tensor_rank else positions, output, count,

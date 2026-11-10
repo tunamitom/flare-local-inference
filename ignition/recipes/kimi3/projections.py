@@ -29,9 +29,21 @@ def prepare_projection(source, weight, output, *, session, name, workspace):
     if isinstance(weight, OutputPartitionedBF16Weight):
         from ignition.components.partitioned_projection import PreparedOutputPartitionProjection
 
-        return PreparedOutputPartitionProjection(source, weight, output, session=session, name=name, workspace=workspace)
-    if isinstance(weight, torch.Tensor):
-        return UnquantizedProjection(source, weight, output, session=session, name=name)
-    return QuantizedProjection(source, weight, output, session=session, name=name,
-                               activation_mode="a16", workspace=workspace,
-                               allow_bf16_atomic_reduction=True if atomic_splitk() else None)
+        projection = PreparedOutputPartitionProjection(source, weight, output, session=session, name=name, workspace=workspace)
+    elif isinstance(weight, torch.Tensor):
+        projection = UnquantizedProjection(source, weight, output, session=session, name=name)
+    else:
+        projection = QuantizedProjection(source, weight, output, session=session, name=name,
+                                   activation_mode="a16", workspace=workspace,
+                                   allow_bf16_atomic_reduction=True if atomic_splitk() else None)
+    if atomic_splitk():
+        # W10 R10b union integration: the atomic funnel outputs ride the E2 union
+        # pattern (same process-local temporary, hoisted strides/offsets, one copy
+        # per element) alongside the exchange and aggregation fields. Preparation
+        # only — the union copies no bytes until pack/unpack runs, so the runtime
+        # stays exactly the W4 funnel.
+        from .e2_union import e2_union_enabled, fold_splitk_funnel
+
+        if e2_union_enabled():
+            projection.e2_funnel_union = fold_splitk_funnel(name, {name: output}, device=output.device)
+    return projection

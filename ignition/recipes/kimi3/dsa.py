@@ -53,6 +53,12 @@ class PreparedDSA:
         self.gathered_context = mode == "prefill" and context is not None and context.prefill_layout == "ckv"
         self.merge_exchange = (decode_exchange_merge() and context is not None and not self.gathered_context
                                and context.shards.world > 1)
+        # W10 R9: exchange + aggregation scratch from the process-local temporary
+        # (ignition/recipes/kimi3/e2_union.py). Off by default; the E2 union path
+        # refuses to construct while a killed lever switch (R6 merge, FP8 partials)
+        # is set.
+        from .e2_union import e2_union_enabled, exchange_aggregation_scratch
+        self.union_scratch = exchange_aggregation_scratch(query.device) if e2_union_enabled() else None
         self.context, self.peers = context, peers
         if self.gathered_context:
             if metadata.starts.numel() != 1 or peers is None or context.slab is None:
@@ -162,7 +168,7 @@ class PreparedDSA:
                 merge = PreparedDistributedTopK(local, scores, selected,
                     world=self.shards.world, rank=self.shards.index, runtime=context.candidates,
                     session=session, coordinator=coordinator, name=stage_name + ".candidates", buffers=cursor,
-                    workspace=workspace,
+                    workspace=workspace, scratch=self.union_scratch,
                     piggyback=((quantized.view(count, -1), q.view(count, -1))
                                if self.merge_exchange and quantized is not None else None))
             caps = dense_mla.Caps(device=device, mode="decode", q_dtype=q.dtype, kv_dtype=cache.dtype,
@@ -213,10 +219,20 @@ class PreparedDSA:
                 lengths = live.sum(1).to(torch.int32)
                 physical = torch.where(physical != torch.iinfo(torch.int32).max, physical, -1)
             else:
-                physical, lengths = selected_local_records(selected, positions, pages, world=shards.world,
-                    rank=shards.owner, page_size=PAGE_TOKENS)
-            self.physical[:count].copy_(physical)
-            self.counts[:count].copy_(lengths)
+                if self.union_scratch is not None:
+                    # W10 R9 copy-count elimination: the compaction kernel writes the
+                    # retained buffers directly, so the per-stage copy into
+                    # self.physical/self.counts disappears (one write per element).
+                    selected_local_records(selected, positions, pages, world=shards.world,
+                        rank=shards.owner, page_size=PAGE_TOKENS,
+                        out=self.physical[:count], count_out=self.counts[:count])
+                    physical = lengths = None
+                else:
+                    physical, lengths = selected_local_records(selected, positions, pages, world=shards.world,
+                        rank=shards.owner, page_size=PAGE_TOKENS)
+            if physical is not None:
+                self.physical[:count].copy_(physical)
+                self.counts[:count].copy_(lengths)
             if quantized is not None and paired is None and not self.merge_exchange:
                 quantized.copy_(self.query[begin:end].float().clamp(-448., 448.).to(torch.float8_e4m3fn))
             if gather is not None:
