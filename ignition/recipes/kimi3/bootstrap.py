@@ -29,7 +29,7 @@ from ignition.components.state_transfer import StateCommands
 from ignition.preparation.collectives import (CollectivePreparation, create_all_gather_runtime,
                                               create_all_reduce_runtime, create_single_round_all_reduce_runtime,
                                               create_fp8_two_shot_all_reduce_runtime,
-                                              create_island_all_reduce_runtime,
+                                              create_island_all_reduce_runtime, create_dma_all_reduce_runtime,
                                               create_head_exchange)
 from .routing import create_route_runtime
 from ignition.preparation.rank_group import minimum_across_ranks
@@ -128,6 +128,10 @@ class PreparationConfig:
     # instead of the exact single-rounding owner sums. Default off keeps that
     # exact path byte-identical as the rollback.
     prefill_island_reduce: bool = False
+    # Fable dig 2026-11-10: prefill graphs of at least this many rows reduce over the copy-engine
+    # ring (b12x DmaAllReduce, BF16 hop sums; measured 1.44 vs 3.52 ms at 3072x7168 on B+D).
+    # 0 keeps every prefill graph on the channel selected above.
+    prefill_dma_ring_rows: int = 0
 
     def __post_init__(self):
         if self.draft_head_quantization not in (None, "mxfp8", "nvfp4"):
@@ -274,10 +278,16 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         reduction_rows = config.decode_tokens if shard.world_size in SUPPORTED_WORLD_SIZES else channel_rows
         collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning,
             max_tokens=reduction_rows, hidden_size=weights.config.hidden, ipc=package_storage.peer_storage)
+        dma_rows = config.prefill_dma_ring_rows if shard.world_size == 8 else 0
+        small_rows = max((c for c in prefill_capacities(config.prefill_chunk_size) if not dma_rows or c < dma_rows),
+                         default=0)
         prefill_collective = (prefill_all_reduce_runtime(config, group, device,
-            max_tokens=config.prefill_chunk_size, hidden_size=weights.config.hidden,
+            max_tokens=small_rows, hidden_size=weights.config.hidden,
             ipc=package_storage.peer_storage)
-            if shard.world_size in SUPPORTED_WORLD_SIZES else None)
+            if shard.world_size in SUPPORTED_WORLD_SIZES and small_rows else None)
+        prefill_dma = (create_dma_all_reduce_runtime(group, device, max_tokens=config.prefill_chunk_size,
+            hidden_size=weights.config.hidden, ipc=package_storage.peer_storage)
+            if dma_rows and dma_rows <= config.prefill_chunk_size else None)
         vocabulary_collective = create_all_gather_runtime(group, device,
             max_rows=max(config.decode_samples, slots * (config.draft_tokens or 1)),
             columns=weights.config.vocabulary, ipc=package_storage.peer_storage)
@@ -498,8 +508,10 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                     decoder = PreparedDecoder(mode_weights, scratch, m, pool, mode=mode,
                         scoring=scoring if kind == "scored_prefill" else None,
                         session=session, name=name, workspace=arena, buffers=decoder_buffers,
-                        **dict(collectives, runtime=(prefill_collective if mode == "prefill"
-                                                   and prefill_collective is not None else collective)))
+                        **dict(collectives, runtime=(
+                            prefill_dma if mode == "prefill" and prefill_dma is not None and capacity >= dma_rows
+                            else prefill_collective if mode == "prefill" and prefill_collective is not None
+                            else collective)))
                     batch = PreparedBatch(inputs, requests, m, mode=mode, shard=weights.shard, pool=pool,
                         validate_prefill=vision_state.validate_prefill if mode == "prefill" and patches else None,
                         page_tokens=config.page_tokens)
@@ -596,8 +608,10 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     capture_order = (*vision_names, *(name for name in forwards if name not in vision_names))
     capture_catalog = {name: forwards[name] for name in capture_order}
     try:
-        communication = contextlib.nullcontext() if prefill_collective is None else prefill_collective.capture()
-        with communication:
+        with contextlib.ExitStack() as communication:
+            for channel in (prefill_collective, prefill_dma):
+                if channel is not None:
+                    communication.enter_context(channel.capture())
             graphs, compiled = capture_forwards(capture_catalog, signatures, session=session, device=device,
                 stream=stream, pool=graph_pool, collective=collective, coordinator=coordinator,
                 compile_decoder=config.compile_decoder, progress=progress, cache_root=config.kernel_cache,
@@ -652,6 +666,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         max_active=config.max_active, session=session, server_config=server_config, memory_report=memory,
         close_resources=(*(() if scoring is None else (scoring,)),
                          *(() if prefill_collective is None else (prefill_collective,)),
+                         *(() if prefill_dma is None else (prefill_dma,)),
                          *(() if context is None or context.index_exchange is None else
                            (context.index_exchange, context.paired_queries))),
         export_zero_ranges=(*(() if scoring is None else scoring.zero_ranges()),
@@ -664,7 +679,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                                            decoder_buffers.scratch_tensors(), *draft_disposable]), *completion.zero_ranges()),
         resources=(scoring, weights, pool, requests, inputs, admission, commands, arena, forwards, prefill_storage, context,
                    decode_storage, metadata, compiled, stream, graph_pool, session, coordinator, collective,
-                   vocabulary_collective, embedding_collective, router_collective, route_collective, prefill_collective,
+                   vocabulary_collective, embedding_collective, router_collective, route_collective, prefill_collective, prefill_dma,
                    vision_inputs, vision_prefill, vision_state, vision_storage, deferred_pool, scratch_pool, shared_scratch, graph_buffers,
                    speculation, context_collective, markov_collective, latent_runtimes,
                    draft_context_collective, convolution_collective, vision_collectives))

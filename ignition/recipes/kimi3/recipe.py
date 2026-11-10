@@ -4,6 +4,7 @@
 
 """Kimi K3 MXFP4-CSF preparation capacities and serving defaults."""
 
+import os
 from pathlib import Path
 from types import MappingProxyType
 
@@ -58,6 +59,7 @@ def prepare_variant(snapshot, plan, *, bootstrap, draft_repository, draft_revisi
         stream_overlap=plan.stream_overlap, context_parallel=plan.context_parallel,
         prefill_fp8_transport=plan.prefill_fp8_transport,
         prefill_island_reduce=plan.prefill_island_reduce,
+        prefill_dma_ring_rows=int(os.environ.get("IGNITION_KIMI_PREFILL_DMA_ROWS", "0")),
         vision=not plan.language_model_only, **drafting)
     if plan.world_size == 1:
         return prepare_rank(snapshot, config, rank=0, group=None, progress=progress, package_storage=package_storage)
