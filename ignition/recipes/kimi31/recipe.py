@@ -33,10 +33,13 @@ RECIPE = replace(KIMI3, name="kimi31", served_model_name="Kimi-K3.1-Pro", prepar
     # page-table width (bootstrap.py server_config). W6 export contract: the old
     # max_model_len >= 1,048,576 gate is OBSOLETE; the gate is now
     # max_model_len / actual Allocate-cache pool in [0.28, 0.36] (~1/3).
-    # 310,272 = 303 x 1,024 (page/1024 grid) = 931,840/3 rounded down to the
-    # grid; ratio 0.33297 against the predicted pool of 931,840 tokens.
-    # Standing directive for every future export/build/launch in this campaign.
-    context=310272,
+    # W6 (E1): 310,272 = 303 x 1,024 (page/1024 grid) = 931,840/3 rounded down
+    # to the grid; the measured E1 pool came in at 1,222,656 (ratio 0.2538, below
+    # the band). W8 (E1.1, J-4 §4): 396,288 = 387 x 1,024 = 129 x 3,072;
+    # predicted pool ~1,193,984 (physical slope 1/3 from the E1 anchor), predicted
+    # ratio ~0.332; the boot gate is the ratio against the ACTUAL pool in
+    # [0.28, 0.36]. Standing directive for every future export/build/launch.
+    context=396288,
     # https://huggingface.co/moonshotai/Kimi-K3.1-Pro#3-evaluation-results
     sampling_defaults=SamplingDefaults(temperature=1., top_p=.95, top_k=-1,
                                       ranges={"top_p": SamplingRange(.95, 1.)}),
