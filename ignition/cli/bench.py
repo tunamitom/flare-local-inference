@@ -156,6 +156,9 @@ def run(args):
         prompt_logprobs=args.prompt_logprobs, expert_scale_compression=args.expert_scale_compression,
         online_mxfp8=args.online_mxfp8, prefill_fp8_transport=args.prefill_fp8_transport,
         prefill_island_reduce=args.prefill_island_reduce,
+        prefill_dma_ring_rows=args.prefill_dma_ring_rows,
+        prefill_dma_bf16=args.prefill_dma_bf16,
+        trellis_prefill_shapes=args.trellis_prefill_shapes,
         language_model_only=args.language_model_only,
         mla_compute_mode=args.mla_compute_mode)
     plan = replace(plan, benchmark_selection=BenchmarkSelection(

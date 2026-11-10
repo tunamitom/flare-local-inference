@@ -206,6 +206,20 @@ class Plan:
     # (complete FP32 island sums, one extra BF16 rounding of the 4-way partial)
     # instead of the exact single-rounding two-shot owner sums.
     prefill_island_reduce: bool = False
+    # W3 (lever R2/R5): prefill reductions of at least this many rows run the
+    # copy-engine DMA ring (b12x DmaAllReduce, BF16 hop sums); smaller graphs
+    # keep the channel above. 0 keeps every prefill graph off the ring. The
+    # ring is a TP8 wire. Recorded here so a package cannot silently drift
+    # from its plan settings (J-1 2.1); the legacy environment switches
+    # IGNITION_KIMI_PREFILL_DMA_ROWS / ..._BF16 still work as fallbacks.
+    prefill_dma_ring_rows: int = 0
+    # W3 (lever R2/R5): the ring's per-hop sums are BF16 (one ring pass per
+    # reduction). False selects the numerically exact FP32 owner-packet ring.
+    prefill_dma_bf16: bool = False
+    # W3 (lever R3): select the measured Trellis prefill launch shapes
+    # (b12x B12X_W4A16_PREFILL_SHAPES=1 at compile time). Decode graphs are
+    # untouched and stay bit-identical.
+    trellis_prefill_shapes: bool = False
     # The plan prepares no vision encoder and serves text requests only.
     language_model_only: bool = False
     benchmark_selection: BenchmarkSelection | None = None
@@ -268,6 +282,15 @@ class Plan:
                 raise UsageError("--prefill-island-reduce supports the Kimi K3/K3.1 recipes")
             if self.prefill_fp8_transport:
                 raise UsageError("--prefill-island-reduce cannot accompany --prefill-fp8-transport")
+        if self.prefill_dma_ring_rows:
+            if self.recipe.name not in ("kimi3", "kimi31"):
+                raise UsageError("--prefill-dma-ring-rows supports the Kimi K3/K3.1 recipes")
+            if type(self.prefill_dma_ring_rows) is not int or self.prefill_dma_ring_rows < 0:
+                raise UsageError("--prefill-dma-ring-rows must be a non-negative row count")
+            if self.prefill_fp8_transport:
+                raise UsageError("--prefill-dma-ring-rows cannot accompany --prefill-fp8-transport")
+        if self.trellis_prefill_shapes and self.recipe.name not in ("kimi3", "kimi31"):
+            raise UsageError("--trellis-prefill-shapes supports the Kimi K3/K3.1 recipes")
 
     @property
     def world_size(self) -> int:
@@ -386,6 +409,9 @@ class Plan:
             "online_mxfp8": self.online_mxfp8, "language_model_only": self.language_model_only,
             "prefill_fp8_transport": self.prefill_fp8_transport,
             "prefill_island_reduce": self.prefill_island_reduce,
+            "prefill_dma_ring_rows": self.prefill_dma_ring_rows,
+            "prefill_dma_bf16": self.prefill_dma_bf16,
+            "trellis_prefill_shapes": self.trellis_prefill_shapes,
             "speculation": None if self.speculation is None else {
                 "draft_tokens": self.speculation.draft_tokens, "adaptive": self.speculation.adaptive,
                 **({} if self.speculation.method is None else {"method": self.speculation.method}),
@@ -421,6 +447,9 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
         image_concurrency: int | None = None, online_mxfp8: bool = False,
         prefill_fp8_transport: bool = False,
         prefill_island_reduce: bool = False,
+        prefill_dma_ring_rows: int = 0,
+        prefill_dma_bf16: bool = False,
+        trellis_prefill_shapes: bool = False,
         language_model_only: bool = False, mla_compute_mode: str | None = None) -> Plan:
     """Size pages and the prefix cache to the supply; the result may not fit.
 
@@ -479,6 +508,9 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
                     if image_concurrency is None else image_concurrency, online_mxfp8=online_mxfp8,
                 prefill_fp8_transport=prefill_fp8_transport,
                 prefill_island_reduce=prefill_island_reduce,
+                prefill_dma_ring_rows=prefill_dma_ring_rows,
+                prefill_dma_bf16=prefill_dma_bf16,
+                trellis_prefill_shapes=trellis_prefill_shapes,
                 language_model_only=language_model_only)
     available = plan.supply_bytes - plan.fixed_bytes
     target = min(CACHE_STATES_PER_REQUEST * concurrency, max(1, available // costs.state_row_bytes))
@@ -535,6 +567,9 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
         image_concurrency: int | None = None, online_mxfp8: bool = False,
         prefill_fp8_transport: bool = False,
         prefill_island_reduce: bool = False,
+        prefill_dma_ring_rows: int = 0,
+        prefill_dma_bf16: bool = False,
+        trellis_prefill_shapes: bool = False,
         language_model_only: bool = False, mla_compute_mode: str | None = None) -> Plan:
     """Select GPUs and size the plan, or raise a capacity error that lists working settings.
 
@@ -614,6 +649,9 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
                    image_concurrency=None if image_concurrency is None else min(image_concurrency, concurrency),
                    online_mxfp8=online_mxfp8, prefill_fp8_transport=prefill_fp8_transport,
                    prefill_island_reduce=prefill_island_reduce,
+                   prefill_dma_ring_rows=prefill_dma_ring_rows,
+                   prefill_dma_bf16=prefill_dma_bf16,
+                   trellis_prefill_shapes=trellis_prefill_shapes,
                    language_model_only=language_model_only,
                    mla_compute_mode=mla_compute_mode)
 
