@@ -126,6 +126,87 @@ say() { echo "$*" >&2; }
 fail=0
 chk() { if "$@"; then return 0; else fail=$((fail+1)); return 1; fi; }
 
+# ── W11 (radiance-mechanics review §3 item 5): post-export settings assertion.
+# Read the recorded settings back from the export record and the package, and
+# compare them with the driver's expected set. One physical fingerprint per
+# switch where one exists: slab sizes for the prefill wires (ContextParallel
+# slab / index_slab in the memory report) and the round-graph/kernel count for
+# decode fusion. The fingerprint baselines are the shipped package
+# gb202-tp8-202611100532 at the ruled config (capacity 20, image concurrency 1,
+# ring rows 1024); other configs assert cross-rank consistency only.
+assert_settings() {
+  local log="$1" pkg="$2" bad=0
+  local args_line; args_line=$(grep -m1 '^=== args ' "$log" || true)
+  for expected in "--prefill-dma-ring-rows $RING_ROWS" "--prefill-dma-bf16" "--trellis-prefill-shapes" \
+                  "--image-concurrency $IMAGE_CONCURRENCY" "--speculative-token-capacity $SPEC_TOKEN_CAPACITY" \
+                  "--block-verification"; do
+    case " $args_line " in *" $expected "*) : ;;
+      *) say "ASSERT: recorded invocation misses '$expected'"; bad=$((bad+1));;
+    esac
+  done
+  if [ "$PREFILL_ISLAND" = 1 ]; then
+    case " $args_line " in *--prefill-island-reduce*) : ;;
+      *) say "ASSERT: recorded invocation misses --prefill-island-reduce"; bad=$((bad+1));;
+    esac
+  fi
+  # The plan-settings record the export prints, when the tree records one.
+  local plan_line; plan_line=$(grep -m1 '^{"plan"' "$log" || true)
+  if [ -n "$plan_line" ]; then
+    local recorded
+    recorded=$("$PYV" -c 'import json,sys
+plan=json.loads(sys.stdin.read())["plan"]
+print(plan.get("prefill_dma_ring_rows"), plan.get("prefill_dma_ring_bf16"), plan.get("trellis_prefill_shapes"))' \
+      <<<"$plan_line" 2>/dev/null || echo unreadable)
+    if [ "$recorded" != "$RING_ROWS True True" ]; then
+      say "ASSERT: recorded plan settings '$recorded' != expected '$RING_ROWS True True'"
+      bad=$((bad+1))
+    fi
+  else
+    say "ASSERT: no plan-settings JSON in the export record; asserting the invocation record + fingerprints"
+  fi
+  # Physical fingerprints from the memory report: every rank must agree.
+  local slab islab graphs n_slab n_islab n_graphs
+  slab=$(grep -E 'ContextParallel>\.slab ' "$log" | awk '{print $1}' | sort -u)
+  islab=$(grep -E 'ContextParallel>\.index_slab ' "$log" | awk '{print $1}' | sort -u)
+  graphs=$(grep -oE 'Graphs: [0-9]+; kernels: [0-9]+' "$log" | sort -u)
+  n_slab=$(grep -cE 'ContextParallel>\.slab ' "$log" || true)
+  n_islab=$(grep -cE 'ContextParallel>\.index_slab ' "$log" || true)
+  n_graphs=$(grep -coE 'Graphs: [0-9]+; kernels: [0-9]+' "$log" || true)
+  if [ -z "$slab" ] || [ -z "$islab" ] || [ -z "$graphs" ]; then
+    say "ASSERT: fingerprints missing from the memory report (slab='$slab' index_slab='$islab' graphs='$graphs')"
+    bad=$((bad+1))
+  else
+    if [ "$(wc -l <<<"$slab")" -ne 1 ] || [ "$(wc -l <<<"$islab")" -ne 1 ] || [ "$(wc -l <<<"$graphs")" -ne 1 ]; then
+      say "ASSERT: fingerprint disagreement across ranks (slab='$slab' index_slab='$islab' graphs='$graphs')"
+      bad=$((bad+1))
+    fi
+    say "ASSERT: fingerprints slab=${slab} MiB (${n_slab} ranks) index_slab=${islab} MiB (${n_islab}) ${graphs} (${n_graphs})"
+    if [ "$SPEC_TOKEN_CAPACITY" = 20 ] && [ "$IMAGE_CONCURRENCY" = 1 ] && [ "$RING_ROWS" = 1024 ]; then
+      [ "$slab" = "170.44" ] || { say "ASSERT: slab fingerprint '$slab' MiB != baseline 170.44 MiB"; bad=$((bad+1)); }
+      [ "$islab" = "39.06" ] || { say "ASSERT: index_slab fingerprint '$islab' MiB != baseline 39.06 MiB"; bad=$((bad+1)); }
+      [ "$graphs" = "Graphs: 66; kernels: 4967" ] || { say "ASSERT: round-graph/kernel fingerprint '$graphs' != baseline 'Graphs: 66; kernels: 4967'"; bad=$((bad+1)); }
+    else
+      say "ASSERT: fingerprint baseline skipped (non-ruled config); cross-rank consistency asserted only"
+    fi
+  fi
+  # Read back from the package: the captured round graphs must be there.
+  if [ -n "$pkg" ] && ls "$pkg"/deployments/*/rank-0/graphs.safetensors >/dev/null 2>&1; then
+    :
+  else
+    say "ASSERT: package $pkg lacks deployments/*/rank-0/graphs.safetensors"
+    bad=$((bad+1))
+  fi
+  if [ "$bad" -ne 0 ]; then
+    say "SETTINGS ASSERTION FAILED: $bad mismatch(es) — package $pkg flagged; review before promotion"
+    echo "settings-mismatch $bad" > "$OUT/export.settings-mismatch"
+    echo "=== SETTINGS ASSERTION FAILED ($bad mismatches)" >>"$log"
+    return 1
+  fi
+  rm -f "$OUT/export.settings-mismatch"
+  echo "=== settings assertion OK: recorded settings == expected set; fingerprints slab=${slab} MiB index_slab=${islab} MiB; ${graphs}" >>"$log"
+  return 0
+}
+
 if [ "$MODE" = --link ]; then
   [ -f "$DONE" ] && [ ! -f "$FAIL" ] || { say "FATAL: download not complete ($DONE missing or $FAIL present)"; exit 1; }
   mkdir -p "$SNAP"
@@ -162,6 +243,21 @@ ig_path=$(cd "$REPO" && "$PYV" -c 'import ignition, pathlib; print(pathlib.Path(
 chk test "$ig_path" = "$REPO/ignition/__init__.py" || say "GUARD: ignition resolves to $ig_path (want $REPO)"
 # J-3 §1: B12X_PCIE_DMA_PIECES must be UNSET in the export environment.
 chk test -z "${B12X_PCIE_DMA_PIECES:-}" || say "GUARD: B12X_PCIE_DMA_PIECES is set (${B12X_PCIE_DMA_PIECES}) — must be UNSET"
+# W11 (radiance-mechanics review §3 item 4): environment allowlist at export
+# start. The driver refuses to run with any IGNITION_KIMI_* / B12X_* variable
+# present that the plan did not set. The accounted set is exactly the shipped
+# B12X_W4A16_SMALL_M_SPLITK=1 kernel switch (set by this driver and recorded);
+# every other name — the legacy IGNITION_KIMI_* switches, B12X_PCIE_DMA_PIECES
+# (J-1 risk 6), future experiments — fails the guard instead of silently
+# changing the package. The plan is the second line of defense
+# (planning.check_switch_environment in the ignition tree).
+env_bad=0
+for name in $(compgen -v | grep -E '^(IGNITION_KIMI_|B12X_)' || true); do
+  if [ "$name" = B12X_W4A16_SMALL_M_SPLITK ] && [ "${!name}" = 1 ]; then continue; fi
+  say "GUARD: unaccounted switch environment ${name}='${!name}' (only B12X_W4A16_SMALL_M_SPLITK=1 is accounted)"
+  env_bad=$((env_bad+1))
+done
+chk test "$env_bad" -eq 0 || say "GUARD: switch-environment allowlist violated (W11 §3 item 4)"
 GPU_LIST="$(python3 /opt/mimo-pro/flare-bd/gpu-select.py B,D 2>/dev/null || true)"
 n_gpu=$(awk -F, '{print NF}' <<<"$GPU_LIST"); chk test "$n_gpu" -eq 8 || say "GUARD: B+D resolved $n_gpu GPUs, need 8"
 busy=0; for g in ${GPU_LIST//,/ }; do u=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$g" 2>/dev/null || echo 99999); [ "$u" -lt 1024 ] || busy=1; done
@@ -219,10 +315,11 @@ fi
 [ "$MODE" = --run ] || { say "unknown mode $MODE"; exit 2; }
 cd "$REPO"
 export CUDA_VISIBLE_DEVICES="$GPU_LIST" CUDA_DEVICE_ORDER=PCI_BUS_ID HF_HUB_OFFLINE=1 TOKENIZERS_PARALLELISM=false
-# W6 E1 (J-3 §1): only the shipped split-K decode switch rides the environment;
-# the ring/bf16/trellis config is in the PLAN FLAGS. B12X_PCIE_DMA_PIECES must
-# stay UNSET (global override; the per-shape table is the ruled selector).
-unset B12X_PCIE_DMA_PIECES IGNITION_KIMI_PREFILL_DMA_ROWS IGNITION_KIMI_PREFILL_DMA_BF16 IGNITION_KIMI_PREFILL_DMA_ROWS || true
+# W6 E1 (J-3 §1) + W11 §3 item 4: only the shipped split-K decode switch rides
+# the environment; the ring/bf16/trellis config is in the PLAN FLAGS. Nothing is
+# silently unset here any more: the switch-environment allowlist guard above
+# refuses any unaccounted IGNITION_KIMI_* / B12X_* variable (including
+# B12X_PCIE_DMA_PIECES) instead of healing the environment.
 export B12X_W4A16_SMALL_M_SPLITK=1
 echo "=== env check: B12X_PCIE_DMA_PIECES='${B12X_PCIE_DMA_PIECES:-}' (must be empty) B12X_W4A16_SMALL_M_SPLITK='$B12X_W4A16_SMALL_M_SPLITK' IGNITION_KIMI_PREFILL_DMA_ROWS='${IGNITION_KIMI_PREFILL_DMA_ROWS:-}'"
 { echo "=== export start $(date -Is) tree $(git rev-parse HEAD) flashinfer $(git -C "$FI" rev-parse HEAD) free ${free}G avail ${avail}G"
@@ -241,6 +338,15 @@ if [ $rc -eq 0 ]; then
   [ -n "$pkg" ] && [ -d "$pkg" ] && ln -sfn "$pkg" "$PKG_LINK" && echo "=== package $pkg -> $PKG_LINK" >>"$LOG"
   n=$(find "$BLOBS" -maxdepth 1 -type f -links 1 -print -delete | wc -l); echo "=== blob prune removed=$n" >>"$LOG"
   if [ -n "$pkg" ]; then echo "$pkg" > "$OUT/export.done"; else echo "package path not found in log" > "$OUT/export.done"; echo "=== package path not found in log" >>"$LOG"; fi
+  # W11 §3 item 5: post-export settings assertion. The package is already
+  # linked and recorded above; a mismatch flags it for review and fails the
+  # driver (export.settings-mismatch, rc=3) instead of letting a drifted
+  # package look ruled (J-1 risk 1).
+  if ! assert_settings "$LOG" "$pkg"; then
+    echo "3" > "$OUT/export.settings-rc"
+    exit 3
+  fi
+  echo "0" > "$OUT/export.settings-rc"
 else
   echo "=== blob prune skipped rc=$rc" >>"$LOG"; echo "$rc" > "$OUT/export.failed"
 fi
