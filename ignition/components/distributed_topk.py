@@ -18,10 +18,16 @@ class PreparedDistributedTopK:
     Every rank contributes k candidates: keeping only k/world could discard global winners.
     Candidate IDs travel as integer bits alongside FP32 scores; the collective transports bytes.
     Missing local positions have score -inf and ID -1. All ranks receive identical candidates.
+
+    With ``piggyback=(local_query, gathered_query)`` the candidate exchange also carries
+    the caller's query bytes in the same launch: one exchange and one rank barrier replace
+    the separate query gather and the candidate gather (W4 R6). The piggybacked fields are
+    packed rank-major beside each rank's candidates and split back out after the exchange,
+    so the merged candidate layout is unchanged.
     """
 
     def __init__(self, indices, scores, output, *, world, rank, runtime, session, coordinator,
-                 name, buffers, workspace):
+                 name, buffers, workspace, piggyback=None):
         if (indices.ndim != 2 or indices.dtype != torch.int32 or scores.shape != indices.shape
                 or scores.dtype != torch.float32 or output.shape != indices.shape or output.dtype != indices.dtype
                 or world < 2 or rank.shape != (1,) or rank.dtype != torch.int64):
@@ -33,16 +39,36 @@ class PreparedDistributedTopK:
         self.gathered = buffers.zeros((rows, world * self.topk, 2), torch.float32)
         self.merge = PreparedCandidateMerge(self.gathered, output, session=session,
             workspace=workspace, name=name + ".merge")
-        self.collective = PreparedAllGather(self.local.view(torch.bfloat16).view(rows, -1),
-            self.gathered.view(torch.bfloat16).view(rows, -1), runtime=runtime, session=session,
-            coordinator=coordinator, name=name)
+        self.paired = self.collective = None
+        if piggyback is None:
+            self.collective = PreparedAllGather(self.local.view(torch.bfloat16).view(rows, -1),
+                self.gathered.view(torch.bfloat16).view(rows, -1), runtime=runtime, session=session,
+                coordinator=coordinator, name=name)
+        else:
+            from .peer_rows import PreparedPairedGather
+
+            local_query, gathered_query = piggyback
+            candidate_bytes = self.topk * 2 * 4
+            query_bytes = local_query.numel() * local_query.element_size() // rows
+            if (local_query.shape[0] != rows or gathered_query.shape[0] != rows
+                    or gathered_query.numel() * gathered_query.element_size() != rows * query_bytes * world
+                    or query_bytes % 16 or candidate_bytes % 16):
+                raise ValueError("piggybacked queries need 16-byte row fields matching the candidate rows")
+            self.paired = PreparedPairedGather(self.local.view(rows, -1), local_query,
+                self.gathered.view(rows, -1), gathered_query, runtime=runtime, session=session,
+                coordinator=coordinator, name=name, buffers=buffers)
+            self.piggyback_first = self.local.view(rows, -1)
+            self.piggyback_second = local_query
 
     def __call__(self):
         live = self.indices >= 0
         self.local[:, :, 0].copy_(torch.where(live, self.scores, -torch.inf))
         self.local.view(torch.int32)[:, :, 1].copy_(
             torch.where(live, self.indices.long() * self.world + self.rank, -1))
-        self.collective(self.local.view(torch.bfloat16).view(self.indices.shape[0], -1))
+        if self.paired is not None:
+            self.paired(self.piggyback_first, self.piggyback_second)
+        else:
+            self.collective(self.local.view(torch.bfloat16).view(self.indices.shape[0], -1))
         self.merge()
         return self.output
 

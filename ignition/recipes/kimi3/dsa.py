@@ -3,6 +3,8 @@
 
 """Gated Kimi DSA: learned selection over context-sharded FP8 keys and latent records."""
 
+import os
+
 import torch
 from b12x.attention import dense_mla
 
@@ -20,6 +22,21 @@ SELECTION_ROWS = 32
 INDEX_HEADS, INDEX_DIM, TOPK = 32, 128, 2048
 
 
+def decode_exchange_merge():
+    """W4 R6: one exchange per decode DSA layer carries candidates and the attention query.
+
+    The index-query shard (partitioned index weights) still rides its own small gather
+    before the indexer; the attention query is only needed at attention time, so it moves
+    onto the candidate exchange. Default off keeps the paired query exchange.
+    """
+    return os.environ.get("IGNITION_KIMI_DSA_EXCHANGE_MERGE", "0") == "1"
+
+
+def lse_combine_blocks():
+    """Launch blocks for the LSE reduce-scatter combine (W4 R6 shrink; default 8)."""
+    return int(os.environ.get("IGNITION_KIMI_DSA_LSE_BLOCKS", "8"))
+
+
 class PreparedDSA:
     def __init__(self, weights, query_residual, key_input, weight_input, query, output, slots,
                  metadata, cache, index_cache, *, context, session, coordinator, name, workspace,
@@ -34,6 +51,8 @@ class PreparedDSA:
                 latent=latent, peers=peers, index_peers=index_peers, eps=eps)
             return
         self.gathered_context = mode == "prefill" and context is not None and context.prefill_layout == "ckv"
+        self.merge_exchange = (decode_exchange_merge() and context is not None and not self.gathered_context
+                               and context.shards.world > 1)
         self.context, self.peers = context, peers
         if self.gathered_context:
             if metadata.starts.numel() != 1 or peers is None or context.slab is None:
@@ -62,7 +81,8 @@ class PreparedDSA:
         self.partitioned = isinstance(weights["index_query"], OutputPartitionedBF16Weight)
         self.local_index_query = self.index_query
         if self.partitioned:
-            if context is None or context.paired_queries is None or self.gathered_context:
+            if context is None or self.gathered_context or (
+                    context.paired_queries is None if not self.merge_exchange else context.index_queries is None):
                 raise ValueError("partitioned index decode requires paired context-parallel query exchange")
             self.local_index_query = allocate("index_query_local",
                 (rows, INDEX_HEADS//self.shards.world, INDEX_DIM), torch.bfloat16)
@@ -106,12 +126,7 @@ class PreparedDSA:
                 session=session, name=stage_name + ".index", workspace=workspace, buffers=cursor,
                 scores=scores, rotation="none")
             merge = None
-            if self.shards.world > 1:
-                merge = PreparedDistributedTopK(local, scores, selected,
-                    world=self.shards.world, rank=self.shards.index, runtime=context.candidates,
-                    session=session, coordinator=coordinator, name=stage_name + ".candidates", buffers=cursor,
-                    workspace=workspace)
-            gather = combine = paired = None
+            gather = combine = paired = index_gather = None
             q, attended = query[begin:end], output[begin:end]
             if self.gathered_context:
                 quantized = cursor.zeros(q.shape, torch.float8_e4m3fn)
@@ -121,7 +136,14 @@ class PreparedDSA:
                 q = cursor.zeros((count, heads * self.shards.world, RECORD_BYTES), torch.float8_e4m3fn)
                 attended = cursor.zeros((count, heads * self.shards.world, 512), torch.bfloat16)
                 lse = cursor.zeros((count, heads * self.shards.world), torch.float32)
-                if self.partitioned:
+                if self.merge_exchange:
+                    # R6: only the index-query shard is needed before the indexer; the
+                    # attention query joins the candidate exchange below.
+                    if self.partitioned:
+                        index_gather = PreparedAllGather(self.local_index_query[begin:end].view(count, -1),
+                            self.index_query[begin:end].view(count, -1), runtime=context.index_queries,
+                            coordinator=coordinator, session=session, name=stage_name + ".index_queries")
+                elif self.partitioned:
                     from ignition.components.peer_rows import PreparedPairedGather
 
                     paired = PreparedPairedGather(quantized.view(count, -1),
@@ -132,9 +154,17 @@ class PreparedDSA:
                     gather = PreparedAllGather(quantized.view(count, -1), q.view(count, -1), runtime=context.heads,
                         coordinator=coordinator, session=session, name=stage_name + ".gather_heads")
                 combine = PreparedLseReduceScatter(attended, lse, output[begin:end], runtime=context.heads,
-                    session=session, coordinator=coordinator, name=stage_name + ".combine", threads=512, block_limit=8)
+                    session=session, coordinator=coordinator, name=stage_name + ".combine", threads=512,
+                    block_limit=lse_combine_blocks())
             else:
                 quantized = lse = None
+            if self.shards.world > 1:
+                merge = PreparedDistributedTopK(local, scores, selected,
+                    world=self.shards.world, rank=self.shards.index, runtime=context.candidates,
+                    session=session, coordinator=coordinator, name=stage_name + ".candidates", buffers=cursor,
+                    workspace=workspace,
+                    piggyback=((quantized.view(count, -1), q.view(count, -1))
+                               if self.merge_exchange and quantized is not None else None))
             caps = dense_mla.Caps(device=device, mode="decode", q_dtype=q.dtype, kv_dtype=cache.dtype,
                 num_q_heads=q.shape[1], max_total_q=count, max_batch=count, page_size=1,
                 max_cache_tokens=TOPK, max_page_table_width=TOPK, num_cache_pages=cache_records.shape[0],
@@ -142,7 +172,8 @@ class PreparedDSA:
             attention = PreparedDenseMLA(q, cache_records, attended,
                 physical, counts, offsets, caps=caps,
                 scale=192**-.5, session=session, name=stage_name + ".sparse_attention", workspace=workspace, lse=lse)
-            self.stages.append((begin, end, selector, merge, quantized, gather, attention, combine, lse, paired))
+            self.stages.append((begin, end, selector, merge, quantized, gather, attention, combine, lse, paired,
+                                index_gather))
 
     def __call__(self):
         if self.prefill is not None:
@@ -152,7 +183,7 @@ class PreparedDSA:
         self.key.copy_(torch.nn.functional.layer_norm(self.key_input.float(), (INDEX_DIM,),
             self.norm_weight.float(), self.norm_bias.float(), self.eps).to(self.key.dtype))
         self.stages[0][2].write_keys(self.key, self.slots)
-        for begin, end, selector, merge, quantized, gather, attention, combine, lse, paired in self.stages:
+        for begin, end, selector, merge, quantized, gather, attention, combine, lse, paired, index_gather in self.stages:
             count = end - begin
             positions, pages = m.positions[begin:end], m.token_page_table[begin:end]
             expanded = pages[:, :, None] * 2 + self.page_halves
@@ -162,6 +193,12 @@ class PreparedDSA:
             if paired is not None:
                 quantized.copy_(self.query[begin:end].float().clamp(-448., 448.).to(torch.float8_e4m3fn))
                 paired(quantized.view(count, -1), self.local_index_query[begin:end].view(count, -1))
+            elif self.merge_exchange and quantized is not None:
+                # R6: the attention query leaves with the candidate exchange below; only the
+                # index-query shard (if any) reaches the indexer in its own small gather.
+                quantized.copy_(self.query[begin:end].float().clamp(-448., 448.).to(torch.float8_e4m3fn))
+                if index_gather is not None:
+                    index_gather(self.local_index_query[begin:end].view(count, -1))
             selector()
             selected = self.local[:count] if merge is None else merge()
             if self.gathered_context:
@@ -180,7 +217,7 @@ class PreparedDSA:
                     rank=shards.owner, page_size=PAGE_TOKENS)
             self.physical[:count].copy_(physical)
             self.counts[:count].copy_(lengths)
-            if quantized is not None and paired is None:
+            if quantized is not None and paired is None and not self.merge_exchange:
                 quantized.copy_(self.query[begin:end].float().clamp(-448., 448.).to(torch.float8_e4m3fn))
             if gather is not None:
                 gather(quantized.view(count, -1))

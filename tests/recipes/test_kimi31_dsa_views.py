@@ -25,7 +25,8 @@ def construct(monkeypatch):
 
     def merge(indices, scores, output, **kwargs):
         return SimpleNamespace(indices=indices, scores=scores, output=output,
-            name=kwargs["name"], buffers=kwargs["buffers"], plan=object())
+            name=kwargs["name"], buffers=kwargs["buffers"], plan=object(),
+            piggyback=kwargs.get("piggyback"))
 
     def attention(query, cache, output, pages, lengths, starts, **kwargs):
         return SimpleNamespace(query=query, cache=cache, output=output, pages=pages,
@@ -82,7 +83,7 @@ def _assert_view(view, expected):
 def test_stages_reuse_identical_views_and_preserve_partial_geometry(construct, rows, world):
     op, cache = construct(rows, world)
     by_count = {}
-    for begin, end, selector, merge, quantized, gather, attention, combine, lse in op.stages:
+    for begin, end, selector, merge, quantized, gather, attention, combine, lse, *_ in op.stages:
         count = end - begin
         views = (selector.pages, selector.lengths, selector.output, selector.scores,
                  None if merge is None else merge.output, attention.pages, attention.lengths, attention.starts)
@@ -105,7 +106,12 @@ def test_stages_reuse_identical_views_and_preserve_partial_geometry(construct, r
         if merge is not None:
             assert selector.output is merge.indices and selector.scores is merge.scores
             assert selector.buffers is merge.buffers
-            assert gather.output.untyped_storage()._cdata == attention.query.untyped_storage()._cdata
+            if merge.piggyback is not None:
+                # R6 merged exchange: the attention query leaves inside the candidate exchange.
+                assert gather is None
+                assert merge.piggyback[1].untyped_storage()._cdata == attention.query.untyped_storage()._cdata
+            else:
+                assert gather.output.untyped_storage()._cdata == attention.query.untyped_storage()._cdata
             assert combine.partial is attention.output and combine.lse is lse
             _assert_view(combine.output, op.output[begin:end])
     assert len({id(stage[2].plan) for stage in op.stages}) == len(op.stages)
