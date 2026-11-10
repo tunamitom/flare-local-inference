@@ -1578,6 +1578,13 @@ impl<'a> Worker<'a> {
         }
         let mut stopped = Vec::new();
         let mut positions = [0usize; crate::execution::REQUEST_LANES];
+        // Per-request round totals: a mid-round host stop discards the rest of its
+        // round from the stream, logprobs and the output parser, and usage counts
+        // only through the stop-completing token.
+        let mut round_totals = [0usize; crate::execution::REQUEST_LANES];
+        for token in &generated {
+            round_totals[token.request.slot as usize] += 1;
+        }
         for token in generated {
             let slot = token.request.slot as usize;
             let position = positions[slot];
@@ -1652,6 +1659,11 @@ impl<'a> Worker<'a> {
                 if stop {
                     self.metrics.completed.fetch_add(1, Ordering::Relaxed);
                     let live = self.scheduler.request(token.request)?;
+                    // R1a: the scheduler's generated_tokens counts every accepted
+                    // token including the round tail discarded after a mid-round
+                    // stop. Usage counts only through the stop-completing token.
+                    let discarded = (round_totals[slot] - positions[slot]) as u32;
+                    let counted = live.generated_tokens - discarded;
                     if request
                         .incoming
                         .events
@@ -1660,8 +1672,7 @@ impl<'a> Worker<'a> {
                                 .carried
                                 .prompt_tokens
                                 .unwrap_or(live.prompt_tokens),
-                            generated_tokens: request.carried.generated_tokens
-                                + live.generated_tokens,
+                            generated_tokens: request.carried.generated_tokens + counted,
                             reused_prompt_tokens: request
                                 .carried
                                 .reused_prompt_tokens
@@ -3411,7 +3422,10 @@ mod tests {
     }
 
     #[test]
-    fn string_and_token_stops_both_require_the_host_stop_scheduler_barrier() {
+    fn string_and_token_stops_both_set_the_host_stop_feedback_flag() {
+        // R1a lifted the width-1 mask for host stops; the flag now marks the
+        // feedback barrier (policy.rs / scheduler.rs plan_requires_feedback)
+        // and the copy/history proposal restriction, not speculation width.
         let (mut incoming, _) = stream(4);
         assert!(!incoming.prompt.has_host_stops());
         incoming.prompt.stop_strings.push("END".into());

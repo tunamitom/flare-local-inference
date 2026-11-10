@@ -1403,7 +1403,7 @@ fn speculative_bad_vector_is_transactional_and_cancel_waits_for_round_fence() {
     assert_eq!(next.generation, h.generation + 1);
 }
 #[test]
-fn fixed_graph_masks_grammar_and_host_stops_to_one_token() {
+fn fixed_graph_masks_only_grammar_to_one_token_and_full_width_for_host_stops() {
     for grammar in [false, true] {
         let (mut s, h) = speculative_scheduler(65, 32);
         let mut graphs = duration_graphs(1);
@@ -1414,7 +1414,9 @@ fn fixed_graph_masks_grammar_and_host_stops_to_one_token() {
         s.request_mut(h).unwrap().host_stops = !grammar;
         let step = s.plan().unwrap();
         assert_eq!(step.token_capacity, 8);
-        assert_eq!(step.lanes[0].tokens, 1);
+        // R1a: host stops verify on the host and plan full rounds; only the
+        // grammar mask (one in-graph mask per request, every row) stays at 1.
+        assert_eq!(step.lanes[0].tokens, if grammar { 1 } else { 8 });
         assert!(step.requires_feedback);
         s.commit(&step, Fence(4)).unwrap();
         assert!(s.plan().is_none());

@@ -670,6 +670,527 @@ fn reasoning_budget_cuts_after_a_multi_token_speculative_completion() {
     );
 }
 
+/// Builds one speculative round frame whose lanes emit `tokens` per lane
+/// (accepted in order; the final token is the verified bonus position).
+/// `logprobed` supplies raw logprob records for that many leading positions;
+/// a stop-discard test omits the tail's records on purpose, so any attempt to
+/// consume the discarded tail would fail the request with a missing record.
+fn speculative_frame(
+    worker: &Worker<'_>,
+    step: &ScheduledStep,
+    sequence: u64,
+    tokens: &[Vec<i64>],
+    status: i64,
+    logprobed: usize,
+) -> FrameCompletion {
+    let mut frame = completion(worker, step, sequence, None);
+    for (row, lane) in step.lanes.iter().enumerate() {
+        let ids = &tokens[row];
+        let emitted = ids.len() as i64;
+        let live = worker.scheduler.request(lane.request).unwrap();
+        let record = &mut frame.records[lane.request.slot as usize];
+        record.consumed_tokens = live.consumed_tokens as i64 + emitted;
+        record.generated_tokens = live.generated_tokens as i64 + emitted;
+        record.token_id = ids[ids.len() - 1];
+        record.status = status;
+        let mut vector = crate::execution::TokenVector {
+            emitted_count: emitted,
+            offered_drafts: emitted - 1,
+            accepted_drafts: emitted - 1,
+            draft_cache_consumed: record.consumed_tokens - 1,
+            verification_width: step.token_capacity as i64,
+            ..Default::default()
+        };
+        vector.tokens[..emitted as usize].copy_from_slice(ids);
+        record.vector = Some(vector);
+    }
+    if logprobed > 0 {
+        let mut values = vec![vec![None; 16]; 4];
+        for (row, lane) in step.lanes.iter().enumerate() {
+            for index in 0..logprobed.min(tokens[row].len()) {
+                values[lane.request.slot as usize][index] =
+                    Some(crate::execution::TokenLogprobs {
+                        token: tokens[row][index] as u32,
+                        logprob: -1.,
+                        top: vec![],
+                    });
+            }
+        }
+        frame.logprobs = Some(values);
+    }
+    frame
+}
+
+/// Visible tokens, finished records (usage, reason, termination, matched stop
+/// string), delivered logprob tokens, and observed tokens in emission order.
+/// Observed tokens prove the stateful output parser's inputs: post-match tokens
+/// must appear in none of these lists.
+fn stop_events(
+    generation: &mut Generation,
+) -> (
+    Vec<u32>,
+    Vec<(usize, u32, &'static str, crate::output::Termination, Option<String>)>,
+    Vec<u32>,
+    Vec<u32>,
+) {
+    let mut tokens = vec![];
+    let mut finished = vec![];
+    let mut logprobs = vec![];
+    let mut observed = vec![];
+    while let Ok(event) = generation.events.try_recv() {
+        match event {
+            GenerationEvent::Token(token) => tokens.push(token),
+            GenerationEvent::LogprobToken(value) => {
+                tokens.push(value.token);
+                logprobs.push(value.token);
+            }
+            GenerationEvent::Protocol(pieces) => {
+                for piece in pieces {
+                    match piece {
+                        crate::output::Piece::Token(token) => tokens.push(token),
+                        crate::output::Piece::Logprob(entry) => logprobs.push(entry.value.token),
+                        _ => {}
+                    }
+                }
+            }
+            GenerationEvent::Finished {
+                prompt_tokens,
+                generated_tokens,
+                reason,
+                termination,
+                stop_sequence,
+                ..
+            } => finished.push((prompt_tokens, generated_tokens, reason, termination, stop_sequence)),
+            GenerationEvent::ObservedToken { token, .. } => observed.push(token),
+            GenerationEvent::Error(error) | GenerationEvent::AdmissionRejected(error) => {
+                panic!("{error}")
+            }
+            _ => {}
+        }
+    }
+    (tokens, finished, logprobs, observed)
+}
+
+/// R1a: host-stop requests run multi-token speculative rounds and the host
+/// verifies each round's accepted tokens against the stops in order. A match
+/// finishes the request and the rest of the round is discarded from the stream,
+/// the logprobs and the output parser; usage counts through the match token.
+mod r1_stops {
+    use super::*;
+
+    fn engine() -> Fixture {
+        let mut fixture = Fixture::new();
+        fixture.config.speculative_widths = vec![1, 4];
+        fixture.config.speculative_fixed_width = Some(4);
+        fixture
+    }
+
+    fn speculative_worker(fixture: &Fixture, receiver: mpsc::Receiver<Vec<Incoming>>) -> Worker<'_> {
+        let mut worker = fixture.worker(receiver);
+        worker.scheduler.enable_speculation(&[1, 4]).unwrap();
+        worker.scheduler.fixed_speculative_width(Some(4)).unwrap();
+        worker
+    }
+
+    /// Init, Prefill carrying the first output token, and the prompt snapshot.
+    fn open(worker: &mut Worker<'_>, first: u32, sequence: &mut u64) {
+        worker.admit().unwrap();
+        advance(worker, GraphKind::Init, { *sequence += 1; *sequence }, None);
+        advance(worker, GraphKind::Prefill, { *sequence += 1; *sequence }, Some(first));
+        advance(worker, GraphKind::Snapshot, { *sequence += 1; *sequence }, None);
+    }
+
+    #[test]
+    fn stop_mid_round_discards_the_tail_and_counts_usage_through_the_match() {
+        let fixture = engine();
+        let (sender, receiver) = mpsc::channel();
+        let (mut incoming, mut generation) = fixture.incoming(vec![0; 13], 5);
+        incoming.prompt.stop_sequences = vec![vec![1, 2]];
+        sender.send(vec![incoming]).unwrap();
+        let mut worker = speculative_worker(&fixture, receiver);
+        let mut sequence = 0;
+        open(&mut worker, 0, &mut sequence);
+        let step = planned(&mut worker, GraphKind::Speculative, sequence + 1);
+        sequence += 1;
+        assert_eq!(step.token_capacity, 4);
+        // R1a: host stops plan full rounds again.
+        assert_eq!(step.lanes[0].tokens, 4);
+        // R1a phase 1: the feedback barrier stays, bounding over-generation to
+        // one round in flight.
+        assert!(step.requires_feedback);
+        // Tokens 1, 2 complete the stop; 4 is the discarded tail.
+        let frame = speculative_frame(&worker, &step, sequence, &[vec![3, 1, 2, 4]], 1, 0);
+        worker.complete(GraphKind::Speculative, frame).unwrap();
+        worker.publish().unwrap();
+        assert_eq!(
+            stop_events(&mut generation),
+            (
+                vec![0, 3],
+                vec![(13, 4, "stop", crate::output::Termination::UserStop, None)],
+                vec![],
+                vec![0, 3, 1, 2],
+            )
+        );
+        assert!(worker.active.iter().all(Option::is_none));
+        assert!(worker.parked.is_empty());
+        assert_eq!(worker.metrics.completed.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn stop_spanning_two_rounds_counts_usage_through_the_match() {
+        let fixture = engine();
+        let (sender, receiver) = mpsc::channel();
+        let (mut incoming, mut generation) = fixture.incoming(vec![0; 13], 6);
+        incoming.prompt.stop_sequences = vec![vec![1, 2]];
+        sender.send(vec![incoming]).unwrap();
+        let mut worker = speculative_worker(&fixture, receiver);
+        let mut sequence = 0;
+        open(&mut worker, 0, &mut sequence);
+        // Round 1 ends with 1 held as a partial stop prefix.
+        let first = planned(&mut worker, GraphKind::Speculative, sequence + 1);
+        sequence += 1;
+        let frame = speculative_frame(&worker, &first, sequence, &[vec![3, 1]], 1, 0);
+        worker.complete(GraphKind::Speculative, frame).unwrap();
+        worker.publish().unwrap();
+        assert!(worker.active.iter().any(Option::is_some));
+        // Round 2 completes the match at its first token and discards 4.
+        let second = planned(&mut worker, GraphKind::Speculative, sequence + 1);
+        sequence += 1;
+        let frame = speculative_frame(&worker, &second, sequence, &[vec![2, 4]], 1, 0);
+        worker.complete(GraphKind::Speculative, frame).unwrap();
+        worker.publish().unwrap();
+        assert_eq!(
+            stop_events(&mut generation),
+            (
+                vec![0, 3],
+                vec![(13, 4, "stop", crate::output::Termination::UserStop, None)],
+                vec![],
+                vec![0, 3, 1, 2],
+            )
+        );
+        assert!(worker.active.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn stop_on_the_last_round_token_beats_the_output_limit() {
+        let fixture = engine();
+        let (sender, receiver) = mpsc::channel();
+        let (mut incoming, mut generation) = fixture.incoming(vec![0; 13], 4);
+        incoming.prompt.stop_sequences = vec![vec![1, 2]];
+        sender.send(vec![incoming]).unwrap();
+        let mut worker = speculative_worker(&fixture, receiver);
+        let mut sequence = 0;
+        open(&mut worker, 0, &mut sequence);
+        let step = planned(&mut worker, GraphKind::Speculative, sequence + 1);
+        sequence += 1;
+        assert_eq!(step.lanes[0].tokens, 3);
+        // The round reaches max_new_tokens at its last token, which also
+        // completes the stop: the stop wins over the length finish.
+        let frame = speculative_frame(&worker, &step, sequence, &[vec![3, 1, 2]], 1, 0);
+        worker.complete(GraphKind::Speculative, frame).unwrap();
+        worker.publish().unwrap();
+        assert_eq!(
+            stop_events(&mut generation),
+            (
+                vec![0, 3],
+                vec![(13, 4, "stop", crate::output::Termination::UserStop, None)],
+                vec![],
+                vec![0, 3, 1, 2],
+            )
+        );
+        assert!(worker.active.iter().all(Option::is_none));
+        assert!(worker.parked.is_empty());
+        assert_eq!(worker.metrics.completed.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn partial_match_that_diverges_flushes_the_holdback() {
+        let fixture = engine();
+        let (sender, receiver) = mpsc::channel();
+        let (mut incoming, mut generation) = fixture.incoming(vec![0; 13], 6);
+        incoming.prompt.stop_sequences = vec![vec![1, 2]];
+        sender.send(vec![incoming]).unwrap();
+        let mut worker = speculative_worker(&fixture, receiver);
+        let mut sequence = 0;
+        open(&mut worker, 3, &mut sequence);
+        // Round 1 holds 1 as a partial stop prefix.
+        let first = planned(&mut worker, GraphKind::Speculative, sequence + 1);
+        sequence += 1;
+        let frame = speculative_frame(&worker, &first, sequence, &[vec![3, 1]], 1, 0);
+        worker.complete(GraphKind::Speculative, frame).unwrap();
+        worker.publish().unwrap();
+        // Round 2 diverges at 4: the held 1 flushes visible with it, and no
+        // stop fires. The round then reaches max_new_tokens: a length finish.
+        let second = planned(&mut worker, GraphKind::Speculative, sequence + 1);
+        sequence += 1;
+        let frame = speculative_frame(&worker, &second, sequence, &[vec![4, 0, 2]], 1, 0);
+        worker.complete(GraphKind::Speculative, frame).unwrap();
+        worker.publish().unwrap();
+        budget_pass(&mut worker, &mut sequence, &[]);
+        assert_eq!(
+            stop_events(&mut generation),
+            (
+                vec![3, 3, 1, 4, 0, 2],
+                vec![(13, 6, "length", crate::output::Termination::OutputLimit, None)],
+                vec![],
+                vec![3, 3, 1, 4, 0, 2],
+            )
+        );
+    }
+
+    #[test]
+    fn stop_sequence_ids_and_stop_strings_together_in_one_round() {
+        let fixture = engine();
+        let (sender, receiver) = mpsc::channel();
+        let (mut first, mut first_generation) = fixture.incoming(vec![0; 13], 5);
+        first.prompt.stop_sequences = vec![vec![1, 2]];
+        let (mut second, mut second_generation) = fixture.incoming(vec![0; 13], 5);
+        // Admission forbids combining both stop kinds in one request, so the
+        // two kinds run as two lanes of the same speculative rounds.
+        second.prompt.stop_strings = vec!["dx".into()];
+        sender.send(vec![first, second]).unwrap();
+        let mut worker = speculative_worker(&fixture, receiver);
+        let mut sequence = 0;
+        worker.admit().unwrap();
+        // Prefill and snapshot steps are per-request; drive rounds until both
+        // requests stop mid-round, whichever way the planner batches lanes.
+        let mut rounds = 0;
+        while worker.active.iter().any(Option::is_some) {
+            rounds += 1;
+            assert!(rounds <= 8, "host-stop rounds did not finish");
+            let (plan, _) = worker.plan(0).unwrap();
+            let Some(step) = plan else { continue };
+            sequence += 1;
+            worker.reserve_and_pack(&step, Fence(sequence)).unwrap();
+            match step.kind {
+                GraphKind::Init | GraphKind::Snapshot => {
+                    let frame = completion(&worker, &step, sequence, None);
+                    worker.complete(step.kind, frame).unwrap();
+                }
+                GraphKind::Prefill => {
+                    let frame = completion(&worker, &step, sequence, Some(0));
+                    worker.complete(step.kind, frame).unwrap();
+                }
+                GraphKind::Speculative => {
+                    // The token-stop lane matches [1, 2] at index 2; the string
+                    // stop lane matches "dx" at index 2. Both discard one tail.
+                    let tokens: Vec<Vec<i64>> = step
+                        .lanes
+                        .iter()
+                        .map(|lane| {
+                            let prompt = &worker.active[lane.request.slot as usize]
+                                .as_ref()
+                                .unwrap()
+                                .incoming
+                                .prompt;
+                            if prompt.stop_strings.is_empty() {
+                                vec![3, 1, 2, 4]
+                            } else {
+                                vec![0, 3, 4, 1]
+                            }
+                        })
+                        .collect();
+                    let frame = speculative_frame(&worker, &step, sequence, &tokens, 1, 0);
+                    worker.complete(step.kind, frame).unwrap();
+                }
+                other => panic!("unexpected step: {other:?}"),
+            }
+            worker.publish().unwrap();
+        }
+        assert_eq!(
+            stop_events(&mut first_generation),
+            (
+                vec![0, 3],
+                vec![(13, 4, "stop", crate::output::Termination::UserStop, None)],
+                vec![],
+                vec![0, 3, 1, 2],
+            )
+        );
+        assert_eq!(
+            stop_events(&mut second_generation),
+            (
+                vec![0, 0],
+                vec![(
+                    13,
+                    4,
+                    "stop",
+                    crate::output::Termination::UserStop,
+                    Some("dx".into())
+                )],
+                vec![],
+                vec![0, 0, 3, 4],
+            )
+        );
+        assert!(worker.active.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn eos_after_the_stop_in_the_same_round_loses_to_the_stop() {
+        let fixture = engine();
+        let (sender, receiver) = mpsc::channel();
+        let (mut incoming, mut generation) = fixture.incoming(vec![0; 13], 6);
+        incoming.prompt.stop_sequences = vec![vec![1, 2]];
+        sender.send(vec![incoming]).unwrap();
+        let mut worker = speculative_worker(&fixture, receiver);
+        let mut sequence = 0;
+        open(&mut worker, 0, &mut sequence);
+        let step = planned(&mut worker, GraphKind::Speculative, sequence + 1);
+        sequence += 1;
+        // The device accepted through EOS (5) behind the stop; the stop comes
+        // first in emission order and wins.
+        let frame = speculative_frame(&worker, &step, sequence, &[vec![3, 1, 2, 5]], 2, 0);
+        worker.complete(GraphKind::Speculative, frame).unwrap();
+        worker.publish().unwrap();
+        assert_eq!(
+            stop_events(&mut generation),
+            (
+                vec![0, 3],
+                vec![(13, 4, "stop", crate::output::Termination::UserStop, None)],
+                vec![],
+                vec![0, 3, 1, 2],
+            )
+        );
+        assert!(worker.active.iter().all(Option::is_none));
+        assert_eq!(worker.metrics.completed.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn ignore_eos_keeps_tokens_visible_until_the_stop_match() {
+        let fixture = engine();
+        let (sender, receiver) = mpsc::channel();
+        let (mut incoming, mut generation) = fixture.incoming(vec![0; 13], 6);
+        incoming.prompt.stop_sequences = vec![vec![1, 2]];
+        incoming.prompt.ignore_eos = true;
+        sender.send(vec![incoming]).unwrap();
+        let mut worker = speculative_worker(&fixture, receiver);
+        let mut sequence = 0;
+        open(&mut worker, 0, &mut sequence);
+        let step = planned(&mut worker, GraphKind::Speculative, sequence + 1);
+        sequence += 1;
+        // With ignore_eos the EOS (5) is an ordinary visible token before the
+        // stop; the tail 4 is still discarded.
+        let frame = speculative_frame(&worker, &step, sequence, &[vec![5, 1, 2, 4]], 1, 0);
+        worker.complete(GraphKind::Speculative, frame).unwrap();
+        worker.publish().unwrap();
+        assert_eq!(
+            stop_events(&mut generation),
+            (
+                vec![0, 5],
+                vec![(13, 4, "stop", crate::output::Termination::UserStop, None)],
+                vec![],
+                vec![0, 5, 1, 2],
+            )
+        );
+    }
+
+    #[test]
+    fn reasoning_budget_cut_and_park_yield_to_a_mid_round_stop() {
+        let fixture = engine();
+        let (sender, receiver) = mpsc::channel();
+        let (mut incoming, mut generation) = fixture.incoming(vec![0; 13], 5);
+        incoming.prompt.stop_sequences = vec![vec![1, 2]];
+        incoming.prompt.reasoning_cut = Some(budget_cut(4, 2));
+        sender.send(vec![incoming]).unwrap();
+        let mut worker = speculative_worker(&fixture, receiver);
+        let mut sequence = 0;
+        open(&mut worker, 0, &mut sequence);
+        let step = planned(&mut worker, GraphKind::Speculative, sequence + 1);
+        sequence += 1;
+        // The round reaches max_new_tokens behind the stop, which is exactly
+        // the reasoning-budget cut trigger: the stop finishes the request
+        // first, so there is no cut and no park.
+        let frame = speculative_frame(&worker, &step, sequence, &[vec![3, 1, 2, 4]], 1, 0);
+        worker.complete(GraphKind::Speculative, frame).unwrap();
+        worker.publish().unwrap();
+        assert_eq!(
+            stop_events(&mut generation),
+            (
+                vec![0, 3],
+                vec![(13, 4, "stop", crate::output::Termination::UserStop, None)],
+                vec![],
+                vec![0, 3, 1, 2],
+            )
+        );
+        assert!(worker.parked.is_empty());
+        assert_eq!(worker.metrics.snapshot(false).reasoning_budget_cuts, 0);
+    }
+
+    #[test]
+    fn discarded_tail_logprobs_never_move_and_never_fail_the_request() {
+        let mut fixture = engine();
+        fixture.config.max_top_logprobs = 20;
+        let (sender, receiver) = mpsc::channel();
+        let (mut incoming, mut generation) = fixture.incoming(vec![0; 13], 5);
+        incoming.prompt.stop_sequences = vec![vec![1, 2]];
+        incoming.prompt.logprobs = true;
+        sender.send(vec![incoming]).unwrap();
+        let mut worker = speculative_worker(&fixture, receiver);
+        let mut sequence = 0;
+        worker.admit().unwrap();
+        sequence += 1;
+        advance(&mut worker, GraphKind::Init, sequence, None);
+        // The prefill frame carries the first token's raw logprob record.
+        let step = planned(&mut worker, GraphKind::Prefill, sequence + 1);
+        sequence += 1;
+        let mut frame = completion(&worker, &step, sequence, Some(0));
+        let slot = step.lanes[0].request.slot as usize;
+        let mut values = vec![vec![None; 16]; 4];
+        values[slot][0] = Some(crate::execution::TokenLogprobs {
+            token: 0,
+            logprob: -1.,
+            top: vec![],
+        });
+        frame.logprobs = Some(values);
+        worker.complete(GraphKind::Prefill, frame).unwrap();
+        sequence += 1;
+        advance(&mut worker, GraphKind::Snapshot, sequence, None);
+        let step = planned(&mut worker, GraphKind::Speculative, sequence + 1);
+        sequence += 1;
+        // Only the three tokens through the match have raw logprob records;
+        // the tail's missing record must never be demanded.
+        let frame = speculative_frame(&worker, &step, sequence, &[vec![3, 1, 2, 4]], 1, 3);
+        worker.complete(GraphKind::Speculative, frame).unwrap();
+        worker.publish().unwrap();
+        assert_eq!(
+            stop_events(&mut generation),
+            (
+                vec![0, 3],
+                vec![(13, 4, "stop", crate::output::Termination::UserStop, None)],
+                // The stop sequence's own tokens are consumed by the match;
+                // only the visible tokens deliver logprobs.
+                vec![0, 3],
+                vec![0, 3, 1, 2],
+            )
+        );
+    }
+
+    #[test]
+    fn the_discarded_tail_still_records_in_the_state_ledger() {
+        let mut fixture = engine();
+        fixture.config.history_drafts = true;
+        let (sender, receiver) = mpsc::channel();
+        let (mut incoming, mut generation) = fixture.incoming(vec![0; 13], 5);
+        incoming.prompt.stop_sequences = vec![vec![1, 2]];
+        sender.send(vec![incoming]).unwrap();
+        let mut worker = speculative_worker(&fixture, receiver);
+        let mut sequence = 0;
+        open(&mut worker, 0, &mut sequence);
+        let step = planned(&mut worker, GraphKind::Speculative, sequence + 1);
+        sequence += 1;
+        let frame = speculative_frame(&worker, &step, sequence, &[vec![3, 1, 2, 4]], 1, 0);
+        worker.complete(GraphKind::Speculative, frame).unwrap();
+        worker.publish().unwrap();
+        assert_eq!(stop_events(&mut generation).1.len(), 1);
+        // 'Record the tail': the device accepted the full round, so the
+        // scheduler's history carries the discarded tail (4) after the match
+        // context [0, 3, 1, 2] even though it never reached the stream.
+        assert_eq!(
+            worker.scheduler.history_proposal(&[0, 3, 1, 2], 7),
+            (vec![4, -1, -1, -1, -1, -1, -1], 1)
+        );
+    }
+}
+
 fn prepared_budget_request(
     fixture: &Fixture,
     protocol: crate::server::protocol::Protocol,

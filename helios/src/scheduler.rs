@@ -2110,9 +2110,13 @@ impl RequestScheduler {
         let context = self.limits.max_sequence_tokens - request.scheduled_consumed as usize;
         let output = (request.max_new_tokens - request.generated_tokens) as usize;
         let output = output.saturating_sub(self.pending_ceiling(request));
-        let proposal = if request.host_stops
-            || (request.grammar_constrained
-                && self.proposal_source == speculation::ProposalSource::Mtp)
+        // Host stop strings are verified on the host after each round (see the emission
+        // loop in server/runtime.rs): a stop ends the request, so tokens accepted after
+        // the match are over-generation on a finishing request and are discarded. R1a:
+        // host stops no longer force verification width 1; the grammar condition is
+        // untouched because the graph applies one grammar mask to every verification row.
+        let proposal = if request.grammar_constrained
+            && self.proposal_source == speculation::ProposalSource::Mtp
         {
             1
         } else if self.proposal_source == speculation::ProposalSource::Copy {
