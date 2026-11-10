@@ -256,6 +256,18 @@ def _preparation_arguments(running, *, model_default="defaults.model"):
                                " (Kimi K3/K3.1, TP 2/4/8; island FP32 sums with one extra BF16 rounding"
                                " of the 4-way partial quarter the cross-switch uplink bytes;"
                                " default: exact single-rounding BF16 owner sums)")
+    advanced.add_argument("--prefill-dma-ring-rows", type=int, default=0,
+                          help="run prefill reductions of at least this many rows over the copy-engine"
+                               " DMA ring (Kimi K3/K3.1, TP8; BF16 hop sums, one ring pass per"
+                               " reduction; smaller graphs keep --prefill-island-reduce / the exact wire;"
+                               " 0 disables the ring)")
+    advanced.add_argument("--prefill-dma-bf16", action="store_true",
+                          help="select the BF16 hop-sum ring wire for --prefill-dma-ring-rows"
+                               " (default: the exact FP32 owner-packet ring)")
+    advanced.add_argument("--trellis-prefill-shapes", action="store_true",
+                          help="select the measured Trellis prefill launch shapes (3 pipeline stages"
+                               " at M>=2048, direct decode table at smaller M; bit-identical outputs,"
+                               " decode graphs untouched; Kimi K3/K3.1)")
     advanced.add_argument("--language-model-only", action="store_true",
                           help="prepare no vision encoder and reject images; its weights and scratch become KV"
                                " pages (recipes with a separable encoder; default: the recipe's image support)")
