@@ -297,7 +297,12 @@ class PreparedDecoder:
         accumulation_buffers = None
         from b12x.comm.pcie import DmaAllReduce
 
-        if isinstance(runtime, DmaAllReduce):
+        if isinstance(runtime, DmaAllReduce) and getattr(runtime, "kimi_bf16_ring", False):
+            # Fable dig 2026-11-10: plain copy-engine ring with BF16 hop sums (one launch per reduction,
+            # no FP32 owner packets): 1.44 ms per 3072x7168 reduction and about half the graph nodes.
+            if mode != "prefill":
+                raise ValueError("Kimi copy-engine reductions are prepared only for prefill")
+        elif isinstance(runtime, DmaAllReduce):
             if mode != "prefill":
                 raise ValueError("Kimi copy-engine reductions are prepared only for prefill")
             count = min(source.numel(), runtime.max_bytes // 4)

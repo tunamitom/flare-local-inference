@@ -61,6 +61,7 @@ def prepare_variant(snapshot, plan, *, bootstrap, draft_repository, draft_revisi
         prefill_fp8_transport=plan.prefill_fp8_transport,
         prefill_island_reduce=plan.prefill_island_reduce,
         prefill_dma_ring_rows=int(os.environ.get("IGNITION_KIMI_PREFILL_DMA_ROWS", "0")),
+        prefill_dma_ring_bf16=os.environ.get("IGNITION_KIMI_PREFILL_DMA_BF16", "0") == "1",
         vision=not plan.language_model_only, **drafting)
     if plan.world_size == 1:
         return prepare_rank(snapshot, config, rank=0, group=None, progress=progress, package_storage=package_storage)
