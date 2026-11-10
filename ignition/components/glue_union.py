@@ -1,6 +1,19 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
+# ─────────────────────────────────────────────────────────────────────────────
+# PARKED (W11, radiance-mechanics review section 4 union ruling): this union
+# pattern is NOT on the path to the E2 bar and nothing executes it — ``pack``
+# and ``unpack`` have no call site in any graph, and ``fold_splitk_funnel`` has
+# been removed from ``ignition/recipes/kimi3/projections.py``. Its 20 CPU tests
+# never covered the union's real hazards (the review lists six: no graph
+# executes it, it would add copies if executed, Python counters stop at
+# capture, mixed dtypes through one uint8 staging region, capture-time races,
+# aliasing across rounds and ranks). The file is kept as history: do not wire
+# it back without a new consult. What survived of W10 is the
+# ``out=``/``count_out=`` compaction in ``ignition/components/distributed_topk.py``.
+# ─────────────────────────────────────────────────────────────────────────────
+
 """Union pattern for decode glue copies: hoisted strides/offsets, one copy each.
 
 The decode glue moves exchange and aggregation fields through per-call copies

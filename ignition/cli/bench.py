@@ -13,7 +13,7 @@ from ignition.errors import FlareError, PreparationError, UsageError
 
 from . import environment
 from .config import Configuration
-from .preparation import Host, context_parallel, derive, fetch, resolve_model, speculation, stream_overlap
+from .preparation import Host, context_parallel, derive, fetch, resolve_model, speculation, stream_overlap, switch_settings
 
 
 def _integers(text):
@@ -159,6 +159,7 @@ def run(args):
         prefill_dma_ring_rows=args.prefill_dma_ring_rows,
         prefill_dma_bf16=args.prefill_dma_bf16,
         trellis_prefill_shapes=args.trellis_prefill_shapes,
+        settings=switch_settings(args),
         language_model_only=args.language_model_only,
         mla_compute_mode=args.mla_compute_mode)
     plan = replace(plan, benchmark_selection=BenchmarkSelection(

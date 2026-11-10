@@ -50,6 +50,7 @@ def derive(configuration: Configuration, model: ResolvedModel, host: Host, *, gp
            prefill_island_reduce: bool = False,
            prefill_dma_ring_rows: int = 0, prefill_dma_bf16: bool = False,
            trellis_prefill_shapes: bool = False,
+           settings: "planning.Settings | None" = None,
            language_model_only: bool = False,
            compile_workers: int | None = None, tuning_gpus: str | None = None, autotune_effort: str | None = None, collective_tuning: str | None = None, collective_ladder=None,
            image_concurrency: int | None = None, mla_compute_mode: str | None = None,
@@ -73,6 +74,7 @@ def derive(configuration: Configuration, model: ResolvedModel, host: Host, *, gp
         prefill_dma_ring_rows=prefill_dma_ring_rows,
         prefill_dma_bf16=prefill_dma_bf16,
         trellis_prefill_shapes=trellis_prefill_shapes,
+        settings=settings,
         language_model_only=language_model_only, mla_compute_mode=mla_compute_mode)
     result = replace(result, compile_workers=workers, hub_cache=configuration.directory("hub_cache"),
                      autotune_effort=tuning_effort(configuration, autotune_effort),
@@ -135,6 +137,12 @@ def tuning_devices(plan, host, flag):
         if gpu.free_bytes < minimum:
             raise UsageError(f"tuning GPU {gpu.index} needs at least {minimum >> 20} MiB free for a model replica")
     return replace(plan, tuning_gpus=selected if len(selected) > count else ())
+
+
+def switch_settings(args) -> "planning.Settings":
+    """The W11 live switch state from the CLI flags (one source of truth)."""
+    return planning.Settings(atomic_splitk=args.atomic_splitk, route_fused_select=args.route_fused_select,
+                             dsa_lse_blocks=args.dsa_lse_blocks, decode_fusion=args.decode_fusion)
 
 
 def context_parallel(args, model: ResolvedModel) -> bool:

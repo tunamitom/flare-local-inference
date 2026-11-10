@@ -10,7 +10,6 @@ replaces the router all-gather, the separate top-k, and the latent all-reduce of
 """
 
 import itertools
-import os
 import weakref
 
 import torch
@@ -29,8 +28,15 @@ def route_fused_select():
     The fused ``all_gather_pair_kimi_topk`` surface exists but its kernel selects inside
     the gather for one row only; 2-8 rows need the batched kernel variant (see
     levers/w4-results.md). Default off keeps gather + prepared top-16 afterwards.
+
+    W11 env-to-flag fold: this is the ``--route-fused-select`` plan setting
+    (``planning.Settings.route_fused_select``), read through ``live_settings()``;
+    the legacy ``IGNITION_KIMI_ROUTE_FUSED_SELECT`` environment switch is refused
+    at plan time, naming the flag that replaced it.
     """
-    return os.environ.get("IGNITION_KIMI_ROUTE_FUSED_SELECT", "0") == "1"
+    from ignition.planning import live_settings
+
+    return live_settings().route_fused_select
 
 
 def create_route_runtime(group, device, *, ipc=None):

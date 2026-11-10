@@ -18,7 +18,7 @@ from ignition.preparation.collective_ladder import resolve as resolve_collective
 from . import display, environment
 
 from .preparation import (Host, collective_tuning_mode, compiler_workers, context_parallel, derive, fetch, image_capacity_setting, resolve_model, speculation,
-                          stream_overlap, tuning_devices, tuning_effort)
+                          stream_overlap, switch_settings, tuning_devices, tuning_effort)
 from .config import Configuration
 
 # Request bytes allowed per context token: JSON-escaped text (a \uXXXX escape takes six bytes per
@@ -203,6 +203,7 @@ def _export_hosts(args):
                          prefill_dma_ring_rows=args.prefill_dma_ring_rows,
                          prefill_dma_bf16=args.prefill_dma_bf16,
                          trellis_prefill_shapes=args.trellis_prefill_shapes,
+                         settings=switch_settings(args),
                          language_model_only=args.language_model_only,
                          mla_compute_mode=args.mla_compute_mode)
     collective_mode = collective_tuning_mode(configuration, model, args.collective_tuning)
@@ -291,6 +292,7 @@ def _prepare(args):
                       prefill_dma_ring_rows=args.prefill_dma_ring_rows,
                       prefill_dma_bf16=args.prefill_dma_bf16,
                       trellis_prefill_shapes=args.trellis_prefill_shapes,
+                      settings=switch_settings(args),
                       language_model_only=args.language_model_only,
                       mla_compute_mode=args.mla_compute_mode)
         indices = planning.format_gpus(gpu.index for gpu in plan.gpus)

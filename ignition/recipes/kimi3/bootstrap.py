@@ -352,7 +352,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         context = None
         if config.context_parallel and shard.world_size > 1:
             from .dcp import RECORD_BYTES, ContextParallel, ContextShards
-            from .dsa import SELECTION_ROWS, TOPK, decode_exchange_merge
+            from .dsa import SELECTION_ROWS, TOPK
 
             # Decode and verification gather every rank's absorbed E4M3 query heads and combine latent outputs.
             heads = weights.config.text["num_attention_heads"]
@@ -367,8 +367,10 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                 coordinator=coordinator,
                 peers=pool.share_pages(package_storage, group), slab=None,
                 candidates=(create_all_gather_runtime(group, device, max_rows=selection_rows,
-                    columns=((8 * TOPK + (heads // shard.world_size) * RECORD_BYTES) * shard.world_size // 2)
-                             if decode_exchange_merge() else 4 * TOPK * shard.world_size,
+                    # Shipped candidate wire (C1): rank-major FP32 score + int32 id pairs.
+                    # The killed R6 merged exchange sized these channels differently and is
+                    # unreachable (no switch exists).
+                    columns=4 * TOPK * shard.world_size,
                     ipc=package_storage.peer_storage) if sparse else None),
                 prefill_layout="query_split" if sparse else "dcp",
                 index_peers=pool.share_pages(package_storage, group, suffix=".index") if sparse else None,
@@ -380,15 +382,11 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                    for layer in weights.layers):
                 from ignition.components.peer_rows import SharedPeerRows
 
-                # R6 merged exchange: the index-query shard travels alone before the indexer
-                # (4 KiB gathered per row); otherwise the paired query exchange carries it
-                # beside the attention query as before.
-                query_channels = (
-                    dict(index_queries=create_all_gather_runtime(group, device, max_rows=selection_rows,
-                        columns=(32 // shard.world_size * 128 * 2) * shard.world_size // 2,
-                        ipc=package_storage.peer_storage)) if decode_exchange_merge()
-                    else dict(paired_queries=create_all_gather_runtime(group, device, max_rows=selection_rows,
-                        columns=(heads * RECORD_BYTES + 32 * 128 * 2)//2, ipc=package_storage.peer_storage)))
+                # Shipped paired query exchange (C1/C2): the killed R6 merged exchange
+                # (index-query shard alone before the indexer) is unreachable — no switch exists.
+                query_channels = dict(paired_queries=create_all_gather_runtime(group, device,
+                    max_rows=selection_rows,
+                    columns=(heads * RECORD_BYTES + 32 * 128 * 2)//2, ipc=package_storage.peer_storage))
                 context = replace(context, **query_channels,
                     index_exchange=SharedPeerRows(group, device, rows=config.prefill_chunk_size,
                         row_bytes=(32//shard.world_size)*132, ipc=package_storage.peer_storage))

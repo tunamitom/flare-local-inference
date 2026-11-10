@@ -60,6 +60,10 @@ def test_preparation_preserves_declared_context_above_estimated_physical_capacit
         headroom_bytes=0, reserve_bytes=0, online_mxfp8=True, stream_overlap=True,
         prefill_fp8_transport=False,
         prefill_island_reduce=False,
+        # W3 plan fields (the live-switch fold) and the W11 settings scope.
+        prefill_dma_ring_rows=0,
+        prefill_dma_bf16=False,
+        trellis_prefill_shapes=False,
         context_parallel=True, language_model_only=True)
     bootstrap = SimpleNamespace(PreparationConfig=config_type,
         prepare_rank=lambda snapshot, config, **kwargs: config)

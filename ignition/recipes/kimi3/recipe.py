@@ -60,13 +60,12 @@ def prepare_variant(snapshot, plan, *, bootstrap, draft_repository, draft_revisi
         stream_overlap=plan.stream_overlap, context_parallel=plan.context_parallel,
         prefill_fp8_transport=plan.prefill_fp8_transport,
         prefill_island_reduce=plan.prefill_island_reduce,
-        # W3 (R2/R5): plan settings are authoritative; the dig's environment
-        # switches keep working as fallbacks so old drivers reproduce the
-        # measured packages byte-for-byte.
-        prefill_dma_ring_rows=plan.prefill_dma_ring_rows
-            or int(os.environ.get("IGNITION_KIMI_PREFILL_DMA_ROWS", "0")),
-        prefill_dma_ring_bf16=plan.prefill_dma_bf16
-            or os.environ.get("IGNITION_KIMI_PREFILL_DMA_BF16", "0") == "1",
+        # W11 env-to-flag fold (radiance-mechanics review section 3): plan
+        # settings are the only source of truth. The legacy environment
+        # fallbacks are gone; check_switch_environment refuses them at plan time
+        # naming the flag that replaced each one.
+        prefill_dma_ring_rows=plan.prefill_dma_ring_rows,
+        prefill_dma_ring_bf16=plan.prefill_dma_bf16,
         vision=not plan.language_model_only, **drafting)
     if plan.trellis_prefill_shapes:
         # W3 (R3): the measured Trellis prefill launch shapes are selected at
@@ -74,10 +73,15 @@ def prepare_variant(snapshot, plan, *, bootstrap, draft_repository, draft_revisi
         # processes read this environment before compiling; recorded in the
         # plan settings by planning.Settings so the package cannot drift.
         os.environ["B12X_W4A16_PREFILL_SHAPES"] = "1"
-    if plan.world_size == 1:
-        return prepare_rank(snapshot, config, rank=0, group=None, progress=progress, package_storage=package_storage)
-    return prepare_group(snapshot, config, prepare_rank, progress=progress, package_storage=package_storage,
-                         checkpoint=plan.checkpoint)
+    from ignition import planning
+
+    # W11: components read the switch state from plan settings through
+    # live_settings(), never from the environment (section 3 item 1).
+    with planning.settings_scope(getattr(plan, "settings", None) or planning.Settings()):
+        if plan.world_size == 1:
+            return prepare_rank(snapshot, config, rank=0, group=None, progress=progress, package_storage=package_storage)
+        return prepare_group(snapshot, config, prepare_rank, progress=progress, package_storage=package_storage,
+                             checkpoint=plan.checkpoint)
 
 
 def usage(prepared):
@@ -113,9 +117,13 @@ RECIPE = Recipe(
     language_model_only=True,
     # vLLM's Kimi K3 launch settings for b12x's PCIe all-reduce (island reduce-scatter, deferred slab
     # consumption, 256 threads), its decode context exchange and its small-M W4A16 experts.
+    # B12X_W4A16_SMALL_M_SPLITK is the shipped split-K decode expert kernel switch (previously a
+    # driver environment variable; W11: kernel switches are recipe-declared, stamped before any
+    # kernel compiles and recorded in the plan settings, and the env guard accounts for them).
     b12x_environment=MappingProxyType({"B12X_PCIE_ALLREDUCE_ALGORITHM": "island_rs",
         "B12X_PCIE_HIERARCHICAL_DEFERRED_CONSUMPTION": "1", "B12X_PCIE_HIERARCHICAL_THREADS": "256",
-        "B12X_PCIE_DCP_THREADS": "512", "B12X_PCIE_DCP_BLOCK_LIMIT": "8", "B12X_W4A16_SMALL_M_HOST_BARRIER_RESET": "0"}),
+        "B12X_PCIE_DCP_THREADS": "512", "B12X_PCIE_DCP_BLOCK_LIMIT": "8", "B12X_W4A16_SMALL_M_HOST_BARRIER_RESET": "0",
+        "B12X_W4A16_SMALL_M_SPLITK": "1"}),
     # Target MLA pages are context-parallel; DSpark keeps its sliding KV windows in continuation rows.
     ranks=MappingProxyType({16: RankCosts(state_row_bytes=34_716_928, page_bytes=1_769_472,
                                         graph_bytes=9 << 29, page_tokens=128 * 16)}),

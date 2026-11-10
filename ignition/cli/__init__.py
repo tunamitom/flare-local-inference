@@ -268,6 +268,23 @@ def _preparation_arguments(running, *, model_default="defaults.model"):
                           help="select the measured Trellis prefill launch shapes (3 pipeline stages"
                                " at M>=2048, direct decode table at smaller M; bit-identical outputs,"
                                " decode graphs untouched; Kimi K3/K3.1)")
+    advanced.add_argument("--atomic-splitk", action="store_true",
+                          help="fold split-K GEMM partials into the BF16 output with atomics, dropping"
+                               " the split-K reduce launches (W4 R10b; Kimi K3/K3.1; numerics change:"
+                               " BF16 atomic rounding, unordered adds; rides the decode export with its"
+                               " calibration/fidelity gates; default: the FP32 split-K reduce)")
+    advanced.add_argument("--route-fused-select", action="store_true",
+                          help="fold the top-16 expert select into the route gather for 2-8 row batches"
+                               " (W4 R10a; Kimi K3; batched kernel variant; default: gather + prepared"
+                               " top-16 afterwards)")
+    advanced.add_argument("--dsa-lse-blocks", type=int, default=8,
+                          help="launch blocks for the DSA LSE reduce-scatter combine"
+                               " (Kimi K3/K3.1; default: 8)")
+    advanced.add_argument("--decode-fusion", action="store_true",
+                          help="replace the 8-kernel decode candidate pack with one compiled kernel"
+                               " writing straight into the operator's existing cursor buffer (W11 R9;"
+                               " Kimi K3/K3.1; select/copy/integer arithmetic, exact by construction;"
+                               " default: the shipped 8-kernel pack)")
     advanced.add_argument("--language-model-only", action="store_true",
                           help="prepare no vision encoder and reject images; its weights and scratch become KV"
                                " pages (recipes with a separable encoder; default: the recipe's image support)")

@@ -3,8 +3,6 @@
 
 """Gated Kimi DSA: learned selection over context-sharded FP8 keys and latent records."""
 
-import os
-
 import torch
 from b12x.attention import dense_mla
 
@@ -21,20 +19,21 @@ from .projections import prepare_projection
 SELECTION_ROWS = 32
 INDEX_HEADS, INDEX_DIM, TOPK = 32, 128, 2048
 
+# W11 (radiance-mechanics review section 3 item 6): the R6 exchange merge
+# (IGNITION_KIMI_DSA_EXCHANGE_MERGE) and the FP8 partials
+# (IGNITION_KIMI_DSA_LSE_FP8) are KILLED levers (J-3) and get NO flag. The
+# piggyback branches below are unreachable: no switch exists to construct them.
+# Setting either legacy name fails at plan time in
+# ``planning.check_switch_environment``, naming the kill. The LSE combine block
+# count is the live ``--dsa-lse-blocks`` plan setting (planning.Settings), read
+# through ``live_settings()`` — never the environment.
 
-def decode_exchange_merge():
-    """W4 R6: one exchange per decode DSA layer carries candidates and the attention query.
 
-    The index-query shard (partitioned index weights) still rides its own small gather
-    before the indexer; the attention query is only needed at attention time, so it moves
-    onto the candidate exchange. Default off keeps the paired query exchange.
-    """
-    return os.environ.get("IGNITION_KIMI_DSA_EXCHANGE_MERGE", "0") == "1"
+def _lse_combine_blocks():
+    """Launch blocks for the LSE reduce-scatter combine (plan setting ``--dsa-lse-blocks``)."""
+    from ignition.planning import live_settings
 
-
-def lse_combine_blocks():
-    """Launch blocks for the LSE reduce-scatter combine (W4 R6 shrink; default 8)."""
-    return int(os.environ.get("IGNITION_KIMI_DSA_LSE_BLOCKS", "8"))
+    return live_settings().dsa_lse_blocks
 
 
 class PreparedDSA:
@@ -51,14 +50,9 @@ class PreparedDSA:
                 latent=latent, peers=peers, index_peers=index_peers, eps=eps)
             return
         self.gathered_context = mode == "prefill" and context is not None and context.prefill_layout == "ckv"
-        self.merge_exchange = (decode_exchange_merge() and context is not None and not self.gathered_context
-                               and context.shards.world > 1)
-        # W10 R9: exchange + aggregation scratch from the process-local temporary
-        # (ignition/recipes/kimi3/e2_union.py). Off by default; the E2 union path
-        # refuses to construct while a killed lever switch (R6 merge, FP8 partials)
-        # is set.
-        from .e2_union import e2_union_enabled, exchange_aggregation_scratch
-        self.union_scratch = exchange_aggregation_scratch(query.device) if e2_union_enabled() else None
+        # Killed R6 lever: no switch exists (see the module header), the exchange
+        # merge never engages and the paired query exchange stays shipped.
+        self.merge_exchange = False
         self.context, self.peers = context, peers
         if self.gathered_context:
             if metadata.starts.numel() != 1 or peers is None or context.slab is None:
@@ -161,14 +155,14 @@ class PreparedDSA:
                         coordinator=coordinator, session=session, name=stage_name + ".gather_heads")
                 combine = PreparedLseReduceScatter(attended, lse, output[begin:end], runtime=context.heads,
                     session=session, coordinator=coordinator, name=stage_name + ".combine", threads=512,
-                    block_limit=lse_combine_blocks())
+                    block_limit=_lse_combine_blocks())
             else:
                 quantized = lse = None
             if self.shards.world > 1:
                 merge = PreparedDistributedTopK(local, scores, selected,
                     world=self.shards.world, rank=self.shards.index, runtime=context.candidates,
                     session=session, coordinator=coordinator, name=stage_name + ".candidates", buffers=cursor,
-                    workspace=workspace, scratch=self.union_scratch,
+                    workspace=workspace,
                     piggyback=((quantized.view(count, -1), q.view(count, -1))
                                if self.merge_exchange and quantized is not None else None))
             caps = dense_mla.Caps(device=device, mode="decode", q_dtype=q.dtype, kv_dtype=cache.dtype,
@@ -219,17 +213,15 @@ class PreparedDSA:
                 lengths = live.sum(1).to(torch.int32)
                 physical = torch.where(physical != torch.iinfo(torch.int32).max, physical, -1)
             else:
-                if self.union_scratch is not None:
-                    # W10 R9 copy-count elimination: the compaction kernel writes the
-                    # retained buffers directly, so the per-stage copy into
-                    # self.physical/self.counts disappears (one write per element).
-                    selected_local_records(selected, positions, pages, world=shards.world,
-                        rank=shards.owner, page_size=PAGE_TOKENS,
-                        out=self.physical[:count], count_out=self.counts[:count])
-                    physical = lengths = None
-                else:
-                    physical, lengths = selected_local_records(selected, positions, pages, world=shards.world,
-                        rank=shards.owner, page_size=PAGE_TOKENS)
+                # W11: the kept copy-count elimination — the compaction kernel
+                # writes the retained buffers directly, so the per-stage copy
+                # into self.physical/self.counts disappears (one write per
+                # element instead of two). Bytes beyond each row's count stay
+                # don't care (T17); consumers read [0, count) only.
+                selected_local_records(selected, positions, pages, world=shards.world,
+                    rank=shards.owner, page_size=PAGE_TOKENS,
+                    out=self.physical[:count], count_out=self.counts[:count])
+                physical = lengths = None
             if physical is not None:
                 self.physical[:count].copy_(physical)
                 self.counts[:count].copy_(lengths)

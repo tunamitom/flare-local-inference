@@ -10,7 +10,9 @@ prefix snapshots borrow KV backing while retained; an idle snapshot slot costs
 no physical memory. Active requests need at least 8,192 tokens each.
 """
 
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
+from contextvars import ContextVar
 import os
 from pathlib import Path
 
@@ -36,6 +38,129 @@ CACHE_STATES_PER_REQUEST = 8
 SUPPORTED_CAPABILITIES = ((10, 3), (12, 0), (12, 1))
 SUPPORTED_ARCHITECTURES = "SM103, SM120, or SM121"
 _GIB = 1 << 30
+
+
+@dataclass(frozen=True)
+class Settings:
+    """Live behavior switches: one source of truth, recorded in plan settings.
+
+    W11 env-to-flag fold (radiance-mechanics review section 3): every live switch
+    is a field here with a CLI flag, default off, recorded in the plan settings.
+    Recipes and components read these values through :func:`live_settings` (set
+    from the plan at preparation); they never read the environment. The legacy
+    ``IGNITION_KIMI_*`` names are refused at plan time by
+    :func:`check_switch_environment`, naming the flag that replaced each one.
+    """
+
+    atomic_splitk: bool = False
+    route_fused_select: bool = False
+    dsa_lse_blocks: int = 8
+    decode_fusion: bool = False
+
+    def to_dict(self) -> dict:
+        return {"atomic_splitk": self.atomic_splitk, "route_fused_select": self.route_fused_select,
+                "dsa_lse_blocks": self.dsa_lse_blocks, "decode_fusion": self.decode_fusion}
+
+    def __post_init__(self):
+        if type(self.dsa_lse_blocks) is not int or self.dsa_lse_blocks < 1:
+            raise UsageError("--dsa-lse-blocks must be a positive integer")
+
+
+_LIVE_SETTINGS: ContextVar = ContextVar("ignition_plan_settings", default=Settings())
+
+
+def live_settings() -> Settings:
+    """The active plan settings; every switch off until a plan says otherwise."""
+    return _LIVE_SETTINGS.get()
+
+
+@contextmanager
+def settings_scope(settings):
+    """Make ``settings`` the source of truth for preparation-time switch reads."""
+    token = _LIVE_SETTINGS.set(settings)
+    try:
+        yield settings
+    finally:
+        _LIVE_SETTINGS.reset(token)
+
+
+# Legacy environment switches and the flags that replaced them (W11 section 3).
+LEGACY_SWITCH_FLAGS = {
+    "IGNITION_KIMI_PREFILL_DMA_ROWS": "--prefill-dma-ring-rows",
+    "IGNITION_KIMI_PREFILL_DMA_BF16": "--prefill-dma-bf16",
+    "IGNITION_KIMI_ATOMIC_SPLITK": "--atomic-splitk",
+    "IGNITION_KIMI_ROUTE_FUSED_SELECT": "--route-fused-select",
+    "IGNITION_KIMI_DSA_LSE_BLOCKS": "--dsa-lse-blocks",
+    "IGNITION_KIMI_E2_UNION": "(removed: the union is parked and the compaction is always on)",
+    "IGNITION_KIMI_E2_R9_VARIANT": "(removed: the R9 allocation variants are deleted)",
+}
+
+# Killed levers get NO flag (J-3): the R6 exchange merge and the FP8 partials
+# are never re-enabled. The env guard that raises here is weaker than a switch
+# that does not exist; neither is folded into settings.
+KILLED_SWITCHES = ("IGNITION_KIMI_DSA_EXCHANGE_MERGE", "IGNITION_KIMI_DSA_LSE_FP8")
+
+# B12X_* kernel switches the plan accounts for: the recipe-declared b12x settings
+# (stamped by the documented dependency setup policy before any kernel compiles)
+# and the one stamped from plan settings as trellis_prefill_shapes does.
+B12X_INFRASTRUCTURE = ("B12X_COMPILE_CACHE_DIR",)
+B12X_TRELLIS = "B12X_W4A16_PREFILL_SHAPES"
+
+
+def check_switch_environment(recipe, settings: Settings, *, trellis_prefill_shapes: bool = False,
+                             environ=None) -> None:
+    """Refuse unaccounted ``IGNITION_KIMI_*``/``B12X_*`` environment switches.
+
+    The plan and the export driver are each one line of defense: nothing may
+    reach an export through the environment that the plan did not set. Legacy
+    ``IGNITION_KIMI_*`` names fail at plan time naming the flag that replaced
+    them; killed levers fail naming the kill; other ``IGNITION_KIMI_*`` or
+    ``B12X_*`` names fail as unaccounted (this closes the
+    ``B12X_PCIE_DMA_PIECES`` leak from J-1 risk 6).
+    """
+    import os
+    environ = os.environ if environ is None else environ
+    violations = []
+    accounted = set(recipe.b12x_environment) | set(B12X_INFRASTRUCTURE)
+    if trellis_prefill_shapes:
+        accounted.add(B12X_TRELLIS)
+    for name in sorted(environ):
+        if name.startswith("IGNITION_KIMI_"):
+            if name in KILLED_SWITCHES:
+                violations.append(f"{name}: killed lever (J-3); it is never re-enabled and has no flag")
+            elif name in LEGACY_SWITCH_FLAGS:
+                violations.append(f"{name}: legacy environment switch; use {LEGACY_SWITCH_FLAGS[name]}")
+            else:
+                violations.append(f"{name}: unaccounted environment switch; use CLI flags")
+        elif name.startswith("B12X_") and name not in accounted:
+            violations.append(f"{name}: B12X_* kernel switches are set from plan settings or recipe"
+                              " declarations before any kernel compiles; unset it")
+    if violations:
+        raise UsageError("unaccounted switch environment (W11 env-to-flag fold):\n  " + "\n  ".join(violations))
+
+
+def verify_recorded_settings(recorded: dict, expected: dict, *, fingerprints: dict | None = None) -> None:
+    """Post-export assertion: compare recorded settings with the driver's expected set.
+
+    ``recorded`` is the plan-settings record read back from the package or the
+    export log; ``expected`` is the driver's expected switch set; ``fingerprints``
+    carries physical fingerprints where one exists for a switch (slab sizes for
+    the prefill wires, the round-graph node count for decode fusion). Raises
+    ``UsageError`` listing every mismatch.
+    """
+    mismatched = []
+    for name, value in expected.items():
+        if name not in recorded:
+            mismatched.append(f"{name}: expected {value!r}, not recorded")
+        elif recorded[name] != value:
+            mismatched.append(f"{name}: recorded {recorded[name]!r}, expected {value!r}")
+    for name, value in (fingerprints or {}).items():
+        if name not in recorded:
+            mismatched.append(f"fingerprint {name}: expected {value!r}, not recorded")
+        elif recorded[name] != value:
+            mismatched.append(f"fingerprint {name}: recorded {recorded[name]!r}, expected {value!r}")
+    if mismatched:
+        raise UsageError("recorded settings disagree with the expected set:\n  " + "\n  ".join(mismatched))
 
 
 @dataclass(frozen=True)
@@ -220,6 +345,10 @@ class Plan:
     # (b12x B12X_W4A16_PREFILL_SHAPES=1 at compile time). Decode graphs are
     # untouched and stay bit-identical.
     trellis_prefill_shapes: bool = False
+    # W11 env-to-flag fold: the live switches (ATOMIC_SPLITK, ROUTE_FUSED_SELECT,
+    # DSA_LSE_BLOCKS, decode fusion) as one source of truth, recorded in the plan
+    # settings below.
+    settings: Settings = Settings()
     # The plan prepares no vision encoder and serves text requests only.
     language_model_only: bool = False
     benchmark_selection: BenchmarkSelection | None = None
@@ -291,6 +420,15 @@ class Plan:
                 raise UsageError("--prefill-dma-ring-rows cannot accompany --prefill-fp8-transport")
         if self.trellis_prefill_shapes and self.recipe.name not in ("kimi3", "kimi31"):
             raise UsageError("--trellis-prefill-shapes supports the Kimi K3/K3.1 recipes")
+        if self.recipe.name not in ("kimi3", "kimi31"):
+            switches = self.settings
+            if switches.atomic_splitk or switches.route_fused_select or switches.decode_fusion \
+                    or switches.dsa_lse_blocks != 8:
+                raise UsageError("--atomic-splitk/--route-fused-select/--dsa-lse-blocks/--decode-fusion"
+                                 " support the Kimi K3/K3.1 recipes")
+        # W11 section 3 item 4: the plan refuses unaccounted switch environment.
+        check_switch_environment(self.recipe, self.settings,
+                                 trellis_prefill_shapes=self.trellis_prefill_shapes)
 
     @property
     def world_size(self) -> int:
@@ -412,6 +550,13 @@ class Plan:
             "prefill_dma_ring_rows": self.prefill_dma_ring_rows,
             "prefill_dma_bf16": self.prefill_dma_bf16,
             "trellis_prefill_shapes": self.trellis_prefill_shapes,
+            # W11: the live switch state and the B12X_* kernel switches the plan
+            # stamps before any kernel compiles, recorded so a package cannot
+            # silently drift from its plan settings (J-1 risk 1).
+            "settings": {**self.settings.to_dict(),
+                         "b12x_environment": {**dict(self.recipe.b12x_environment),
+                                              **({"B12X_W4A16_PREFILL_SHAPES": "1"}
+                                                 if self.trellis_prefill_shapes else {})}},
             "speculation": None if self.speculation is None else {
                 "draft_tokens": self.speculation.draft_tokens, "adaptive": self.speculation.adaptive,
                 **({} if self.speculation.method is None else {"method": self.speculation.method}),
@@ -451,6 +596,7 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
         prefill_dma_ring_rows: int = 0,
         prefill_dma_bf16: bool = False,
         trellis_prefill_shapes: bool = False,
+        settings: Settings | None = None,
         language_model_only: bool = False, mla_compute_mode: str | None = None) -> Plan:
     """Size pages and the prefix cache to the supply; the result may not fit.
 
@@ -514,6 +660,7 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
                 prefill_dma_ring_rows=prefill_dma_ring_rows,
                 prefill_dma_bf16=prefill_dma_bf16,
                 trellis_prefill_shapes=trellis_prefill_shapes,
+                settings=Settings() if settings is None else settings,
                 language_model_only=language_model_only)
     available = plan.supply_bytes - plan.fixed_bytes
     target = min(CACHE_STATES_PER_REQUEST * concurrency, max(1, available // costs.state_row_bytes))
@@ -573,6 +720,7 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
         prefill_dma_ring_rows: int = 0,
         prefill_dma_bf16: bool = False,
         trellis_prefill_shapes: bool = False,
+        settings: Settings | None = None,
         language_model_only: bool = False, mla_compute_mode: str | None = None) -> Plan:
     """Select GPUs and size the plan, or raise a capacity error that lists working settings.
 
@@ -655,6 +803,7 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
                    prefill_dma_ring_rows=prefill_dma_ring_rows,
                    prefill_dma_bf16=prefill_dma_bf16,
                    trellis_prefill_shapes=trellis_prefill_shapes,
+                   settings=settings,
                    language_model_only=language_model_only,
                    mla_compute_mode=mla_compute_mode)
 

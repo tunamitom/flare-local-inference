@@ -1,3 +1,4 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
@@ -11,6 +12,81 @@ from .candidate_merge import PreparedCandidateMerge
 from .collectives import PreparedAllGather
 
 
+# -- W11 fused pack (radiance-mechanics review section 1 "Corrected mechanics") ----
+#
+# The shipped pack writes the score/ID pairs with 8 dispatched kernels per call
+# (ge, where, copy, cast, mul, add, where, copy). The fused pack replaces them
+# with one small compiled kernel that reads ``indices``, ``scores`` and ``rank``
+# and writes the pairs straight into the operator's existing ``self.local``
+# cursor buffer (``buffers.zeros``, the ``GraphBufferPool`` pattern used by
+# ``_records``). It is select, copy and integer arithmetic only, so it is exact
+# by construction, and it allocates nothing: no process-local temporary and no
+# registry (threat rows T11-T13). Gate: ``decode_fusion`` (planning.Settings,
+# default off keeps the shipped 8-kernel pack bit for bit).
+
+
+def _pack_pairs_reference(local, indices, scores, rank, world):
+    """CPU semantics of ``_pack_pairs``: the same select/copy/integer arithmetic.
+
+    Dead entries (``indices < 0``) pack as score ``-inf`` and ID ``-1``; live
+    entries pack as their FP32 score and ``int64(index) * world + rank`` narrowed
+    to int32 bits in the second slot (C1: rank-major, FP32 score and int32 id).
+    Ties are plain byte copies, so equal scores on different ranks pack
+    symmetrically (C3).
+    """
+    live = indices >= 0
+    packed = indices.to(torch.int64).mul_(world).add_(rank)
+    packed.masked_fill_(~live, -1)
+    local.view(torch.int32)[:, :, 1].copy_(packed)
+    local[:, :, 0].copy_(torch.where(live, scores, -torch.inf))
+
+
+@triton.jit
+def _pack_pairs(Indices, Scores, Rank, Local, Ids,
+                WIDTH: tl.constexpr, WORLD: tl.constexpr, BLOCK: tl.constexpr,
+                TENSOR_RANK: tl.constexpr, STATIC_RANK: tl.constexpr):
+    row = tl.program_id(0)
+    col = tl.arange(0, BLOCK)
+    mask = col < WIDTH
+    index = tl.load(Indices + row*WIDTH + col, mask=mask, other=-1)
+    score = tl.load(Scores + row*WIDTH + col, mask=mask, other=0.0)
+    rank = STATIC_RANK
+    if TENSOR_RANK:
+        rank = tl.load(Rank)
+    live = mask & (index >= 0)
+    slot = (row*WIDTH + col)*2
+    tl.store(Local + slot, tl.where(live, score, -float('inf')), mask=mask)
+    tl.store(Ids + slot + 1,
+             tl.where(live, (index.to(tl.int64)*WORLD + rank).to(tl.int32), -1), mask=mask)
+
+
+@torch.library.custom_op("ignition::pack_score_id_pairs", mutates_args=("local",))
+def pack_score_id_pairs(local: torch.Tensor, indices: torch.Tensor, scores: torch.Tensor,
+                        rank: torch.Tensor, world: int) -> None:
+    """One compiled kernel replacing the 8-kernel pack (``decode_fusion``).
+
+    Writes score/ID pairs straight into ``local``, an existing cursor buffer:
+    it allocates nothing and re-views no storage across element sizes. The CUDA
+    body launches ``_pack_pairs`` (one kernel = one round-graph node per call);
+    the CPU body runs the same arithmetic for the CPU tests.
+    """
+    if (local.stride() != (local.shape[1] * 2, 2, 1) or indices.stride() != (indices.shape[1], 1)
+            or scores.stride() != indices.stride()):
+        raise ValueError("fused pack requires contiguous row-major pair, index and score tensors")
+    if local.is_cuda:
+        rows, width = indices.shape
+        torch.library.wrap_triton(_pack_pairs)[(rows,)](
+            indices, scores, rank, local, local.view(torch.int32),
+            width, world, triton.next_power_of_2(width), True, 0, num_warps=8)
+    else:
+        _pack_pairs_reference(local, indices, scores, rank, world)
+
+
+@pack_score_id_pairs.register_fake
+def _pack_score_id_pairs_fake(local, indices, scores, rank, world):
+    pass
+
+
 class PreparedDistributedTopK:
     """Merge each rank's local top-k into global logical positions.
 
@@ -19,20 +95,23 @@ class PreparedDistributedTopK:
     Candidate IDs travel as integer bits alongside FP32 scores; the collective transports bytes.
     Missing local positions have score -inf and ID -1. All ranks receive identical candidates.
 
+    ``decode_fusion`` (W11, default off) swaps the 8-kernel pack for the single
+    compiled ``_pack_pairs`` kernel writing straight into ``self.local``. The wire
+    boundary is unchanged (C1: same tensors, addresses, layout and launch position
+    relative to the collective; C2: no collective is constructed, replaced or
+    reordered — the killed R6 merge and FP8 partials stay off).
+
     With ``piggyback=(local_query, gathered_query)`` the candidate exchange also carries
     the caller's query bytes in the same launch: one exchange and one rank barrier replace
-    the separate query gather and the candidate gather (W4 R6). The piggybacked fields are
+    the separate query gather and the candidate gather. The piggybacked fields are
     packed rank-major beside each rank's candidates and split back out after the exchange,
-    so the merged candidate layout is unchanged.
-
-    ``scratch`` (W10 R9) is a ``GlueScratch`` over the process-local temporary for the
-    decode glue: the exchange packing and aggregation views are carved at preparation and
-    the round loop allocates nothing (R9 threat T3/T4). Default ``None`` keeps the
-    original per-call allocation path bit for bit.
+    so the merged candidate layout is unchanged. This is the killed R6 lever (J-3):
+    no switch exists to construct it, the branch is unreachable and the 4-byte
+    ``DmaAllReduce`` wire stays banned (threat T6).
     """
 
     def __init__(self, indices, scores, output, *, world, rank, runtime, session, coordinator,
-                 name, buffers, workspace, piggyback=None, scratch=None):
+                 name, buffers, workspace, piggyback=None, decode_fusion=None):
         if (indices.ndim != 2 or indices.dtype != torch.int32 or scores.shape != indices.shape
                 or scores.dtype != torch.float32 or output.shape != indices.shape or output.dtype != indices.dtype
                 or world < 2 or rank.shape != (1,) or rank.dtype != torch.int64):
@@ -42,11 +121,11 @@ class PreparedDistributedTopK:
         self.world, self.rank = world, rank
         self.local = buffers.zeros((rows, self.topk, 2), torch.float32)
         self.gathered = buffers.zeros((rows, world * self.topk, 2), torch.float32)
-        self._live = self._packed_ids = None
-        if scratch is not None:
-            # W10 R9: exchange + aggregation scratch from the process-local temporary.
-            self._live = scratch.zeros(name + ".live", (rows, self.topk), torch.bool)
-            self._packed_ids = scratch.zeros(name + ".packed_ids", (rows, self.topk), torch.int64)
+        if decode_fusion is None:
+            from ignition.planning import live_settings
+
+            decode_fusion = live_settings().decode_fusion
+        self.decode_fusion = bool(decode_fusion)
         self.merge = PreparedCandidateMerge(self.gathered, output, session=session,
             workspace=workspace, name=name + ".merge")
         self.paired = self.collective = None
@@ -71,21 +150,14 @@ class PreparedDistributedTopK:
             self.piggyback_second = local_query
 
     def __call__(self):
-        if self._live is None:
+        if self.decode_fusion:
+            pack_score_id_pairs(self.local, self.indices, self.scores, self.rank, self.world)
+        else:
+            # Shipped pack: 8 dispatched kernels per call.
             live = self.indices >= 0
             self.local[:, :, 0].copy_(torch.where(live, self.scores, -torch.inf))
             self.local.view(torch.int32)[:, :, 1].copy_(
                 torch.where(live, self.indices.long() * self.world + self.rank, -1))
-        else:
-            # W10 R9: the same values via the process-local scratch — zero per-call
-            # allocation, identical arithmetic (int64 chain, then the same casts).
-            torch.ge(self.indices, 0, out=self._live)
-            scores = self.local[:, :, 0]
-            scores.copy_(self.scores)
-            scores.masked_fill_(~self._live, -torch.inf)
-            self._packed_ids.copy_(self.indices)
-            self._packed_ids.mul_(self.world).add_(self.rank).masked_fill_(~self._live, -1)
-            self.local.view(torch.int32)[:, :, 1].copy_(self._packed_ids)
         if self.paired is not None:
             self.paired(self.piggyback_first, self.piggyback_second)
         else:
@@ -122,28 +194,43 @@ def _records(Selected, Positions, Pages, Rank, Output, Counts,
     tl.store(Counts + row, count)
 
 
+def _shares_storage(tensor, others):
+    storage = tensor.untyped_storage()
+    return any(storage.data_ptr() == other.untyped_storage().data_ptr() for other in others)
+
+
 def selected_local_records(selected, positions, pages, *, world, rank, page_size, out=None, count_out=None):
     """Compact selected global positions into this rank's physical records.
 
     ``pages`` is a model-page table per query row. The selected positions are independently
     bounded by that row's causal position; negative positions denote inactive rows.
 
-    ``out``/``count_out`` (W10 R9 copy-count elimination) are the caller's retained
-    buffers: when given, the compaction kernel writes them directly and the caller's
-    follow-up copy disappears (one write per element instead of two). Default ``None``
-    allocates exactly as before.
+    ``out``/``count_out`` are the caller's retained buffers: when given, the compaction
+    kernel writes them directly and the caller's follow-up copy disappears (one write per
+    element instead of two — the kept copy-count elimination). Default ``None`` allocates
+    exactly as before.
+
+    T17 (radiance-mechanics review): ``out`` and ``count_out`` must not alias or share
+    storage with ``selected``, ``positions`` or ``pages`` (or with each other) — ``out=``
+    aliasing an input of the same kernel is undefined. Bytes beyond each row's ``count``
+    are stale or ``-1`` and stay **don't care** for every consumer: consumers read
+    exactly ``[0, count)`` records and nothing past them.
     """
     if out is None:
         output = torch.empty_like(selected, memory_format=torch.contiguous_format)
     else:
         if out.shape != selected.shape or out.dtype != selected.dtype or not out.is_contiguous():
             raise ValueError("out must be a contiguous buffer matching selected")
+        if out.data_ptr() == selected.data_ptr() or _shares_storage(out, (selected, positions, pages)):
+            raise ValueError("out must not overlap selected, positions or pages (T17)")
         output = out
     if count_out is None:
         count = torch.empty((selected.shape[0],), dtype=torch.int32, device=selected.device)
     else:
         if count_out.shape != (selected.shape[0],) or count_out.dtype != torch.int32 or not count_out.is_contiguous():
             raise ValueError("count_out must be a contiguous int32 buffer with one entry per row")
+        if count_out.data_ptr() == output.data_ptr() or _shares_storage(count_out, (selected, positions, pages, output)):
+            raise ValueError("count_out must not overlap out, selected, positions or pages (T17)")
         count = count_out
     tensor_rank = isinstance(rank, torch.Tensor)
     torch.library.wrap_triton(_records)[(selected.shape[0],)](
