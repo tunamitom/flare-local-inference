@@ -10,6 +10,7 @@ replaces the router all-gather, the separate top-k, and the latent all-reduce of
 """
 
 import itertools
+import os
 import weakref
 
 import torch
@@ -20,6 +21,16 @@ from ignition.preparation.tuning import declare
 MAX_ROWS = 8
 _OWNERS = weakref.WeakValueDictionary()
 _HANDLES = itertools.count()
+
+
+def route_fused_select():
+    """W4 R10a: fold the top-16 expert select into the route gather for every batch width.
+
+    The fused ``all_gather_pair_kimi_topk`` surface exists but its kernel selects inside
+    the gather for one row only; 2-8 rows need the batched kernel variant (see
+    levers/w4-results.md). Default off keeps gather + prepared top-16 afterwards.
+    """
+    return os.environ.get("IGNITION_KIMI_ROUTE_FUSED_SELECT", "0") == "1"
 
 
 def create_route_runtime(group, device, *, ipc=None):
@@ -59,13 +70,19 @@ class PreparedRouteGather:
         self.runtime, self.rows = runtime, rows
         self.local_down, self.local_router, self.correction_bias = local_down, local_router, correction_bias
         self.latent, self.weights, self.ids = latent, weights, ids
+        self.fused_select = rows == 1 or route_fused_select()
         ranks = tuple(dist.get_process_group_ranks(runtime.exchange_group))
         requests = []
-        if rows == 1:
+        if self.fused_select:
             self.fused = dict(local_down=local_down, local_router=local_router, correction_bias=correction_bias,
                               out_down=latent, topk_weights=weights, topk_ids=ids)
-            self.plan = pcie.plan(pcie.query_from_runtime(runtime, surface="DcpAllToAll.all_gather_pair_kimi_topk",
-                                                          call=self.fused), runtime=runtime)
+            try:
+                self.plan = pcie.plan(pcie.query_from_runtime(runtime, surface="DcpAllToAll.all_gather_pair_kimi_topk",
+                                                              call=self.fused), runtime=runtime)
+            except Exception as error:
+                raise RuntimeError("IGNITION_KIMI_ROUTE_FUSED_SELECT needs the batched all_gather_pair_kimi_topk "
+                                   "surface (select fused inside the gather for 2-8 rows, W4 R10a); this b12x "
+                                   "build accepts one row only") from error
             requests.append(self.plan.request(name=name, prepare_call=lambda state: PreparedCall(
                 run=lambda: state.run(**self.fused), output=latent, owners=(runtime, latent, weights, ids)),
                 collective=CollectiveRequirement(key=name, ranks=ranks)))
@@ -98,7 +115,7 @@ def _route_gather(local_down: torch.Tensor, local_router: torch.Tensor, latent: 
                   weights: torch.Tensor, ids: torch.Tensor, handle: int) -> None:
     owner = _OWNERS[handle]
     runtime = owner.runtime
-    if owner.rows == 1:
+    if owner.fused_select:
         runtime.all_gather_pair_kimi_topk(local_down, local_router, owner.correction_bias, latent, weights, ids,
                                           plan=owner.plan)
         return
