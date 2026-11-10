@@ -1,0 +1,41 @@
+[Unit]
+# Kimi-K3.1-Pro EXL3-2bit `smart` (:8001) — FLARE TP8 on switches B+D.
+#
+# Spec: /home/tom/kimi31-exl3/TP8-CONFIG-PLAN.md (revision 2, 2026-11-09).
+# Package: our own export of /storage/models/Kimi-K3.1-Pro-EXL3-2bit on tree
+#   /home/tom/build/flare-k31exl3 branch kimi31-exl3-turin (voipmonitor release
+#   01327bf2 + token-wise block verification), FlashInfer 6a842a7d. TP8/DCP8, c4,
+#   DFlash2 K7, vision 65,536 patches, prefill chunk 3072, 262,144 tokens/request,
+#   online MXFP8 dense, autotuned on B+D. Locally built => development publisher,
+#   so the launcher passes the two --dangerously-* trust flags.
+# Runtime: local/flare:rt-k31exl3-<sha>, pinned by docker ID in the launcher.
+#
+# Installed DISABLED: the owner boots it supervised (dev-box rule). It conflicts
+# with every other :8001 tenant and with kimi.service (TP16 took B+D too). It must
+# NOT conflict with mimo-pro.service (`fast`, A+C, :8002), which keeps running.
+Description=Kimi-K3.1-Pro EXL3-2bit `smart` (:8001) — FLARE TP8 (turin, switches B+D)
+Conflicts=shutdown.target kimi.service ds41f-flare.service glm53.service
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+RequiresMountsFor=/opt/models /dockers
+
+[Service]
+Type=simple
+# House convention: a failed boot stays down for inspection.
+Restart=no
+LimitMEMLOCK=infinity
+LimitNOFILE=1048576
+TimeoutStartSec=3600
+# The launcher resolves the 8 switch-port buses by PCI root port (fail-closed); it
+# needs the driver fabric present first. It docker-rm -f's the name and refuses a
+# busy :8001, so a stale container can never be silently taken over.
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 60); do [ -e /dev/nvidia-uvm ] && [ "$(nvidia-smi -L 2>/dev/null | wc -l)" -ge 16 ] && exit 0; sleep 5; done; echo "GPU fabric not ready (uvm + >=16 GPUs)"; exit 1'
+ExecStartPre=/bin/bash -c 'DETACH=1 /bin/bash /opt/kimi31-exl3/start-kimi31-exl3.sh'
+ExecStart=/bin/bash -c 'exit "$(docker wait kimi31-exl3)"'
+# NEVER kill a live 8-way serve: docker stop -t 90 lets ranks shut down (the
+# author asks for 90 s); a SIGKILL leaves cards pinned with no process.
+ExecStop=/usr/bin/docker stop -t 90 kimi31-exl3
+
+[Install]
+WantedBy=multi-user.target

@@ -15,6 +15,9 @@
 #     bash tools/export-kimi31-exl3.sh --check   # guards + planner dry-run, creates nothing
 #     bash tools/export-kimi31-exl3.sh --image   # the runtime image (docker build, pinned by ID)
 #     bash tools/export-kimi31-exl3.sh --detach  # the export (graph-only --reuse-weights)
+#     REUSE_WEIGHTS=0 … --detach                 # FULL export without --reuse-weights
+#                                                # (weights from the source checkpoints; see README.md)
+#   Share story + serve copies: README.md, tools/serve/README.md.
 #   Requires the EXL3-2bit checkpoint + DFlash2 draft at the CKPT/DRAFT paths below (or
 #   override via env) and the box's 8 B+D GPUs.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -265,9 +268,9 @@ if [ "$MODE" = --image ]; then
   chk test -z "$(git -C "$REPO" status --porcelain 2>/dev/null)" || say "GUARD: tree dirty"
   chk git -C "$REPO" merge-base --is-ancestor "$EXPECT_HEAD" HEAD 2>/dev/null \
     || say "GUARD: merged tip $EXPECT_HEAD is not an ancestor of HEAD"
-  chk test -z "$(git -C "$REPO" diff --name-only "$EXPECT_HEAD" HEAD -- ':!tools' 2>/dev/null)" \
+  chk test -z "$(git -C "$REPO" diff --name-only "$EXPECT_HEAD" HEAD -- ':!tools' ':!README.md' 2>/dev/null)" \
     || say "GUARD: non-tools diff against pinned merged tip $EXPECT_HEAD"
-  chk test -z "$(git -C "$REPO" diff --name-only "$EXPECT_EXPORT_SRC" HEAD -- ':!helios' ':!tools' 2>/dev/null)" \
+  chk test -z "$(git -C "$REPO" diff --name-only "$EXPECT_EXPORT_SRC" HEAD -- ':!helios' ':!tools' ':!README.md' 2>/dev/null)" \
     || say "GUARD: export-consumed files drift from the pinned export tree $EXPECT_EXPORT_SRC"
   chk test -z "$(git -C "$REPO" diff --name-only "$EXPECT_IMAGE_SRC" HEAD -- "${IMAGE_PATHS[@]}" 2>/dev/null)" \
     || say "GUARD: image inputs drift from the pinned image tree $EXPECT_IMAGE_SRC"
@@ -307,13 +310,14 @@ chk test -f "$CONFIG"          || say "GUARD: config $CONFIG missing"
 chk test -x "$PYV" || say "GUARD: venv missing ($PYV)"
 chk git -C "$REPO" merge-base --is-ancestor "$EXPECT_HEAD" HEAD 2>/dev/null \
   || say "GUARD: export tree $EXPECT_HEAD is not an ancestor of HEAD"
-chk test -z "$(git -C "$REPO" diff --name-only "$EXPECT_HEAD" HEAD -- ':!tools' 2>/dev/null)" \
+chk test -z "$(git -C "$REPO" diff --name-only "$EXPECT_HEAD" HEAD -- ':!tools' ':!README.md' 2>/dev/null)" \
   || say "GUARD: non-tools diff against pinned export tree $EXPECT_HEAD"
 # W13 lineage guards: the tree must reproduce the exact code the running serve's
 # package export (b8dcebb5) and runtime image build (5585a9a7) consumed. The
-# export side excludes helios (the export never reads it; the image build does),
-# the image side is exactly the Dockerfile COPY input set.
-chk test -z "$(git -C "$REPO" diff --name-only "$EXPECT_EXPORT_SRC" HEAD -- ':!helios' ':!tools' 2>/dev/null)" \
+# export side excludes helios (the export never reads it; the image build does)
+# plus tools/ and README.md (driver + documentation, W15); the image side is
+# exactly the Dockerfile COPY input set.
+chk test -z "$(git -C "$REPO" diff --name-only "$EXPECT_EXPORT_SRC" HEAD -- ':!helios' ':!tools' ':!README.md' 2>/dev/null)" \
   || say "GUARD: export-consumed files drift from the pinned export tree $EXPECT_EXPORT_SRC"
 chk test -z "$(git -C "$REPO" diff --name-only "$EXPECT_IMAGE_SRC" HEAD -- "${IMAGE_PATHS[@]}" 2>/dev/null)" \
   || say "GUARD: image inputs drift from the pinned image tree $EXPECT_IMAGE_SRC"
@@ -395,7 +399,7 @@ if [ "$MODE" = --detach ]; then
   sudo -n systemd-run --unit="$unit" --collect --uid=tom --gid=tom \
     --setenv=HOME=/home/tom --setenv=USER=tom --setenv=EXPORT_TS="$TS" --setenv=EXPORT_LOG="$LOG" \
     --setenv=PREFILL_ISLAND="$PREFILL_ISLAND" --setenv=IMAGE_CONCURRENCY="$IMAGE_CONCURRENCY" \
-    --setenv=PYTHONPATH="$PYTHONPATH" --setenv=B12X_W4A16_SMALL_M_SPLITK=1 --setenv=PREFILL_FP8="$PREFILL_FP8" --setenv=SPEC_TOKEN_CAPACITY="$SPEC_TOKEN_CAPACITY" \
+    --setenv=PYTHONPATH="$PYTHONPATH" --setenv=B12X_W4A16_SMALL_M_SPLITK=1 --setenv=PREFILL_FP8="$PREFILL_FP8" --setenv=SPEC_TOKEN_CAPACITY="$SPEC_TOKEN_CAPACITY" --setenv=REUSE_WEIGHTS="$REUSE_WEIGHTS" \
     -p LimitNOFILE=1048576 -p LimitMEMLOCK=infinity --working-directory="$REPO" \
     /bin/bash "$SELF" --run
   say "detached unit: $unit   log: $LOG   follow: journalctl -u $unit -f / tail -f $LOG"
