@@ -320,6 +320,24 @@ impl RequestScheduler {
         if kind == GraphKind::ScoredPrefill { &self.scored_prefill_catalog } else { &self.prefill_catalog }
     }
 
+    /// Chunk-rule scope: with no other lane competing, one request's prefill
+    /// chunking is a function of prompt length alone
+    /// (`cost::deterministic_prefill_capacity`). Any second live request is a
+    /// competing lane, so under concurrency the catalog competes as before and
+    /// decode interleaving is unaffected.
+    fn deterministic_prefill_capacity(&self, kind: GraphKind, mask: u64) -> Option<usize> {
+        if !kind.is_prefill() || mask.count_ones() != 1 {
+            return None;
+        }
+        let competing = self.slots.iter().filter(|entry| entry.request.is_some()).count();
+        if competing != 1 {
+            return None;
+        }
+        let r = self.slots[mask.trailing_zeros() as usize].request.as_ref().unwrap();
+        let remaining = self.prefill_work(r, usize::MAX);
+        cost::deterministic_prefill_capacity(self.prefill_catalog(kind), remaining)
+    }
+
     pub(super) fn prefill_work(&self, request: &LiveRequest, capacity: usize) -> usize {
         let start = request.consumed_tokens as usize;
         let mut end = request
@@ -961,6 +979,12 @@ impl RequestScheduler {
                 continue;
             }
             if kind.is_prefill() {
+                // Chunk rule (J-4b): solo prefill chunking is a function of
+                // prompt length alone; the measured catalog must not choose.
+                if let Some(capacity) = self.deterministic_prefill_capacity(kind, mask) {
+                    self.add_candidate(output, kind, 1, capacity, mask, values, age_price);
+                    continue;
+                }
                 for &capacity in self.prefill_catalog(kind) {
                     self.add_candidate(output, kind, 1, capacity, mask, values, age_price);
                 }
@@ -1016,6 +1040,18 @@ impl RequestScheduler {
                 let kind = self.request_kind(r);
                 match kind {
                     Some(GraphKind::Prefill) if self.prefill_work(r, prefill) > 0 => {
+                        // Chunk rule (J-4b): a solo prompt's chunking is a
+                        // function of prompt length alone. A mixed shape may
+                        // carry the chunk only when its prefill row IS the
+                        // deterministic chunk graph; any other fixed prefill
+                        // capacity would cut the prompt by measured preference.
+                        if let Some(capacity) =
+                            self.deterministic_prefill_capacity(GraphKind::Prefill, 1 << slot)
+                        {
+                            if prefill != capacity {
+                                continue;
+                            }
+                        }
                         if duration_ns == 0 && self.mixed_catalog.iter().any(|&(b, w, smaller)| {
                             b == batch && w == width && smaller < prefill
                                 && self.prefill_work(r, smaller) == self.prefill_work(r, prefill)
