@@ -216,3 +216,50 @@ def test_prefill_island_reduce_flag_states_select_the_reduction_channel(monkeypa
         replace(config, devices=tuple(range(16)), prefill_island_reduce=True)
     with pytest.raises(ValueError, match="mutually exclusive"):
         replace(config, prefill_island_reduce=True, prefill_fp8_transport=True)
+
+
+@pytest.mark.parametrize(("rows", "pushed", "fused"),
+                         ((1, True, True), (4, True, True), (8, True, True),
+                          (1, False, True), (4, False, False), (8, False, False)))
+def test_route_gather_selects_inside_a_pushed_paired_exchange(monkeypatch, rows, pushed, fused):
+    """W22 row 1 (world 8): the fused route exchange is used when b12x plans the paired
+    exchange as a push (up to PAIR_PUSH_MAX_ROWS rows), and always for one row, as before."""
+    import sys
+    import torch
+    from types import SimpleNamespace
+    from b12x.comm import pcie
+    from ignition.recipes.kimi3 import routing
+
+    down_width, router_width = 3584 // 8, 896 // 8
+    runtime = SimpleNamespace(world_size=8, query_head_dim=2 * down_width + 4 * router_width,
+                              exchange_group=object())
+    declared, planned = [], []
+    plan = SimpleNamespace(request=lambda **kwargs: kwargs["name"])
+
+    def query(runtime, *, surface, call):
+        # b12x marks the paired surfaces of a push plan; other surfaces carry no transport.
+        pair = surface.endswith(("all_gather_pair", "all_gather_pair_kimi_topk"))
+        return SimpleNamespace(surface=surface, call={"pair_transport": "push"} if (pair and pushed) else {})
+
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda group: tuple(range(8)))
+    monkeypatch.setattr(pcie, "query_from_runtime", query)
+    monkeypatch.setattr(pcie, "plan", lambda query, *, runtime: planned.append(query.surface) or plan)
+    monkeypatch.setattr(routing, "declare", lambda session, requests, **kwargs: declared.extend(requests))
+    monkeypatch.setitem(sys.modules, "b12x.comm.pcie.pcie_dcp_a2a", SimpleNamespace(PAIR_PUSH_MAX_ROWS=8))
+
+    gather = routing.PreparedRouteGather(
+        torch.zeros((rows, down_width), dtype=torch.bfloat16),
+        torch.zeros((rows, router_width), dtype=torch.float32), torch.zeros(896, dtype=torch.float32),
+        torch.zeros((rows, 3584), dtype=torch.bfloat16), torch.zeros((rows, 16), dtype=torch.float32),
+        torch.zeros((rows, 16), dtype=torch.int32), runtime=runtime, session=None, coordinator=None,
+        name="route")
+
+    if fused:
+        # One exchange gathers the shards and selects: no separate selection launch.
+        assert gather.fused is not None
+        assert planned == ["DcpAllToAll.all_gather_pair_kimi_topk"] and declared == ["route"]
+    else:
+        # Without a push plan two rows and above keep the paired exchange + prepared top-16.
+        assert gather.fused is None
+        assert planned == ["DcpAllToAll.all_gather_pair", "DcpAllToAll.kimi_topk16"]
+        assert declared == ["route/gather", "route/select"]
