@@ -1,10 +1,19 @@
 #!/usr/bin/env bash
-# kimi31-exl3-live: THE single branch that exports the CURRENT RUNNING SERVE.
-#   Package: gb202-tp8-202611100532 (smart on :8001 as of 2026-11-10) = this tree (160832b9)
-#   + flashinfer levers/prefill-shapes (0aa09dd61, auto-cloned from the fork if missing).
-#   Measured: prefill 8k 2,117 / 32k 2,312 tok/s, mid-size TTFT -26/-29%, pool 1,222,656,
-#   max context 310,272 (owner rule: ~1/3 of pool). Reproduce:
+# kimi31-exl3-live: THE single branch that reproduces the CURRENT RUNNING SERVE —
+# package AND image (W13 live-branch rule).
+#   Package: gb202-tp8-202611100809 (E1.1, smart on :8001) = this merged tree
+#   (EXPECT_HEAD = the E1.1 export lineage b8dcebb5 merged with the chunkfix image
+#   lineage 5585a9a7) + flashinfer levers/prefill-shapes (0aa09dd61, auto-cloned
+#   from the fork if missing). Export config: ring rows 1024 + BF16 + trellis +
+#   island, split-K decode (B12X_W4A16_SMALL_M_SPLITK=1, B12X_PCIE_DMA_PIECES
+#   unset), recipe context 396,288 (W8/J-4 section 4).
+#   Image: local/flare:rt-k31exl3-chunkfix-5585a9a7 (container kimi31-exl3) — the
+#   chunkfix lineage @ 5585a9a7 on the 35134e2b image tree, built from this same
+#   merged tree by --image, pinned by image ID
+#   sha256:50bda5a7f78e113cee8a7e566f156ecd50f307408a401f1d3256dd338dd0db0c.
+#   Reproduce:
 #     bash tools/export-kimi31-exl3.sh --check   # guards + planner dry-run, creates nothing
+#     bash tools/export-kimi31-exl3.sh --image   # the runtime image (docker build, pinned by ID)
 #     bash tools/export-kimi31-exl3.sh --detach  # the export (graph-only --reuse-weights)
 #   Requires the EXL3-2bit checkpoint + DFlash2 draft at the CKPT/DRAFT paths below (or
 #   override via env) and the box's 8 B+D GPUs.
@@ -14,8 +23,8 @@
 # FlashInfer 6a842a7d (editable, leads PYTHONPATH). GPUs resolved topologically (B then D) by
 # /opt/mimo-pro/flare-bd/gpu-select.py. The watchdog only logs: a running export is never interrupted.
 #
-# WHAT THIS DRIVER NOW REPRODUCES (lever W1 sync, 2026-11-10): the live package
-# gb202-tp8-202611100247 exactly — the defaults below are the measured config:
+# WHAT THIS DRIVER REPRODUCED AT THE LEVER W1 SYNC (history, 2026-11-10): the live
+# package gb202-tp8-202611100247 exactly — the defaults below are the measured config:
 #   EXPECT_HEAD 2f0acabf        kimi31-exl3-dma branch head (BF16 DMA ring + split-K decode)
 #   PREFILL_ISLAND=1            --prefill-island-reduce (L1) armed
 #   IMAGE_CONCURRENCY=1         owner rider (was 4 at revision 3)
@@ -36,6 +45,8 @@
 #
 #   ./export-kimi31-exl3.sh --check    guards + planner dry-run (both capacity variants),
 #                                      prints the exact command, creates nothing
+#   ./export-kimi31-exl3.sh --image    build the runtime image from this tree, pinned
+#                                      by image ID (docker build; no GPU, no export)
 #   ./export-kimi31-exl3.sh --link     populate the snapshot dir from the verified checkpoint (needs the .done marker)
 #   ./export-kimi31-exl3.sh --detach   run under a transient system unit as tom (survives the turn)
 #   ./export-kimi31-exl3.sh --run      run in the foreground (what --detach executes)
@@ -50,9 +61,12 @@ set -euo pipefail
 #                  (+ --prefill-island-reduce kept, PREFILL_ISLAND=1)
 #   env          -> B12X_W4A16_SMALL_M_SPLITK=1 as shipped; B12X_PCIE_DMA_PIECES UNSET
 #                  (verified at --run); NO IGNITION_KIMI_PREFILL_DMA_* (plan flags instead)
-#   max context  -> OWNER DIRECTIVE: recipe context 310,272 (= pool/3 on the 1,024
-#                  grid, ratio 0.33297 vs predicted 931,840); the 1M gate is obsolete,
-#                  the gate is max_model_len / actual Allocate pool in [0.28, 0.36]
+#   max context  -> W6 OWNER DIRECTIVE: recipe context = ~1/3 of the pool on the
+#                  1,024 grid; the 1M gate is obsolete, the gate is
+#                  max_model_len / actual Allocate pool in [0.28, 0.36].
+#                  E1 shipped the W6 value; E1.1 (W8, J-4 section 4) shipped
+#                  396,288 (387 x 1,024 = 129 x 3,072) and this merged tree carries
+#                  the E1.1 recipe context 396,288 (guard below asserts it).
 # R = 1024 decided by W6 step 0 (levers/evidence/w6/step0-shapes.log): ring wins
 # 29.7-56.3% at every capacity 1024..3072 in the 185*t(7168)+185*t(3584) rule.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -63,10 +77,28 @@ EXPECT_FI_BRANCH="${EXPECT_FI_BRANCH:-kimi31-exl3-live}"   # same single-branch 
 if [ ! -e "$FI/flashinfer/__init__.py" ]; then
   git clone --branch "$EXPECT_FI_BRANCH" https://github.com/tunamitom/flashinfer "$FI"
 fi
+FI=$(readlink -f "$FI")   # normalize (the default path carries a literal '..'; the resolve guard compares real paths)
 PYV="${PYV:-$REPO/.venv/bin/python}"; [ -x "$PYV" ] || PYV="$(command -v python3)"
 RING_ROWS="${RING_ROWS:-1024}"
-EXPECT_HEAD="${EXPECT_HEAD:-160832b9}"
+EXPECT_HEAD="${EXPECT_HEAD:-ae1ea944}"          # W13 merged tip (E1.1 export lineage + chunkfix image lineage)
 EXPECT_FI="${EXPECT_FI:-0aa09dd61}"
+# W13 lineage pins: the two trees the running serve was actually produced from.
+# The merged tip must reproduce each source exactly for the file set that source
+# consumed (guards below; verified in levers/w13-live-branch.md).
+EXPECT_EXPORT_SRC="${EXPECT_EXPORT_SRC:-b8dcebb5}"   # export tree of gb202-tp8-202611100809 (E1.1)
+EXPECT_IMAGE_SRC="${EXPECT_IMAGE_SRC:-5585a9a7}"     # image build tree (chunkfix on 35134e2b)
+# W13 image step (--image): the runtime image the serve runs, built from this
+# tree with the campaign build path (docker build -t local/flare:rt-<variant>-<sha>
+# <tree>, Dockerfile rust:1.94.1-slim-trixie build -> debian:trixie-slim) and
+# pinned by image ID, exactly like the launcher pins its image.
+IMAGE_NAME="${IMAGE_NAME:-local/flare}"
+IMAGE_VARIANT="${IMAGE_VARIANT:-rt-k31exl3-chunkfix}"
+LIVE_IMAGE_TAG="${LIVE_IMAGE_TAG:-rt-k31exl3-chunkfix-5585a9a7}"   # tag of the running serve's image
+EXPECT_IMAGE_ID="${EXPECT_IMAGE_ID:-sha256:50bda5a7f78e113cee8a7e566f156ecd50f307408a401f1d3256dd338dd0db0c}"
+# File set the runtime image build consumes (Dockerfile COPY inputs + licenses).
+IMAGE_PATHS=(Dockerfile flare helios eos selene selene-manager
+  ignition/recipes/kimi3/assets ignition/recipes/qwen38/assets ignition/recipes/step5/assets
+  LICENSE NOTICE)
 CKPT=/storage/models/Kimi-K3.1-Pro-EXL3-2bit
 DONE=/storage/models/kimi-k31-exl3-download.done
 FAIL=/storage/models/kimi-k31-exl3-download.failed
@@ -132,8 +164,10 @@ chk() { if "$@"; then return 0; else fail=$((fail+1)); return 1; fi; }
 # switch where one exists: slab sizes for the prefill wires (ContextParallel
 # slab / index_slab in the memory report) and the round-graph/kernel count for
 # decode fusion. The fingerprint baselines are the shipped package
-# gb202-tp8-202611100532 at the ruled config (capacity 20, image concurrency 1,
-# ring rows 1024); other configs assert cross-rank consistency only.
+# gb202-tp8-202611100809 (E1.1, context 396,288) at the ruled config (capacity 20,
+# image concurrency 1, ring rows 1024); other configs assert cross-rank
+# consistency only. (E1's gb202-tp8-202611100532 baselines were 170.44 / 39.06
+# MiB at the pre-E1.1 context — superseded.)
 assert_settings() {
   local log="$1" pkg="$2" bad=0
   local args_line; args_line=$(grep -m1 '^=== args ' "$log" || true)
@@ -182,8 +216,8 @@ print(plan.get("prefill_dma_ring_rows"), plan.get("prefill_dma_ring_bf16"), plan
     fi
     say "ASSERT: fingerprints slab=${slab} MiB (${n_slab} ranks) index_slab=${islab} MiB (${n_islab}) ${graphs} (${n_graphs})"
     if [ "$SPEC_TOKEN_CAPACITY" = 20 ] && [ "$IMAGE_CONCURRENCY" = 1 ] && [ "$RING_ROWS" = 1024 ]; then
-      [ "$slab" = "170.44" ] || { say "ASSERT: slab fingerprint '$slab' MiB != baseline 170.44 MiB"; bad=$((bad+1)); }
-      [ "$islab" = "39.06" ] || { say "ASSERT: index_slab fingerprint '$islab' MiB != baseline 39.06 MiB"; bad=$((bad+1)); }
+      [ "$slab" = "217.69" ] || { say "ASSERT: slab fingerprint '$slab' MiB != baseline 217.69 MiB"; bad=$((bad+1)); }
+      [ "$islab" = "49.89" ] || { say "ASSERT: index_slab fingerprint '$islab' MiB != baseline 49.89 MiB"; bad=$((bad+1)); }
       [ "$graphs" = "Graphs: 66; kernels: 4967" ] || { say "ASSERT: round-graph/kernel fingerprint '$graphs' != baseline 'Graphs: 66; kernels: 4967'"; bad=$((bad+1)); }
     else
       say "ASSERT: fingerprint baseline skipped (non-ruled config); cross-rank consistency asserted only"
@@ -219,6 +253,48 @@ if [ "$MODE" = --link ]; then
   exit 0
 fi
 
+# ── W13 image step (--image): reproduce the RUNNING runtime image from this
+# tree. Same build path the chunkfix image used (campaign runtime-image path:
+# docker build -t local/flare:rt-<variant>-<tree sha> <tree>; Dockerfile
+# rust:1.94.1-slim-trixie build stage -> debian:trixie-slim, ~15-25 min), pinned
+# by image ID exactly the way the launcher pins its image. The image inputs are
+# guarded against the pinned image tree (EXPECT_IMAGE_SRC); a build whose ID
+# drifts from EXPECT_IMAGE_ID is flagged, never silently accepted.
+if [ "$MODE" = --image ]; then
+  chk command -v docker >/dev/null 2>&1 || say "GUARD: docker missing"
+  chk test -z "$(git -C "$REPO" status --porcelain 2>/dev/null)" || say "GUARD: tree dirty"
+  chk git -C "$REPO" merge-base --is-ancestor "$EXPECT_HEAD" HEAD 2>/dev/null \
+    || say "GUARD: merged tip $EXPECT_HEAD is not an ancestor of HEAD"
+  chk test -z "$(git -C "$REPO" diff --name-only "$EXPECT_HEAD" HEAD -- ':!tools' 2>/dev/null)" \
+    || say "GUARD: non-tools diff against pinned merged tip $EXPECT_HEAD"
+  chk test -z "$(git -C "$REPO" diff --name-only "$EXPECT_EXPORT_SRC" HEAD -- ':!helios' ':!tools' 2>/dev/null)" \
+    || say "GUARD: export-consumed files drift from the pinned export tree $EXPECT_EXPORT_SRC"
+  chk test -z "$(git -C "$REPO" diff --name-only "$EXPECT_IMAGE_SRC" HEAD -- "${IMAGE_PATHS[@]}" 2>/dev/null)" \
+    || say "GUARD: image inputs drift from the pinned image tree $EXPECT_IMAGE_SRC"
+  if [ "$fail" -ne 0 ]; then say "IMAGE CHECK FAILED: $fail guard(s); nothing built"; exit 1; fi
+  head_short=$(git -C "$REPO" rev-parse --short=8 HEAD)
+  img_tag="$IMAGE_NAME:$IMAGE_VARIANT-$head_short"
+  img_log="$OUT/image-build-$TS.log"
+  say "── building runtime image $img_tag from $REPO (log $img_log) ──"
+  if docker build -t "$img_tag" "$REPO" >"$img_log" 2>&1; then
+    built_id=$(docker inspect --format '{{.Id}}' "$img_tag")
+    echo "=== image $img_tag id $built_id pin $EXPECT_IMAGE_ID" >>"$img_log"
+    if [ "$built_id" = "$EXPECT_IMAGE_ID" ]; then
+      docker tag "$img_tag" "$IMAGE_NAME:$LIVE_IMAGE_TAG"
+      printf '%s\n%s\n' "$built_id" "$IMAGE_NAME:$LIVE_IMAGE_TAG" > "$OUT/image.done"
+      rm -f "$OUT/image.id-mismatch"
+      say "IMAGE OK: $img_tag id $built_id == pinned $EXPECT_IMAGE_ID; tagged $IMAGE_NAME:$LIVE_IMAGE_TAG"
+      say "IMAGE OK recorded: $OUT/image.done"
+      exit 0
+    fi
+    echo "$built_id" > "$OUT/image.id-mismatch"
+    say "IMAGE PIN MISMATCH: built $built_id != pinned $EXPECT_IMAGE_ID"
+    say "  (image-input drift or non-reproducible toolchain — review before promotion; recorded in $OUT/image.id-mismatch)"
+    exit 3
+  fi
+  say "IMAGE BUILD FAILED: see $img_log"; exit 1
+fi
+
 # ── Guards (all modes) ────────────────────────────────────────────────────────
 chk test -f "$DONE"            || say "GUARD: $DONE missing (download not verified)"
 chk test ! -f "$FAIL"          || say "GUARD: $FAIL present"
@@ -233,6 +309,18 @@ chk git -C "$REPO" merge-base --is-ancestor "$EXPECT_HEAD" HEAD 2>/dev/null \
   || say "GUARD: export tree $EXPECT_HEAD is not an ancestor of HEAD"
 chk test -z "$(git -C "$REPO" diff --name-only "$EXPECT_HEAD" HEAD -- ':!tools' 2>/dev/null)" \
   || say "GUARD: non-tools diff against pinned export tree $EXPECT_HEAD"
+# W13 lineage guards: the tree must reproduce the exact code the running serve's
+# package export (b8dcebb5) and runtime image build (5585a9a7) consumed. The
+# export side excludes helios (the export never reads it; the image build does),
+# the image side is exactly the Dockerfile COPY input set.
+chk test -z "$(git -C "$REPO" diff --name-only "$EXPECT_EXPORT_SRC" HEAD -- ':!helios' ':!tools' 2>/dev/null)" \
+  || say "GUARD: export-consumed files drift from the pinned export tree $EXPECT_EXPORT_SRC"
+chk test -z "$(git -C "$REPO" diff --name-only "$EXPECT_IMAGE_SRC" HEAD -- "${IMAGE_PATHS[@]}" 2>/dev/null)" \
+  || say "GUARD: image inputs drift from the pinned image tree $EXPECT_IMAGE_SRC"
+# The E1.1 context lives in the recipe (no CLI flag): assert 396,288 so no stale
+# E1 context can ride an export out of this branch.
+chk grep -q 'context=396288' "$REPO/ignition/recipes/kimi31/recipe.py" 2>/dev/null \
+  || say "GUARD: recipe context is not 396288 in $REPO/ignition/recipes/kimi31/recipe.py"
 chk test -z "$(git -C "$REPO" status --porcelain 2>/dev/null)" || say "GUARD: tree dirty"
 fi_head=$(git -C "$FI" rev-parse --short HEAD 2>/dev/null || echo none)
 chk test "$fi_head" = "$EXPECT_FI" || say "GUARD: flashinfer HEAD $fi_head != $EXPECT_FI"
@@ -286,9 +374,9 @@ if [ "$PREFILL_FP8" = 1 ]; then DRYRUN_ARGS+=(--prefill-fp8); fi
 if [ "$PREFILL_ISLAND" = 1 ]; then DRYRUN_ARGS+=(--prefill-island); fi
 say "── planner dry-run (capacity $SPEC_TOKEN_CAPACITY armed; both variants priced) ──"
 if "$PYV" "$HERE/plan-dryrun.py" "${DRYRUN_ARGS[@]}" >&2; then
-  say "── dry-run OK: c4 + 1M accepted at capacity 20 and 24 ─────────────────────"
+  say "── dry-run OK: c4 + recipe context accepted at capacity 20 and 24 ──────────"
 else
-  fail=$((fail+1)); say "GUARD: planner dry-run refused the c4 + 1M shape"
+  fail=$((fail+1)); say "GUARD: planner dry-run refused the c4 + recipe-context shape"
 fi
 
 say "── would run ──────────────────────────────────────────────"
@@ -296,6 +384,8 @@ say "  cd $REPO; CUDA_VISIBLE_DEVICES=<8 UUIDs B then D> CUDA_DEVICE_ORDER=PCI_B
 say "  PYTHONPATH=$PYTHONPATH"
 say "  .venv/bin/python -m ignition export $SNAP ${EXPORT_ARGS[*]}"
 say "  log $LOG  (+ .mem every 30 s); after rc=0: prune nlink==1 blobs under $BLOBS, link $PKG_LINK"
+say "  (package AND image: bash tools/export-kimi31-exl3.sh --image builds the pinned"
+say "   runtime image $IMAGE_NAME:$IMAGE_VARIANT-<tree sha> -> $IMAGE_NAME:$LIVE_IMAGE_TAG)"
 say "───────────────────────────────────────────────────────────"
 if [ "$fail" -ne 0 ]; then say "CHECK FAILED: $fail guard(s); nothing run"; exit 1; fi
 [ "$MODE" = --check ] && { say "CHECK OK: all guards pass; nothing run"; exit 0; }

@@ -3,20 +3,24 @@
 # CPU only: synthetic GPUs at the measured B/D free memory, no NVML and no CUDA calls.
 # Invoked by export-kimi31-exl3.sh --check; safe to run standalone:
 #
-#   /home/tom/build/flare-k31exl3/.venv/bin/python k31-plan-dryrun.py [--capacity 20]
+#   python3 tools/plan-dryrun.py [--capacity 20]
 #
 # Two sections print:
 #   1. the Ignition planner gate (ignition.planning.plan) for the export shape
-#      (c4 + 1,048,576 context, dflash2 K7, block verification, online MXFP8,
-#      image-concurrency 1) at both --speculative-token-capacity variants, and
+#      (c4 + the recipe context (396,288 at E1.1), dflash2 K7, block verification,
+#      online MXFP8, image-concurrency 1) at both --speculative-token-capacity
+#      variants, and
 #   2. the boot KV supply projection ("Allocate cache" tokens) for capacity 20
 #      and 24 with and without the K2 vision riders.
 """Planner and KV-supply dry-run for the K1+K2 export delta. Creates nothing."""
 import argparse
+import os
 import sys
 from pathlib import Path
 
-REPO = Path("/home/tom/build/levers-prefill")
+# The branch's own tree by default (W13: one branch reproduces the whole serve);
+# REPO in the environment overrides for side-by-side experiments.
+REPO = Path(os.environ.get("REPO", Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(REPO))
 
 from ignition.planning import Gpu, plan  # noqa: E402
@@ -90,7 +94,7 @@ def main():
     args = parser.parse_args()
     free_bytes = int(args.free_gib * GIB)
 
-    print("== planner gate (c4 + recipe context = pool/3 per owner directive, dflash2 K7 + block verification, online MXFP8)")
+    print("== planner gate (c4 + recipe context 396,288 per owner directive, dflash2 K7 + block verification, online MXFP8)")
     model = None
     ok = True
     for capacity in (20, 24):
@@ -109,14 +113,18 @@ def main():
               f" planner pages {fitted.pages} ({fitted.tokens:,} tokens, gate estimate only);"
               f" spec capacity {fitted.speculative_token_capacity},"
               f" graph budget 16 -> {len(packed_speculative_shapes(4, 8, capacity, 16))} packed shapes")
-    print("  context is the recipe's pool/3 value (owner directive, W6); boot KV is sized"
-          " from measured free memory (KvCacheLimit::Memory). The obsolete 1M gate is"
-          " replaced by max_model_len / Allocate-pool in [0.28, 0.36] at the boot.")
+    print("  context is the recipe's E1.1 value 396,288 (W8/J-4 section 4, ~1/3 of the"
+          " pool per the W6 owner directive); boot KV is sized from measured free"
+          " memory (KvCacheLimit::Memory). The obsolete 1M gate is replaced by"
+          " max_model_len / Allocate-pool in [0.28, 0.36] at the boot.")
     if not ok:
-        print("PLANNER GATE REFUSED the c4 + 1M shape: do not launch", file=sys.stderr)
+        print("PLANNER GATE REFUSED the c4 + recipe-context shape: do not launch", file=sys.stderr)
         return 1
 
     patch, arena = vision_rider_bytes()
+    # Context/pool ratio uses the recipe's own context (396,288 at E1.1) so this
+    # projection cannot go stale against the tree (W13; was a hardcoded literal).
+    recipe_context = model.recipe.context
     print("== boot KV supply projection (anchor: live boot"
           f" {BASELINE_POOL_TOKENS:,} tokens at capacity {BASELINE_SPEC_CAPACITY},"
           f" {BASELINE_PATCHES:,} patches, image-concurrency {BASELINE_IMAGE_CONCURRENCY};"
@@ -131,7 +139,7 @@ def main():
         loaded = BASELINE_LOADED_GIB - freed / GIB
         print(f"  {label:24s} freed {freed / GIB:5.3f} GiB/rank -> loaded {loaded:6.3f} GiB"
               f" -> Allocate cache ~{pool:,} KV tokens"
-              f" ({pool / 1e6:.2f}M, context/pool ratio {310272 / pool:.3f})")
+              f" ({pool / 1e6:.2f}M, context/pool ratio {recipe_context / pool:.3f})")
     print(f"  K2 rider split: patch cap {patch / GIB:.3f} GiB"
           f" ({patch // KV_TOKEN_BYTES:,} tokens) + image-concurrency 1"
           f" {arena / GIB:.3f} GiB ({arena // KV_TOKEN_BYTES:,} tokens);"
