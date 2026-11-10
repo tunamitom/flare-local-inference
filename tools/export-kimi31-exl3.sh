@@ -59,7 +59,7 @@ set -euo pipefail
 SELF=$(readlink -f "${BASH_SOURCE[0]}"); HERE=$(dirname "$SELF")
 REPO="${REPO:-$(cd "$HERE/.." && pwd)}"                      # this repo (the branch)
 FI="${FI:-$REPO/../flashinfer-k31exl3-live}"                 # auto-cloned at the pin below
-EXPECT_FI_BRANCH="${EXPECT_FI_BRANCH:-levers/prefill-shapes}"
+EXPECT_FI_BRANCH="${EXPECT_FI_BRANCH:-kimi31-exl3-live}"   # same single-branch name on the flashinfer fork
 if [ ! -e "$FI/flashinfer/__init__.py" ]; then
   git clone --branch "$EXPECT_FI_BRANCH" https://github.com/tunamitom/flashinfer "$FI"
 fi
