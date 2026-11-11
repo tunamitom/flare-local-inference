@@ -227,6 +227,11 @@ class Plan:
     # 64,128,64,128 for >= 2560-row launches. Meant together with
     # trellis_prefill_shapes. Decode / verify / draft launches never see it.
     trellis_prefill_table: str = "0"
+    # W22 rider (W11 fused pack): replace the 8-kernel decode score/ID pack
+    # with one compiled kernel (bit-equal, stamped as
+    # IGNITION_KIMI_DECODE_FUSION before preparation). Default off keeps the
+    # shipped pack bit for bit; the out=/count_out= compaction rides always on.
+    decode_fusion: bool = False
     # The plan prepares no vision encoder and serves text requests only.
     language_model_only: bool = False
     benchmark_selection: BenchmarkSelection | None = None
@@ -302,6 +307,8 @@ class Plan:
             raise UsageError("--trellis-prefill-table must be 0, 1 or 2")
         if self.trellis_prefill_table != "0" and self.recipe.name not in ("kimi3", "kimi31"):
             raise UsageError("--trellis-prefill-table supports the Kimi K3/K3.1 recipes")
+        if self.decode_fusion and self.recipe.name not in ("kimi3", "kimi31"):
+            raise UsageError("--decode-fusion supports the Kimi K3/K3.1 recipes")
 
     @property
     def world_size(self) -> int:
@@ -424,6 +431,7 @@ class Plan:
             "prefill_dma_bf16": self.prefill_dma_bf16,
             "trellis_prefill_shapes": self.trellis_prefill_shapes,
             "trellis_prefill_table": self.trellis_prefill_table,
+            "decode_fusion": self.decode_fusion,
             "speculation": None if self.speculation is None else {
                 "draft_tokens": self.speculation.draft_tokens, "adaptive": self.speculation.adaptive,
                 **({} if self.speculation.method is None else {"method": self.speculation.method}),
@@ -464,6 +472,7 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
         prefill_dma_bf16: bool = False,
         trellis_prefill_shapes: bool = False,
         trellis_prefill_table: str = "0",
+        decode_fusion: bool = False,
         language_model_only: bool = False, mla_compute_mode: str | None = None) -> Plan:
     """Size pages and the prefix cache to the supply; the result may not fit.
 
@@ -528,6 +537,7 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
                 prefill_dma_bf16=prefill_dma_bf16,
                 trellis_prefill_shapes=trellis_prefill_shapes,
                 trellis_prefill_table=trellis_prefill_table,
+                decode_fusion=decode_fusion,
                 language_model_only=language_model_only)
     available = plan.supply_bytes - plan.fixed_bytes
     target = min(CACHE_STATES_PER_REQUEST * concurrency, max(1, available // costs.state_row_bytes))
@@ -588,6 +598,7 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
         prefill_dma_bf16: bool = False,
         trellis_prefill_shapes: bool = False,
         trellis_prefill_table: str = "0",
+        decode_fusion: bool = False,
         language_model_only: bool = False, mla_compute_mode: str | None = None) -> Plan:
     """Select GPUs and size the plan, or raise a capacity error that lists working settings.
 
@@ -671,6 +682,7 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
                    prefill_dma_bf16=prefill_dma_bf16,
                    trellis_prefill_shapes=trellis_prefill_shapes,
                 trellis_prefill_table=trellis_prefill_table,
+                decode_fusion=decode_fusion,
                    language_model_only=language_model_only,
                    mla_compute_mode=mla_compute_mode)
 

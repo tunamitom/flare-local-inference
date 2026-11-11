@@ -160,6 +160,7 @@ def run(args):
         prefill_dma_bf16=args.prefill_dma_bf16,
         trellis_prefill_shapes=args.trellis_prefill_shapes,
         trellis_prefill_table=args.trellis_prefill_table,
+        decode_fusion=args.decode_fusion,
         language_model_only=args.language_model_only,
         mla_compute_mode=args.mla_compute_mode)
     plan = replace(plan, benchmark_selection=BenchmarkSelection(

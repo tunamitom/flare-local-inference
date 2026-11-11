@@ -274,6 +274,9 @@ def _preparation_arguments(running, *, model_default="defaults.model"):
                                " 2: additionally 64-row blocks, 3 stages, tile 64,128,64,128 at"
                                " >=2560 rows; use with --trellis-prefill-shapes; decode graphs"
                                " untouched; Kimi K3/K3.1)")
+    advanced.add_argument("--decode-fusion", action="store_true",
+                          help="replace the decode score/ID pack's 8 dispatched kernels with one"
+                               " compiled kernel (bit-equal; Kimi K3/K3.1)")
     advanced.add_argument("--language-model-only", action="store_true",
                           help="prepare no vision encoder and reject images; its weights and scratch become KV"
                                " pages (recipes with a separable encoder; default: the recipe's image support)")
