@@ -199,6 +199,11 @@ class Plan:
     image_concurrency: int = 0
     # The recipe's eligible BF16 projections load as MXFP8 when the plan asks for it.
     online_mxfp8: bool = False
+    # Replace the decode score/ID pack's eight dispatched kernels with one compiled
+    # kernel (bit-equal at the pair bytes; default off keeps the shipped pack). A plan
+    # setting: recorded here and threaded through the preparation config to the
+    # component constructor, never through the process environment.
+    decode_fusion: bool = False
     # The plan prepares no vision encoder and serves text requests only.
     language_model_only: bool = False
     benchmark_selection: BenchmarkSelection | None = None
@@ -244,6 +249,8 @@ class Plan:
                 raise UsageError("--force-moe-decode-a16 requires rank-local expert intermediate width divisible by 64")
             if self.mixed_prefill:
                 raise UsageError("--force-moe-decode-a16 cannot accompany --mixed-prefill: combined rows share one expert precision")
+        if self.decode_fusion and self.recipe.name not in ("kimi3", "kimi31"):
+            raise UsageError("--decode-fusion supports the Kimi K3/K3.1 recipes")
         if self.shard_hyperconnections:
             if self.recipe.name != "qwen38":
                 raise UsageError("--shard-hyperconnections requires Qwen3.8 Flash")
@@ -369,7 +376,8 @@ class Plan:
             "force_moe_decode_a16": self.force_moe_decode_a16,
             "tuning_gpus": [gpu.index for gpu in self.tuning_gpus],
             "speculative_token_capacity": self.speculative_token_capacity,
-            "online_mxfp8": self.online_mxfp8, "language_model_only": self.language_model_only,
+            "online_mxfp8": self.online_mxfp8, "decode_fusion": self.decode_fusion,
+            "language_model_only": self.language_model_only,
             "speculation": None if self.speculation is None else {
                 "draft_tokens": self.speculation.draft_tokens, "adaptive": self.speculation.adaptive,
                 **({} if self.speculation.method is None else {"method": self.speculation.method}),
@@ -403,7 +411,8 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
         expert_scale_compression: str | None = None, roce_ring: bool = False,
         roce_chain: bool = False,
         image_concurrency: int | None = None, online_mxfp8: bool = False,
-        language_model_only: bool = False, mla_compute_mode: str | None = None) -> Plan:
+        language_model_only: bool = False, decode_fusion: bool = False,
+        mla_compute_mode: str | None = None) -> Plan:
     """Size pages and the prefix cache to the supply; the result may not fit.
 
     Weights come from the checkpoint's stored tensors and graphs and scratch from
@@ -459,6 +468,7 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
                 # Language-only plans prepare no vision encoder, so no image feature slots.
                 image_concurrency=0 if language_model_only else (min(4, concurrency) if recipe.max_images else 0)
                     if image_concurrency is None else image_concurrency, online_mxfp8=online_mxfp8,
+                decode_fusion=decode_fusion,
                 language_model_only=language_model_only)
     available = plan.supply_bytes - plan.fixed_bytes
     target = min(CACHE_STATES_PER_REQUEST * concurrency, max(1, available // costs.state_row_bytes))
@@ -513,7 +523,8 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
          cache_states: int | None = None, mixed_prefill: bool = False, prompt_logprobs: bool = False,
          expert_scale_compression: str | None = None, roce_ring: bool = False, roce_chain: bool = False,
          image_concurrency: int | None = None, online_mxfp8: bool = False,
-         language_model_only: bool = False, mla_compute_mode: str | None = None) -> Plan:
+         language_model_only: bool = False, decode_fusion: bool = False,
+         mla_compute_mode: str | None = None) -> Plan:
     """Select GPUs and size the plan, or raise a capacity error that lists working settings.
 
     Without `selected`, the plan uses the smallest supported tensor-parallel size
@@ -576,6 +587,7 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
                    expert_scale_compression=expert_scale_compression, roce_ring=roce_ring, roce_chain=roce_chain,
                    image_concurrency=None if image_concurrency is None else min(image_concurrency, concurrency),
                    online_mxfp8=online_mxfp8, language_model_only=language_model_only,
+                   decode_fusion=decode_fusion,
                    mla_compute_mode=mla_compute_mode)
 
     def automatic(world_size, **settings):

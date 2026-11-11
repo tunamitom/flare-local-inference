@@ -199,6 +199,7 @@ def _export_hosts(args):
                          mixed_prefill=args.mixed_prefill, prompt_logprobs=args.prompt_logprobs,
                          expert_scale_compression=args.expert_scale_compression,
                          online_mxfp8=args.online_mxfp8, language_model_only=args.language_model_only,
+                         decode_fusion=args.decode_fusion,
                          mla_compute_mode=args.mla_compute_mode)
     collective_mode = collective_tuning_mode(configuration, model, args.collective_tuning)
     plan = replace(plan, compile_workers=compiler_workers(configuration, args.compile_workers), hub_cache=hub_cache,
@@ -282,6 +283,7 @@ def _prepare(args):
                       mixed_prefill=args.mixed_prefill, prompt_logprobs=args.prompt_logprobs,
                       expert_scale_compression=args.expert_scale_compression,
                       online_mxfp8=args.online_mxfp8, language_model_only=args.language_model_only,
+                      decode_fusion=args.decode_fusion,
                       mla_compute_mode=args.mla_compute_mode)
         indices = planning.format_gpus(gpu.index for gpu in plan.gpus)
         # A caller's restriction changes which GPU each index names.
@@ -461,7 +463,8 @@ def debug_serve(args) -> int:
                          roce_ring=args.roce_ring, roce_chain=args.roce_chain,
                          cache_states=args.prefix_cache_states, mixed_prefill=args.mixed_prefill, prompt_logprobs=args.prompt_logprobs,
                          expert_scale_compression=args.expert_scale_compression, online_mxfp8=args.online_mxfp8,
-                         language_model_only=args.language_model_only, mla_compute_mode=args.mla_compute_mode)
+                         language_model_only=args.language_model_only, decode_fusion=args.decode_fusion,
+                         mla_compute_mode=args.mla_compute_mode)
     collective_mode = collective_tuning_mode(configuration, model, args.collective_tuning)
     plan = replace(plan, compile_workers=compiler_workers(configuration, args.compile_workers), hub_cache=hub_cache,
                    autotune_effort=tuning_effort(configuration, args.autotune_effort),

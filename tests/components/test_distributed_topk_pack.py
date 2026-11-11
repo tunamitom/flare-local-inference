@@ -13,8 +13,20 @@ from __future__ import annotations
 import pytest
 import torch
 
-from ignition.components.distributed_topk import _overlaps, selected_local_records
+from ignition.components.distributed_topk import (
+    _overlaps,
+    _pack_pairs_reference,
+    pack_score_id_pairs,
+    selected_local_records,
+)
 from ignition.preparation.scratch import GraphBufferPool
+
+
+def _shipped_pack(local, indices, scores, rank, world):
+    live = indices >= 0
+    local[:, :, 0].copy_(torch.where(live, scores, -torch.inf))
+    local.view(torch.int32)[:, :, 1].copy_(
+        torch.where(live, indices.long() * world + rank, -1))
 
 
 def _inputs(rows=3, width=16):
@@ -87,3 +99,76 @@ def test_compaction_retained_pool_buffers_match_the_allocating_path():
     assert got_out is out_buf and got_count is count_buf
     assert torch.equal(ref_out, out_buf)
     assert torch.equal(ref_count, count_buf)
+
+
+def _packed_pair_inputs(rows, width, seed, *, ties=True, specials=True):
+    gen = torch.Generator().manual_seed(seed)
+    indices = torch.randint(-1, 896, (rows, width), generator=gen).to(torch.int32)
+    scores = torch.randn(rows, width, generator=gen)
+    if ties and width > 4:
+        scores[0, 1] = scores[0, 2] = 0.25
+    if specials and width > 8:
+        scores[0, 3] = float("nan")
+        scores[0, 4] = float("-inf")
+    return indices, scores
+
+
+def test_fused_pack_matches_the_shipped_pack_bitwise():
+    for rows, width in ((4, 32), (1, 16), (3, 48)):
+        indices, scores = _packed_pair_inputs(rows, width, 1234 + rows)
+        rank = torch.tensor([3], dtype=torch.int64)
+        world = 8
+        shipped = torch.zeros((rows, width, 2), dtype=torch.float32)
+        fused = torch.zeros((rows, width, 2), dtype=torch.float32)
+        _shipped_pack(shipped, indices, scores, rank, world)
+        _pack_pairs_reference(fused, indices, scores, rank, world)
+        # Compare bits: dead entries carry id -1 whose FP32 view is NaN, and
+        # torch.equal would report NaN != NaN even for identical bits.
+        assert torch.equal(shipped.view(torch.int32), fused.view(torch.int32))
+        # dead entries pack as score -inf and id -1
+        dead = indices < 0
+        if dead.any():
+            assert torch.isinf(fused[:, :, 0][dead]).all() and (fused[:, :, 0][dead] < 0).all()
+            assert (fused.view(torch.int32)[:, :, 1][dead] == -1).all()
+
+
+def test_pack_score_id_pairs_cpu_body_matches_reference():
+    indices, scores = _packed_pair_inputs(2, 32, 7)
+    rank = torch.tensor([5], dtype=torch.int64)
+    direct = torch.zeros((2, 32, 2), dtype=torch.float32)
+    via_op = torch.zeros((2, 32, 2), dtype=torch.float32)
+    _pack_pairs_reference(direct, indices, scores, rank, 8)
+    pack_score_id_pairs(via_op, indices, scores, rank, 8)
+    assert torch.equal(direct.view(torch.int32), via_op.view(torch.int32))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the fused pack is a Triton GPU kernel")
+@pytest.mark.parametrize(("rows", "width", "world"),
+                         ((1, 48, 8), (3, 256, 8), (8, 2048, 8), (5, 1024, 16), (2, 48, 16)))
+def test_fused_pack_matches_the_shipped_pack_on_cuda(rows, width, world):
+    # Bit-exact GPU cover of the fused pack against the shipped pack: tied and
+    # non-finite scores, dead entries, and ids whose int32 narrowing overflows.
+    indices, scores = _packed_pair_inputs(rows, width, 99 + rows + width)
+    if width > 16:
+        indices[0, 8] = 1 << 28  # (id * world + rank) wraps past int32
+    rank = torch.tensor([world - 1], dtype=torch.int64, device="cuda")
+    shipped = torch.zeros((rows, width, 2), dtype=torch.float32, device="cuda")
+    fused = torch.zeros((rows, width, 2), dtype=torch.float32, device="cuda")
+    _shipped_pack(shipped, indices.cuda(), scores.cuda(), rank, world)
+    pack_score_id_pairs(fused, indices.cuda(), scores.cuda(), rank, world)
+    assert torch.equal(shipped.view(torch.int32), fused.view(torch.int32))
+
+
+def test_the_component_never_reads_the_environment_to_choose_behaviour():
+    """Source-text check, not a behavioural proof: it asserts only that the module's
+    source text contains no ``os.environ`` reference and no ``getenv`` call. It does not
+    observe runtime behaviour and does not prove the component could never read the
+    environment by another spelling; it pins the two idioms the component must not use.
+    The gate for captured behaviour is the ``decode_fusion`` constructor argument."""
+    import inspect
+
+    import ignition.components.distributed_topk as module
+
+    source = inspect.getsource(module)
+    assert "os.environ" not in source, "source-text check: module source must not contain os.environ"
+    assert "getenv" not in source, "source-text check: module source must not contain getenv"
