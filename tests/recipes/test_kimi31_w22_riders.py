@@ -81,18 +81,46 @@ def test_compaction_retained_buffers_match_the_allocating_path():
     assert torch.equal(ref_count, count_buf)
 
 
-def test_compaction_t17_aliasing_guards():
+def test_compaction_overlap_guards():
     rows, width = 3, 16
     selected = torch.zeros((rows, width), dtype=torch.int32)
     positions = torch.zeros((rows,), dtype=torch.int32)
     pages = torch.zeros((rows, 4), dtype=torch.int32)
     rank = torch.tensor([1], dtype=torch.int64)
-    with pytest.raises(ValueError, match="T17"):
+    with pytest.raises(ValueError, match="must not overlap"):
         selected_local_records(selected, positions, pages, world=8, rank=rank, page_size=32,
                                out=selected)
-    with pytest.raises(ValueError, match="T17"):
+    with pytest.raises(ValueError, match="must not overlap"):
         selected_local_records(selected, positions, pages, world=8, rank=rank, page_size=32,
                                out=selected.clone(), count_out=positions)
     with pytest.raises(ValueError, match="contiguous"):
         selected_local_records(selected, positions, pages, world=8, rank=rank, page_size=32,
                                out=selected[:, :width // 2])
+
+
+def test_compaction_overlap_guards_accept_disjoint_shared_storage():
+    rows, width = 3, 16
+    span = rows * width
+    total = span + rows + rows * 4 + span + rows
+    base = torch.zeros((total,), dtype=torch.int32)
+    selected = base[:span].view(rows, width)
+    positions = base[span:span + rows]
+    pages = base[span + rows:span + rows + rows * 4].view(rows, 4)
+    out = base[span + rows + rows * 4:span + rows + rows * 4 + span].view(rows, width)
+    count_out = base[span + rows + rows * 4 + span:]
+    # All five buffers are disjoint slices of one storage: the storage-equality
+    # guard rejected this legitimate pooled layout; the byte-range guard must
+    # accept it (the guard is what this exercises — kernel-stage errors on CPU
+    # are outside its scope).
+    assert selected.untyped_storage().data_ptr() == out.untyped_storage().data_ptr()
+    try:
+        selected_local_records(selected, positions, pages, world=8,
+                               rank=torch.tensor([1], dtype=torch.int64), page_size=32,
+                               out=out, count_out=count_out)
+    except ValueError as exc:
+        # Triton's own "cpu tensor?" ValueError is kernel-stage and out of scope;
+        # only the overlap guard's message is this test's business.
+        if "must not overlap" in str(exc):
+            pytest.fail(f"disjoint shared-storage buffers must not trip the overlap guard: {exc}")
+    except Exception:
+        pass

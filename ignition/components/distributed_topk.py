@@ -159,9 +159,14 @@ def _records(Selected, Positions, Pages, Rank, Output, Counts,
     tl.store(Counts + row, count)
 
 
-def _shares_storage(tensor, others):
-    storage = tensor.untyped_storage()
-    return any(storage.data_ptr() == other.untyped_storage().data_ptr() for other in others)
+def _extent(tensor):
+    start = tensor.data_ptr()
+    return start, start + tensor.numel() * tensor.element_size()
+
+
+def _overlaps(tensor, others):
+    start, end = _extent(tensor)
+    return any(start < hi and lo < end for lo, hi in (_extent(other) for other in others))
 
 
 def selected_local_records(selected, positions, pages, *, world, rank, page_size, out=None, count_out=None):
@@ -175,8 +180,8 @@ def selected_local_records(selected, positions, pages, *, world, rank, page_size
     element instead of two — the kept copy-count elimination, W22 rider). Default
     ``None`` allocates exactly as before.
 
-    T17: ``out`` and ``count_out`` must not alias or share storage with ``selected``,
-    ``positions`` or ``pages`` (or with each other) — ``out=`` aliasing an input of the
+    ``out`` and ``count_out`` must not overlap ``selected``,
+    ``positions`` or ``pages`` (or with each other) — ``out=`` overlapping an input of the
     same kernel is undefined. Bytes beyond each row's ``count`` are stale or ``-1`` and
     stay **don't care** for every consumer: consumers read exactly ``[0, count)``
     records and nothing past them.
@@ -186,12 +191,12 @@ def selected_local_records(selected, positions, pages, *, world, rank, page_size
     else:
         if out.shape != selected.shape or out.dtype != selected.dtype or not out.is_contiguous():
             raise ValueError("out must be a contiguous buffer matching selected")
-        # T17 overlap is a caller invariant, checked eagerly only: Dynamo cannot
-        # trace data-pointer comparisons (and at capture time the caller's
+        # The overlap contract is a caller invariant, checked eagerly only: Dynamo
+        # cannot trace data-pointer comparisons (and at capture time the caller's
         # retained buffers are the prepared, statically distinct ones).
         if not torch.compiler.is_compiling():
-            if out.data_ptr() == selected.data_ptr() or _shares_storage(out, (selected, positions, pages)):
-                raise ValueError("out must not overlap selected, positions or pages (T17)")
+            if _overlaps(out, (selected, positions, pages)):
+                raise ValueError("out must not overlap selected, positions or pages")
         output = out
     if count_out is None:
         count = torch.empty((selected.shape[0],), dtype=torch.int32, device=selected.device)
@@ -199,8 +204,8 @@ def selected_local_records(selected, positions, pages, *, world, rank, page_size
         if count_out.shape != (selected.shape[0],) or count_out.dtype != torch.int32 or not count_out.is_contiguous():
             raise ValueError("count_out must be a contiguous int32 buffer with one entry per row")
         if not torch.compiler.is_compiling():
-            if count_out.data_ptr() == output.data_ptr() or _shares_storage(count_out, (selected, positions, pages, output)):
-                raise ValueError("count_out must not overlap out, selected, positions or pages (T17)")
+            if _overlaps(count_out, (selected, positions, pages, output)):
+                raise ValueError("count_out must not overlap out, selected, positions or pages")
         count = count_out
     tensor_rank = isinstance(rank, torch.Tensor)
     torch.library.wrap_triton(_records)[(selected.shape[0],)](
