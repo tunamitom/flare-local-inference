@@ -38,7 +38,7 @@ IMAGE_SHA="${IMAGE_SHA:-sha256:50bda5a7f78e113cee8a7e566f156ecd50f307408a401f1d3
 PKG_LINK="${PKG_DIR:-/opt/models/Kimi-K3.1-Pro-EXL3-TP8}"   # symlink to the package cache entry
 PKG_PRIMARY="model.safetensors"
 PKG="/model/$PKG_PRIMARY"
-PKG_PRIMARY_SHA="${PKG_PRIMARY_SHA:-ef06d73556069947}"  # sha256(model.safetensors)[:16], gb202-tp8-202611100809 (E1.1: ring threshold 1024 + BF16 + trellis shapes + context 396288 = pool/3). Earlier: gb202-tp8-202611100247 = 4b41bb6a8edf50ab (ring >=2560 rows; relink + .bak-w6 to roll back); gb202-tp8-202611100153 = a42ad7204608d0ec (FP32 owner ring, pool 786k); gb202-tp8-202611091623 = afccc82f2fa2b5cf (L1)
+PKG_PRIMARY_SHA="${PKG_PRIMARY_SHA:-27dea1ad8a8f71cc}"  # sha256(model.safetensors)[:16], gb202-tp8-202611110549 (W22: rows 5+1+3 + riders, J-D/J-E config). Earlier: gb202-tp8-202611100809 = ef06d73556069947 (E1.1: ring threshold 1024 + BF16 + trellis shapes + context 396288 = pool/3). Earlier: gb202-tp8-202611100247 = 4b41bb6a8edf50ab (ring >=2560 rows; relink + .bak-w6 to roll back); gb202-tp8-202611100153 = a42ad7204608d0ec (FP32 owner ring, pool 786k); gb202-tp8-202611091623 = afccc82f2fa2b5cf (L1)
 EXPECT_WEIGHTS="${EXPECT_WEIGHTS:-752}"            # files under weights/ (94 per rank x 8) — recorded after export
 EXPECT_DEPLOYMENTS="${EXPECT_DEPLOYMENTS:-25}"     # files under deployments/ — recorded after export (25 at cap 20 + K2 riders + image-concurrency 1)
 STATE_HOST="/opt/kimi31-exl3/state"
