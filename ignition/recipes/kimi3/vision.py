@@ -19,7 +19,13 @@ from ignition.components.weights import DirectWeightLoader, quantize_bf16_linear
 from ignition.preparation.scratch import ScratchArena
 from ignition.preparation.tuning import RecordedPreparationSession, declare, register_finalizer
 
-PATCH_CAPACITIES = (256, 1024, 4096, 16384, 65536)
+# Cap the admitted tiers at 16,384 patches. VisionInputs keeps PATCH_CAPACITIES[-1] x 588
+# f32 pixels plus VisionScratch's projected and attention slabs, so the dropped 65,536-slot
+# tier frees 320,274,432 B per rank (pixels 115,605,504 + projected 100,663,296 + attention
+# 100,663,296 + indices 3,342,336) at zero decode/prefill cost; the slabs are permanently
+# reserved per rank on every deployment. Images above 16,384 patches (about 1,790 x 1,790 px
+# before the processor's own resizing) exceed every admitted tier.
+PATCH_CAPACITIES = (256, 1024, 4096, 16384)
 FEATURES = 16384
 HIDDEN = 7168
 VISION_HEADS = 12

@@ -14,8 +14,8 @@ from ignition.components.parallel import TensorParallelShard
 from ignition.components.weights import DirectWeightLoader
 from ignition.preparation.scratch import GraphBufferPool
 from ignition.recipes.kimi3.vision import (
-    HEAD_SIZE, HIDDEN, INTERMEDIATE, VISION_HEADS, PreparedVision, ProjectionGatherScratch, VisionScratch,
-    VisionWeights, head_range, projection_partitions,
+    HEAD_SIZE, HIDDEN, INTERMEDIATE, PATCH_CAPACITIES, VISION_HEADS, PreparedVision, ProjectionGatherScratch,
+    VisionInputs, VisionScratch, VisionWeights, head_range, projection_partitions,
 )
 
 
@@ -113,6 +113,26 @@ def test_sharded_workspace_is_bounded_by_merger_output():
     assert VisionScratch.workspace_elements(65536) == 65536 * 4608
     assert VisionScratch.workspace_elements(65536, TensorParallelShard(0, 8)) == 65536 * 1792
     assert VisionScratch.workspace_elements(65536, TensorParallelShard(7, 8)) == 65536 * 1792
+
+
+def test_patch_capacities_bound_vision_input_and_scratch_storage():
+    # Cap 65,536 -> 16,384 patches: the dropped tier freed 320,274,432 B per rank:
+    # pixels 115,605,504 + projected 100,663,296 + attention_storage 100,663,296 +
+    # interpolation/merge indices 3,342,336. Images above 16,384 patches (about
+    # 1,790 x 1,790 px) exceed every admitted tier. The pixel buffer stays float32:
+    # the frontend stages f32 bytes (helios/src/frontend/images/packing.rs
+    # tensor_layout and spatial_merge).
+    assert PATCH_CAPACITIES == (256, 1024, 4096, 16384)
+    patches = PATCH_CAPACITIES[-1]
+    inputs = VisionInputs.allocate('cpu')
+    assert inputs.vision_pixel_values.shape == (patches, 588)
+    assert inputs.vision_pixel_values.dtype == torch.float32
+    scratch = VisionScratch.allocate(patches, 'cpu', shard=TensorParallelShard(0, 8))
+    assert scratch.projected.shape == (patches, 1024) and scratch.projected.dtype == torch.bfloat16
+    # TP8 attention storage slab is max(3 * patches * 256, patches * 1024) bf16 elements.
+    assert scratch.normalized.shape == (patches, 1024) and scratch.normalized.dtype == torch.bfloat16
+    dropped = 65536 - patches
+    assert dropped * (588 * 4 + 1024 * 2 + 1024 * 2) + dropped * 68 == 320_274_432
 
 
 def test_sharded_encoder_rejects_missing_gather_before_preparation():
