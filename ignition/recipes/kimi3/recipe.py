@@ -55,6 +55,7 @@ def prepare_variant(snapshot, plan, *, bootstrap, draft_repository, draft_revisi
         snapshot_budget_bytes=plan.snapshots * plan.costs.state_row_bytes,
         headroom_bytes=plan.headroom_bytes + plan.reserve_bytes, compile_decoder=compile_forwards,
         retain_graphs=retain_graphs, kernel_cache=kernel_cache, online_mxfp8=plan.online_mxfp8,
+        decode_fusion=plan.decode_fusion,
         stream_overlap=plan.stream_overlap, context_parallel=plan.context_parallel,
         vision=not plan.language_model_only, **drafting)
     if plan.world_size == 1:

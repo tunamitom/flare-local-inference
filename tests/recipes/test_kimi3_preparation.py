@@ -58,7 +58,7 @@ def test_preparation_preserves_declared_context_above_estimated_physical_capacit
         recipe=SimpleNamespace(context=1048576), concurrency=1, image_concurrency=0,
         prefill_chunk=1024, snapshots=1, costs=SimpleNamespace(state_row_bytes=1),
         headroom_bytes=0, reserve_bytes=0, online_mxfp8=True, stream_overlap=True,
-        context_parallel=True, language_model_only=True)
+        context_parallel=True, language_model_only=True, decode_fusion=False)
     bootstrap = SimpleNamespace(PreparationConfig=config_type,
         prepare_rank=lambda snapshot, config, **kwargs: config)
     prepared = prepare_variant("checkpoint", plan, bootstrap=bootstrap,

@@ -97,6 +97,9 @@ class PreparationConfig:
     context_parallel: bool = True
     # The MoonViT encoder and its graphs prepare beside the text model unless the plan serves text only.
     vision: bool = True
+    # Replace the decode score/ID pack's eight dispatched kernels with one compiled
+    # kernel (the plan's --decode-fusion setting; bit-equal at the pair bytes).
+    decode_fusion: bool = False
 
     def __post_init__(self):
         if self.draft_head_quantization not in (None, "mxfp8", "nvfp4"):
@@ -418,7 +421,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     prefill_sizes, batch_sizes = prefill_capacities(config.prefill_chunk_size), batch_capacities(config.max_active)
     collectives = dict(runtime=collective, embedding_runtime=embedding_collective, router_runtime=router_collective,
         route_runtime=route_collective, vocabulary_runtime=vocabulary_collective, coordinator=coordinator,
-        vision_state=vision_state, context=context, latent_runtimes=latent_runtimes)
+        vision_state=vision_state, context=context, latent_runtimes=latent_runtimes,
+        decode_fusion=config.decode_fusion)
     speculation = None
     if drafting:
         from .dspark import SpeculativePreparation

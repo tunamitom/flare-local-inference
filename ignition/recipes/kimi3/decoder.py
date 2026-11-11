@@ -286,7 +286,7 @@ class PreparedDecoder:
 
     def __init__(self, weights, scratch, metadata, pool, *, mode, runtime, vocabulary_runtime, embedding_runtime, router_runtime, vision_state,
                  coordinator, session, name, workspace, buffers, kda_records=None, route_runtime=None, context=None,
-                 latent_runtimes=(), scoring=None):
+                 latent_runtimes=(), scoring=None, decode_fusion=False):
         # Verification records its candidate rows; other modes ignore records.
         if mode not in ("prefill", "decode", "verify") or mode == "verify" and kda_records is None:
             raise ValueError("Kimi K3 verification decodes recorded candidate rows")
@@ -355,6 +355,7 @@ class PreparedDecoder:
                 **kwargs) if kind == "kda" else
                 PreparedMLA(w["attention"], source, metadata, pool.attention(index), context=context,
                             index_cache=pool.index(index) if kind == "dsa" else None,
+                            decode_fusion=decode_fusion,
                             eps=config.text["rms_norm_eps"],
                             peers=context.peers.get(index) if context is not None else None,
                             index_peers=(context.index_peers.get(index)
