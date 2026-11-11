@@ -117,7 +117,7 @@ class PreparedDistributedTopK:
             self.gathered.view(torch.bfloat16).view(rows, -1), runtime=runtime, session=session,
             coordinator=coordinator, name=name)
 
-    def __call__(self):
+    def collect(self):
         if self.decode_fusion:
             pack_score_id_pairs(self.local, self.indices, self.scores, self.rank, self.world)
         else:
@@ -127,8 +127,14 @@ class PreparedDistributedTopK:
             self.local.view(torch.int32)[:, :, 1].copy_(
                 torch.where(live, self.indices.long() * self.world + self.rank, -1))
         self.collective(self.local.view(torch.bfloat16).view(self.indices.shape[0], -1))
+
+    def merge_result(self):
         self.merge()
         return self.output
+
+    def __call__(self):
+        self.collect()
+        return self.merge_result()
 
 
 
