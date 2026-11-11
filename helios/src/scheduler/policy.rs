@@ -320,6 +320,54 @@ impl RequestScheduler {
         if kind == GraphKind::ScoredPrefill { &self.scored_prefill_catalog } else { &self.prefill_catalog }
     }
 
+    /// Chunk-rule scope: with no other lane competing, one request's prefill
+    /// chunking is a function of its remaining prefill segment alone
+    /// (`cost::deterministic_prefill_capacity`). Any second live request is a
+    /// competing lane, so under concurrency the catalog competes as before and
+    /// decode interleaving is unaffected.
+    ///
+    /// The rule must not engage when its chunk would not survive
+    /// `add_candidate`'s prefill filter (no measured duration, an unmeasured
+    /// chunk cut back to a smaller graph's work, or a chunk consuming no work):
+    /// narrowing a solo request to an unschedulable chunk would leave it
+    /// without any prefill candidate, so the measured catalog keeps the choice
+    /// instead.
+    fn deterministic_prefill_capacity(&self, kind: GraphKind, mask: u64) -> Option<usize> {
+        if !kind.is_prefill() || mask.count_ones() != 1 {
+            return None;
+        }
+        let competing = self.slots.iter().filter(|entry| entry.request.is_some()).count();
+        if competing != 1 {
+            return None;
+        }
+        let r = self.slots[mask.trailing_zeros() as usize].request.as_ref().unwrap();
+        let remaining = self.prefill_work(r, usize::MAX);
+        let capacity =
+            cost::deterministic_prefill_capacity(self.prefill_catalog(kind), remaining)?;
+        // Mirror of add_candidate's per-request prefill drop conditions for the
+        // single live request: the candidate filter is what decides whether the
+        // chunk can run at all.
+        let catalog = self.prefill_catalog(kind);
+        let work = self.prefill_work(r, capacity);
+        if work == 0 {
+            return None;
+        }
+        match self.costs.duration(kind, 1, capacity) {
+            None => return None,
+            Some(duration_ns)
+                if duration_ns == 0
+                    && catalog
+                        .iter()
+                        .take_while(|&&smaller| smaller < capacity)
+                        .any(|&smaller| self.prefill_work(r, smaller) == work) =>
+            {
+                return None
+            }
+            Some(_) => {}
+        }
+        Some(capacity)
+    }
+
     pub(super) fn prefill_work(&self, request: &LiveRequest, capacity: usize) -> usize {
         let start = request.consumed_tokens as usize;
         let mut end = request
@@ -961,6 +1009,20 @@ impl RequestScheduler {
                 continue;
             }
             if kind.is_prefill() {
+                // Solo chunk rule: with no competing lane, one request's
+                // chunking is a function of its remaining prefill segment; the
+                // measured catalog must not choose the chunk.
+                if let Some(capacity) = self.deterministic_prefill_capacity(kind, mask) {
+                    let before = output.len();
+                    self.add_candidate(output, kind, 1, capacity, mask, values, age_price);
+                    if output.len() > before {
+                        continue;
+                    }
+                    // Liveness: if the candidate filter rejected the rule's
+                    // chunk anyway (an unmeasured graph cut back to a smaller
+                    // graph's work), fall back to the measured catalog so a
+                    // solo request can never stall without a prefill candidate.
+                }
                 for &capacity in self.prefill_catalog(kind) {
                     self.add_candidate(output, kind, 1, capacity, mask, values, age_price);
                 }
@@ -1016,6 +1078,19 @@ impl RequestScheduler {
                 let kind = self.request_kind(r);
                 match kind {
                     Some(GraphKind::Prefill) if self.prefill_work(r, prefill) > 0 => {
+                        // Solo chunk rule: a mixed shape may carry the solo
+                        // chunk only when its prefill row IS the deterministic
+                        // chunk graph; any other fixed prefill capacity would
+                        // cut the prompt by measured preference. The rule
+                        // bails (no restriction here) when its own chunk is
+                        // unschedulable.
+                        if let Some(capacity) =
+                            self.deterministic_prefill_capacity(GraphKind::Prefill, 1 << slot)
+                        {
+                            if prefill != capacity {
+                                continue;
+                            }
+                        }
                         if duration_ns == 0 && self.mixed_catalog.iter().any(|&(b, w, smaller)| {
                             b == batch && w == width && smaller < prefill
                                 && self.prefill_work(r, smaller) == self.prefill_work(r, prefill)

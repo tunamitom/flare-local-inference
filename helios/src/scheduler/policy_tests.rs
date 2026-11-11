@@ -1267,6 +1267,173 @@ fn equivalent_prefill_tails_use_the_smaller_graph_despite_a_faster_padded_estima
 }
 
 #[test]
+fn solo_prefill_chunking_is_the_remaining_segment_under_adversarial_costs() {
+    // Solo chunk rule: with no other lane competing, chunking is a function of
+    // the remaining prefill segment. Two duration profiles that disagree about
+    // the cheapest graph must produce the identical chunk sequence: full-size
+    // chunks while the remainder is at least one chunk (4096 x 8 for the
+    // 34268-token prompt), then the single smallest graph covering the rest
+    // (2048 for the 1500-token tail).
+    let mut sequences = Vec::new();
+    for profile in 0..2 {
+        let mut s = interactive_engine(2, false);
+        for capacity in [64usize, 128, 256, 512, 1024, 2048, 4096] {
+            let nanos = if (profile == 0) == (capacity == 4096) { MS } else { 1 };
+            set_cost(&mut s, GraphKind::Prefill, 1, capacity, nanos);
+        }
+        add(&mut s, 1, 32768 + 1500, 128);
+        let mut chunks = Vec::new();
+        while chunks.len() < 9 {
+            let plan = step(&mut s, 0);
+            if plan.kind == GraphKind::Prefill {
+                chunks.push((plan.token_capacity, plan.lanes[0].tokens));
+            }
+        }
+        assert!(chunks[..8].iter().all(|&chunk| chunk == (4096, 4096)), "{chunks:?}");
+        assert_eq!(chunks[8], (2048, 1500), "{chunks:?}");
+        sequences.push(chunks);
+    }
+    assert_eq!(sequences[0], sequences[1]);
+}
+
+#[test]
+fn competing_lanes_keep_the_measured_catalog_choice() {
+    // With a second live request the chunk rule is scoped out: the measured
+    // catalog competes as before and decode interleaving stays possible. The
+    // rule would cut the 34268-token prompt with a full 4096 chunk; under
+    // competition the cheap mid-size graph must win instead.
+    let mut s = interactive_engine(4, false);
+    for capacity in [64usize, 128, 256, 512, 1024, 2048, 4096] {
+        set_cost(&mut s, GraphKind::Prefill, 1, capacity, if capacity == 4096 { MS } else { 1 });
+    }
+    add(&mut s, 1, 32768 + 1500, 128);
+    add(&mut s, 2, 32768 + 1500, 128);
+    let mut first = None;
+    for _ in 0..40 {
+        let plan = step(&mut s, 0);
+        if plan.kind == GraphKind::Prefill {
+            first = Some(plan.token_capacity);
+            break;
+        }
+    }
+    assert!(first.is_some(), "competing prefills must still make progress");
+    assert_ne!(first, Some(4096), "the chunk rule must not engage under competition");
+}
+
+#[test]
+fn solo_prefill_survives_an_unmeasured_chunk_cut_back_by_an_atomic_span() {
+    // Liveness regression: an atomic span that straddles the end of the full
+    // chunk cuts it back to the span start, so the full graph consumes exactly
+    // what a smaller measured graph consumes and the candidate filter drops the
+    // unmeasured duplicate. The chunk rule must never leave a solo request with
+    // no prefill candidate at all: before the liveness fallback the request
+    // stalled forever after the Init graph here.
+    let mut s = interactive_engine(2, false);
+    for capacity in [64usize, 128, 256, 512, 1024, 2048] {
+        set_cost(&mut s, GraphKind::Prefill, 1, capacity, MS);
+    }
+    set_cost(&mut s, GraphKind::Prefill, 1, 4096, 0);
+    let h = add(&mut s, 1, 6000, 128);
+    s.set_prefill_spans(h, &[2000..5000]).unwrap();
+    let mut chunks = Vec::new();
+    while s.request(h).unwrap().consumed_tokens < 6000 {
+        assert!(
+            s.plan().is_some(),
+            "solo request stalled: the chunk rule left no prefill candidate"
+        );
+        let plan = step(&mut s, 0);
+        if plan.kind == GraphKind::Prefill {
+            chunks.push((plan.token_capacity, plan.lanes[0].tokens));
+        }
+        assert!(chunks.len() <= 4, "unbounded chunking: {chunks:?}");
+    }
+    // The span cuts both the unmeasured full chunk and the 2048 graph back to
+    // 2000 tokens, so the measured 2048 graph takes the first chunk; the tail
+    // runs on the full graph (the 2048 graph would cut at the span again).
+    assert_eq!(chunks, vec![(2048, 2000), (4096, 4000)], "{chunks:?}");
+}
+
+#[test]
+fn solo_prefill_survives_an_unmeasured_chunk_cut_back_by_a_span_and_message_boundary() {
+    // The same stall through a message boundary ahead of an atomic span: the
+    // boundary stops the full chunk at 5000 while the span cuts it back to
+    // 2000, again equalling a smaller measured graph's work. Preparation
+    // contexts cut chunks at message boundaries and model spans alike.
+    let mut s = interactive_engine(2, false);
+    for capacity in [64usize, 128, 256, 512, 1024, 2048] {
+        set_cost(&mut s, GraphKind::Prefill, 1, capacity, MS);
+    }
+    set_cost(&mut s, GraphKind::Prefill, 1, 4096, 0);
+    let h = s.admit(RequestSpec {
+        prompt: vec![1; 6000],
+        message_boundaries: vec![5000],
+        conditioning: vec![],
+        max_new_tokens: 128,
+        grammar_constrained: false,
+        host_stops: false,
+        prompt_logprobs: false,
+        growable_output: false,
+    }).unwrap();
+    s.set_prefill_spans(h, &[2000..5000]).unwrap();
+    let mut chunks = Vec::new();
+    while s.request(h).unwrap().consumed_tokens < 6000 {
+        assert!(
+            s.plan().is_some(),
+            "solo request stalled: the chunk rule left no prefill candidate"
+        );
+        let plan = step(&mut s, 0);
+        if plan.kind == GraphKind::Prefill {
+            chunks.push((plan.token_capacity, plan.lanes[0].tokens));
+        }
+        assert!(chunks.len() <= 4, "unbounded chunking: {chunks:?}");
+    }
+    assert_eq!(chunks, vec![(2048, 2000), (4096, 3000), (1024, 1000)], "{chunks:?}");
+}
+
+#[test]
+fn solo_prefill_ttft_harness_reports_launch_counts_and_prefill_time() {
+    // TTFT harness for the chunk rule. The scheduler's catalog is set to the
+    // harness duration model below; a "drift" arm over-measures the full graph
+    // (one slow capture polluting the catalog). Reported per arm: prefill
+    // launches and the accumulated true prefill time to the first token, where
+    // the true model is the clean estimate (2 ms + tokens/64 ms per graph) and
+    // the simulator's clock advances per completed plan. Compare this test's
+    // output on the base tree to read the before/after; the rule's contract is
+    // that the chunk sequence (and hence the numbers) never depend on the
+    // catalog at all.
+    for (label, prompt) in [("3.5k", 3504usize), ("14k", 14000)] {
+        for (profile, drift) in [("clean", false), ("full-graph-drift-x1.6", true)] {
+            let mut s = interactive_engine(2, false);
+            let true_ms = |capacity: u64| 2 * MS + capacity * MS / 64;
+            for capacity in [64usize, 128, 256, 512, 1024, 2048, 4096] {
+                let mut nanos = true_ms(capacity as u64);
+                if drift && capacity == 4096 {
+                    nanos = nanos * 8 / 5;
+                }
+                set_cost(&mut s, GraphKind::Prefill, 1, capacity, nanos);
+            }
+            let h = add(&mut s, 1, prompt, 128);
+            let mut launches = 0usize;
+            let mut ttft_ns = 0u64;
+            while s.request(h).unwrap().consumed_tokens < prompt as u64 {
+                let plan = step(&mut s, 0);
+                ttft_ns += if plan.kind == GraphKind::Prefill {
+                    launches += 1;
+                    true_ms(plan.token_capacity as u64)
+                } else {
+                    MS / 10
+                };
+                assert!(launches <= 16, "unbounded chunking");
+            }
+            println!(
+                "ttft-harness prompt={label} profile={profile} launches={launches} ttft_ms={:.2}",
+                ttft_ns as f64 / 1e6
+            );
+        }
+    }
+}
+
+#[test]
 fn efficient_thirty_millisecond_speculation_beats_seventeen_millisecond_rounds() {
     let mut s = interactive_engine(1, true);
     let h = add(&mut s, 1, 64, 2048);

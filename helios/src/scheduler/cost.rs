@@ -12,6 +12,24 @@ use crate::{
     execution::{ExecutionTiming, GraphDescriptor, GraphKind},
 };
 
+/// Deterministic prefill chunk capacity: a function of the request's remaining
+/// prefill segment alone (the tokens to the next message boundary or prefill
+/// limit, cut at atomic spans). Full-size chunks while the remainder is at
+/// least one chunk, then the single smallest graph that covers the rest.
+/// Measured durations never enter this choice, so the launch count is a
+/// function of the remaining segment alone and identical across boots and
+/// requests.
+pub(crate) fn deterministic_prefill_capacity(catalog: &[usize], remaining: usize) -> Option<usize> {
+    let full = *catalog.last()?;
+    if remaining == 0 {
+        return None;
+    }
+    if remaining >= full {
+        return Some(full);
+    }
+    catalog.iter().copied().find(|&capacity| capacity >= remaining)
+}
+
 pub(crate) fn observed_duration_ns(timing: ExecutionTiming) -> Option<u64> {
     timing
         .gpu_ns
@@ -272,7 +290,24 @@ impl ActionCosts {
 
 #[cfg(test)]
 mod tests {
-    use super::ReplayTimes;
+    use super::{ReplayTimes, deterministic_prefill_capacity};
+
+    #[test]
+    fn chunk_rule_is_a_function_of_the_remaining_prefill_segment() {
+        let catalog = [128usize, 256, 512, 1024, 1536, 2048, 2560, 3072];
+        // Full-size chunks while the remainder is at least one chunk.
+        assert_eq!(deterministic_prefill_capacity(&catalog, 3504), Some(3072));
+        assert_eq!(deterministic_prefill_capacity(&catalog, 3072), Some(3072));
+        assert_eq!(deterministic_prefill_capacity(&catalog, 3073), Some(3072));
+        assert_eq!(deterministic_prefill_capacity(&catalog, 6144), Some(3072));
+        // Then the single smallest graph that covers the rest.
+        assert_eq!(deterministic_prefill_capacity(&catalog, 432), Some(512));
+        assert_eq!(deterministic_prefill_capacity(&catalog, 1649), Some(2048));
+        assert_eq!(deterministic_prefill_capacity(&catalog, 1), Some(128));
+        assert_eq!(deterministic_prefill_capacity(&catalog, 3071), Some(3072));
+        assert_eq!(deterministic_prefill_capacity(&catalog, 0), None);
+        assert_eq!(deterministic_prefill_capacity(&[], 100), None);
+    }
 
     #[test]
     fn isolated_slow_replay_does_not_displace_the_steady_cost() {
