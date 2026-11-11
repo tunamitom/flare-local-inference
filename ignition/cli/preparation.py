@@ -46,7 +46,8 @@ def derive(configuration: Configuration, model: ResolvedModel, host: Host, *, gp
            concurrency: Setting, speculation: Speculation | None, prefill_chunk: int | None = None,
            context_parallel: bool = True, stream_overlap: bool = True, roce_ring: bool = False, roce_chain: bool = False,
            mixed_prefill: bool = False, prompt_logprobs: bool = False, expert_scale_compression: str | None = None,
-           online_mxfp8: bool = False, prefill_fp8_transport: bool = False, language_model_only: bool = False,
+           online_mxfp8: bool = False, prefill_fp8_transport: bool = False,
+           prefill_island_reduce: bool = False, language_model_only: bool = False,
            compile_workers: int | None = None, tuning_gpus: str | None = None, autotune_effort: str | None = None, collective_tuning: str | None = None, collective_ladder=None,
            image_concurrency: int | None = None, mla_compute_mode: str | None = None,
            lock_gpu_clocks: bool = False, native_dense_activations: bool = False,
@@ -65,6 +66,7 @@ def derive(configuration: Configuration, model: ResolvedModel, host: Host, *, gp
         mixed_prefill=mixed_prefill, prompt_logprobs=prompt_logprobs, expert_scale_compression=expert_scale_compression,
         image_concurrency=image_capacity_setting(configuration, model, image_concurrency),
         online_mxfp8=online_mxfp8, prefill_fp8_transport=prefill_fp8_transport,
+        prefill_island_reduce=prefill_island_reduce,
         language_model_only=language_model_only, mla_compute_mode=mla_compute_mode)
     result = replace(result, compile_workers=workers, hub_cache=configuration.directory("hub_cache"),
                      autotune_effort=tuning_effort(configuration, autotune_effort),
