@@ -225,6 +225,20 @@ def test_prefill_island_reduce_is_gated_to_kimi_recipes_and_supported_tp():
                       prefill_island_reduce=True)
 
 
+def test_prefill_latent_gather_is_a_plan_setting_for_kimi_recipes():
+    kimi = replace(SOLO, name="kimi31")
+    exact = derive(model=kimi, gpus=[gpu(index, 95) for index in range(4)], selected=(0, 1, 2, 3))
+    assert exact.prefill_latent_gather is False and exact.to_dict()["prefill_latent_gather"] is False
+    wire = planning.plan(kimi, kimi.checkpoints[0], tuple(gpu(index, 95) for index in range(4)),
+                         selected=(0, 1, 2, 3), concurrency=4, reserve_bytes=0, speculation=kimi.speculation,
+                         prefill_latent_gather=True)
+    assert wire.prefill_latent_gather is True and wire.to_dict()["prefill_latent_gather"] is True
+    assert replace(wire, prefill_latent_gather=False) == exact
+    with pytest.raises(UsageError, match="--prefill-latent-gather"):
+        planning.plan(SOLO, SOLO.checkpoints[0], (gpu(0, 95),), selected=(0,), concurrency=4, reserve_bytes=0,
+                      speculation=SOLO.speculation, prefill_latent_gather=True)
+
+
 def test_image_concurrency_defaults_and_explicit_capacity():
     vision = replace(SOLO, max_images=4)
     settings = dict(concurrency=32, reserve_bytes=0, speculation=None, selected=None)

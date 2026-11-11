@@ -52,6 +52,7 @@ def derive(configuration: Configuration, model: ResolvedModel, host: Host, *, gp
            trellis_prefill_shapes: bool = False,
            trellis_prefill_table: str = "0",
            decode_fusion: bool = False,
+           prefill_latent_gather: bool = False,
            language_model_only: bool = False,
            compile_workers: int | None = None, tuning_gpus: str | None = None, autotune_effort: str | None = None, collective_tuning: str | None = None, collective_ladder=None,
            image_concurrency: int | None = None, mla_compute_mode: str | None = None,
@@ -77,6 +78,7 @@ def derive(configuration: Configuration, model: ResolvedModel, host: Host, *, gp
         trellis_prefill_shapes=trellis_prefill_shapes,
         trellis_prefill_table=trellis_prefill_table,
         decode_fusion=decode_fusion,
+        prefill_latent_gather=prefill_latent_gather,
         language_model_only=language_model_only, mla_compute_mode=mla_compute_mode)
     result = replace(result, compile_workers=workers, hub_cache=configuration.directory("hub_cache"),
                      autotune_effort=tuning_effort(configuration, autotune_effort),

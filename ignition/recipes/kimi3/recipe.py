@@ -67,6 +67,8 @@ def prepare_variant(snapshot, plan, *, bootstrap, draft_repository, draft_revisi
             or int(os.environ.get("IGNITION_KIMI_PREFILL_DMA_ROWS", "0")),
         prefill_dma_ring_bf16=plan.prefill_dma_bf16
             or os.environ.get("IGNITION_KIMI_PREFILL_DMA_BF16", "0") == "1",
+        # L4: plan setting authoritative (the upstream environment switch is not read).
+        prefill_latent_gather=plan.prefill_latent_gather,
         vision=not plan.language_model_only, **drafting)
     if plan.trellis_prefill_shapes:
         # W3 (R3): the measured Trellis prefill launch shapes are selected at

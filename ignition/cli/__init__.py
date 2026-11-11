@@ -277,6 +277,13 @@ def _preparation_arguments(running, *, model_default="defaults.model"):
     advanced.add_argument("--decode-fusion", action="store_true",
                           help="replace the decode score/ID pack's 8 dispatched kernels with one"
                                " compiled kernel (bit-equal; Kimi K3/K3.1)")
+    advanced.add_argument("--prefill-latent-gather", action="store_true",
+                          help="compute each prefill row's latent columns from the full hidden row"
+                               " with the decode row-sharded latent_down_rows weights and all-gather"
+                               " them, replacing the latent down-projection's all-reduce (changes"
+                               " results: one FP32 full-K dot product rounded to BF16 once per latent"
+                               " value, better relative error to float64; prefill graphs only;"
+                               " Kimi K3/K3.1)")
     advanced.add_argument("--language-model-only", action="store_true",
                           help="prepare no vision encoder and reject images; its weights and scratch become KV"
                                " pages (recipes with a separable encoder; default: the recipe's image support)")

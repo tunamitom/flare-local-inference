@@ -26,6 +26,26 @@ from .projections import prepare_projection
 from .residual import ADD, REPLACE, ResidualStream
 from .routing import MAX_ROWS as ROUTE_ROWS, PreparedRouteGather
 
+# L4 (upstream flare #16): the prefill latent gather's measured launch geometry,
+# (threads, block_limit) of the DcpAllToAll.all_gather_heads channel: 512:32 was
+# the fastest measured at TP8 for the 3072x3584 gather. A caller-chosen geometry
+# rides the collective's plan; None would keep the channel default (256:16), and
+# the export's recipe environment clamps the block dimension (see the probe
+# record). The two-island transport is armed by the export's W22 switches.
+LATENT_GATHER_LAUNCH = (512, 32)
+
+
+def latent_gather_supported(world_size, latent):
+    """The latent gather needs 64-column rank partitions (3584: world 2, 4, 7, 8).
+
+    Prefill rows project their own latent columns from the full hidden row with
+    the decode row-sharded ``latent_down_rows`` weights and all-gather them,
+    replacing the latent down-projection's all-reduce. Each latent value is then
+    one FP32-accumulated dot product over all 7168 inputs, rounded to BF16 once
+    (the reduction rounds eight BF16 partials, sums in FP32 and rounds again).
+    Decode, verification and draft graphs are unchanged."""
+    return world_size > 1 and latent % (world_size * 64) == 0
+
 
 # A concurrent shared-expert MLP forks onto the auxiliary stream after its input is written and joins before its
 # output is added; the explicit mutated outputs order both against the routed branch through compilation.
@@ -184,7 +204,7 @@ class PreparedMLP:
 
 class PreparedLatentMoE:
     def __init__(self, weights, source, config, shard, *, runtime, router_runtime, coordinator, session, name, workspace, buffers, storage,
-                 route_runtime=None, allocator=None, accumulation_buffers=None):
+                 route_runtime=None, allocator=None, accumulation_buffers=None, latent_gather_runtime=None):
         tokens, hidden = source.shape
         c, device = config.text, source.device
         latent = c["routed_expert_hidden_size"]
@@ -219,8 +239,16 @@ class PreparedLatentMoE:
         if "routes" not in buffers:
             buffers["routes"] = RouterScratch.allocate(tokens, device, experts=c["num_experts"], top_k=c["num_experts_per_token"])
         routes = buffers["routes"].rows(tokens)
-        self.route_gather = None
-        if route_runtime is not None and tokens <= ROUTE_ROWS:
+        self.route_gather = self.down_gather = None
+        if latent_gather_runtime is not None:
+            # Prefill rows project their own latent columns from the full hidden row (the decode row-sharded
+            # weights) and gather them: no reduction, one BF16 rounding per latent value.
+            self.down = prepare_projection(source, weights["latent_down_rows"],
+                buffer("prefill_local_down", latent // shard.world_size), session=session,
+                name=name + ".latent_down_rows", workspace=workspace)
+            self.down_gather = PreparedChunkedAllGather(self.down.output, self.latent, runtime=latent_gather_runtime,
+                coordinator=coordinator, session=session, name=name + ".down_gather", launch=LATENT_GATHER_LAUNCH)
+        elif route_runtime is not None and tokens <= ROUTE_ROWS:
             # Decode rows gather row-sharded latent and router shards and select experts in one exchange.
             self.down = prepare_projection(source, weights["latent_down_rows"],
                 buffer("local_down", latent // shard.world_size), session=session, name=name + ".latent_down_rows",
@@ -233,6 +261,7 @@ class PreparedLatentMoE:
                                             session=session, name=name + ".latent_down", workspace=workspace)
             self.down_reduce = reduction(self.down.output, self.latent, runtime=runtime,
                 coordinator=coordinator, session=session, name=name + ".down_reduce", **reduction_args)
+        if self.route_gather is None:
             logits = buffer("router", c["num_experts"], torch.float32)
             self.router_logits = logits
             local_experts = local_logits.shape[1]
@@ -266,8 +295,11 @@ class PreparedLatentMoE:
             self.router_gather(self.router_input.view(torch.bfloat16))
             self.router_output.copy_(self.router_columns)
             self.router(self.router_logits)
-            self.source.copy_(source.index_select(1, self.hidden_columns))
-            self.down_reduce(self.down(self.source))
+            if self.down_gather is not None:
+                self.down_gather(self.down(source))
+            else:
+                self.source.copy_(source.index_select(1, self.hidden_columns))
+                self.down_reduce(self.down(self.source))
         self.expert_reduce(self.experts())
         rms_norm_columns(self.latent_sum, self.latent_norm, self.up_input, self.eps, begin=self.latent_begin)
         self.up(self.up_input)
@@ -286,7 +318,7 @@ class PreparedDecoder:
 
     def __init__(self, weights, scratch, metadata, pool, *, mode, runtime, vocabulary_runtime, embedding_runtime, router_runtime, vision_state,
                  coordinator, session, name, workspace, buffers, kda_records=None, route_runtime=None, context=None,
-                 latent_runtimes=(), scoring=None):
+                 latent_runtimes=(), scoring=None, latent_gather_runtime=None):
         # Verification records its candidate rows; other modes ignore records.
         if mode not in ("prefill", "decode", "verify") or mode == "verify" and kda_records is None:
             raise ValueError("Kimi K3 verification decodes recorded candidate rows")
@@ -385,7 +417,9 @@ class PreparedDecoder:
                     router_runtime=router_runtime, route_runtime=route_runtime if mode != "prefill" else None,
                     coordinator=coordinator, session=session, name=prefix + ".moe", workspace=workspace,
                     buffers=self.buffers.setdefault("moe", {}), storage=buffers, allocator=buffers.stage_allocator("moe"),
-                    accumulation_buffers=accumulation_buffers)
+                    accumulation_buffers=accumulation_buffers,
+                    # Only prefill graphs gather the latent; decode, verification and drafts keep their paths.
+                    latent_gather_runtime=latent_gather_runtime if mode == "prefill" else None)
             # The sum buffer is consumed before the next attention or MLP reduction.
             total = self.buffers["total"][:source.shape[0]]
             reduction = PreparedChunkedAllReduce if accumulation_buffers is None else PreparedOwnerPacketAllReduce

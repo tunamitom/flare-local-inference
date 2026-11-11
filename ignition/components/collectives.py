@@ -363,12 +363,13 @@ class PreparedChunkedAllGather:
     for decode can also gather prefill activations; the chunks run in order on one stream.
     """
 
-    def __init__(self, source, output, *, runtime, session, coordinator, name):
+    def __init__(self, source, output, *, runtime, session, coordinator, name, launch=None):
         rows = source.shape[0]
         step = rows if runtime is None or _roce(runtime) else max(1, min(rows, runtime.max_batch_size))
         self.bounds = [(start, min(start + step, rows)) for start in range(0, rows, step)]
         self.parts = [PreparedAllGather(source[begin:end], output[begin:end], runtime=runtime, session=session,
-                                        coordinator=coordinator, name=name if len(self.bounds) == 1 else f"{name}.{index}")
+                                        coordinator=coordinator, name=name if len(self.bounds) == 1 else f"{name}.{index}",
+                                        launch=launch)
                       for index, (begin, end) in enumerate(self.bounds)]
         self.output = output
 
@@ -788,7 +789,7 @@ class PreparedAllGather:
     Operations sharing the channel must execute serially on every rank.
     """
 
-    def __init__(self, source, output, *, runtime, session, coordinator, name):
+    def __init__(self, source, output, *, runtime, session, coordinator, name, launch=None):
         import torch.distributed as dist
         from b12x.comm import pcie
 
@@ -835,6 +836,9 @@ class PreparedAllGather:
         self.runtime, self.output = runtime, output
         call = {"local_input": transport_source.view(source.shape[0], runtime.heads_per_rank, runtime.query_head_dim),
                 "out": transport_output.view(output.shape[0], runtime.total_heads, runtime.query_head_dim)}
+        if launch is not None:
+            # A caller-chosen (threads, block_limit) geometry for large gathers; None keeps the channel default.
+            call.update(threads=int(launch[0]), block_limit=int(launch[1]))
         query = pcie.query_from_runtime(runtime, surface="DcpAllToAll.all_gather_heads", call=call)
         startup = False
         if getattr(session, "collective_tuning", "static") == "runtime":

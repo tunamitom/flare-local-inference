@@ -50,7 +50,7 @@ from ignition.progress import phase
 from .config import PAGE_TOKENS, LatentDSparkConfig
 from ignition.recipes.kimi31.dflash_config import DFlash2Config
 from .contract import prepare as prepare_contract
-from .decoder import DecoderStorage, PreparedDecoder, Scratch, retained_auxiliary_rows
+from .decoder import DecoderStorage, PreparedDecoder, Scratch, latent_gather_supported, retained_auxiliary_rows
 from .pool import ContinuationPool, continuation_layout, page_bytes
 from .weights import ModelWeights
 from .vision import (PATCH_CAPACITIES, FEATURES, HIDDEN, PreparedVision, VisionInputs, VisionScratch,
@@ -135,6 +135,12 @@ class PreparationConfig:
     prefill_dma_ring_rows: int = 0
     # True: BF16 hop sums on the ring (TP16-era wire); False: the exact FP32 owner-packet reduction.
     prefill_dma_ring_bf16: bool = False
+    # L4 (upstream flare #16): prefill MoE layers compute their own latent columns
+    # from the full hidden row with the decode row-sharded latent_down_rows weights
+    # and all-gather them, replacing the latent down-projection's all-reduce.
+    # Default off keeps the shipped prefill arithmetic byte-identical as the
+    # rollback. Decode, verification and draft graphs are unchanged either way.
+    prefill_latent_gather: bool = False
 
     def __post_init__(self):
         if self.draft_head_quantization not in (None, "mxfp8", "nvfp4"):
@@ -334,6 +340,18 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         router_collective = create_all_gather_runtime(group, device, max_rows=channel_rows,
             columns=router_columns,
             ipc=package_storage.peer_storage)
+        # L4 (plan setting, default off): prefill rows project their own latent columns
+        # from the full hidden row and all-gather them instead of reducing column-sharded
+        # partials. The channel stages the serial channels' row staging; larger prefills
+        # gather in chunks. Needs 64-column rank partitions.
+        latent_gather_collective = None
+        if config.prefill_latent_gather:
+            latent = weights.config.text["routed_expert_hidden_size"]
+            if not latent_gather_supported(shard.world_size, latent):
+                raise ValueError("prefill latent gather needs the latent width to divide into"
+                                 " 64-column rank partitions")
+            latent_gather_collective = create_all_gather_runtime(group, device, max_rows=channel_rows,
+                columns=latent, ipc=package_storage.peer_storage)
         vision_collectives = {}
         if config.vision and weights.vision.shard.world_size > 1:
             from .vision import HEAD_SIZE, INTERMEDIATE, VISION_HEADS
@@ -533,7 +551,9 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                         **dict(collectives, runtime=(
                             prefill_dma if mode == "prefill" and prefill_dma is not None and capacity >= dma_rows
                             else prefill_collective if mode == "prefill" and prefill_collective is not None
-                            else collective)))
+                            else collective),
+                            # Speculation's decoders never see the prefill latent gather channel.
+                            latent_gather_runtime=latent_gather_collective if mode == "prefill" else None))
                     batch = PreparedBatch(inputs, requests, m, mode=mode, shard=weights.shard, pool=pool,
                         validate_prefill=vision_state.validate_prefill if mode == "prefill" and patches else None,
                         page_tokens=config.page_tokens)
@@ -702,6 +722,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         resources=(scoring, weights, pool, requests, inputs, admission, commands, arena, forwards, prefill_storage, context,
                    decode_storage, metadata, compiled, stream, graph_pool, session, coordinator, collective,
                    vocabulary_collective, embedding_collective, router_collective, route_collective, prefill_collective, prefill_dma,
+                   latent_gather_collective,
                    vision_inputs, vision_prefill, vision_state, vision_storage, deferred_pool, scratch_pool, shared_scratch, graph_buffers,
                    speculation, context_collective, markov_collective, latent_runtimes,
                    draft_context_collective, convolution_collective, vision_collectives))
