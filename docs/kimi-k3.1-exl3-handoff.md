@@ -3,9 +3,12 @@
 The production-signed package for
 [local-inference-lab/Kimi-K3.1-Pro-EXL3-2bit](https://huggingface.co/local-inference-lab/Kimi-K3.1-Pro-EXL3-2bit)
 serves eight RTX PRO 6000 Blackwell 96 GB GPUs with TP8/DCP8, DFlash2 K7,
-vision, four concurrent requests and a 3072-token prefill limit. It supports
-262,144 tokens per request. The qualified host allocated 1,281,024 physical KV
-tokens shared across requests and cached histories.
+vision, four concurrent requests and a 3072-token prefill limit. The signed
+export was qualified at 262,144 tokens per request, the context it baked as
+its maximum; the recipe now declares 1,048,576, so re-exports bake a larger
+maximum sequence length and page table, and requests are admitted up to the
+boot KV pool. The qualified host allocated 1,281,024 physical KV tokens
+shared across requests and cached histories.
 
 This guide starts from the published checkpoint. Encoding the source weights
 is outside its scope. The model card contains the checkpoint description,
