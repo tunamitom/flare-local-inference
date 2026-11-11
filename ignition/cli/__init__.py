@@ -248,6 +248,11 @@ def _preparation_arguments(running, *, model_default="defaults.model"):
                                " (Kimi K3/K3.1; halves reduction transfer bytes and replaces the exact"
                                " FP32 owner sums over BF16 inputs with quantized accumulation;"
                                " default: exact BF16 owner sums)")
+    advanced.add_argument("--prefill-island-reduce", action="store_true",
+                          help="run prefill reductions over the TP8 two-island BF16 wire"
+                               " (Kimi K3/K3.1, TP 2/4/8; island FP32 sums with one extra BF16 rounding"
+                               " of the 4-way partial quarter the cross-switch uplink bytes;"
+                               " default: exact single-rounding BF16 owner sums)")
     advanced.add_argument("--language-model-only", action="store_true",
                           help="prepare no vision encoder and reject images; its weights and scratch become KV"
                                " pages (recipes with a separable encoder; default: the recipe's image support)")

@@ -155,6 +155,7 @@ def run(args):
         image_concurrency=args.image_concurrency, mixed_prefill=args.mixed_prefill,
         prompt_logprobs=args.prompt_logprobs, expert_scale_compression=args.expert_scale_compression,
         online_mxfp8=args.online_mxfp8, prefill_fp8_transport=args.prefill_fp8_transport,
+        prefill_island_reduce=args.prefill_island_reduce,
         language_model_only=args.language_model_only,
         mla_compute_mode=args.mla_compute_mode)
     plan = replace(plan, benchmark_selection=BenchmarkSelection(

@@ -199,6 +199,7 @@ def _export_hosts(args):
                          mixed_prefill=args.mixed_prefill, prompt_logprobs=args.prompt_logprobs,
                          expert_scale_compression=args.expert_scale_compression,
                          online_mxfp8=args.online_mxfp8, prefill_fp8_transport=args.prefill_fp8_transport,
+                         prefill_island_reduce=args.prefill_island_reduce,
                          language_model_only=args.language_model_only,
                          mla_compute_mode=args.mla_compute_mode)
     collective_mode = collective_tuning_mode(configuration, model, args.collective_tuning)
@@ -283,6 +284,7 @@ def _prepare(args):
                       mixed_prefill=args.mixed_prefill, prompt_logprobs=args.prompt_logprobs,
                       expert_scale_compression=args.expert_scale_compression,
                       online_mxfp8=args.online_mxfp8, prefill_fp8_transport=args.prefill_fp8_transport,
+                      prefill_island_reduce=args.prefill_island_reduce,
                       language_model_only=args.language_model_only,
                       mla_compute_mode=args.mla_compute_mode)
         indices = planning.format_gpus(gpu.index for gpu in plan.gpus)
