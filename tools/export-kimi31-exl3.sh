@@ -85,15 +85,18 @@ PYV="${PYV:-$REPO/.venv/bin/python}"; [ -x "$PYV" ] || PYV="$(command -v python3
 RING_ROWS="${RING_ROWS:-1024}"
 # ─────────────────────────────────────────────────────────────────────────────
 # W22 (TP9 transplant, levers/w22-handover.md): the combined graph-only export.
-# Code tip 457af1a8 = kimi31-exl3-live + row-5 direct decode table (upstream
+# Code tip 0c6c6465 = kimi31-exl3-live + row-5 direct decode table (upstream
 # #94/#95 + --trellis-prefill-table), row-1 paired-gather push recipe (fn1),
-# and the fused-pack + compaction riders (W11 ports). Rows 2/6/7/10 dropped,
-# row 4's LSE push is in-tree but OFF (speed rule failed on B+D).
+# the fused-pack + compaction riders (W11 ports), and the J-D row-1 policy
+# notes (recipe + branch notes). flashinfer tip 5db9c10bc = rows 1/3/4 picks
+# + the policy note at the push switch. Rows 2/6/7/10 dropped, row 4's LSE
+# push is in-tree but OFF (speed rule failed on B+D).
 #   TRELLIS_TABLE=2   row-5 direct decode table (2 = 48-row blocks 1536..2560 +
 #                     the >=2560 128-thread geometry; 1 = 48-row band only)
 #   DECODE_FUSION=1   the fused decode score/ID pack rider (bit-equal)
 #   R1_PUSH / R3_ISLAND / R3_ACQUIRE: transport switches of the surviving
-#   decode rows (recorded per the W22 gate; switch off = row out).
+#   decode rows (recorded per the W22 gate; switch off = row out). R3_ACQUIRE
+#   is part of row 3's identity+speed-tested configuration (J-D section 4).
 # E1.1 (gb202-tp8-202611100809) remains the documented fallback package.
 # ─────────────────────────────────────────────────────────────────────────────
 TRELLIS_TABLE="${TRELLIS_TABLE:-2}"
@@ -101,12 +104,12 @@ DECODE_FUSION="${DECODE_FUSION:-1}"
 R1_PUSH="${R1_PUSH:-1}"
 R3_ISLAND="${R3_ISLAND:-1}"
 R3_ACQUIRE="${R3_ACQUIRE:-1}"
-EXPECT_HEAD="${EXPECT_HEAD:-457af1a8}"          # W22 code tip (TP9 transplant)
-EXPECT_FI="${EXPECT_FI:-f1213780a}"
+EXPECT_HEAD="${EXPECT_HEAD:-0c6c6465}"          # W22 code tip (TP9 transplant + J-D notes)
+EXPECT_FI="${EXPECT_FI:-5db9c10bc}"
 # W13 lineage pins (re-pinned at W22): the tree the running serve's package is
 # produced from must match the pinned export tree for every export-consumed
 # file (guards below). The image inputs are unchanged since 5585a9a7.
-EXPECT_EXPORT_SRC="${EXPECT_EXPORT_SRC:-457af1a8}"   # export tree of the W22 package
+EXPECT_EXPORT_SRC="${EXPECT_EXPORT_SRC:-0c6c6465}"   # export tree of the W22 package
 EXPECT_IMAGE_SRC="${EXPECT_IMAGE_SRC:-5585a9a7}"     # image build tree (chunkfix on 35134e2b)
 # W13 image step (--image): the runtime image the serve runs, built from this
 # tree with the campaign build path (docker build -t local/flare:rt-<variant>-<sha>
