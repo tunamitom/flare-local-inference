@@ -73,6 +73,11 @@ def prepare_variant(snapshot, plan, *, bootstrap, draft_repository, draft_revisi
         # processes read this environment before compiling; recorded in the
         # plan settings by planning.Settings so the package cannot drift.
         os.environ["B12X_W4A16_PREFILL_SHAPES"] = "1"
+    if plan.trellis_prefill_table != "0":
+        # W22 (row 5): the direct Trellis decode table for large prefill
+        # launches (B12X_W4A16_PREFILL_TABLE=1|2 at kernel compile time),
+        # same stamping contract as the R3 shapes above.
+        os.environ["B12X_W4A16_PREFILL_TABLE"] = plan.trellis_prefill_table
     if plan.world_size == 1:
         return prepare_rank(snapshot, config, rank=0, group=None, progress=progress, package_storage=package_storage)
     return prepare_group(snapshot, config, prepare_rank, progress=progress, package_storage=package_storage,
