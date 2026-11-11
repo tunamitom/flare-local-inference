@@ -102,17 +102,36 @@ SPARE_GPU="${SPARE_GPU:-GPU-253e168e-256f-4457-82f4-d26fd2f3c0bd}"
 #   is part of row 3's identity+speed-tested configuration (J-D section 4).
 # E1.1 (gb202-tp8-202611100809) remains the documented fallback package.
 # ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# W23 (TP9 transplant final export, levers/tp9-jG-review.md section 6):
+# MAX_ROWS 8 -> 20 (lever 1: rows 9..20 route through the pushed pair gather +
+# the standalone top-16; flare b4889fe5, flashinfer 89ac9418e). The J-G rider
+# switches are ALL UNSET per the W23-C verdicts:
+#   B12X_TRELLIS_INKERNEL_ROUTE_PACK / B12X_TRELLIS_FLOW_FLAGS — rider (a)
+#     FAILED its 20-row condition (bit-exact but +10.21 us per layer vs the
+#     1 us bar, w23c-rider-a20.log; "if it fails either, the rider is off
+#     entirely" — tp9-jG-review.md section 2).
+#   B12X_A16_SPLITK_REDUCE_PDL — rider (c) DROPPED by its precondition: the
+#     switch enters the dense compile key and with it the selection-cache key
+#     (candidate_program_identity), so every dense blockscaled key re-races
+#     (tools/preflight/pdl-compile-key-probe.py; section 4).
+#   KDA fused verify stays OFF (rider (b) HOLD, W23-A verdict 4); the lever-2
+#   knobs (B12X_MXFP8_A16_DECODE_W4_TK64 / _MAX_ROWS) stay UNSET (killed).
+# The pre-authorized FALLBACK is the W22 package gb202-tp8-202611110549 (never
+# deleted; revert to it and report if a tripwire trips on a new switch). E1.1
+# (gb202-tp8-202611100809) remains behind it.
+# ─────────────────────────────────────────────────────────────────────────────
 TRELLIS_TABLE="${TRELLIS_TABLE:-2}"
 DECODE_FUSION="${DECODE_FUSION:-1}"
 R1_PUSH="${R1_PUSH:-1}"
 R3_ISLAND="${R3_ISLAND:-1}"
 R3_ACQUIRE="${R3_ACQUIRE:-1}"
-EXPECT_HEAD="${EXPECT_HEAD:-ac377ae4}"          # W22 code tip (TP9 transplant + J-D notes)
-EXPECT_FI="${EXPECT_FI:-5db9c10bc}"
+EXPECT_HEAD="${EXPECT_HEAD:-b4889fe5}"          # W23 code tip (MAX_ROWS 20, lever 1)
+EXPECT_FI="${EXPECT_FI:-89ac9418e}"             # W23 flashinfer tip (top-16 cap 20 + riders in-tree)
 # W13 lineage pins (re-pinned at W22): the tree the running serve's package is
 # produced from must match the pinned export tree for every export-consumed
 # file (guards below). The image inputs are unchanged since 5585a9a7.
-EXPECT_EXPORT_SRC="${EXPECT_EXPORT_SRC:-ac377ae4}"   # export tree of the W22 package
+EXPECT_EXPORT_SRC="${EXPECT_EXPORT_SRC:-b4889fe5}"   # export tree of the W23 package
 EXPECT_IMAGE_SRC="${EXPECT_IMAGE_SRC:-5585a9a7}"     # image build tree (chunkfix on 35134e2b)
 # W13 image step (--image): the runtime image the serve runs, built from this
 # tree with the campaign build path (docker build -t local/flare:rt-<variant>-<sha>
@@ -188,20 +207,28 @@ say() { echo "$*" >&2; }
 fail=0
 chk() { if "$@"; then return 0; else fail=$((fail+1)); return 1; fi; }
 
-# ── W22 fingerprint registry (shared by the post-export assertion and the
+# ── W22/W23 fingerprint registry (shared by the post-export assertion and the
 # ── preflight PRE-mode check). Key: TRELLIS_TABLE/DECODE_FUSION/R1_PUSH/
-# ── R3_ISLAND/R3_ACQUIRE at capacity 20, image 1, ring 1024. The W22 switches
-# ── are launch fusions and move the round-graph/kernel count (the decode-fusion
-# ── detector); a knob config with no registered baseline cannot pass the
-# ── post-export assertion — the preflight refuses to start for it.
-# ──   2/1/1/1/1  W22 ruled config (gb202-tp8-202611110549; E1.1's 4967
-# ──              superseded: -63 kernels = -63 modules, -1.83 MiB cubin,
-# ──              graphs 66 and slab/index_slab unchanged)
-# ──   0/0/0/0/0  E1.1 (gb202-tp8-202611100809)
+# ── R3_ISLAND/R3_ACQUIRE @ the export tree tip (EXPECT_EXPORT_SRC) at capacity
+# ── 20, image 1, ring 1024. The W22 switches are launch fusions and move the
+# ── round-graph/kernel count (the decode-fusion detector); a knob config with
+# ── no registered baseline cannot pass the post-export assertion — the
+# ── preflight refuses to start for it.
+# ──   2/1/1/1/1@ac377ae4  W22 ruled config (gb202-tp8-202611110549; E1.1's
+# ──                       4967 superseded: -63 kernels = -63 modules, -1.83
+# ──                       MiB cubin, graphs 66 and slab/index_slab unchanged)
+# ──   0/0/0/0/0@*         E1.1 (gb202-tp8-202611100809)
+# ──   2/1/1/1/1@b4889fe5  W23 ruled config (MAX_ROWS 20): the compiled kernel
+# ──                       set is unknowable before the first export (lever 1
+# ──                       replaces the general route path at rows 9..20), so
+# ──                       the W11 supersede flow applies: PRE warns, the export
+# ──                       records the measured fingerprint here, then
+# ──                       --reassert must pass.
 fp_baseline() {
-  case "$TRELLIS_TABLE/$DECODE_FUSION/$R1_PUSH/$R3_ISLAND/$R3_ACQUIRE" in
-    2/1/1/1/1) echo "Graphs: 66; kernels: 4904" ;;
-    0/0/0/0/0) echo "Graphs: 66; kernels: 4967" ;;
+  case "$TRELLIS_TABLE/$DECODE_FUSION/$R1_PUSH/$R3_ISLAND/$R3_ACQUIRE@$EXPECT_EXPORT_SRC" in
+    2/1/1/1/1@ac377ae4) echo "Graphs: 66; kernels: 4904" ;;
+    0/0/0/0/0@*) echo "Graphs: 66; kernels: 4967" ;;
+    2/1/1/1/1@b4889fe5) echo "" ;;
     *) echo "" ;;
   esac
 }
@@ -223,19 +250,34 @@ assert_pre_settings() {
   case "${B12X_PCIE_DCP_LSE_PUSH_TP8:-0}" in 0|"") : ;;
     *) say "PRE-SETTINGS: B12X_PCIE_DCP_LSE_PUSH_TP8=${B12X_PCIE_DCP_LSE_PUSH_TP8} — row 4 stays OFF (J-D §4)"; bad=$((bad+1));;
   esac
+  # W23-C rider verdicts (tp9-jG-review.md sections 2/4): all three J-G rider
+  # switches stay UNSET. Rider (a) failed its 20-row condition (bit-exact but
+  # +10.21 us/layer vs the 1 us bar -> "the rider is off entirely"); rider (c)
+  # enters the dense compile key and re-races the dense selections (proof:
+  # tools/preflight/pdl-compile-key-probe.py). Lever-2 knobs stay unset too.
+  case "${B12X_TRELLIS_INKERNEL_ROUTE_PACK:-}:${B12X_TRELLIS_FLOW_FLAGS:-}:${B12X_A16_SPLITK_REDUCE_PDL:-}:${B12X_MXFP8_A16_DECODE_W4_TK64:-}:${B12X_MXFP8_A16_DECODE_MAX_ROWS:-}" in
+    "::::") : ;;
+    *) say "PRE-SETTINGS: W23 rider / lever-2 switches must all be UNSET (rider (a) off per its 20-row cell; rider (c) dropped per the dense re-race probe; lever 2 killed-with-evidence)"; bad=$((bad+1));;
+  esac
   local key="$TRELLIS_TABLE/$DECODE_FUSION/$R1_PUSH/$R3_ISLAND/$R3_ACQUIRE"
   if [ -n "$(fp_baseline)" ]; then
-    say "PRE-SETTINGS: fingerprint baseline registered for $key: $(fp_baseline)"
+    say "PRE-SETTINGS: fingerprint baseline registered for $key@$EXPECT_EXPORT_SRC: $(fp_baseline)"
   else
-    case "$key" in
-      0/1/1/1/1|2/1/0/1/1|0/1/0/1/1)
+    case "$key@$EXPECT_EXPORT_SRC" in
+      2/1/1/1/1@b4889fe5)
+        # W23 ruled config, first export: the compiled kernel count is
+        # unknowable before it (lever 1 swaps the route path at rows 9..20).
+        # W11 supersede flow: proceed, record the measured fingerprint in
+        # fp_baseline and run --reassert.
+        say "PRE-SETTINGS: WARNING — $key@$EXPECT_EXPORT_SRC is the W23 ruled config with no registered fingerprint baseline yet; after the export record the memory-report fingerprint in fp_baseline and run --reassert" ;;
+      0/1/1/1/1@*|2/1/0/1/1@*|0/1/0/1/1@*)
         # Pre-authorized fallback exports (J-D section 3: row 5 off / R1_PUSH=0 /
         # both off). Their fingerprint is unknowable before the first export:
         # proceed, but the post-export assertion WILL flag the package until the
         # measured fingerprint is registered in fp_baseline and --reassert runs.
         say "PRE-SETTINGS: WARNING — $key is a pre-authorized fallback config (J-D §3) with no registered fingerprint baseline; after the export record the memory-report fingerprint in fp_baseline and run --reassert" ;;
       *)
-        say "PRE-SETTINGS: no ruled fingerprint baseline for $key — the post-export settings assertion cannot pass (the 2026-11-11 12:50 class); register the baseline (consult) before exporting"
+        say "PRE-SETTINGS: no ruled fingerprint baseline for $key@$EXPECT_EXPORT_SRC — the post-export settings assertion cannot pass (the 2026-11-11 12:50 class); register the baseline (consult) before exporting"
         bad=$((bad+1)) ;;
     esac
   fi
@@ -255,6 +297,10 @@ run_preflight() {
   fi
   # The `flashinfer/data/csrc missing` class: every JIT build path must resolve.
   if "$PYV" "$HERE/preflight/jit-src-dryrun.py" >&2; then :; else bad=$((bad+1)); fi
+  # W23-C rider-(c) precondition (tp9-jG-review.md section 4): prove from the
+  # pinned trees whether B12X_A16_SPLITK_REDUCE_PDL enters the dense compile
+  # key / re-races the dense selections (CPU; verdict recorded at each run).
+  if "$PYV" "$HERE/preflight/pdl-compile-key-probe.py" >&2; then :; else bad=$((bad+1)); fi
   # Plan acceptance + PRE-mode settings vs rulings.
   if "$PYV" "$HERE/plan-dryrun.py" "${DRYRUN_ARGS[@]}" >&2; then
     say "preflight: planner dry-run OK"
@@ -320,6 +366,14 @@ assert_settings() {
         *) say "ASSERT: recorded export env misses $envname=1 (knob $knob)"; bad=$((bad+1));;
       esac
     fi
+  done
+  # W23-C verdicts: the rider / lever-2 switches must be ABSENT from the
+  # recorded export env (J-G section 6 with the rider switches per the W23-C
+  # rider-(a) 20-row cell and the rider-(c) dense re-race precondition).
+  for name in B12X_TRELLIS_INKERNEL_ROUTE_PACK B12X_TRELLIS_FLOW_FLAGS B12X_A16_SPLITK_REDUCE_PDL B12X_MXFP8_A16_DECODE_W4_TK64 B12X_MXFP8_A16_DECODE_MAX_ROWS B12X_PCIE_DCP_LSE_PUSH_TP8; do
+    case "$env_line" in *"$name="*)
+      say "ASSERT: recorded export env sets $name (must be UNSET per the W23-C verdicts / J-D §4)"; bad=$((bad+1));;
+    esac
   done
   # The plan-settings record the export prints, when the tree records one.
   local plan_line; plan_line=$(grep -m1 '^{"plan"' "$log" || true)
@@ -494,6 +548,12 @@ chk test -z "$(git -C "$REPO" diff --name-only "$EXPECT_IMAGE_SRC" HEAD -- "${IM
 # E1 context can ride an export out of this branch.
 chk grep -q 'context=396288' "$REPO/ignition/recipes/kimi31/recipe.py" 2>/dev/null \
   || say "GUARD: recipe context is not 396288 in $REPO/ignition/recipes/kimi31/recipe.py"
+# J-G section 5 (W23): MAX_ROWS 20 is recipe code on both sides of the route
+# exchange — the flare routing cap and the flashinfer standalone top-16 cap.
+chk grep -q '^MAX_ROWS = 20$' "$REPO/ignition/recipes/kimi3/routing.py" 2>/dev/null \
+  || say "GUARD: recipe MAX_ROWS is not 20 in $REPO/ignition/recipes/kimi3/routing.py"
+chk grep -q '^KIMI_TOPK16_MAX_ROWS = 20$' "$FI/flashinfer/experimental/b12x/comm/pcie/pcie_dcp_a2a.py" 2>/dev/null \
+  || say "GUARD: KIMI_TOPK16_MAX_ROWS is not 20 in the flashinfer tree"
 chk test -z "$(git -C "$REPO" status --porcelain 2>/dev/null)" || say "GUARD: tree dirty"
 fi_head=$(git -C "$FI" rev-parse --short HEAD 2>/dev/null || echo none)
 chk test "$fi_head" = "$EXPECT_FI" || say "GUARD: flashinfer HEAD $fi_head != $EXPECT_FI"
@@ -504,6 +564,12 @@ ig_path=$(cd "$REPO" && "$PYV" -c 'import ignition, pathlib; print(pathlib.Path(
 chk test "$ig_path" = "$REPO/ignition/__init__.py" || say "GUARD: ignition resolves to $ig_path (want $REPO)"
 # J-3 §1: B12X_PCIE_DMA_PIECES must be UNSET in the export environment.
 chk test -z "${B12X_PCIE_DMA_PIECES:-}" || say "GUARD: B12X_PCIE_DMA_PIECES is set (${B12X_PCIE_DMA_PIECES}) — must be UNSET"
+# W23-C verdicts (tp9-jG-review.md sections 2/4/6): the three rider switches
+# and the two lever-2 knobs must be UNSET in the export environment. Rider (a)
+# failed its 20-row condition (the rider is off entirely), rider (c) is dropped
+# because it re-races the dense selections, and lever 2 is killed-with-evidence.
+chk test -z "${B12X_TRELLIS_INKERNEL_ROUTE_PACK:-}${B12X_TRELLIS_FLOW_FLAGS:-}${B12X_A16_SPLITK_REDUCE_PDL:-}${B12X_MXFP8_A16_DECODE_W4_TK64:-}${B12X_MXFP8_A16_DECODE_MAX_ROWS:-}" \
+  || say "GUARD: W23 rider / lever-2 switch set (B12X_TRELLIS_INKERNEL_ROUTE_PACK / B12X_TRELLIS_FLOW_FLAGS / B12X_A16_SPLITK_REDUCE_PDL / B12X_MXFP8_A16_DECODE_*) — all must be UNSET per the W23-C verdicts"
 # W11 (radiance-mechanics review §3 item 4): environment allowlist at export
 # start. The driver refuses to run with any IGNITION_KIMI_* / B12X_* variable
 # present that the plan did not set. The accounted set is exactly the shipped
