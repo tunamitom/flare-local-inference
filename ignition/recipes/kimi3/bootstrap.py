@@ -168,6 +168,22 @@ class PreparationConfig:
         return max((batch * width for batch, width, _ in self.speculative_round_shapes), default=request_capacity(self.max_active))
 
     @property
+    def draft_reduce_rows(self):
+        """Rows one draft generator reduces per layer: a complete proposal block per admitted request.
+
+        Draft graphs run every admitted request through its whole block
+        (batch * draft_tokens+1 rows) independently of the packed target capacity,
+        so their reductions can exceed the packed verification envelope.
+        """
+        return (request_capacity(self.max_active) * (self.draft_tokens + 1)
+                if any(width > 1 for _, width, _ in self.speculative_round_shapes) else 0)
+
+    @property
+    def all_reduce_rows(self):
+        """Largest prepared all-reduce source: packed target rows or one complete draft block."""
+        return max(self.decode_tokens, self.draft_reduce_rows)
+
+    @property
     def draft_tokens(self):
         return max(self.speculative_widths) - 1 if self.drafting else 0
 
@@ -233,7 +249,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
 
         # Prefill uses complete FP32 owner sums over original BF16 inputs. Keep
         # decode/verification and small control reductions on their own channel.
-        reduction_rows = config.decode_tokens if shard.world_size in SUPPORTED_WORLD_SIZES else channel_rows
+        reduction_rows = config.all_reduce_rows if shard.world_size in SUPPORTED_WORLD_SIZES else channel_rows
         collective = create_all_reduce_runtime(group, device, collective_tuning=config.collective_tuning,
             max_tokens=reduction_rows, hidden_size=weights.config.hidden, ipc=package_storage.peer_storage)
         prefill_collective = (create_single_round_all_reduce_runtime(group, device,
