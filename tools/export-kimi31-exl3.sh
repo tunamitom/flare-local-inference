@@ -120,6 +120,17 @@ SPARE_GPU="${SPARE_GPU:-GPU-253e168e-256f-4457-82f4-d26fd2f3c0bd}"
 # The pre-authorized FALLBACK is the W22 package gb202-tp8-202611110549 (never
 # deleted; revert to it and report if a tripwire trips on a new switch). E1.1
 # (gb202-tp8-202611100809) remains behind it.
+# J-H (levers/tp9-jH-review.md, fable): the first W23 export (package
+# gb202-tp8-202611110758) DISCARDED — the rider (a)+(c) commits alone moved the
+# dense/expert compiled-program cache keys with every switch off (the rider-(c)
+# _DenseGemmPolicy field and rider-(a)'s fused-kernel cache-key fields), which
+# re-raced the dense set (172/185 selections moved, w23c-seldiff.json). The
+# rider ports are reverted on the live flashinfer branch (c3f3912a2 = 5db9c10bc
+# + the top-16 row cap 20 + the inert KDA verify API); the key probe shows the
+# flagship dense launch hash byte-identical to W22 (88ff1a2db736f1d1). This
+# export must show the dense set on race-cache hits only; a few new measured
+# entries for lever 1's route step are expected (fable J-H), any measured dense
+# entry means stop and consult.
 # ─────────────────────────────────────────────────────────────────────────────
 TRELLIS_TABLE="${TRELLIS_TABLE:-2}"
 DECODE_FUSION="${DECODE_FUSION:-1}"
@@ -127,7 +138,7 @@ R1_PUSH="${R1_PUSH:-1}"
 R3_ISLAND="${R3_ISLAND:-1}"
 R3_ACQUIRE="${R3_ACQUIRE:-1}"
 EXPECT_HEAD="${EXPECT_HEAD:-b4889fe5}"          # W23 code tip (MAX_ROWS 20, lever 1)
-EXPECT_FI="${EXPECT_FI:-89ac9418e}"             # W23 flashinfer tip (top-16 cap 20 + riders in-tree)
+EXPECT_FI="${EXPECT_FI:-c3f3912a2}"             # W23 flashinfer tip (top-16 cap 20; J-H: rider (a)+(c) ports reverted)
 # W13 lineage pins (re-pinned at W22): the tree the running serve's package is
 # produced from must match the pinned export tree for every export-consumed
 # file (guards below). The image inputs are unchanged since 5585a9a7.
