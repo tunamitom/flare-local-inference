@@ -24,7 +24,7 @@ from .kda import PreparedKDA
 from .pointwise import rms_norm_columns, situ
 from .projections import prepare_projection
 from .residual import ADD, REPLACE, ResidualStream
-from .routing import MAX_ROWS as ROUTE_ROWS, PreparedRouteGather
+from .routing import MAX_ROWS as ROUTE_ROWS, PreparedRouteGather, route_row_cap
 
 
 # A concurrent shared-expert MLP forks onto the auxiliary stream after its input is written and joins before its
@@ -220,8 +220,10 @@ class PreparedLatentMoE:
             buffers["routes"] = RouterScratch.allocate(tokens, device, experts=c["num_experts"], top_k=c["num_experts_per_token"])
         routes = buffers["routes"].rows(tokens)
         self.route_gather = None
-        if route_runtime is not None and tokens <= ROUTE_ROWS:
-            # Decode rows gather row-sharded latent and router shards and select experts in one exchange.
+        if route_runtime is not None and tokens <= route_row_cap():
+            # Decode rows gather row-sharded latent and router shards and select experts in one
+            # exchange. Rows above the pinned top-16's cap take the general path below, so
+            # preparation never routes rows the pin refuses.
             self.down = prepare_projection(source, weights["latent_down_rows"],
                 buffer("local_down", latent // shard.world_size), session=session, name=name + ".latent_down_rows",
                 workspace=workspace)

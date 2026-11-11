@@ -5,8 +5,16 @@
 
 Each rank projects its rows of the routed-expert down projection and its experts' router logits.
 One b12x exchange gathers both shards; a single decode row also selects Kimi's 16 experts inside
-that exchange, and two to eight rows select them with b12x's prepared top-16 afterwards. This
+that exchange, and two to twenty rows select them with b12x's prepared top-16 afterwards. This
 replaces the router all-gather, the separate top-k, and the latent all-reduce of the general path.
+
+The exchange is not gated on a pushed transport: it runs on whatever paired-gather transport the
+b12x plan selects. The measured per-layer speedups for nine to twenty rows were taken on a
+push-planned exchange; the pull transport at those widths is unmeasured. Rows above the pinned
+standalone top-16's row cap take the general path instead of raising at the top-16 row check, so
+preparation never fails for nine to twenty rows: the cap is ``KIMI_TOPK16_MAX_ROWS`` where the
+FlashInfer pin declares it (the 17-20-row work, a local-inference-lab pull request pending on
+their #101), and pins predating the constant hard-code the historical 8-row check.
 """
 
 import itertools
@@ -17,13 +25,33 @@ from b12x.preparation import CollectiveRequirement, PreparedCall
 
 from ignition.preparation.tuning import declare
 
-MAX_ROWS = 8
+MAX_ROWS = 20
 _OWNERS = weakref.WeakValueDictionary()
 _HANDLES = itertools.count()
 
 
+def route_row_cap():
+    """Rows the pinned FlashInfer standalone top-16 accepts, capped at ``MAX_ROWS``.
+
+    The row cap is a Python check in the pin (``KIMI_TOPK16_MAX_ROWS`` where the
+    pin declares it; 17-20 rows need the pending local-inference-lab change based
+    on their #101). Decoding the cap keeps preparation working on every pin:
+    ``decoder`` routes only rows within it and sends the rest down the general
+    path instead of failing at the top-16 row check.
+    """
+    try:
+        from b12x.comm.pcie import pcie_dcp_a2a
+    except ImportError:
+        return MAX_ROWS
+    declared = getattr(pcie_dcp_a2a, "KIMI_TOPK16_MAX_ROWS", None)
+    if declared is None:
+        # Pins predating the constant hard-code the historical 8-row check.
+        return 8
+    return min(MAX_ROWS, int(declared))
+
+
 def create_route_runtime(group, device, *, ipc=None):
-    """Allocate the b12x exchange that carries 1-8 rows of K3 latent and router shards."""
+    """Allocate the b12x exchange that carries 1-20 rows of K3 latent and router shards."""
     import torch.distributed as dist
     from b12x.comm.pcie import DcpAllToAll
 
@@ -55,7 +83,7 @@ class PreparedRouteGather:
         wrong = [(tuple(t.shape), t.dtype, t.is_contiguous(), shape, dtype) for t, shape, dtype in expected
                  if t.shape != shape or t.dtype != dtype or not t.is_contiguous()]
         if not 1 <= rows <= MAX_ROWS or wrong:
-            raise ValueError(f"K3 route gather requires contiguous 1-8 row latent, router and route tensors: {wrong}")
+            raise ValueError(f"K3 route gather requires contiguous 1-{MAX_ROWS} row latent, router and route tensors: {wrong}")
         self.runtime, self.rows = runtime, rows
         self.local_down, self.local_router, self.correction_bias = local_down, local_router, correction_bias
         self.latent, self.weights, self.ids = latent, weights, ids
