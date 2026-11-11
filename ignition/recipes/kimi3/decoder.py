@@ -286,7 +286,7 @@ class PreparedDecoder:
 
     def __init__(self, weights, scratch, metadata, pool, *, mode, runtime, vocabulary_runtime, embedding_runtime, router_runtime, vision_state,
                  coordinator, session, name, workspace, buffers, kda_records=None, route_runtime=None, context=None,
-                 latent_runtimes=(), scoring=None):
+                 latent_runtimes=(), scoring=None, mix_split_rows=0, candidate_merge_radix=False):
         # Verification records its candidate rows; other modes ignore records.
         if mode not in ("prefill", "decode", "verify") or mode == "verify" and kda_records is None:
             raise ValueError("Kimi K3 verification decodes recorded candidate rows")
@@ -360,6 +360,7 @@ class PreparedDecoder:
                 **kwargs) if kind == "kda" else
                 PreparedMLA(w["attention"], source, metadata, pool.attention(index), context=context,
                             index_cache=pool.index(index) if kind == "dsa" else None,
+                            candidate_merge_radix=candidate_merge_radix,
                             eps=config.text["rms_norm_eps"],
                             peers=context.peers.get(index) if context is not None else None,
                             index_peers=(context.index_peers.get(index)
@@ -401,7 +402,8 @@ class PreparedDecoder:
         # The normalized mixture entering attention takes the MoE output, which the previous reduction
         # consumed; the one entering the MLP takes the attention output, which its reduction consumed.
         self.mlp_input = self.buffers["kda"]["output"][:tokens]
-        self.residual = ResidualStream(r["prefix"][:tokens], r["blocks"][:tokens], self.buffers["moe"]["output"][:tokens])
+        self.residual = ResidualStream(r["prefix"][:tokens], r["blocks"][:tokens], self.buffers["moe"]["output"][:tokens],
+                                      mix_split_rows=mix_split_rows)
         self.scoring = None if scoring is None else scoring.prepare(self.residual.output, weights.head,
             vocabulary=weights.config.text["vocab_size"], session=session, coordinator=coordinator, name=name + ".prompt")
         self.head = PreparedVocabularyProjection(scratch.hidden, weights.head, scratch.local_logits, scratch.logits,

@@ -60,6 +60,9 @@ def test_preparation_preserves_declared_context_above_estimated_physical_capacit
         headroom_bytes=0, reserve_bytes=0, online_mxfp8=True, stream_overlap=True,
         prefill_fp8_transport=False,
         prefill_island_reduce=False,
+        prefill_dma_ring_rows=0, prefill_dma_bf16=False,
+        trellis_prefill_shapes=False, trellis_prefill_table="0", decode_fusion=False,
+        mix_split_rows=16, candidate_merge_radix=True,
         context_parallel=True, language_model_only=True)
     bootstrap = SimpleNamespace(PreparationConfig=config_type,
         prepare_rank=lambda snapshot, config, **kwargs: config)
@@ -67,3 +70,32 @@ def test_preparation_preserves_declared_context_above_estimated_physical_capacit
         draft_repository="unused", draft_revision="unused", compile_forwards=True,
         kernel_cache=None, progress=None)
     assert prepared.context == 1048576
+
+
+def test_plan_settings_reach_the_preparation_config(config_type, monkeypatch):
+    """The L3/L6 plan settings thread from the plan into PreparationConfig as constructor
+    arguments (never through the process environment)."""
+    from ignition.recipes.kimi3.recipe import prepare_variant
+    from ignition.preparation import rank_group
+
+    monkeypatch.setattr(rank_group, "prepare_group", lambda snapshot, config, *args, **kwargs: config)
+
+    plan = SimpleNamespace(speculation=None, collective_tuning="static", collective_ladder=None,
+        prompt_logprobs=False, compile_workers=1, autotune_effort="default", tuning_replica=None,
+        native_dense_activations=False, lock_gpu_clocks=False, world_size=8, context=48128, checkpoint=None,
+        recipe=SimpleNamespace(context=1048576), concurrency=1, image_concurrency=0,
+        prefill_chunk=1024, snapshots=1, costs=SimpleNamespace(state_row_bytes=1),
+        headroom_bytes=0, reserve_bytes=0, online_mxfp8=True, stream_overlap=True,
+        prefill_fp8_transport=False, prefill_island_reduce=False,
+        prefill_dma_ring_rows=0, prefill_dma_bf16=False,
+        trellis_prefill_shapes=False, trellis_prefill_table="0", decode_fusion=False,
+        mix_split_rows=16, candidate_merge_radix=True,
+        context_parallel=True, language_model_only=True)
+    bootstrap = SimpleNamespace(PreparationConfig=config_type,
+        prepare_rank=lambda snapshot, config, **kwargs: config)
+    prepared = prepare_variant("checkpoint", plan, bootstrap=bootstrap,
+        draft_repository="unused", draft_revision="unused", compile_forwards=True,
+        kernel_cache=None, progress=None)
+    assert prepared.mix_split_rows == 16 and prepared.candidate_merge_radix is True
+    defaults = config_type()
+    assert defaults.mix_split_rows == 0 and defaults.candidate_merge_radix is False

@@ -25,7 +25,8 @@ def construct(monkeypatch):
 
     def merge(indices, scores, output, **kwargs):
         return SimpleNamespace(indices=indices, scores=scores, output=output,
-            name=kwargs["name"], buffers=kwargs["buffers"], plan=object())
+            name=kwargs["name"], buffers=kwargs["buffers"], plan=object(),
+            radix=kwargs.get("candidate_merge_radix", "absent"))
 
     def attention(query, cache, output, pages, lengths, starts, **kwargs):
         return SimpleNamespace(query=query, cache=cache, output=output, pages=pages,
@@ -45,7 +46,7 @@ def construct(monkeypatch):
     monkeypatch.setattr(dsa, "PreparedLseReduceScatter", combine)
     monkeypatch.setattr(dsa.dense_mla, "Caps", lambda **kwargs: SimpleNamespace(**kwargs))
 
-    def build(rows, world=2):
+    def build(rows, world=2, **settings):
         context = None if world == 1 else SimpleNamespace(
             shards=ContextShards.on(0, world, "cpu"), candidates=object(), heads=object())
         cache = torch.zeros((2, 128, RECORD_BYTES), dtype=torch.float8_e4m3fn)
@@ -56,10 +57,19 @@ def construct(monkeypatch):
             torch.zeros((rows, 1, 512), dtype=torch.bfloat16), torch.zeros(rows, dtype=torch.int64),
             SimpleNamespace(token_page_table=torch.zeros((rows, 2), dtype=torch.int32)),
             cache, torch.zeros((4, 64 * 132), dtype=torch.uint8), context=context,
-            session=None, coordinator=None, name="attention", workspace=None, buffers={})
+            session=None, coordinator=None, name="attention", workspace=None, buffers={}, **settings)
         return op, cache
 
     return build
+
+
+def test_candidate_merge_radix_is_a_constructor_argument(construct):
+    """The L6 plan setting reaches the merge as the PreparedDistributedTopK constructor
+    argument: default off, explicit on."""
+    default, _ = construct(4, 2)
+    assert all(stage[3].radix is False for stage in default.stages if stage[3] is not None)
+    armed, _ = construct(4, 2, candidate_merge_radix=True)
+    assert all(stage[3].radix is True for stage in armed.stages if stage[3] is not None)
 
 
 def _selection_operands(stage):
@@ -82,7 +92,7 @@ def _assert_view(view, expected):
 def test_stages_reuse_identical_views_and_preserve_partial_geometry(construct, rows, world):
     op, cache = construct(rows, world)
     by_count = {}
-    for begin, end, selector, merge, quantized, gather, attention, combine, lse in op.stages:
+    for begin, end, selector, merge, quantized, gather, attention, combine, lse, paired in op.stages:
         count = end - begin
         views = (selector.pages, selector.lengths, selector.output, selector.scores,
                  None if merge is None else merge.output, attention.pages, attention.lengths, attention.starts)

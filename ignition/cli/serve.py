@@ -205,6 +205,7 @@ def _export_hosts(args):
                          trellis_prefill_shapes=args.trellis_prefill_shapes,
                          trellis_prefill_table=args.trellis_prefill_table,
                          decode_fusion=args.decode_fusion,
+                         mix_split_rows=args.mix_split_rows, candidate_merge_radix=args.candidate_merge_radix,
                          language_model_only=args.language_model_only,
                          mla_compute_mode=args.mla_compute_mode)
     collective_mode = collective_tuning_mode(configuration, model, args.collective_tuning)
@@ -295,6 +296,7 @@ def _prepare(args):
                       trellis_prefill_shapes=args.trellis_prefill_shapes,
                       trellis_prefill_table=args.trellis_prefill_table,
                       decode_fusion=args.decode_fusion,
+                      mix_split_rows=args.mix_split_rows, candidate_merge_radix=args.candidate_merge_radix,
                       language_model_only=args.language_model_only,
                       mla_compute_mode=args.mla_compute_mode)
         indices = planning.format_gpus(gpu.index for gpu in plan.gpus)
@@ -475,6 +477,7 @@ def debug_serve(args) -> int:
                          roce_ring=args.roce_ring, roce_chain=args.roce_chain,
                          cache_states=args.prefix_cache_states, mixed_prefill=args.mixed_prefill, prompt_logprobs=args.prompt_logprobs,
                          expert_scale_compression=args.expert_scale_compression, online_mxfp8=args.online_mxfp8,
+                         mix_split_rows=args.mix_split_rows, candidate_merge_radix=args.candidate_merge_radix,
                          language_model_only=args.language_model_only, mla_compute_mode=args.mla_compute_mode)
     collective_mode = collective_tuning_mode(configuration, model, args.collective_tuning)
     plan = replace(plan, compile_workers=compiler_workers(configuration, args.compile_workers), hub_cache=hub_cache,

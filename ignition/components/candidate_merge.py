@@ -98,6 +98,69 @@ def _select(Values, Ids, Lengths, Cutoffs, Greater, Ties, Output,
         tl.store(Output+row*K+destination,ids,mask=selected)
 
 
+@triton.jit
+def _radix_counts(Values, Ids, Lengths, Cutoffs, Greater, Ties, Output, WIDTH: tl.constexpr, K: tl.constexpr,
+                  TILES: tl.constexpr, BLOCK: tl.constexpr, ROW_BLOCK: tl.constexpr, BITS: tl.constexpr):
+    """Row top-k + ``_threshold`` + ``_counts`` in one program per row (the ``candidate_merge_radix`` plan setting).
+
+    The K-th largest order key of the compacted row (FP32 bits mapped to the unsigned total order the
+    radix top-k uses) is found exactly by a radix select, BITS per pass, most significant digit first.
+    It stops as soon as the digit holding the K-th key holds exactly the keys still needed; then (as
+    after the last pass) the keys at or above the resolved prefix are precisely a top-K set. The cutoff
+    is ``tl.min`` over that set's values, the reduction ``_threshold`` applies to the top-k values
+    (minnum: the NaN padding is neutral). Per-tile greater/tie counts and the -1 fill are written for the
+    unchanged ``_select``. Rows with at most K candidates copy their compacted IDs, as the top-k does.
+    """
+    row = tl.program_id(0)
+    col = tl.arange(0, ROW_BLOCK)
+    value = tl.load(Values+row*WIDTH+col, mask=col < WIDTH, other=0.0)
+    length = tl.load(Lengths+row)
+    kcol = tl.arange(0, K)
+    if length > K:
+        live = (col < length) & (col < WIDTH)
+        bits = value.to(tl.uint32, bitcast=True)
+        # The unsigned total order of FP32 keys (invert negatives, flip the sign bit); a bitwise
+        # complement of the widened bits keeps the Python interpreter's uint32 in-range.
+        key = tl.where((bits & 0x80000000) != 0, (bits ^ 0xFFFFFFFF).to(tl.uint32), bits | 0x80000000)
+        bins = tl.arange(0, 1 << BITS).to(tl.int64)
+        remaining = length*0+K
+        prefix = (length*0).to(tl.uint32)
+        resolved = length*0
+        for p in tl.static_range(32 // BITS):
+            if resolved == 0:
+                if p == 0:
+                    match = live
+                else:
+                    match = live & ((key >> (32-p*BITS)) == prefix)
+                digit = ((key >> (32-(p+1)*BITS)) & ((1 << BITS)-1)).to(tl.int32)
+                hist = tl.histogram(digit, 1 << BITS, mask=match)
+                at_least = tl.cumsum(hist, 0, reverse=True)
+                # The digit holding the K-th key is the largest bin with at_least >= remaining; one max
+                # reduction returns it with the count above it (non-increasing in the bin) and its own count.
+                packed = tl.max(tl.where(at_least >= remaining,
+                                         (bins << 32) | ((at_least-hist).to(tl.int64) << 16) | hist.to(tl.int64),
+                                         -1), 0)
+                above = ((packed >> 16) & 0xFFFF).to(tl.int32)
+                remaining = remaining-above
+                prefix = (prefix << BITS) | (packed >> 32).to(tl.uint32)
+                if (packed & 0xFFFF).to(tl.int32) == remaining:
+                    resolved = length*0+(p+1)*BITS
+        if resolved == 0:
+            resolved = length*0+32
+        lower = prefix << (32-resolved).to(tl.uint32)
+        cutoff = tl.min(tl.where(live & (key >= lower), value, float("nan")), 0)
+        tl.store(Cutoffs+row, cutoff)
+        tl.store(Output+row*K+kcol, -1)
+        greater = tl.sum(tl.reshape((live & (value > cutoff)).to(tl.int32), (ROW_BLOCK//BLOCK, BLOCK)), 1)
+        ties = tl.sum(tl.reshape((live & (value == cutoff)).to(tl.int32), (ROW_BLOCK//BLOCK, BLOCK)), 1)
+        tiles = tl.arange(0, ROW_BLOCK//BLOCK)
+        tl.store(Greater+row*TILES+tiles, greater, mask=tiles < TILES)
+        tl.store(Ties+row*TILES+tiles, ties, mask=tiles < TILES)
+    else:
+        ids = tl.load(Ids+row*WIDTH+kcol, mask=(kcol < length) & (kcol < WIDTH), other=-1)
+        tl.store(Output+row*K+kcol, ids)
+
+
 
 @dataclass(frozen=True)
 class Query:
@@ -122,6 +185,31 @@ CONTRACT = native_contract(component_id="flare.candidate_merge", query_type=Quer
                            tactics=lambda q: (0,), semantic_version=2)
 
 
+@dataclass(frozen=True)
+class RadixQuery(Query):
+    """The radix-select variant's query; its own contract keeps the default query and cache keys unchanged."""
+    radix: bool = True
+
+
+CONTRACT_RADIX = native_contract(component_id="flare.candidate_merge_radix", query_type=RadixQuery,
+                                 tactics=lambda q: (0,), semantic_version=1)
+# 8-bit digits (4 passes at most) at 16 warps measured fastest on SM120 (4/8/10/11/12 bits, 8/16/32 warps).
+RADIX_BITS, RADIX_WARPS, RADIX_MAX_WIDTH = 8, 16, 16384
+
+
+def radix_variant(width, enabled):
+    """Whether a merge of ``width`` candidates takes the radix path: the plan setting, and only at most
+    RADIX_MAX_WIDTH candidates (the counts travel in 16-bit fields and the row stays in registers);
+    wider merges keep the default contract."""
+    return bool(enabled) and width <= RADIX_MAX_WIDTH
+
+
+def merge_query(rows, width, topk, radix):
+    """The query and contract for one merge: the radix select replaces the row top-k, threshold and
+    cutoff-count kernels (6 -> 4 launches) when the plan asks for it."""
+    return (RadixQuery if radix else Query)(rows, width, topk)
+
+
 def _buffers(scratch, query):
     storage, offset = scratch.view(torch.float32), 0
 
@@ -141,7 +229,8 @@ def _buffers(scratch, query):
 
 @program_cache(scope="preparation")
 def compile_merge(payload, ordinal):
-    q = Query(**dict(payload))
+    payload = dict(payload)
+    q = merge_query(payload["rows"], payload["width"], payload["topk"], payload.get("radix", False))
     packed = torch.empty((q.rows, q.width, 2), dtype=torch.float32, device="meta")
     output = torch.empty((q.rows, q.topk), dtype=torch.int32, device="meta")
     scratch = torch.empty(q.scratch_bytes, dtype=torch.uint8, device="meta")
@@ -151,6 +240,13 @@ def compile_merge(payload, ordinal):
         count = launch_triton(_count, grid, packed, counts, q.width, q.tiles, 512, num_warps=4)
         compact = launch_triton(_compact, grid, packed, counts, values, ids, lengths,
                                q.width, q.tiles, 512, triton.next_power_of_2(q.tiles), num_warps=4)
+        if getattr(q, "radix", False):
+            radix = launch_triton(_radix_counts, (q.rows, 1, 1), values, ids, lengths, cutoffs, counts, ties, output,
+                                  q.width, q.topk, q.tiles, 512, triton.next_power_of_2(q.tiles*512), RADIX_BITS,
+                                  num_warps=RADIX_WARPS)
+            select = launch_triton(_select, grid, values, ids, lengths, cutoffs, counts, ties, output,
+                                   q.width, q.topk, q.tiles, 512, triton.next_power_of_2(q.tiles), num_warps=4)
+            return dict(count=count, compact=compact, radix=radix, select=select)
         topk = {}
         run_row_topk(row_logits=values, lengths=lengths, topk=q.topk,
                      output_values=top_values, output_indices=output,
@@ -177,6 +273,12 @@ class State:
         p["count"][grid](packed, counts, q.width, q.tiles, 512)
         p["compact"][grid](packed, counts, values, ids, lengths, q.width, q.tiles,
                            512, triton.next_power_of_2(q.tiles))
+        if getattr(q, "radix", False):
+            p["radix"][(q.rows, 1, 1)](values, ids, lengths, cutoffs, counts, ties, output, q.width, q.topk,
+                                       q.tiles, 512, triton.next_power_of_2(q.tiles*512), RADIX_BITS)
+            p["select"][grid](values, ids, lengths, cutoffs, counts, ties, output,
+                              q.width, q.topk, q.tiles, 512, triton.next_power_of_2(q.tiles))
+            return
         run_row_topk(row_logits=values, lengths=lengths, topk=q.topk,
                      output_values=top_values, output_indices=output,
                      output_gather_table=ids, write_values=True, launcher=p["topk"])
@@ -210,19 +312,24 @@ class PreparedCandidateMerge:
     Sequential calls borrow their compaction storage from the shared arena.
     """
 
-    def __init__(self, packed, output, *, session, workspace, name):
+    def __init__(self, packed, output, *, session, workspace, name, radix=False):
         if (packed.ndim != 3 or packed.shape[-1] != 2 or packed.dtype != torch.float32
                 or not packed.is_contiguous() or output.ndim != 2 or output.dtype != torch.int32
                 or not output.is_contiguous() or output.shape[0] != packed.shape[0]
                 or output.device != packed.device or output.shape[1] not in (512, 1024, 2048)):
             raise ValueError("candidate merge requires contiguous FP32 score/ID pairs and int32 top-k output")
         self.packed, self.output = packed, output
-        q = Query(packed.shape[0], packed.shape[1], output.shape[1])
-        payload = CONTRACT.encode_query(q)
+        radix = radix_variant(packed.shape[1], radix)
+        contract = CONTRACT_RADIX if radix else CONTRACT
+        q = merge_query(packed.shape[0], packed.shape[1], output.shape[1], radix)
+        payload = contract.encode_query(q)
 
         def materialize(tactic):
             programs = compile_merge(payload, packed.device.index)
             load_programs(programs)
+            if radix:
+                return attach_programs(State(q, programs), programs["count"], programs["compact"],
+                                       programs["radix"], programs["select"])
             return attach_programs(State(q, programs), programs["count"], programs["compact"],
                                    *programs["topk"].values(), programs["threshold"],
                                    programs["count_cutoff"], programs["select"])
