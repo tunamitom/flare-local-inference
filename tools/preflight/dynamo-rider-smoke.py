@@ -75,10 +75,11 @@ def case_w23_route_pack_flow():
         read_exl3_manifest,
         trellis_from_exl3,
     )
-    from b12x.moe._shared.kernels.w4a16.kernel.types import W4A16_FLOW_WORKSPACE_EXTRA
+    from b12x.moe._shared.kernels.w4a16.kernel import types as w4a16_types
     from b12x.preparation import PreparedCall, PreparationSession
     from b12x.preparation.types import require_prepared
 
+    knobs_available = hasattr(w4a16_types, "W4A16_FLOW_WORKSPACE_EXTRA")
     knobs = ("B12X_TRELLIS_INKERNEL_ROUTE_PACK", "B12X_TRELLIS_FLOW_FLAGS")
     saved = {name: os.environ.get(name) for name in knobs}
 
@@ -172,14 +173,24 @@ def case_w23_route_pack_flow():
     out = torch.empty_like(x)
 
     off_eager, off_traced, off_words = build_and_run(False)
+    if not knobs_available:
+        # J-H post-revert state: the rider knob code is reverted on the live
+        # tree (its compile-key fields moved the dense/expert identities), so
+        # the knob plumbing cannot be engaged. Smoke the same 20-row chain for
+        # compiled == eager and replay determinism.
+        again_eager, again_traced, _ = build_and_run(False)
+        assert off_eager == off_traced, "compiled run differs from eager"
+        assert off_eager == again_eager == again_traced, "replay is not deterministic"
+        return ("compiled == eager; deterministic replays (rider knob code "
+                "reverted on the live tree per J-H; no new knob rides)")
     on_eager, on_traced, on_words = build_and_run(True)
     assert off_eager == off_traced, "knob-off compiled run differs from eager"
     assert on_eager == on_traced, "knob-on compiled run differs from eager"
     assert on_eager == off_eager, "knob-on output differs from knob-off (not bit-exact)"
-    assert on_words > off_words and (on_words - off_words) % W4A16_FLOW_WORKSPACE_EXTRA == 0, (
+    assert on_words > off_words and (on_words - off_words) % w4a16_types.W4A16_FLOW_WORKSPACE_EXTRA == 0, (
         f"flow knob did not extend the planned workspace "
         f"({off_words} -> {on_words}, want a positive multiple of "
-        f"+{W4A16_FLOW_WORKSPACE_EXTRA} words)"
+        f"+{w4a16_types.W4A16_FLOW_WORKSPACE_EXTRA} words)"
     )
     return (
         "compiled == eager both knob states; output bit-equal across states; "
