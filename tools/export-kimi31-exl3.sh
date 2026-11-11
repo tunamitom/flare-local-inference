@@ -85,7 +85,7 @@ PYV="${PYV:-$REPO/.venv/bin/python}"; [ -x "$PYV" ] || PYV="$(command -v python3
 RING_ROWS="${RING_ROWS:-1024}"
 # ─────────────────────────────────────────────────────────────────────────────
 # W22 (TP9 transplant, levers/w22-handover.md): the combined graph-only export.
-# Code tip 0c6c6465 = kimi31-exl3-live + row-5 direct decode table (upstream
+# Code tip ac377ae4 = kimi31-exl3-live + row-5 direct decode table (upstream
 # #94/#95 + --trellis-prefill-table), row-1 paired-gather push recipe (fn1),
 # the fused-pack + compaction riders (W11 ports), and the J-D row-1 policy
 # notes (recipe + branch notes). flashinfer tip 5db9c10bc = rows 1/3/4 picks
@@ -104,12 +104,12 @@ DECODE_FUSION="${DECODE_FUSION:-1}"
 R1_PUSH="${R1_PUSH:-1}"
 R3_ISLAND="${R3_ISLAND:-1}"
 R3_ACQUIRE="${R3_ACQUIRE:-1}"
-EXPECT_HEAD="${EXPECT_HEAD:-0c6c6465}"          # W22 code tip (TP9 transplant + J-D notes)
+EXPECT_HEAD="${EXPECT_HEAD:-ac377ae4}"          # W22 code tip (TP9 transplant + J-D notes)
 EXPECT_FI="${EXPECT_FI:-5db9c10bc}"
 # W13 lineage pins (re-pinned at W22): the tree the running serve's package is
 # produced from must match the pinned export tree for every export-consumed
 # file (guards below). The image inputs are unchanged since 5585a9a7.
-EXPECT_EXPORT_SRC="${EXPECT_EXPORT_SRC:-0c6c6465}"   # export tree of the W22 package
+EXPECT_EXPORT_SRC="${EXPECT_EXPORT_SRC:-ac377ae4}"   # export tree of the W22 package
 EXPECT_IMAGE_SRC="${EXPECT_IMAGE_SRC:-5585a9a7}"     # image build tree (chunkfix on 35134e2b)
 # W13 image step (--image): the runtime image the serve runs, built from this
 # tree with the campaign build path (docker build -t local/flare:rt-<variant>-<sha>
