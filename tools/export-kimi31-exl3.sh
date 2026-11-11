@@ -83,12 +83,30 @@ fi
 FI=$(readlink -f "$FI")   # normalize (the default path carries a literal '..'; the resolve guard compares real paths)
 PYV="${PYV:-$REPO/.venv/bin/python}"; [ -x "$PYV" ] || PYV="$(command -v python3)"
 RING_ROWS="${RING_ROWS:-1024}"
-EXPECT_HEAD="${EXPECT_HEAD:-ae1ea944}"          # W13 merged tip (E1.1 export lineage + chunkfix image lineage)
-EXPECT_FI="${EXPECT_FI:-0aa09dd61}"
-# W13 lineage pins: the two trees the running serve was actually produced from.
-# The merged tip must reproduce each source exactly for the file set that source
-# consumed (guards below; verified in levers/w13-live-branch.md).
-EXPECT_EXPORT_SRC="${EXPECT_EXPORT_SRC:-b8dcebb5}"   # export tree of gb202-tp8-202611100809 (E1.1)
+# ─────────────────────────────────────────────────────────────────────────────
+# W22 (TP9 transplant, levers/w22-handover.md): the combined graph-only export.
+# Code tip 457af1a8 = kimi31-exl3-live + row-5 direct decode table (upstream
+# #94/#95 + --trellis-prefill-table), row-1 paired-gather push recipe (fn1),
+# and the fused-pack + compaction riders (W11 ports). Rows 2/6/7/10 dropped,
+# row 4's LSE push is in-tree but OFF (speed rule failed on B+D).
+#   TRELLIS_TABLE=2   row-5 direct decode table (2 = 48-row blocks 1536..2560 +
+#                     the >=2560 128-thread geometry; 1 = 48-row band only)
+#   DECODE_FUSION=1   the fused decode score/ID pack rider (bit-equal)
+#   R1_PUSH / R3_ISLAND / R3_ACQUIRE: transport switches of the surviving
+#   decode rows (recorded per the W22 gate; switch off = row out).
+# E1.1 (gb202-tp8-202611100809) remains the documented fallback package.
+# ─────────────────────────────────────────────────────────────────────────────
+TRELLIS_TABLE="${TRELLIS_TABLE:-2}"
+DECODE_FUSION="${DECODE_FUSION:-1}"
+R1_PUSH="${R1_PUSH:-1}"
+R3_ISLAND="${R3_ISLAND:-1}"
+R3_ACQUIRE="${R3_ACQUIRE:-1}"
+EXPECT_HEAD="${EXPECT_HEAD:-457af1a8}"          # W22 code tip (TP9 transplant)
+EXPECT_FI="${EXPECT_FI:-f1213780a}"
+# W13 lineage pins (re-pinned at W22): the tree the running serve's package is
+# produced from must match the pinned export tree for every export-consumed
+# file (guards below). The image inputs are unchanged since 5585a9a7.
+EXPECT_EXPORT_SRC="${EXPECT_EXPORT_SRC:-457af1a8}"   # export tree of the W22 package
 EXPECT_IMAGE_SRC="${EXPECT_IMAGE_SRC:-5585a9a7}"     # image build tree (chunkfix on 35134e2b)
 # W13 image step (--image): the runtime image the serve runs, built from this
 # tree with the campaign build path (docker build -t local/flare:rt-<variant>-<sha>
@@ -155,6 +173,9 @@ EXPORT_ARGS=(--config "$CONFIG" --repo-id local-inference-lab/Kimi-K3.1-Pro-EXL3
 if [ "$REUSE_WEIGHTS" = 1 ]; then EXPORT_ARGS+=(--reuse-weights); fi
 if [ "$PREFILL_FP8" = 1 ]; then EXPORT_ARGS+=(--prefill-fp8-transport); fi
 if [ "$PREFILL_ISLAND" = 1 ]; then EXPORT_ARGS+=(--prefill-island-reduce); fi
+# W22: the row-5 direct decode table and the fused-pack rider.
+if [ "$TRELLIS_TABLE" != 0 ]; then EXPORT_ARGS+=(--trellis-prefill-table "$TRELLIS_TABLE"); fi
+if [ "$DECODE_FUSION" = 1 ]; then EXPORT_ARGS+=(--decode-fusion); fi
 
 MODE="${1:---check}"
 say() { echo "$*" >&2; }
@@ -346,7 +367,13 @@ chk test -z "${B12X_PCIE_DMA_PIECES:-}" || say "GUARD: B12X_PCIE_DMA_PIECES is s
 env_bad=0
 for name in $(compgen -v | grep -E '^(IGNITION_KIMI_|B12X_)' || true); do
   if [ "$name" = B12X_W4A16_SMALL_M_SPLITK ] && [ "${!name}" = 1 ]; then continue; fi
-  say "GUARD: unaccounted switch environment ${name}='${!name}' (only B12X_W4A16_SMALL_M_SPLITK=1 is accounted)"
+  # W22 transport switches are armed by this driver's R1_PUSH / R3_ISLAND /
+  # R3_ACQUIRE knobs and exported below; a caller-provided copy equal to the
+  # armed value is accounted, anything else is not.
+  if [ "$name" = B12X_PCIE_DCP_PAIR_PUSH ] && [ "$R1_PUSH" = 1 ] && [ "${!name}" = 1 ]; then continue; fi
+  if [ "$name" = B12X_PCIE_DCP_GATHER_ISLAND ] && [ "$R3_ISLAND" = 1 ] && [ "${!name}" = 1 ]; then continue; fi
+  if [ "$name" = B12X_PCIE_DCP_GATHER_ACQUIRE ] && [ "$R3_ACQUIRE" = 1 ] && [ "${!name}" = 1 ]; then continue; fi
+  say "GUARD: unaccounted switch environment ${name}='${!name}' (accounted: B12X_W4A16_SMALL_M_SPLITK=1 and the armed W22 transport switches)"
   env_bad=$((env_bad+1))
 done
 chk test "$env_bad" -eq 0 || say "GUARD: switch-environment allowlist violated (W11 §3 item 4)"
@@ -370,6 +397,14 @@ chk test "$PREFILL_ISLAND" = 0 -o "$PREFILL_FP8" = 0 \
   || say "GUARD: PREFILL_ISLAND and PREFILL_FP8 are mutually exclusive"
 chk test "$IMAGE_CONCURRENCY" -ge 1 -a "$IMAGE_CONCURRENCY" -le 4 2>/dev/null \
   || say "GUARD: IMAGE_CONCURRENCY $IMAGE_CONCURRENCY must be 1..4"
+chk test "$TRELLIS_TABLE" = 0 -o "$TRELLIS_TABLE" = 1 -o "$TRELLIS_TABLE" = 2 \
+  || say "GUARD: TRELLIS_TABLE $TRELLIS_TABLE must be 0, 1 or 2"
+chk test "$DECODE_FUSION" = 0 -o "$DECODE_FUSION" = 1 \
+  || say "GUARD: DECODE_FUSION $DECODE_FUSION must be 0 or 1"
+for knob in R1_PUSH R3_ISLAND R3_ACQUIRE; do
+  val="${!knob}"
+  chk test "$val" = 0 -o "$val" = 1 || say "GUARD: $knob $val must be 0 or 1"
+done
 
 # ── Planner dry-run (CPU only, no NVML/CUDA): accept the c4 + 1M shape and print
 # ── the boot KV supply projection for both --speculative-token-capacity variants.
@@ -400,6 +435,8 @@ if [ "$MODE" = --detach ]; then
     --setenv=HOME=/home/tom --setenv=USER=tom --setenv=EXPORT_TS="$TS" --setenv=EXPORT_LOG="$LOG" \
     --setenv=PREFILL_ISLAND="$PREFILL_ISLAND" --setenv=IMAGE_CONCURRENCY="$IMAGE_CONCURRENCY" \
     --setenv=PYTHONPATH="$PYTHONPATH" --setenv=B12X_W4A16_SMALL_M_SPLITK=1 --setenv=PREFILL_FP8="$PREFILL_FP8" --setenv=SPEC_TOKEN_CAPACITY="$SPEC_TOKEN_CAPACITY" --setenv=REUSE_WEIGHTS="$REUSE_WEIGHTS" \
+    --setenv=TRELLIS_TABLE="$TRELLIS_TABLE" --setenv=DECODE_FUSION="$DECODE_FUSION" \
+    --setenv=R1_PUSH="$R1_PUSH" --setenv=R3_ISLAND="$R3_ISLAND" --setenv=R3_ACQUIRE="$R3_ACQUIRE" \
     -p LimitNOFILE=1048576 -p LimitMEMLOCK=infinity --working-directory="$REPO" \
     /bin/bash "$SELF" --run
   say "detached unit: $unit   log: $LOG   follow: journalctl -u $unit -f / tail -f $LOG"
@@ -415,10 +452,16 @@ export CUDA_VISIBLE_DEVICES="$GPU_LIST" CUDA_DEVICE_ORDER=PCI_BUS_ID HF_HUB_OFFL
 # refuses any unaccounted IGNITION_KIMI_* / B12X_* variable (including
 # B12X_PCIE_DMA_PIECES) instead of healing the environment.
 export B12X_W4A16_SMALL_M_SPLITK=1
-echo "=== env check: B12X_PCIE_DMA_PIECES='${B12X_PCIE_DMA_PIECES:-}' (must be empty) B12X_W4A16_SMALL_M_SPLITK='$B12X_W4A16_SMALL_M_SPLITK' IGNITION_KIMI_PREFILL_DMA_ROWS='${IGNITION_KIMI_PREFILL_DMA_ROWS:-}'"
+# W22 transport switches (rows 1/3 per the W22 gate; recorded in the plan's
+# b12x environment and compiled into the package's graphs).
+W22_SWITCHES=""
+if [ "$R1_PUSH" = 1 ]; then export B12X_PCIE_DCP_PAIR_PUSH=1; W22_SWITCHES="$W22_SWITCHES B12X_PCIE_DCP_PAIR_PUSH=1"; fi
+if [ "$R3_ISLAND" = 1 ]; then export B12X_PCIE_DCP_GATHER_ISLAND=1; W22_SWITCHES="$W22_SWITCHES B12X_PCIE_DCP_GATHER_ISLAND=1"; fi
+if [ "$R3_ACQUIRE" = 1 ]; then export B12X_PCIE_DCP_GATHER_ACQUIRE=1; W22_SWITCHES="$W22_SWITCHES B12X_PCIE_DCP_GATHER_ACQUIRE=1"; fi
+echo "=== env check: B12X_PCIE_DMA_PIECES='${B12X_PCIE_DMA_PIECES:-}' (must be empty) B12X_W4A16_SMALL_M_SPLITK='$B12X_W4A16_SMALL_M_SPLITK' IGNITION_KIMI_PREFILL_DMA_ROWS='${IGNITION_KIMI_PREFILL_DMA_ROWS:-}' W22:$W22_SWITCHES TRELLIS_TABLE=$TRELLIS_TABLE DECODE_FUSION=$DECODE_FUSION"
 { echo "=== export start $(date -Is) tree $(git rev-parse HEAD) flashinfer $(git -C "$FI" rev-parse HEAD) free ${free}G avail ${avail}G"
   echo "=== gpus $GPU_LIST"; echo "=== args ${EXPORT_ARGS[*]}"
-  echo "=== env B12X_W4A16_SMALL_M_SPLITK=1 B12X_PCIE_DMA_PIECES=unset IGNITION_KIMI_PREFILL_DMA_*=unset"; } >>"$LOG"
+  echo "=== env B12X_W4A16_SMALL_M_SPLITK=1 B12X_PCIE_DMA_PIECES=unset IGNITION_KIMI_PREFILL_DMA_*=unset$W22_SWITCHES TRELLIS_TABLE=$TRELLIS_TABLE DECODE_FUSION=$DECODE_FUSION"; } >>"$LOG"
 "$PYV" -m ignition export "$SNAP" "${EXPORT_ARGS[@]}" >>"$LOG" 2>&1 &
 E=$!
 while kill -0 $E 2>/dev/null; do
