@@ -220,10 +220,14 @@ def test_prefill_island_reduce_flag_states_select_the_reduction_channel(monkeypa
 
 @pytest.mark.parametrize(("rows", "pushed", "fused"),
                          ((1, True, True), (4, True, True), (8, True, True),
-                          (1, False, True), (4, False, False), (8, False, False)))
+                          (1, False, True), (4, False, False), (8, False, False),
+                          (9, True, False), (12, True, False), (16, True, False),
+                          (20, True, False), (20, False, False)))
 def test_route_gather_selects_inside_a_pushed_paired_exchange(monkeypatch, rows, pushed, fused):
     """W22 row 1 (world 8): the fused route exchange is used when b12x plans the paired
-    exchange as a push (up to PAIR_PUSH_MAX_ROWS rows), and always for one row, as before."""
+    exchange as a push (up to PAIR_PUSH_MAX_ROWS rows), and always for one row, as before.
+    W23-A lever 1: rows 9..20 stay on the route exchange through the pushed pair gather
+    plus the standalone top-16 (the fused select's row cap leaves them two-step)."""
     import sys
     import torch
     from types import SimpleNamespace
