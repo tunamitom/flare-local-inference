@@ -268,6 +268,12 @@ def _preparation_arguments(running, *, model_default="defaults.model"):
                           help="select the measured Trellis prefill launch shapes (3 pipeline stages"
                                " at M>=2048, direct decode table at smaller M; bit-identical outputs,"
                                " decode graphs untouched; Kimi K3/K3.1)")
+    advanced.add_argument("--trellis-prefill-table", choices=("0", "1", "2"), default="0",
+                          help="select the direct Trellis decode table for large prefill launches"
+                               " (1: 48-row blocks, 2 stages, tile 128,128,64,256 at 1536..2560 rows;"
+                               " 2: additionally 64-row blocks, 3 stages, tile 64,128,64,128 at"
+                               " >=2560 rows; use with --trellis-prefill-shapes; decode graphs"
+                               " untouched; Kimi K3/K3.1)")
     advanced.add_argument("--language-model-only", action="store_true",
                           help="prepare no vision encoder and reject images; its weights and scratch become KV"
                                " pages (recipes with a separable encoder; default: the recipe's image support)")
