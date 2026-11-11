@@ -229,17 +229,21 @@ chk() { if "$@"; then return 0; else fail=$((fail+1)); return 1; fi; }
 # ──                       4967 superseded: -63 kernels = -63 modules, -1.83
 # ──                       MiB cubin, graphs 66 and slab/index_slab unchanged)
 # ──   0/0/0/0/0@*         E1.1 (gb202-tp8-202611100809)
-# ──   2/1/1/1/1@b4889fe5  W23 ruled config (MAX_ROWS 20): the compiled kernel
-# ──                       set is unknowable before the first export (lever 1
-# ──                       replaces the general route path at rows 9..20), so
-# ──                       the W11 supersede flow applies: PRE warns, the export
-# ──                       records the measured fingerprint here, then
-# ──                       --reassert must pass.
+# ──   2/1/1/1/1@b4889fe5  W23 ruled config (MAX_ROWS 20), registered from the
+# ──                       settled export gb202-tp8-202611110845 (export-
+# ──                       20261111-152641.log, all 8 ranks): 4900 kernels, -4
+# ──                       vs W22's 4904 — the route step at rows 9..20 replaces
+# ──                       general-path route kernels with the pushed pair
+# ──                       gather + standalone top-16. (The first W23 export of
+# ──                       this config showed a 4980-4982 per-rank spread: the
+# ──                       five then-new route-step latent_down_rows races left
+# ──                       per-shard compile artifacts in the tail inventory;
+# ──                       with those selections cached the count is uniform.)
 fp_baseline() {
   case "$TRELLIS_TABLE/$DECODE_FUSION/$R1_PUSH/$R3_ISLAND/$R3_ACQUIRE@$EXPECT_EXPORT_SRC" in
     2/1/1/1/1@ac377ae4) echo "Graphs: 66; kernels: 4904" ;;
     0/0/0/0/0@*) echo "Graphs: 66; kernels: 4967" ;;
-    2/1/1/1/1@b4889fe5) echo "" ;;
+    2/1/1/1/1@b4889fe5) echo "Graphs: 66; kernels: 4900" ;;
     *) echo "" ;;
   esac
 }
