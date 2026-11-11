@@ -271,10 +271,13 @@ def _exl3_mxfp8_savings(metadata):
     # row and column partitions. Credit only 1/16 of the original pair's bytes
     # as net savings, retaining margin for that duplication, scales and padding.
     latent_bytes = (layers - c["first_k_dense_replace"]) * 4 * hidden * c["routed_expert_hidden_size"]
-    # Use 37.5% of BF16 bytes rather than the ideal 48.4% reduction. The remainder
-    # covers scale layouts, alignment, and replicated retained tensors. Actual KV
-    # allocation is still derived from measured free memory after preparation.
-    return 2 * elements * 3 // 8 + latent_bytes // 16
+    # Credit 47.5% of counted BF16 projection bytes, calibrated against measured
+    # converted storage: the worst measured rank saves 47.63% under online MXFP8
+    # conversion, and rounding the credit below that keeps the planner's per-rank
+    # weights estimate (88.05 GiB at TP8) above the largest measured rank (88.03
+    # GiB). Actual KV allocation is still derived from measured free memory after
+    # preparation.
+    return 2 * elements * 475 // 1000 + latent_bytes // 16
 
 
 def _hub_metadata(repository: str, revision: str | None, hub_cache: Path | None) -> tuple[Path, Path]:

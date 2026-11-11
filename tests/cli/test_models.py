@@ -97,7 +97,8 @@ def test_kimi_exl3_reports_conversion_savings_without_enabling_conversion(tmp_pa
     original = model.recipe.weights_bytes(model.checkpoint, 8, None)
     converted = model.recipe.weights_bytes(model.checkpoint, 8, None, online_mxfp8=True)
     assert original == 99_625_000_000
-    assert 4 << 30 < original - converted < 5 << 30
+    # Credit is bounded below the measured worst-rank conversion rate (see _exl3_mxfp8_savings).
+    assert 5 << 30 < original - converted < 6 << 30
     assert model.checkpoint.stored_bytes == 797_000_000_000
     assert raw["text_config"]["quantization_config"]["dense_format"] == "bf16"
 
@@ -122,7 +123,7 @@ def test_kimi_conversion_estimate_counts_sharded_mla_and_duplicated_latent_views
         * (c["qk_nope_head_dim"] + c["qk_rope_head_dim"])
         + hidden * (c["q_lora_rank"] + c["kv_lora_rank"] + c["qk_rope_head_dim"]))
     latent_pair = (layers-c["first_k_dense_replace"]) * 4 * hidden * c["routed_expert_hidden_size"]
-    assert _exl3_mxfp8_savings(tmp_path) == 2 * (base+mla) * 3 // 8 + latent_pair // 16
+    assert _exl3_mxfp8_savings(tmp_path) == 2 * (base+mla) * 475 // 1000 + latent_pair // 16
     model = resolve(str(tmp_path))
     # The estimate must not silently enable conversion or alter source size.
     assert model.recipe.weights_bytes(model.checkpoint, 8, None) == 99_625_000_000

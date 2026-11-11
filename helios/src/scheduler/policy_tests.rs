@@ -1267,6 +1267,60 @@ fn equivalent_prefill_tails_use_the_smaller_graph_despite_a_faster_padded_estima
 }
 
 #[test]
+fn solo_prefill_chunking_is_length_alone_under_adversarial_costs() {
+    // J-4b chunk rule: with no other lane competing, chunking is a function of
+    // prompt length alone. Two duration profiles that disagree about the
+    // cheapest graph must produce the identical chunk sequence: full-size
+    // chunks while the remainder is at least one chunk (4096 x 8 for the
+    // 34268-token prompt), then the single smallest graph covering the rest
+    // (2048 for the 1500-token tail).
+    let mut sequences = Vec::new();
+    for profile in 0..2 {
+        let mut s = interactive_engine(2, false);
+        for capacity in [64usize, 128, 256, 512, 1024, 2048, 4096] {
+            let nanos = if (profile == 0) == (capacity == 4096) { MS } else { 1 };
+            set_cost(&mut s, GraphKind::Prefill, 1, capacity, nanos);
+        }
+        add(&mut s, 1, 32768 + 1500, 128);
+        let mut chunks = Vec::new();
+        while chunks.len() < 9 {
+            let plan = step(&mut s, 0);
+            if plan.kind == GraphKind::Prefill {
+                chunks.push((plan.token_capacity, plan.lanes[0].tokens));
+            }
+        }
+        assert!(chunks[..8].iter().all(|&chunk| chunk == (4096, 4096)), "{chunks:?}");
+        assert_eq!(chunks[8], (2048, 1500), "{chunks:?}");
+        sequences.push(chunks);
+    }
+    assert_eq!(sequences[0], sequences[1]);
+}
+
+#[test]
+fn competing_lanes_keep_the_measured_catalog_choice() {
+    // With a second live request the chunk rule is scoped out: the measured
+    // catalog competes as before and decode interleaving stays possible. The
+    // rule would cut the 34268-token prompt with a full 4096 chunk; under
+    // competition the cheap mid-size graph must win instead.
+    let mut s = interactive_engine(4, false);
+    for capacity in [64usize, 128, 256, 512, 1024, 2048, 4096] {
+        set_cost(&mut s, GraphKind::Prefill, 1, capacity, if capacity == 4096 { MS } else { 1 });
+    }
+    add(&mut s, 1, 32768 + 1500, 128);
+    add(&mut s, 2, 32768 + 1500, 128);
+    let mut first = None;
+    for _ in 0..40 {
+        let plan = step(&mut s, 0);
+        if plan.kind == GraphKind::Prefill {
+            first = Some(plan.token_capacity);
+            break;
+        }
+    }
+    assert!(first.is_some(), "competing prefills must still make progress");
+    assert_ne!(first, Some(4096), "the chunk rule must not engage under competition");
+}
+
+#[test]
 fn efficient_thirty_millisecond_speculation_beats_seventeen_millisecond_rounds() {
     let mut s = interactive_engine(1, true);
     let h = add(&mut s, 1, 64, 2048);
