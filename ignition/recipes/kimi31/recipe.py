@@ -53,6 +53,14 @@ RECIPE = replace(KIMI3, name="kimi31", served_model_name="Kimi-K3.1-Pro", prepar
         16: RankCosts(state_row_bytes=35_450_112, page_bytes=2_174_976, graph_bytes=9 << 29, page_tokens=128*16),
     }), draft_bytes=5_569_622_016)}),
     # Gather threads are tuned independently; the attention components declare LSE's 512-thread geometry.
+    # W22 (TP9 transplant): the plan may arm the paired-gather push transport
+    # (B12X_PCIE_DCP_PAIR_PUSH=1, fused in-kernel expert select; ties -> lower
+    # expert id; near-ties within a few fp32 ULP may swap the sixteenth expert,
+    # measured 6.7e-6 of rows; a non-finite router logit is never a candidate,
+    # an all-non-finite row yields ids 0-15 at weight exactly zero; engages at
+    # 8 rows or fewer — single-stream rounds only) and the two-island
+    # all_gather_heads (B12X_PCIE_DCP_GATHER_ISLAND=1 + B12X_PCIE_DCP_GATHER_ACQUIRE=1).
+    # The LSE reduce-scatter push stays OFF (row 4 failed its speed rule).
     b12x_environment=MappingProxyType({**KIMI3.b12x_environment, "B12X_PCIE_DCP_THREADS": "0"}),
     ranks=MappingProxyType({8: RankCosts(state_row_bytes=63_181_056, page_bytes=2_543_616,
                                        graph_bytes=9 << 29, page_tokens=128 * 8),

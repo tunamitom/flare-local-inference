@@ -37,6 +37,43 @@ After a green export `--detach` records the package path, relinks
 recorded settings + memory fingerprints (slab 217.69 / index_slab 49.89 MiB,
 `Graphs: 66; kernels: 4967` across all 8 ranks).
 
+## W22 decode rows (TP9 transplant) — what rides the export, and the row-1 policy
+
+The W22 combined graph-only export arms, behind the driver's knobs:
+`TRELLIS_TABLE=2` (row 5 direct Trellis decode table), `DECODE_FUSION=1` (fused
+decode pack + compaction riders), `R3_ISLAND=1` + `R3_ACQUIRE=1` (row 3
+two-island head gather, exactly the identity+speed-tested configuration),
+`R1_PUSH=1` (row 1 paired-gather push transport with the fused in-kernel expert
+select). Row 4's LSE reduce-scatter push stays OFF (speed rule failed), and rows
+2/6/7/8/9/10/12 are dropped by the J-A ruling. `plan.concurrency` stays 4 and
+`image_concurrency` at the rider 1 (J-E: admission 8 is a documented TODO —
+it costs ~0.25 GiB/rank per 4 extra slots (~100-125k KV tokens), needs higher
+token capacity + larger graph budget, and the c2/c4 trend does not extrapolate
+to c8).
+
+Row 1 is a **numerics-light decode change**, not a byte-identical transport
+(J-D). Policy at the switch (`B12X_PCIE_DCP_PAIR_PUSH`, flashinfer) and in the
+kimi31 recipe:
+
+- **Ties:** equal selection scores pick the lower expert id — identical in the
+  two-step and the fused select.
+- **Near-ties:** scores within a few fp32 ULP may rank opposite (the two
+  selects use different sigmoid forms; weights land 1-4 ULP apart), so the
+  sixteenth expert can differ. Measured rate over 2.4M production-shaped rows
+  at 1/4/8 rows: 6.7e-6 boundary swaps (every swapped pair within 2 ULP) and
+  5.6e-5 same-set slot-order swaps.
+- **Non-finite:** a non-finite router logit is never a candidate in the fused
+  select; a row with no finite candidate returns ids 0-15 at weight exactly
+  zero. The old two-step path would score `+inf` as sigmoid=1 and select it —
+  out of contract (real router logits are finite).
+- **Scope:** the fused select engages at 8 rows or fewer — it helps
+  single-stream rounds, not packed multi-stream ones.
+
+Owner-bench note: decode in this package is not bit-identical to E1.1 (router
+weights within 4 ULP, occasional near-tie expert swaps). Acceptance lengths
+within 5% of 3.81 / 2.52 / 2.54 and the decode round against the fit are the
+cells that close row 1.
+
 ## Full export (no `--reuse-weights`) — for a reproducer without our blob store
 
 The driver defaults to `REUSE_WEIGHTS=1`, which passes `--reuse-weights`: the
