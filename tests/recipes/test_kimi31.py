@@ -3,15 +3,15 @@
 
 """Kimi K3.1 checkpoint identity, attention partition and complete history storage."""
 
-from dataclasses import replace
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from ignition.components.parallel import TensorParallelShard
-from ignition.recipes.kimi3.config import ModelConfig, DSparkConfig, LatentDSparkConfig
-from ignition.recipes.kimi3.pool import continuation_layout, page_specs, page_bytes
+from ignition.recipes.kimi3.config import DSparkConfig, LatentDSparkConfig, ModelConfig
+from ignition.recipes.kimi3.pool import continuation_layout, page_bytes, page_specs
 from ignition.recipes.kimi31.recipe import RECIPE
 
 FIXTURES = Path(__file__).parents[1] / "fixtures" / "kimi31"
@@ -158,3 +158,68 @@ def test_exl3_rejects_shards_that_split_intermediate_hadamard_blocks(raw):
     config = ModelConfig.from_dict(raw)
     with pytest.raises(ValueError, match="aligned rank partitions"):
         config.validate_shard(TensorParallelShard(0, 16))
+
+
+@pytest.mark.parametrize(("rows", "fused"),
+                         ((1, True), (2, False), (8, False), (9, False), (12, False), (16, False), (20, False)))
+def test_route_gather_keeps_one_to_twenty_rows_on_the_pair_gather_and_top16(monkeypatch, rows, fused):
+    """Rows 1-20 stay on the route exchange: one row fuses the expert select into the
+    exchange itself, two to twenty rows pair the exchange with the standalone top-16.
+    The route choice is transport-agnostic -- it runs on whatever paired-gather
+    transport the b12x plan selects."""
+    from types import SimpleNamespace
+
+    import torch
+    from b12x.comm import pcie
+
+    from ignition.recipes.kimi3 import routing
+
+    down_width, router_width = 3584 // 8, 896 // 8
+    runtime = SimpleNamespace(world_size=8, query_head_dim=2 * down_width + 4 * router_width,
+                              exchange_group=object())
+    declared, planned = [], []
+    plan = SimpleNamespace(request=lambda **kwargs: kwargs["name"])
+
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda group: tuple(range(8)))
+    monkeypatch.setattr(pcie, "query_from_runtime",
+                        lambda runtime, *, surface, call: SimpleNamespace(surface=surface, call=call))
+    monkeypatch.setattr(pcie, "plan", lambda query, *, runtime: planned.append(query.surface) or plan)
+    monkeypatch.setattr(routing, "declare", lambda session, requests, **kwargs: declared.extend(requests))
+
+    gather = routing.PreparedRouteGather(
+        torch.zeros((rows, down_width), dtype=torch.bfloat16),
+        torch.zeros((rows, router_width), dtype=torch.float32), torch.zeros(896, dtype=torch.float32),
+        torch.zeros((rows, 3584), dtype=torch.bfloat16), torch.zeros((rows, 16), dtype=torch.float32),
+        torch.zeros((rows, 16), dtype=torch.int32), runtime=runtime, session=None, coordinator=None,
+        name="route")
+
+    if fused:
+        # One exchange gathers the shards and selects: no separate selection launch.
+        assert gather.fused is not None
+        assert planned == ["DcpAllToAll.all_gather_pair_kimi_topk"] and declared == ["route"]
+    else:
+        # Two rows and above pair the exchange with the prepared top-16.
+        assert getattr(gather, "fused", None) is None
+        assert planned == ["DcpAllToAll.all_gather_pair", "DcpAllToAll.kimi_topk16"]
+        assert declared == ["route/gather", "route/select"]
+
+
+def test_route_gather_rejects_rows_beyond_the_recipe_envelope():
+    """Rows outside 1-20 are rejected loudly at preparation: there is no pin detection
+    and no fallback path, so the recipe prepares 1-20 rows or raises."""
+    from types import SimpleNamespace
+
+    import torch
+
+    from ignition.recipes.kimi3 import routing
+
+    down_width, router_width = 3584 // 8, 896 // 8
+    runtime = SimpleNamespace(world_size=8, query_head_dim=2 * down_width + 4 * router_width,
+                              exchange_group=object())
+    with pytest.raises(ValueError, match="1-20 row"):
+        routing.PreparedRouteGather(
+            torch.zeros((21, down_width), dtype=torch.bfloat16),
+            torch.zeros((21, router_width), dtype=torch.float32), torch.zeros(896, dtype=torch.float32),
+            torch.zeros((21, 3584), dtype=torch.bfloat16), torch.zeros((21, 16), dtype=torch.float32),
+            torch.zeros((21, 16), dtype=torch.int32), runtime=runtime, session=None, coordinator=None,
+            name="route")
