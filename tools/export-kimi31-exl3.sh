@@ -210,6 +210,27 @@ assert_settings() {
       *) say "ASSERT: recorded invocation misses --prefill-island-reduce"; bad=$((bad+1));;
     esac
   fi
+  # W22 knobs: the armed switches must appear in the recorded invocation and
+  # the recorded export environment.
+  if [ "$TRELLIS_TABLE" != 0 ]; then
+    case " $args_line " in *--trellis-prefill-table*) : ;;
+      *) say "ASSERT: recorded invocation misses --trellis-prefill-table"; bad=$((bad+1));;
+    esac
+  fi
+  if [ "$DECODE_FUSION" = 1 ]; then
+    case " $args_line " in *--decode-fusion*) : ;;
+      *) say "ASSERT: recorded invocation misses --decode-fusion"; bad=$((bad+1));;
+    esac
+  fi
+  local env_line; env_line=$(grep -m1 '^=== env ' "$log" || true)
+  for pair in "R1_PUSH:B12X_PCIE_DCP_PAIR_PUSH" "R3_ISLAND:B12X_PCIE_DCP_GATHER_ISLAND" "R3_ACQUIRE:B12X_PCIE_DCP_GATHER_ACQUIRE"; do
+    knob="${pair%%:*}"; envname="${pair##*:}"
+    if [ "${!knob}" = 1 ]; then
+      case " $env_line " in *"$envname=1"*) : ;;
+        *) say "ASSERT: recorded export env misses $envname=1 (knob $knob)"; bad=$((bad+1));;
+      esac
+    fi
+  done
   # The plan-settings record the export prints, when the tree records one.
   local plan_line; plan_line=$(grep -m1 '^{"plan"' "$log" || true)
   if [ -n "$plan_line" ]; then
@@ -242,10 +263,24 @@ print(plan.get("prefill_dma_ring_rows"), plan.get("prefill_dma_ring_bf16"), plan
       bad=$((bad+1))
     fi
     say "ASSERT: fingerprints slab=${slab} MiB (${n_slab} ranks) index_slab=${islab} MiB (${n_islab}) ${graphs} (${n_graphs})"
-    if [ "$SPEC_TOKEN_CAPACITY" = 20 ] && [ "$IMAGE_CONCURRENCY" = 1 ] && [ "$RING_ROWS" = 1024 ]; then
+    # W22 re-baseline (J-D review, package gb202-tp8-202611110549): the
+    # round-graph/kernel count is the decode-fusion detector, and the W22
+    # switches are launch FUSIONS — they strictly remove compiled kernels.
+    # E1.1's 'Graphs: 66; kernels: 4967' is superseded at the W22 ruled config
+    # (TRELLIS_TABLE=2 DECODE_FUSION=1 R1_PUSH=1 R3_ISLAND=1 R3_ACQUIRE=1) by
+    # 'Graphs: 66; kernels: 4904' (-63 kernels = -63 modules, -1.83 MiB cubin;
+    # graph count and the prefill-wire slab sizes unchanged). Configs outside
+    # the ruled set assert cross-rank consistency only.
+    local ruled=1
+    [ "$SPEC_TOKEN_CAPACITY" = 20 ] || ruled=0
+    [ "$IMAGE_CONCURRENCY" = 1 ] || ruled=0
+    [ "$RING_ROWS" = 1024 ] || ruled=0
+    [ "$TRELLIS_TABLE" = 2 ] && [ "$DECODE_FUSION" = 1 ] && [ "$R1_PUSH" = 1 ] \
+      && [ "$R3_ISLAND" = 1 ] && [ "$R3_ACQUIRE" = 1 ] || ruled=0
+    if [ "$ruled" = 1 ]; then
       [ "$slab" = "217.69" ] || { say "ASSERT: slab fingerprint '$slab' MiB != baseline 217.69 MiB"; bad=$((bad+1)); }
       [ "$islab" = "49.89" ] || { say "ASSERT: index_slab fingerprint '$islab' MiB != baseline 49.89 MiB"; bad=$((bad+1)); }
-      [ "$graphs" = "Graphs: 66; kernels: 4967" ] || { say "ASSERT: round-graph/kernel fingerprint '$graphs' != baseline 'Graphs: 66; kernels: 4967'"; bad=$((bad+1)); }
+      [ "$graphs" = "Graphs: 66; kernels: 4904" ] || { say "ASSERT: round-graph/kernel fingerprint '$graphs' != W22 baseline 'Graphs: 66; kernels: 4904'"; bad=$((bad+1)); }
     else
       say "ASSERT: fingerprint baseline skipped (non-ruled config); cross-rank consistency asserted only"
     fi
@@ -267,6 +302,20 @@ print(plan.get("prefill_dma_ring_rows"), plan.get("prefill_dma_ring_bf16"), plan
   echo "=== settings assertion OK: recorded settings == expected set; fingerprints slab=${slab} MiB index_slab=${islab} MiB; ${graphs}" >>"$log"
   return 0
 }
+
+# ── --reassert <log> <pkg>: re-run the post-export settings assertion against
+# ── an existing export record and package (review follow-up; exports nothing).
+if [ "$MODE" = --reassert ]; then
+  [ $# -ge 3 ] || { say "usage: $0 --reassert <export-log> <package-dir>"; exit 2; }
+  if assert_settings "$2" "$3"; then
+    echo "0" > "$OUT/export.settings-rc"
+    say "REASSERT OK: $3 matches the ruled settings + fingerprints"
+    exit 0
+  fi
+  echo "3" > "$OUT/export.settings-rc"
+  say "REASSERT FAILED: $3 still mismatches"
+  exit 3
+fi
 
 if [ "$MODE" = --link ]; then
   [ -f "$DONE" ] && [ ! -f "$FAIL" ] || { say "FATAL: download not complete ($DONE missing or $FAIL present)"; exit 1; }
