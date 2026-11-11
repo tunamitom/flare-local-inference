@@ -83,6 +83,9 @@ fi
 FI=$(readlink -f "$FI")   # normalize (the default path carries a literal '..'; the resolve guard compares real paths)
 PYV="${PYV:-$REPO/.venv/bin/python}"; [ -x "$PYV" ] || PYV="$(command -v python3)"
 RING_ROWS="${RING_ROWS:-1024}"
+# Spare card for preflight rider traces: 11:00.0 (GPU identity = switch port +
+# PCI BDF; index 0). Work happens under flock /tmp/gpu-spare.lock and leaves it clean.
+SPARE_GPU="${SPARE_GPU:-GPU-253e168e-256f-4457-82f4-d26fd2f3c0bd}"
 # ─────────────────────────────────────────────────────────────────────────────
 # W22 (TP9 transplant, levers/w22-handover.md): the combined graph-only export.
 # Code tip ac377ae4 = kimi31-exl3-live + row-5 direct decode table (upstream
@@ -185,6 +188,93 @@ say() { echo "$*" >&2; }
 fail=0
 chk() { if "$@"; then return 0; else fail=$((fail+1)); return 1; fi; }
 
+# ── W22 fingerprint registry (shared by the post-export assertion and the
+# ── preflight PRE-mode check). Key: TRELLIS_TABLE/DECODE_FUSION/R1_PUSH/
+# ── R3_ISLAND/R3_ACQUIRE at capacity 20, image 1, ring 1024. The W22 switches
+# ── are launch fusions and move the round-graph/kernel count (the decode-fusion
+# ── detector); a knob config with no registered baseline cannot pass the
+# ── post-export assertion — the preflight refuses to start for it.
+# ──   2/1/1/1/1  W22 ruled config (gb202-tp8-202611110549; E1.1's 4967
+# ──              superseded: -63 kernels = -63 modules, -1.83 MiB cubin,
+# ──              graphs 66 and slab/index_slab unchanged)
+# ──   0/0/0/0/0  E1.1 (gb202-tp8-202611100809)
+fp_baseline() {
+  case "$TRELLIS_TABLE/$DECODE_FUSION/$R1_PUSH/$R3_ISLAND/$R3_ACQUIRE" in
+    2/1/1/1/1) echo "Graphs: 66; kernels: 4904" ;;
+    0/0/0/0/0) echo "Graphs: 66; kernels: 4967" ;;
+    *) echo "" ;;
+  esac
+}
+
+# ── PRE-mode settings assertion: the knob env must match the rulings before
+# ── any GPU work starts. Sources: levers/tp9-jD-review.md section 4 (rows 1/3/4/5
+# ── + riders) and levers/tp9-jE-review.md (admission 4, image rider 1).
+assert_pre_settings() {
+  local bad=0 kv k v
+  for kv in TRELLIS_TABLE=2 DECODE_FUSION=1 R1_PUSH=1 R3_ISLAND=1 R3_ACQUIRE=1 \
+            PREFILL_FP8=0 PREFILL_ISLAND=1 IMAGE_CONCURRENCY=1 RING_ROWS=1024; do
+    k="${kv%%=*}"; v="${kv##*=}"
+    [ "${!k}" = "$v" ] || { say "PRE-SETTINGS: $k=${!k} deviates from the ruling ($kv) — tp9-jD-review.md §4 / tp9-jE-review.md; consult before export"; bad=$((bad+1)); }
+  done
+  case "$SPEC_TOKEN_CAPACITY" in 20|24) : ;;
+    *) say "PRE-SETTINGS: SPEC_TOKEN_CAPACITY=$SPEC_TOKEN_CAPACITY must be 20 (primary) or 24 (K1 fallback)"; bad=$((bad+1));;
+  esac
+  # Row 4's LSE reduce-scatter push stays OFF (speed rule failed).
+  case "${B12X_PCIE_DCP_LSE_PUSH_TP8:-0}" in 0|"") : ;;
+    *) say "PRE-SETTINGS: B12X_PCIE_DCP_LSE_PUSH_TP8=${B12X_PCIE_DCP_LSE_PUSH_TP8} — row 4 stays OFF (J-D §4)"; bad=$((bad+1));;
+  esac
+  local key="$TRELLIS_TABLE/$DECODE_FUSION/$R1_PUSH/$R3_ISLAND/$R3_ACQUIRE"
+  if [ -n "$(fp_baseline)" ]; then
+    say "PRE-SETTINGS: fingerprint baseline registered for $key: $(fp_baseline)"
+  else
+    case "$key" in
+      0/1/1/1/1|2/1/0/1/1|0/1/0/1/1)
+        # Pre-authorized fallback exports (J-D section 3: row 5 off / R1_PUSH=0 /
+        # both off). Their fingerprint is unknowable before the first export:
+        # proceed, but the post-export assertion WILL flag the package until the
+        # measured fingerprint is registered in fp_baseline and --reassert runs.
+        say "PRE-SETTINGS: WARNING — $key is a pre-authorized fallback config (J-D §3) with no registered fingerprint baseline; after the export record the memory-report fingerprint in fp_baseline and run --reassert" ;;
+      *)
+        say "PRE-SETTINGS: no ruled fingerprint baseline for $key — the post-export settings assertion cannot pass (the 2026-11-11 12:50 class); register the baseline (consult) before exporting"
+        bad=$((bad+1)) ;;
+    esac
+  fi
+  return $bad
+}
+
+# ── Mandatory preflight (owner order 2026-11-11: catch the fails earlier).
+# ── No 8-GPU run starts without this passing. CPU-only except the rider
+# ── traces, which use the spare card (11:00.0) under /tmp/gpu-spare.lock.
+run_preflight() {
+  local mode="$1" bad=0
+  say "── preflight ($mode) ──"
+  if "$PYV" -c 'import flashinfer, ignition' 2>/dev/null; then
+    say "preflight: flashinfer + ignition import OK"
+  else
+    say "preflight: IMPORT FAILED (flashinfer/ignition)"; bad=$((bad+1))
+  fi
+  # The `flashinfer/data/csrc missing` class: every JIT build path must resolve.
+  if "$PYV" "$HERE/preflight/jit-src-dryrun.py" >&2; then :; else bad=$((bad+1)); fi
+  # Plan acceptance + PRE-mode settings vs rulings.
+  if "$PYV" "$HERE/plan-dryrun.py" "${DRYRUN_ARGS[@]}" >&2; then
+    say "preflight: planner dry-run OK"
+  else
+    say "preflight: planner dry-run FAILED"; bad=$((bad+1))
+  fi
+  assert_pre_settings || bad=$((bad+1))
+  # Rider traces on the spare card (full preflight only).
+  if [ "$mode" = full ]; then
+    if flock /tmp/gpu-spare.lock env CUDA_VISIBLE_DEVICES="${SPARE_GPU}" \
+         "$PYV" "$HERE/preflight/dynamo-rider-smoke.py" >&2; then :; else bad=$((bad+1)); fi
+  fi
+  if [ "$bad" -eq 0 ]; then
+    say "preflight: OK ($mode)"
+    return 0
+  fi
+  say "preflight: FAILED ($mode) — $bad check(s); no GPU run starts"
+  return 1
+}
+
 # ── W11 (radiance-mechanics review §3 item 5): post-export settings assertion.
 # Read the recorded settings back from the export record and the package, and
 # compare them with the driver's expected set. One physical fingerprint per
@@ -267,22 +357,28 @@ print(plan.get("prefill_dma_ring_rows"), plan.get("prefill_dma_ring_bf16"), plan
     # round-graph/kernel count is the decode-fusion detector, and the W22
     # switches are launch FUSIONS — they strictly remove compiled kernels.
     # E1.1's 'Graphs: 66; kernels: 4967' is superseded at the W22 ruled config
-    # (TRELLIS_TABLE=2 DECODE_FUSION=1 R1_PUSH=1 R3_ISLAND=1 R3_ACQUIRE=1) by
-    # 'Graphs: 66; kernels: 4904' (-63 kernels = -63 modules, -1.83 MiB cubin;
-    # graph count and the prefill-wire slab sizes unchanged). Configs outside
-    # the ruled set assert cross-rank consistency only.
+    # by 'Graphs: 66; kernels: 4904' (-63 kernels = -63 modules, -1.83 MiB
+    # cubin; graph count and the prefill-wire slab sizes unchanged). The
+    # registry in fp_baseline() is the single source of truth; the preflight's
+    # PRE-mode check refuses configs without a registered baseline before the
+    # export starts. Configs outside the ruled capacity/image/ring set assert
+    # cross-rank consistency only.
     local ruled=1
     [ "$SPEC_TOKEN_CAPACITY" = 20 ] || ruled=0
     [ "$IMAGE_CONCURRENCY" = 1 ] || ruled=0
     [ "$RING_ROWS" = 1024 ] || ruled=0
-    [ "$TRELLIS_TABLE" = 2 ] && [ "$DECODE_FUSION" = 1 ] && [ "$R1_PUSH" = 1 ] \
-      && [ "$R3_ISLAND" = 1 ] && [ "$R3_ACQUIRE" = 1 ] || ruled=0
     if [ "$ruled" = 1 ]; then
-      [ "$slab" = "217.69" ] || { say "ASSERT: slab fingerprint '$slab' MiB != baseline 217.69 MiB"; bad=$((bad+1)); }
-      [ "$islab" = "49.89" ] || { say "ASSERT: index_slab fingerprint '$islab' MiB != baseline 49.89 MiB"; bad=$((bad+1)); }
-      [ "$graphs" = "Graphs: 66; kernels: 4904" ] || { say "ASSERT: round-graph/kernel fingerprint '$graphs' != W22 baseline 'Graphs: 66; kernels: 4904'"; bad=$((bad+1)); }
+      local base; base="$(fp_baseline)"
+      if [ -n "$base" ]; then
+        [ "$slab" = "217.69" ] || { say "ASSERT: slab fingerprint '$slab' MiB != baseline 217.69 MiB"; bad=$((bad+1)); }
+        [ "$islab" = "49.89" ] || { say "ASSERT: index_slab fingerprint '$islab' MiB != baseline 49.89 MiB"; bad=$((bad+1)); }
+        [ "$graphs" = "$base" ] || { say "ASSERT: round-graph/kernel fingerprint '$graphs' != registered baseline '$base' (knobs $TRELLIS_TABLE/$DECODE_FUSION/$R1_PUSH/$R3_ISLAND/$R3_ACQUIRE)"; bad=$((bad+1)); }
+      else
+        say "ASSERT: no registered fingerprint baseline for knobs $TRELLIS_TABLE/$DECODE_FUSION/$R1_PUSH/$R3_ISLAND/$R3_ACQUIRE — record '$graphs' in fp_baseline() and run --reassert"
+        bad=$((bad+1))
+      fi
     else
-      say "ASSERT: fingerprint baseline skipped (non-ruled config); cross-rank consistency asserted only"
+      say "ASSERT: fingerprint baseline skipped (non-ruled capacity/image/ring); cross-rank consistency asserted only"
     fi
   fi
   # Read back from the package: the captured round graphs must be there.
@@ -432,7 +528,14 @@ chk test "$env_bad" -eq 0 || say "GUARD: switch-environment allowlist violated (
 GPU_LIST="$(python3 /opt/mimo-pro/flare-bd/gpu-select.py B,D 2>/dev/null || true)"
 n_gpu=$(awk -F, '{print NF}' <<<"$GPU_LIST"); chk test "$n_gpu" -eq 8 || say "GUARD: B+D resolved $n_gpu GPUs, need 8"
 busy=0; for g in ${GPU_LIST//,/ }; do u=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits -i "$g" 2>/dev/null || echo 99999); [ "$u" -lt 1024 ] || busy=1; done
-chk test "$busy" -eq 0        || say "GUARD: a B/D card is in use"
+if [ "$MODE" = --preflight ]; then
+  # Preflight is allowed while the serve owns B+D; the free-card guard is a
+  # launch-time check and is re-run at --check/--detach.
+  [ "$busy" -eq 0 ] && say "preflight: B+D cards free" \
+    || say "preflight: NOTE — B+D cards in use (serve live); launch-time guard re-checks at --check/--detach"
+else
+  chk test "$busy" -eq 0        || say "GUARD: a B/D card is in use"
+fi
 free=$(df -BG --output=avail /opt/models | tail -1 | tr -dc 0-9); chk test "$free" -ge "$MIN_FREE_G" || say "GUARD: /opt/models free ${free}G < ${MIN_FREE_G}G"
 avail=$(awk '/MemAvailable/{print int($2/1048576)}' /proc/meminfo); chk test "$avail" -ge 400 || say "GUARD: MemAvailable ${avail}G < 400G"
 if [ "$MODE" = --run ]; then
@@ -481,7 +584,20 @@ say "─────────────────────────
 if [ "$fail" -ne 0 ]; then say "CHECK FAILED: $fail guard(s); nothing run"; exit 1; fi
 [ "$MODE" = --check ] && { say "CHECK OK: all guards pass; nothing run"; exit 0; }
 
+# ── Mandatory preflight stage (owner order 2026-11-11). No 8-GPU run starts
+# ── without it passing: --preflight runs it standalone, --detach runs the full
+# ── set (incl. the spare-card rider traces) before detaching, --run repeats the
+# ── CPU subset inside the unit before the export touches the B+D cards.
+if [ "$MODE" = --preflight ]; then
+  if run_preflight full; then
+    say "PREFLIGHT OK: imports, JIT sources, rider traces, planner + pre-settings all pass"
+    exit 0
+  fi
+  say "PREFLIGHT FAILED"; exit 1
+fi
+
 if [ "$MODE" = --detach ]; then
+  run_preflight full || { say "PREFLIGHT FAILED: nothing detached"; exit 1; }
   unit="kimi31-exl3-export-$TS"
   sudo -n systemd-run --unit="$unit" --collect --uid=tom --gid=tom \
     --setenv=HOME=/home/tom --setenv=USER=tom --setenv=EXPORT_TS="$TS" --setenv=EXPORT_LOG="$LOG" \
@@ -496,6 +612,8 @@ if [ "$MODE" = --detach ]; then
 fi
 
 [ "$MODE" = --run ] || { say "unknown mode $MODE"; exit 2; }
+# CPU subset of the preflight, repeated inside the unit before any GPU work.
+run_preflight light || { say "PREFLIGHT FAILED (run): export not started"; exit 1; }
 cd "$REPO"
 export CUDA_VISIBLE_DEVICES="$GPU_LIST" CUDA_DEVICE_ORDER=PCI_BUS_ID HF_HUB_OFFLINE=1 TOKENIZERS_PARALLELISM=false
 # W6 E1 (J-3 §1) + W11 §3 item 4: only the shipped split-K decode switch rides
