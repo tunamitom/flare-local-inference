@@ -89,6 +89,7 @@ class PreparationConfig:
     speculative_fixed_width: int | None = None
     speculative_token_capacity: int | None = None
     speculative_graph_budget: int = 64
+    block_verification: bool = False
     # Store eligible attention, shared-expert, latent MoE, and DSpark projections as MXFP8.
     online_mxfp8: bool = False
     # Shared experts overlap routing and routed experts on an auxiliary stream.
@@ -433,6 +434,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             frame=frame, sequence=sequence, session=session, workspace=arena, collectives=collectives,
             decoder_buffers=decoder_buffers, draft_tokens=config.draft_tokens, context_runtime=context_collective,
             page_tokens=config.page_tokens, **extra)
+        speculation.block_verification = config.block_verification
     modes = (True, False) if drafting else (False,)
     count = (len(modes) * (prefill_graph_count(prefill_sizes, scoring) + 4 * len(batch_sizes)) + len(batch_sizes)
              + len(config.speculative_round_shapes) + len(patches))

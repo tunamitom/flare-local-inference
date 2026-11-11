@@ -120,10 +120,13 @@ class Speculation:
     markov_head_quantization: str | None = None
     vocabulary_parallel_sampling: bool = False
     method: str | None = None
+    block_verification: bool = False
 
     def __post_init__(self):
         if self.method not in (None, "mtp", "dflash2"):
             raise ValueError("speculative method must be omitted, mtp or dflash2")
+        if self.block_verification and (self.vocabulary_parallel_sampling or self.draft_tokens < 1):
+            raise ValueError("token-wise block verification requires positive draft depth without vocabulary sharding")
         if self.vocabulary_parallel_sampling and self.draft_tokens < 1:
             raise ValueError("vocabulary-parallel sampling requires positive learned draft depth")
         if self.vocabulary_parallel_sampling and self.markov_head_quantization == "nvfp4":
