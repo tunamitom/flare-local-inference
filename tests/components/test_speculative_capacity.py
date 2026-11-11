@@ -58,6 +58,38 @@ def test_insufficient_or_noninteger_capacity_is_rejected(capacity):
         speculative_shapes(4, tuple(range(1, 9)), capacity)
 
 
+def test_all_reduce_rows_cover_complete_draft_blocks():
+    """The shared reduction channel must fit a whole draft proposal block.
+
+    Draft graphs reduce batch * (draft_tokens + 1) rows regardless of the packed
+    target capacity, so shrinking the capacity envelope (for example 32 -> 20) must not
+    undersize the channel: at max_active 4 and seven drafts the batch-4 block is
+    32 rows while the packed envelope may be only 20.
+    """
+    from pathlib import Path
+
+    from ignition.recipes.kimi3.bootstrap import PreparationConfig as Kimi3
+
+    for capacity in (None, 8, 20, 24, 32):
+        config = Kimi3(max_active=4, speculative_widths=tuple(range(1, 9)),
+                       speculative_token_capacity=capacity, speculative_graph_budget=16,
+                       draft_checkpoint=Path("draft"))
+        batches = [batch for batch, width, _ in config.speculative_round_shapes if width > 1]
+        block_rows = max(batches) * (config.draft_tokens + 1)
+        assert config.draft_reduce_rows == block_rows
+        assert config.all_reduce_rows == max(config.decode_tokens, block_rows)
+        assert config.all_reduce_rows >= config.decode_tokens
+    config = Kimi3(max_active=4, speculative_widths=tuple(range(1, 9)),
+                   speculative_token_capacity=20, speculative_graph_budget=16,
+                   draft_checkpoint=Path("draft"))
+    assert config.decode_tokens == 20
+    assert config.draft_reduce_rows == 32 == config.all_reduce_rows
+    plain = Kimi3(max_active=4, speculative_widths=tuple(range(1, 9)),
+                  speculative_token_capacity=20, speculative_graph_budget=16)
+    assert plain.draft_reduce_rows == 0
+    assert plain.all_reduce_rows == plain.decode_tokens
+
+
 @pytest.mark.parametrize("recipe,enabled", [(DeepSeek4, "dspark"), (Mimo, "dflash")])
 def test_parallel_rounds_bound_physical_rows_independently_of_samples(recipe, enabled):
     config = recipe(max_active=2, speculative_widths=(1, 2, 3, 4),
