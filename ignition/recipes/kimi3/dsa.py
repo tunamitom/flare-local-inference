@@ -176,10 +176,17 @@ class PreparedDSA:
                 lengths = live.sum(1).to(torch.int32)
                 physical = torch.where(physical != torch.iinfo(torch.int32).max, physical, -1)
             else:
-                physical, lengths = selected_local_records(selected, positions, pages, world=shards.world,
-                    rank=shards.owner, page_size=PAGE_TOKENS)
-            self.physical[:count].copy_(physical)
-            self.counts[:count].copy_(lengths)
+                # The compaction kernel writes the retained buffers directly, so
+                # the per-stage copy into self.physical/self.counts disappears
+                # (one write per element instead of two). Bytes beyond each
+                # row's count are -1 and don't care; consumers read [0, count).
+                selected_local_records(selected, positions, pages, world=shards.world,
+                    rank=shards.owner, page_size=PAGE_TOKENS,
+                    out=self.physical[:count], count_out=self.counts[:count])
+                physical = lengths = None
+            if physical is not None:
+                self.physical[:count].copy_(physical)
+                self.counts[:count].copy_(lengths)
             if quantized is not None and paired is None:
                 quantized.copy_(self.query[begin:end].float().clamp(-448., 448.).to(torch.float8_e4m3fn))
             if gather is not None:

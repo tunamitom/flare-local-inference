@@ -75,14 +75,62 @@ def _records(Selected, Positions, Pages, Rank, Output, Counts,
     tl.store(Counts + row, count)
 
 
-def selected_local_records(selected, positions, pages, *, world, rank, page_size):
+def _extent(tensor):
+    """The tensor's byte range in its storage: the strided bounding box [start, end)."""
+    start = tensor.data_ptr()
+    if tensor.numel() == 0:
+        return start, start
+    span = 1 + sum((size - 1) * abs(stride) for size, stride in zip(tensor.shape, tensor.stride()))
+    return start, start + span * tensor.element_size()
+
+
+def _overlaps(tensor, others):
+    """True when ``tensor`` shares any byte with one of ``others``.
+
+    Buffers carved from one shared pool chunk are disjoint and must pass: the
+    check compares byte ranges, never whole storages.
+    """
+    start, end = _extent(tensor)
+    return any(start < hi and lo < end for lo, hi in (_extent(other) for other in others))
+
+
+def selected_local_records(selected, positions, pages, *, world, rank, page_size, out=None, count_out=None):
     """Compact selected global positions into this rank's physical records.
 
     ``pages`` is a model-page table per query row. The selected positions are independently
     bounded by that row's causal position; negative positions denote inactive rows.
+
+    ``out``/``count_out`` are the caller's retained buffers: when given, the compaction
+    kernel writes them directly and the caller's follow-up copy disappears (one write per
+    element instead of two). Default ``None`` allocates exactly as before.
+
+    ``out`` and ``count_out`` must not overlap ``selected``, ``positions`` or ``pages``
+    (or each other) by byte range -- ``out=`` aliasing an input of the same kernel is
+    undefined. Disjoint buffers carved from one shared pool chunk are legal and pass.
+    Bytes beyond each row's ``count`` are ``-1`` and stay don't care for every consumer:
+    consumers read exactly ``[0, count)`` records and nothing past them.
     """
-    output = torch.empty_like(selected, memory_format=torch.contiguous_format)
-    count = torch.empty((selected.shape[0],), dtype=torch.int32, device=selected.device)
+    if out is None:
+        output = torch.empty_like(selected, memory_format=torch.contiguous_format)
+    else:
+        if out.shape != selected.shape or out.dtype != selected.dtype or not out.is_contiguous():
+            raise ValueError("out must be a contiguous buffer matching selected")
+        # The overlap contract is a caller invariant, checked eagerly only: Dynamo cannot
+        # trace data-pointer comparisons (and at capture time the caller's retained
+        # buffers are the prepared, statically distinct ones).
+        if not torch.compiler.is_compiling():
+            if _overlaps(out, (selected, positions, pages)):
+                raise ValueError("out must not overlap selected, positions or pages")
+        output = out
+    if count_out is None:
+        count = torch.empty((selected.shape[0],), dtype=torch.int32, device=selected.device)
+    else:
+        if count_out.shape != (selected.shape[0],) or count_out.dtype != torch.int32 or not count_out.is_contiguous():
+            raise ValueError("count_out must be a contiguous int32 buffer with one entry per row")
+        if not torch.compiler.is_compiling():
+            if _overlaps(count_out, (selected, positions, pages, output)):
+                raise ValueError("count_out must not overlap out, selected, positions or pages")
+        count = count_out
     tensor_rank = isinstance(rank, torch.Tensor)
     torch.library.wrap_triton(_records)[(selected.shape[0],)](
         selected, positions, pages, rank if tensor_rank else positions, output, count,
