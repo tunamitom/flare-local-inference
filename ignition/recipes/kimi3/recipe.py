@@ -59,9 +59,20 @@ def prepare_variant(snapshot, plan, *, bootstrap, draft_repository, draft_revisi
         stream_overlap=plan.stream_overlap, context_parallel=plan.context_parallel,
         prefill_fp8_transport=plan.prefill_fp8_transport,
         prefill_island_reduce=plan.prefill_island_reduce,
-        prefill_dma_ring_rows=int(os.environ.get("IGNITION_KIMI_PREFILL_DMA_ROWS", "0")),
-        prefill_dma_ring_bf16=os.environ.get("IGNITION_KIMI_PREFILL_DMA_BF16", "0") == "1",
+        # W3 (R2/R5): plan settings are authoritative; the dig's environment
+        # switches keep working as fallbacks so old drivers reproduce the
+        # measured packages byte-for-byte.
+        prefill_dma_ring_rows=plan.prefill_dma_ring_rows
+            or int(os.environ.get("IGNITION_KIMI_PREFILL_DMA_ROWS", "0")),
+        prefill_dma_ring_bf16=plan.prefill_dma_bf16
+            or os.environ.get("IGNITION_KIMI_PREFILL_DMA_BF16", "0") == "1",
         vision=not plan.language_model_only, **drafting)
+    if plan.trellis_prefill_shapes:
+        # W3 (R3): the measured Trellis prefill launch shapes are selected at
+        # kernel compile time inside b12x (B12X_W4A16_PREFILL_SHAPES). Export
+        # processes read this environment before compiling; recorded in the
+        # plan settings by planning.Settings so the package cannot drift.
+        os.environ["B12X_W4A16_PREFILL_SHAPES"] = "1"
     if plan.world_size == 1:
         return prepare_rank(snapshot, config, rank=0, group=None, progress=progress, package_storage=package_storage)
     return prepare_group(snapshot, config, prepare_rank, progress=progress, package_storage=package_storage,
