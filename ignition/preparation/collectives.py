@@ -98,6 +98,30 @@ def create_single_round_all_reduce_runtime(group, device, *, max_tokens, hidden_
         max_rows=max_tokens, row_elems=hidden_size, ipc=ipc)
 
 
+def create_fp8_two_shot_all_reduce_runtime(group, device, *, max_tokens, hidden_size):
+    """Own the E4M3-transport two-shot channel offered beside the exact BF16 sums.
+
+    P3′ (REVIEW-J4): reduce-scatter and all-gather carry per-row FP8 payloads
+    with per-row FP32 scales instead of the original BF16 inputs, halving the
+    reduction wire at the cost of quantization error. Kimi's `prefill_fp8_transport`
+    selects it (default off keeps `create_single_round_all_reduce_runtime`, the
+    exact rollback). Capacities match that runtime's envelope: reductions of up
+    to `max_tokens` rows of `hidden_size` elements.
+    """
+    from b12x.comm.pcie import TwoShotReduceScatter
+    from ignition.components.collectives import Fp8TwoShotAllReduce
+
+    if any(type(value) is not int or value <= 0 for value in (max_tokens, hidden_size)):
+        raise ValueError("all-reduce capacities must be positive integers")
+    if hidden_size % 16:
+        raise ValueError("fp8 transport rows must occupy complete 16-byte packs")
+    if max_tokens % dist.get_world_size(group):
+        raise ValueError("fp8 transport rows must divide the world size")
+    runtime = TwoShotReduceScatter.from_exchange_group(exchange_group=group, device=device,
+        max_rows=max_tokens, row_elems=hidden_size)
+    return Fp8TwoShotAllReduce(runtime, max_rows=max_tokens, row_elems=hidden_size)
+
+
 def create_result_broadcast_runtime(group, device, *, layouts, ipc=None):
     """Allocate one local PCIe channel covering every declared result payload.
 
