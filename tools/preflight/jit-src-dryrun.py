@@ -59,8 +59,7 @@ def spy(name, sources, extra_include_paths=None, **kw):
 core.gen_jit_spec = spy
 
 pkg = importlib.import_module("flashinfer.jit")
-sub = sorted({m for m in pkg.__dict__ if not m.startswith("_")} |
-             {p.name for p in pathlib.Path(pkg.__path__[0]).glob("*.py")})
+sub = sorted({p.stem for p in pathlib.Path(pkg.__path__[0]).glob("*.py")})
 generators = 0
 for modname in sub:
     if modname.endswith(".py"):
