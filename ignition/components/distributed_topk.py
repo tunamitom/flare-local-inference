@@ -186,16 +186,21 @@ def selected_local_records(selected, positions, pages, *, world, rank, page_size
     else:
         if out.shape != selected.shape or out.dtype != selected.dtype or not out.is_contiguous():
             raise ValueError("out must be a contiguous buffer matching selected")
-        if out.data_ptr() == selected.data_ptr() or _shares_storage(out, (selected, positions, pages)):
-            raise ValueError("out must not overlap selected, positions or pages (T17)")
+        # T17 overlap is a caller invariant, checked eagerly only: Dynamo cannot
+        # trace data-pointer comparisons (and at capture time the caller's
+        # retained buffers are the prepared, statically distinct ones).
+        if not torch.compiler.is_compiling():
+            if out.data_ptr() == selected.data_ptr() or _shares_storage(out, (selected, positions, pages)):
+                raise ValueError("out must not overlap selected, positions or pages (T17)")
         output = out
     if count_out is None:
         count = torch.empty((selected.shape[0],), dtype=torch.int32, device=selected.device)
     else:
         if count_out.shape != (selected.shape[0],) or count_out.dtype != torch.int32 or not count_out.is_contiguous():
             raise ValueError("count_out must be a contiguous int32 buffer with one entry per row")
-        if count_out.data_ptr() == output.data_ptr() or _shares_storage(count_out, (selected, positions, pages, output)):
-            raise ValueError("count_out must not overlap out, selected, positions or pages (T17)")
+        if not torch.compiler.is_compiling():
+            if count_out.data_ptr() == output.data_ptr() or _shares_storage(count_out, (selected, positions, pages, output)):
+                raise ValueError("count_out must not overlap out, selected, positions or pages (T17)")
         count = count_out
     tensor_rank = isinstance(rank, torch.Tensor)
     torch.library.wrap_triton(_records)[(selected.shape[0],)](
