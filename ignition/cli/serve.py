@@ -490,6 +490,11 @@ def debug_serve(args) -> int:
     environment.apply(configuration, local, plan.recipe.b12x_environment)
     options = _server_options(configuration, model, plan)
     options["thinking_token_budget"] = configuration.get("server.thinking_token_budget").value
+    # A serving policy, like the thinking budget: the diagnostic server reads it from the same
+    # configuration key as flare run, and exported packages do not carry it.
+    message_checkpoints = configuration.get("prefix_cache.message_checkpoints").value
+    if message_checkpoints:
+        options["message_checkpoints"] = message_checkpoints
     print(json.dumps({"plan": plan.to_dict()}), file=sys.stderr, flush=True)
     if args.history_drafts is not None:
         if args.history_drafts and (plan.speculation is None or plan.speculation.draft_tokens == 0):
