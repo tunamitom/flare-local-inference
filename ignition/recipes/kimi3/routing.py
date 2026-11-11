@@ -5,13 +5,17 @@
 
 Each rank projects its rows of the routed-expert down projection and its experts' router logits.
 One b12x exchange gathers both shards; a single decode row also selects Kimi's 16 experts inside
-that exchange, and two to eight rows select them with b12x's prepared top-16 afterwards. This
+that exchange, and two to twenty rows select them with b12x's prepared top-16 afterwards. This
 replaces the router all-gather, the separate top-k, and the latent all-reduce of the general path.
 
 When b12x plans the paired exchange itself as a push (one block per row writes the row into every
 peer), that exchange also selects the experts for up to eight rows, and it is used in place of
 both forms above (W22 row 1; the push transport is a b12x preparation setting, and with the
-setting absent nothing changes).
+setting absent nothing changes). Rows nine to twenty (W23-A lever 1, TP9 transplant) gather
+through that same push transport and select with the standalone top-16, staying on the route
+exchange instead of the general path's latent all-reduce, router gather, copies and top-k.
+The row limit is the standalone top-16's Python check (its kernel selects rows independently);
+the pushed gather accepts up to 64 rows.
 """
 
 import itertools
@@ -22,13 +26,13 @@ from b12x.preparation import CollectiveRequirement, PreparedCall
 
 from ignition.preparation.tuning import declare
 
-MAX_ROWS = 8
+MAX_ROWS = 20
 _OWNERS = weakref.WeakValueDictionary()
 _HANDLES = itertools.count()
 
 
 def create_route_runtime(group, device, *, ipc=None):
-    """Allocate the b12x exchange that carries 1-8 rows of K3 latent and router shards."""
+    """Allocate the b12x exchange that carries 1-20 rows of K3 latent and router shards."""
     import torch.distributed as dist
     from b12x.comm.pcie import DcpAllToAll
 
@@ -75,7 +79,7 @@ class PreparedRouteGather:
         wrong = [(tuple(t.shape), t.dtype, t.is_contiguous(), shape, dtype) for t, shape, dtype in expected
                  if t.shape != shape or t.dtype != dtype or not t.is_contiguous()]
         if not 1 <= rows <= MAX_ROWS or wrong:
-            raise ValueError(f"K3 route gather requires contiguous 1-8 row latent, router and route tensors: {wrong}")
+            raise ValueError(f"K3 route gather requires contiguous 1-{MAX_ROWS} row latent, router and route tensors: {wrong}")
         self.runtime, self.rows = runtime, rows
         self.local_down, self.local_router, self.correction_bias = local_down, local_router, correction_bias
         self.latent, self.weights, self.ids = latent, weights, ids
