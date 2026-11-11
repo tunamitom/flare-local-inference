@@ -334,7 +334,7 @@ class PreparedCandidateMerge:
                                    *programs["topk"].values(), programs["threshold"],
                                    programs["count_cutoff"], programs["select"])
 
-        self.plan = native_plan(contract=CONTRACT, query=q, device=packed.device,
+        self.plan = native_plan(contract=contract, query=q, device=packed.device,
             scratch_bytes=lambda tactic: q.scratch_bytes, materialize=materialize,
             compile_jobs=lambda tactic, device: (CompileJob.create(
                 "ignition.components.candidate_merge:compile_merge", payload, device.ordinal),))
