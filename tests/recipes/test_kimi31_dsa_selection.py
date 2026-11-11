@@ -1,11 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""CPU checks for the shared DSA selection metadata.
+"""CPU checks for the shared DSA selection metadata and the key writer.
 
-The shared selection metadata is plain torch and is compared bitwise against the
-per-layer sequence it replaces. The candidate packing fusion is covered by our
-fused pack rider's tests (tests/recipes/test_kimi31_w22_riders.py).
+The shared selection metadata and the key writer are Triton programs of
+integer and FP32 arithmetic; their cases run in Triton's interpreter
+(tests/triton_interpreter.py) and are compared with the torch sequence they
+replace. The candidate packing fusion is covered by our fused pack rider's
+tests (tests/recipes/test_kimi31_w22_riders.py).
 """
 
 from types import SimpleNamespace
@@ -16,6 +18,12 @@ import torch
 from ignition.recipes.kimi3 import dsa
 from ignition.recipes.kimi3.dcp import ContextShards, RECORD_BYTES
 from ignition.recipes.kimi3.selection import PreparedSelectionMetadata
+from tests.triton_interpreter import interpreted, run_interpreted
+
+
+def test_program_cases_in_triton_interpreter():
+    run_interpreted(__file__, 9, "test_shared_selection_metadata_matches_per_layer_sequence",
+                    "test_query_gather_branch_starts_after_the_exchange_and_joins_before_attention")
 
 
 def _per_layer_metadata(metadata, shards, rows):
@@ -28,6 +36,7 @@ def _per_layer_metadata(metadata, shards, rows):
     return pages, lengths, active
 
 
+@interpreted
 @pytest.mark.parametrize("rows,width,world,rank", [
     (1, 7, 9, 0), (7, 7, 9, 8), (24, 7, 9, 4), (32, 911, 9, 3),
     (33, 7, 9, 5), (40, 7, 2, 1), (96, 911, 9, 8), (32, 1, 1, 0),
@@ -45,6 +54,8 @@ def test_shared_selection_metadata_matches_per_layer_sequence(rows, width, world
     assert torch.equal(view.pages, expected[0])
     assert torch.equal(view.lengths, expected[1])
     assert torch.equal(view.active, expected[2])
+    # Every layer writes its records at the slots it derived from the same positions and tables.
+    assert torch.equal(view.slots, shards.token_slots(metadata.positions, metadata.token_page_table))
     # A second call rewrites the same buffers from new metadata values.
     metadata.positions.add_(3)
     view = component()
@@ -52,6 +63,7 @@ def test_shared_selection_metadata_matches_per_layer_sequence(rows, width, world
     assert torch.equal(view.pages, expected[0])
     assert torch.equal(view.lengths, expected[1])
     assert torch.equal(view.active, expected[2])
+    assert torch.equal(view.slots, shards.token_slots(metadata.positions, metadata.token_page_table))
 
 
 def test_hoisted_buffers_are_allocated_from_the_variant_cursor():
@@ -133,7 +145,8 @@ def test_layer_binds_shared_selection_slices(monkeypatch, rows, world):
         assert torch.equal(selector.active, shared.active[stage:stage + 1])
 
 
-def test_query_gather_branch_orders_after_merge_and_joins_before_attention(monkeypatch):
+@interpreted
+def test_query_gather_branch_starts_after_the_exchange_and_joins_before_attention(monkeypatch):
     events = []
 
     class _Stream:
@@ -144,11 +157,9 @@ def test_query_gather_branch_orders_after_merge_and_joins_before_attention(monke
         auxiliary_stream = _Stream()
 
     class _Selector:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def write_keys(self, *args):
-            pass
+        def __init__(self, query, weights, cache, *args, rotation, **kwargs):
+            # The recipe's key writer stores into the selector's index cache.
+            self.cache, self.rotation = cache, rotation
 
         def __call__(self):
             events.append("selector")
@@ -157,7 +168,10 @@ def test_query_gather_branch_orders_after_merge_and_joins_before_attention(monke
         def __init__(self, *args, **kwargs):
             pass
 
-        def __call__(self):
+        def collect(self):
+            events.append("exchange")
+
+        def merge_result(self):
             events.append("merge")
             return None
 
@@ -226,4 +240,7 @@ def test_query_gather_branch_orders_after_merge_and_joins_before_attention(monke
     assert op.stream_handle == 7
     op()
     assert "start" in events and "join" in events
-    assert events.index("merge") < events.index("start") < events.index("join") < events.index("attention")
+    # One DCP collective is in flight: the branch starts after the candidate exchange, runs beside
+    # the local merge and record mapping, and attention reads its gathered queries after the join.
+    assert events.index("exchange") < events.index("start") < events.index("merge")
+    assert events.index("merge") < events.index("records") < events.index("join") < events.index("attention")
