@@ -7,6 +7,11 @@ Each rank projects its rows of the routed-expert down projection and its experts
 One b12x exchange gathers both shards; a single decode row also selects Kimi's 16 experts inside
 that exchange, and two to eight rows select them with b12x's prepared top-16 afterwards. This
 replaces the router all-gather, the separate top-k, and the latent all-reduce of the general path.
+
+When b12x plans the paired exchange itself as a push (one block per row writes the row into every
+peer), that exchange also selects the experts for up to eight rows, and it is used in place of
+both forms above (W22 row 1; the push transport is a b12x preparation setting, and with the
+setting absent nothing changes).
 """
 
 import itertools
@@ -35,6 +40,21 @@ def create_route_runtime(group, device, *, ipc=None):
         stream_affine=False, ipc=ipc)
 
 
+def _selects_in_pushed_exchange(pcie, runtime, local_down, local_router, rows):
+    """Whether b12x plans this channel's paired exchange as a push that also selects `rows` rows' experts.
+
+    The transport is a b12x preparation setting; its plan query reports it. Only that transport runs one
+    block per row, so only it selects experts for more than one row and for padded shards.
+    """
+    query = pcie.query_from_runtime(runtime, surface="DcpAllToAll.all_gather_pair",
+        call=dict(local_first=local_down, local_second=local_router, threads=512))
+    if getattr(query, "call", {}).get("pair_transport") != "push":
+        return False
+    from b12x.comm.pcie.pcie_dcp_a2a import PAIR_PUSH_MAX_ROWS
+
+    return rows <= PAIR_PUSH_MAX_ROWS
+
+
 class PreparedRouteGather:
     """Gather latent and FP32 router shards into full rows, then select 16 experts per row.
 
@@ -61,7 +81,8 @@ class PreparedRouteGather:
         self.latent, self.weights, self.ids = latent, weights, ids
         ranks = tuple(dist.get_process_group_ranks(runtime.exchange_group))
         requests = []
-        if rows == 1:
+        self.fused = None
+        if rows == 1 or _selects_in_pushed_exchange(pcie, runtime, local_down, local_router, rows):
             self.fused = dict(local_down=local_down, local_router=local_router, correction_bias=correction_bias,
                               out_down=latent, topk_weights=weights, topk_ids=ids)
             self.plan = pcie.plan(pcie.query_from_runtime(runtime, surface="DcpAllToAll.all_gather_pair_kimi_topk",
@@ -98,7 +119,7 @@ def _route_gather(local_down: torch.Tensor, local_router: torch.Tensor, latent: 
                   weights: torch.Tensor, ids: torch.Tensor, handle: int) -> None:
     owner = _OWNERS[handle]
     runtime = owner.runtime
-    if owner.rows == 1:
+    if owner.fused is not None:
         runtime.all_gather_pair_kimi_topk(local_down, local_router, owner.correction_bias, latent, weights, ids,
                                           plan=owner.plan)
         return
