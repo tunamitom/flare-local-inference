@@ -78,6 +78,10 @@ def prepare_variant(snapshot, plan, *, bootstrap, draft_repository, draft_revisi
         # launches (B12X_W4A16_PREFILL_TABLE=1|2 at kernel compile time),
         # same stamping contract as the R3 shapes above.
         os.environ["B12X_W4A16_PREFILL_TABLE"] = plan.trellis_prefill_table
+    if plan.decode_fusion:
+        # W22 rider: the fused decode score/ID pack (bit-equal), stamped
+        # before the decode glue prepares.
+        os.environ["IGNITION_KIMI_DECODE_FUSION"] = "1"
     if plan.world_size == 1:
         return prepare_rank(snapshot, config, rank=0, group=None, progress=progress, package_storage=package_storage)
     return prepare_group(snapshot, config, prepare_rank, progress=progress, package_storage=package_storage,
