@@ -5,6 +5,8 @@
 """Kimi K3 attention residuals and latent MoE composed into complete forwards."""
 
 from dataclasses import dataclass, field
+import json
+import os
 
 import torch
 import triton
@@ -308,6 +310,88 @@ class PreparedLatentMoE:
         return self.output
 
 
+def _scratch_spans(value, path, found):
+    """Record (path, start, end) byte spans for every tensor reachable from decoder scratch."""
+    if isinstance(value, torch.Tensor):
+        if value.numel():
+            found.append((path or "scratch", value.data_ptr(), value.data_ptr() + value.numel() * value.element_size()))
+    elif isinstance(value, dict):
+        for key, sub in value.items():
+            _scratch_spans(sub, f"{path}.{key}" if path else str(key), found)
+    elif isinstance(value, (list, tuple)):
+        for index, sub in enumerate(value):
+            _scratch_spans(sub, f"{path}[{index}]", found)
+
+
+class SelectionOverlapCheck:
+    """J-fault in-export gate (levers/j-fault-fable-review.md §3.1), at construction only.
+
+    Before the layer loop it takes the four selection shapes from a fork of the
+    shared cursor without writing them — the ranges the hoist's tables would have
+    occupied before the fix — and afterwards it asserts the actually bound tables
+    share no byte with any decoder-storage tensor and reports the would-be ranges
+    against the buffers this decoder newly bound. The 20-row round graph must show
+    shared-cursor overlap (the CPU-reproduced cause); its absence falsifies the
+    diagnosis and stops the export before compile (restart with
+    IGNITION_KIMI_SELECTION_HOIST=0).
+    """
+
+    def __init__(self, selection, buffers, allocator, metadata, source, name, mode):
+        from .dsa import SELECTION_ROWS
+
+        self.name, self.mode = name, mode
+        self.rows = source.shape[0]
+        self.buffers = buffers
+        self.tables = ({label: getattr(selection, label)
+                        for label in ("pages", "lengths", "active", "slots")}
+                       if selection is not None else None)
+        self.before = []
+        _scratch_spans(buffers.scratch, "", self.before)
+        self.would_be = {}
+        if allocator is not None:
+            width = metadata.token_page_table.shape[1]
+            capacity = min(self.rows, SELECTION_ROWS)
+            fork = allocator.fork()
+            for label, shape, dtype in (("pages", (self.rows, 2 * width), torch.int32),
+                                       ("lengths", (self.rows,), torch.int32),
+                                       ("active", (-(-self.rows // capacity),), torch.int32),
+                                       ("slots", (self.rows,), torch.int64)):
+                taken = fork._take(shape, dtype)        # never written
+                self.would_be[label] = [taken.data_ptr(), taken.data_ptr() + taken.numel() * taken.element_size()]
+
+    def finish(self):
+        after = []
+        _scratch_spans(self.buffers.scratch, "", after)
+        anchored = {start for _, start, _ in self.before}
+        fresh = {path: [start, end] for path, start, end in after if start not in anchored}
+        violations = []
+        if self.tables:
+            for label, tensor in self.tables.items():
+                start, count = tensor.data_ptr(), tensor.numel() * tensor.element_size()
+                for path, other_start, other_end in after:
+                    if max(start, other_start) < min(start + count, other_end):
+                        violations.append(f"{label} overlaps {path}")
+        hits = []
+        for label, (start, end) in self.would_be.items():
+            for path, (other_start, other_end) in fresh.items():
+                shared = max(0, min(end, other_end) - max(start, other_start))
+                if shared:
+                    hits.append({"table": label, "buffer": path, "bytes": shared})
+        print("[overlap-check] " + json.dumps({"graph": self.name.split(".")[0], "decoder": self.name,
+              "mode": self.mode, "rows": self.rows, "hoist": self.tables is not None,
+              "assert": "clear" if not violations else violations,
+              "would_be_ranges": self.would_be, "newly_bound": fresh, "would_be_overlaps": hits}),
+              flush=True)
+        if violations:
+            raise RuntimeError(f"J-fault overlap check FAILED on {self.name}: the selection tables share memory "
+                               f"with decoder storage: {violations}")
+        if self.rows == 20 and self.tables is not None and not hits:
+            raise RuntimeError(f"J-fault overlap check: the 20-row graph ({self.name}) reports NO overlap on the "
+                               "shared-cursor side — the diagnosis in levers/j-fault-fable-review.md §1 is wrong. "
+                               "Stop before compile and restart the export with IGNITION_KIMI_SELECTION_HOIST=0.")
+        return hits
+
+
 class PreparedDecoder:
     """Kimi K3's decoder over packed rows.
 
@@ -384,14 +468,29 @@ class PreparedDecoder:
                 self.buffers["auxiliary"] = zeros((auxiliary_rows, len(self.auxiliary_layers) * hidden))
             self.auxiliary = self.buffers["auxiliary"][:auxiliary_rows]
         # One request-metadata derivation per replay, shared by every DSA layer.
+        # J-fault fix (levers/j-fault-fable-review.md §2): the hoist's four tables
+        # live on private torch.zeros storage — allocator=None (was
+        # allocator=allocator), so no cursor of the shared decoder storage can
+        # ever hand a layer buffer the same bytes. IGNITION_KIMI_SELECTION_HOIST=0
+        # selects the per-layer path kept in dsa.py/attention.py (selection=None).
+        # Read here, in the decoder constructor: never in a serialized settings
+        # dataclass (that moves compile keys and re-races the dense set) and never
+        # inside a @program_cache factory. Unset keeps the hoist armed.
+        hoist = os.environ.get("IGNITION_KIMI_SELECTION_HOIST", "1") != "0"
         self.selection = None
-        if mode != "prefill" and "dsa" in config.layers:
+        if mode != "prefill" and "dsa" in config.layers and hoist:
             from .dcp import ContextShards
             from .selection import PreparedSelectionMetadata
 
             shards = context.shards if context is not None else ContextShards()
             self.selection = PreparedSelectionMetadata(metadata, shards, rows=source.shape[0],
-                device=source.device, allocator=allocator)
+                device=source.device, allocator=None)
+        # J-fault §3.1 stop-the-line gate, inside "Construct graph catalog": the
+        # four table shapes are taken from a fork of the shared cursor before the
+        # layer loop (the pre-fix placement, never written); finish() asserts and
+        # reports after the loop.
+        overlap = (SelectionOverlapCheck(self.selection, buffers, allocator, metadata, source, name, mode)
+                   if mode != "prefill" else None)
         for index, w in enumerate(weights.layers):
             prefix = f"{name}.layer{index}"
             kind = config.layers[index]
@@ -440,6 +539,8 @@ class PreparedDecoder:
             self.layers.append((w, attention, mlp, reduce))
         if allocator is not None:
             allocator.join(*buffers.stage_allocators.values())
+        if overlap is not None:
+            overlap.finish()
         # The running block sum and committed blocks persist through one forward; every forward
         # rewrites them from its embeddings before reading them.
         r = self.buffers["residual"]

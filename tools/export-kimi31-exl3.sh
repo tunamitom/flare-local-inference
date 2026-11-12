@@ -684,6 +684,12 @@ for name in $(compgen -v | grep -E '^(IGNITION_KIMI_|B12X_)' || true); do
   # compile-key engagement evidence for the §4 export-log checks.
   if [ "$name" = B12X_PCIE_DCP_LSE_PUSH_TP8 ] && [ "$LSE_PUSH" = 1 ] && [ "${!name}" = 1 ]; then continue; fi
   if [ "$name" = B12X_LOG_CUTE_COMPILES ] && [ "${!name}" = 1 ]; then continue; fi
+  # J-fault fallback switch (levers/j-fault-fable-review.md §2): the decoder reads
+  # it in its constructor (not a plan setting, no compile key). 0 selects the
+  # per-layer selection path, 1 the hoist on private storage; the J-fault export
+  # keeps it UNSET (hoist armed). Accounted so the pre-authorized fallback export
+  # can arm 0 without tripping this guard.
+  if [ "$name" = IGNITION_KIMI_SELECTION_HOIST ] && { [ "${!name}" = 0 ] || [ "${!name}" = 1 ]; }; then continue; fi
   say "GUARD: unaccounted switch environment ${name}='${!name}' (accounted: B12X_W4A16_SMALL_M_SPLITK=1 and the armed W22 transport switches)"
   env_bad=$((env_bad+1))
 done
