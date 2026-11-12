@@ -4,9 +4,11 @@ This records the code-reading stream-schedule audit for the residual mix split (
 upstream flare #11). The lever is wired as a plan setting (`--mix-split-rows`), never
 through the process environment.
 
-Note: the candidate-merge radix cutoff (L6) is DELIBERATELY ABSENT from this tree (the
-export ruling holds it out in both forms). Its kernels, plan setting and design notes live
-on the `lever/L3L6-split-radix` branch for a future export.
+Note: the candidate-merge radix cutoff (L6) is RETIRED (j-missed-fable-review.md §2:
+"the radix cutoff only shortened the merge this replaces"). The candidate-score exchange
+(docs/kimi3-score-exchange.md) replaces the merge whose latency the radix shortened, so L6
+must not be brought into this tree in any form. Its kernels, plan setting and design notes
+stay on the `lever/L3L6-split-radix` branch.
 
 ## L3 — the split kernel's cross-program spin-wait versus our stream schedule
 
@@ -73,8 +75,9 @@ holding its CTAs) on an auxiliary stream and is being ported alongside this leve
 
 The setting is default-off, so today's schedules are unchanged until that run passes.
 
-## L6 — held out of this tree
+## L6 — retired, held out of this tree
 
-See the note above: the export tree carries no radix-cutoff code in any form. The
+See the note above: the export tree carries no radix-cutoff code in any form, and L6 is
+retired (the candidate-score exchange replaces the merge the radix shortened). The
 L6/L1 combination analysis is preserved on `lever/L3L6-split-radix`
 (`docs/kimi3-l3-l6-ports.md` there).
