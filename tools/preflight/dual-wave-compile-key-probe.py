@@ -22,8 +22,12 @@ reductions per layer). Determination, CPU only:
     constructions. Armed plans therefore add NEW race entries; every existing
     dense selection keeps its identity and must show race-cache hits.
  4. the schedule reads no environment switch (prefill_dual_wave is a plan
-    setting); the only stamped environment is B12X_W4A16_NONCOOP_PREFILL_SMS in
-    recipe.py (the capped expert launch knob, g0san's recipe mechanism).
+    setting); the B12X_W4A16_NONCOOP_PREFILL_SMS stamp is gone (F4: the w4a16
+    reader stays landed, the stamp returns only on armed A/B evidence).
+ 5. the mix kernel's constants (F1): the TILES table and split geometry are
+    pinned, and mix() takes its tile/warps from the TILES table alone — the
+    ported unconditional (2, 16) override changed every armed and unarmed mix
+    and escaped the call-site inventory.
 
 Unarmed plans construct none of the new call sites' modules (the dual-wave
 branch is behind `if self.dual_wave:` and `continue`s), so the unarmed tree's
@@ -177,6 +181,43 @@ split_sites = attention_source.count('name + ".output.w0"') + attention_source.c
 record("split MLA output projections", split_sites == 2,
        "attention.py prepares .output.w0/.output.w1 (new obligations when armed; the"
        " single .output projection keeps its identity for unarmed and non-dual callers)")
+
+# ── 5. the mix kernel's constants (F1: the tile/warps override class) ─────────
+# The ported rows >= 128 / sources >= 4 TILE=2/num_warps=16 override moved the
+# mix kernel's compile constants for EVERY armed and unarmed graph and escaped
+# this probe (it inventories decoder.py call sites, not the mix kernel's
+# constants). Inventory them: the TILES table and the split geometry are pinned
+# constants, and mix() may take its tile/warps from the TILES table alone.
+residual_source = (root / "recipes" / "kimi3" / "residual.py").read_text()
+import ignition.recipes.kimi3.residual as residual  # noqa: E402
+
+TILES_RECORD = ((2, 4), (2, 4), (4, 8), (4, 8), (8, 8), (8, 8), (8, 8), (8, 8), (4, 8))
+record("mix kernel tile table pinned", residual.TILES == TILES_RECORD,
+       f"residual.TILES = {residual.TILES} (recorded {TILES_RECORD}); the mix kernel's"
+       " TILE/num_warps compile constants derive from this table alone")
+record("mix split constants pinned",
+       (residual.SPLIT_CHUNK_DEFAULT, residual.SPLIT_WARPS_DEFAULT,
+        residual.SPLIT_SOURCES, residual.SPLIT_CHUNKS, residual.SPLIT_STRIDE)
+       == (1024, 4, 16, 16, 2 * 16 * 16 + 16),
+       "SPLIT_CHUNK_DEFAULT/SPLIT_WARPS_DEFAULT/SPLIT_SOURCES/SPLIT_CHUNKS/SPLIT_STRIDE"
+       " at their recorded values")
+
+mix_assignments = []
+for node in ast.walk(ast.parse(residual_source)):
+    if isinstance(node, ast.Assign):
+        names = [target.id for target in node.targets if isinstance(target, ast.Name)]
+        names += [element.id for target in node.targets if isinstance(target, ast.Tuple)
+                  for element in target.elts if isinstance(element, ast.Name)]
+        if "tile" in names or "warps" in names:
+            mix_assignments.append((names, ast.unparse(node.value)))
+override = [(names, value) for names, value in mix_assignments
+            if not value.startswith("TILES[") and "split_warps" not in value]
+record("no unconditional mix tile override", not override,
+       "mix() assigns tile/warps only from the TILES table (and split_warps from the"
+       " split geometry)" if not override else f"TILE/WARP OVERRIDE STILL PRESENT: {override}")
+print("dual-wave-probe: mix kernel constants inventoried: TILES table + split geometry +"
+      " the tile/warps selection in ResidualStream.mix; any future change to the mix"
+      " kernel's constants must re-run this probe (the F1 class)")
 
 print("dual-wave-probe: NEW keys when armed (expected race entries, enumerated):")
 print("  (1) per-wave prepared modules per MoE/KDA/dense layer: <name>.moe.w0/.w0,"

@@ -274,11 +274,12 @@ class ResidualStream:
             raise ValueError("residual output must be BF16 rows matching the running sum")
         rows, hidden = self.prefix.shape
         delta = self.prefix if delta is None else delta
+        # F1 (l9-transplant-fable-review.md (a)): the tile/warps pair comes from the
+        # TILES table alone. The ported rows >= 128 / sources >= 4 (2, 16) override
+        # changed the mix's accumulation order for every armed and unarmed graph
+        # and is gone; a dual-wave substream takes the same geometry as the serial
+        # mix, so substreams stay bit-identical to the shipped mix as well.
         tile, warps = TILES[min(sources, len(TILES) - 1)]
-        if rows >= 128 and sources >= 4:
-            # L9 (29aac9e): avoid 255-register saturation and local-memory spills at
-            # TILE=8 on large prefill rows.
-            tile, warps = 2, 16
         if self.split is not None and sources < SPLIT_SOURCES:
             partial, epoch, chunk, split_warps = self.split
             torch.library.wrap_triton(_mix_split)[(rows, triton.cdiv(hidden, chunk))](
