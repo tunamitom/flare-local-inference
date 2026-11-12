@@ -488,7 +488,7 @@ def dual_wave_alias_phases(dual_layers, *, residual, delta, attn_in, mlp_in, tot
         return {
             "down_pack": [("moe.router_input", module.router_input), ("moe.source", module.source),
                           ("moe.down", module.down.output)],
-            "route_ring": [("moe.router_input", module.router_input), ("moe.gathered", module.gathered_router),
+            "route_ring": [("moe.router_input", module.router_input), ("moe.gathered", module.gathered_logits),
                            ("moe.down", module.down.output), ("moe.latent", module.latent)],
             "router_experts": [("moe.router_logits", module.router_logits),
                                ("moe.expert_output", module.expert_output),

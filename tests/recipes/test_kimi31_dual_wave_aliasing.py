@@ -39,7 +39,7 @@ def fake_mlp():
 def fake_moe():
     module = SimpleNamespace(
         router_input=torch.zeros((HALF, 32), dtype=torch.float32),
-        gathered_router=torch.zeros((HALF, 128), dtype=torch.float32),
+        gathered_logits=torch.zeros((HALF, 128), dtype=torch.float32),
         router_logits=torch.zeros((HALF, 32), dtype=torch.float32),
         source=bf16(HALF, 32), latent=bf16(HALF, 64), expert_output=bf16(HALF, 64),
         up_input=bf16(HALF, 32), output=bf16(HALF, HIDDEN),

@@ -604,9 +604,13 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                     # dual wave arms; every other prefill graph keeps the shipped
                     # hop-ring runtime. The decision mirrors dual_wave_prefill_enabled's
                     # shape side so the decoder's wire-scope check cannot disagree.
-                    aux_layers = (config.draft.auxiliary_layers
-                                  if (mode_weights.draft is not None and config.draft is not None) else ())
-                    aux_source = config.draft.auxiliary_source if config.draft is not None else None
+                    # G1 tree fix (fdced037 defect, recorded in G1-REPORT): the draft
+                    # config lives on the model config (`weights.config.draft`, as
+                    # every other reference in this function); `config` here is the
+                    # PreparationConfig, which has no `draft` attribute.
+                    aux_layers = (weights.config.draft.auxiliary_layers
+                                  if (mode_weights.draft is not None and weights.config.draft is not None) else ())
+                    aux_source = weights.config.draft.auxiliary_source if weights.config.draft is not None else None
                     dual = (mode == "prefill" and capacity in armed_shapes
                             and dual_wave_shape_enabled(config.prefill_dual_wave, capacity, workspace=arena,
                                                         auxiliary_layers=aux_layers, auxiliary_source=aux_source))
