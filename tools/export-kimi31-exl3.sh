@@ -285,10 +285,12 @@ fp_baseline() {
     # ──                       flare.candidate_share family + the
     # ──                       ignition::pack_candidate_keys launcher); W11 supersede
     # ──                       flow — proceed, record the measured fingerprint here
-    # ──                       and run --reassert. Registered placeholder
-    # ──                       SCOREX-FIRST-EXPORT until then (the post-export
-    # ──                       assertion flags the package by design). The graph
-    # ──                       catalog is shape-determined and unchanged at 66.
+    # ──                       and run --reassert. Placeholder SCOREX-FIRST-EXPORT
+    # ──                       registered before the export (the post-export
+    # ──                       assertion flagged the package by design), superseded
+    # ──                       after it by the measured 4318 -> 4314 (see the entry
+    # ──                       below). The graph catalog is shape-determined and
+    # ──                       unchanged at 66.
     # ──                       Derived census expectations (recorded, checked
     # ──                       per-graph after the export): the pair chain
     # ──                       _pack_pairs+_count+_compact+row-topk+_threshold+
@@ -306,8 +308,19 @@ fp_baseline() {
     # measured deviation still fails the post-export assertion and flags the
     # package instead of passing silently.
     2/1/1/1/1/16@4b3ca8c5) echo "Graphs: 66; kernels: 4318" ;;
-    # score-exchange first export: the designed placeholder above; W11 supersede flow.
-    2/1/1/1/1/16@ad1bdbee) echo "Graphs: 66; kernels: SCOREX-FIRST-EXPORT" ;;
+    # score-exchange export (levers/j-missed-fable-review.md §2 "If it is exported",
+    # plan setting ARMED): registered from the first armed export
+    # gb202-tp8-202611120708 (export-20261112-scorex.log, all 8 ranks uniform):
+    # 4314 kernels in 4267 modules, -4 vs the J-fault fix's 4318 — exactly the
+    # documented program-family swap (flare.candidate_merge's 6 per-stage
+    # functions exit the 22 decode/verify graphs, flare.candidate_share's
+    # _pack_keys + _select_share enter, the DSATiledTopk row-topk variant swaps
+    # 1:1). Graph catalog unchanged at 66 (shape-determined); per-graph census:
+    # -96 nodes on each of the 22 decode/verify graphs (-4 x 24 sparse stages),
+    # 0 deltas on the other 44 graphs, 20-row graph 4264 -> 4168, totals
+    # 450,003/450,597 -> 447,891/448,485. Slab fingerprints unchanged at
+    # 217.69/49.89 MiB. Supersedes the SCOREX-FIRST-EXPORT placeholder.
+    2/1/1/1/1/16@ad1bdbee) echo "Graphs: 66; kernels: 4314" ;;
     *) echo "" ;;
   esac
 }
