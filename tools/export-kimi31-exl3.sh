@@ -275,6 +275,7 @@ fp_baseline() {
     0/0/0/0/0/0@*) echo "Graphs: 66; kernels: 4967" ;;
     2/1/1/1/1/0@b4889fe5) echo "Graphs: 66; kernels: 4900" ;;
     2/1/1/1/1/16@757b5140) echo "Graphs: 66; kernels: 4318" ;;
+    2/1/1/1/1/0@757b5140) echo "Graphs: 66; kernels: 4318" ;;
     *) echo "" ;;
   esac
 }
