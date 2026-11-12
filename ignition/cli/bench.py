@@ -161,6 +161,7 @@ def run(args):
         trellis_prefill_shapes=args.trellis_prefill_shapes,
         trellis_prefill_table=args.trellis_prefill_table,
         decode_fusion=args.decode_fusion,
+        mix_split_rows=args.mix_split_rows, candidate_merge_radix=args.candidate_merge_radix,
         language_model_only=args.language_model_only,
         mla_compute_mode=args.mla_compute_mode)
     plan = replace(plan, benchmark_selection=BenchmarkSelection(

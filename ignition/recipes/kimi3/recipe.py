@@ -58,6 +58,7 @@ def prepare_variant(snapshot, plan, *, bootstrap, draft_repository, draft_revisi
         headroom_bytes=plan.headroom_bytes + plan.reserve_bytes, compile_decoder=compile_forwards,
         retain_graphs=retain_graphs, kernel_cache=kernel_cache, online_mxfp8=plan.online_mxfp8,
         stream_overlap=plan.stream_overlap, context_parallel=plan.context_parallel,
+        mix_split_rows=plan.mix_split_rows, candidate_merge_radix=plan.candidate_merge_radix,
         prefill_fp8_transport=plan.prefill_fp8_transport,
         prefill_island_reduce=plan.prefill_island_reduce,
         # W3 (R2/R5): plan settings are authoritative; the dig's environment

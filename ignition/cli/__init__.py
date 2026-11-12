@@ -277,6 +277,14 @@ def _preparation_arguments(running, *, model_default="defaults.model"):
     advanced.add_argument("--decode-fusion", action="store_true",
                           help="replace the decode score/ID pack's 8 dispatched kernels with one"
                                " compiled kernel (bit-equal; Kimi K3/K3.1)")
+    advanced.add_argument("--mix-split-rows", type=int, default=0, metavar="N",
+                          help="split the residual mixture across column chunks for decode streams of at"
+                               " most N rows (0 keeps one program per row; numerics-light: mixture within"
+                               " one BF16 ulp, normalized output within three; Kimi K3/K3.1)")
+    advanced.add_argument("--candidate-merge-radix", action="store_true",
+                          help="compute the DSA candidate-merge cutoff with one exact radix select per row"
+                               " instead of the row top-k, threshold and cutoff-count kernels (6 to 4"
+                               " launches per merge; bitwise identical selected IDs and order; Kimi K3/K3.1)")
     advanced.add_argument("--language-model-only", action="store_true",
                           help="prepare no vision encoder and reject images; its weights and scratch become KV"
                                " pages (recipes with a separable encoder; default: the recipe's image support)")

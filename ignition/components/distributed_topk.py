@@ -97,7 +97,7 @@ class PreparedDistributedTopK:
     """
 
     def __init__(self, indices, scores, output, *, world, rank, runtime, session, coordinator,
-                 name, buffers, workspace, decode_fusion=None):
+                 name, buffers, workspace, decode_fusion=None, candidate_merge_radix=False):
         if (indices.ndim != 2 or indices.dtype != torch.int32 or scores.shape != indices.shape
                 or scores.dtype != torch.float32 or output.shape != indices.shape or output.dtype != indices.dtype
                 or world < 2 or rank.shape != (1,) or rank.dtype != torch.int64):
@@ -112,7 +112,7 @@ class PreparedDistributedTopK:
             decode_fusion = os.environ.get("IGNITION_KIMI_DECODE_FUSION", "0") == "1"
         self.decode_fusion = bool(decode_fusion)
         self.merge = PreparedCandidateMerge(self.gathered, output, session=session,
-            workspace=workspace, name=name + ".merge")
+            workspace=workspace, name=name + ".merge", radix=candidate_merge_radix)
         self.collective = PreparedAllGather(self.local.view(torch.bfloat16).view(rows, -1),
             self.gathered.view(torch.bfloat16).view(rows, -1), runtime=runtime, session=session,
             coordinator=coordinator, name=name)

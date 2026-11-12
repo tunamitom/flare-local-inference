@@ -232,6 +232,17 @@ class Plan:
     # IGNITION_KIMI_DECODE_FUSION before preparation). Default off keeps the
     # shipped pack bit for bit; the out=/count_out= compaction rides always on.
     decode_fusion: bool = False
+    # L3 (upstream flare #11): split the residual mixture across column chunks for streams of at
+    # most this many decode rows (0 keeps one program per row). A plan setting, threaded through
+    # the preparation config to the ResidualStream constructor; never through the process
+    # environment. Numerics-light: the mixture is within one BF16 ulp, the normalized output
+    # within three.
+    mix_split_rows: int = 0
+    # L6 (upstream flare #14): compute the candidate-merge cutoff with one exact radix select per
+    # row instead of the row top-k, threshold and cutoff-count kernels (6 -> 4 launches per
+    # merge; bitwise identical selected IDs and order). A plan setting, threaded through the
+    # preparation config to the PreparedCandidateMerge constructor.
+    candidate_merge_radix: bool = False
     # The plan prepares no vision encoder and serves text requests only.
     language_model_only: bool = False
     benchmark_selection: BenchmarkSelection | None = None
@@ -309,6 +320,12 @@ class Plan:
             raise UsageError("--trellis-prefill-table supports the Kimi K3/K3.1 recipes")
         if self.decode_fusion and self.recipe.name not in ("kimi3", "kimi31"):
             raise UsageError("--decode-fusion supports the Kimi K3/K3.1 recipes")
+        if type(self.mix_split_rows) is not int or self.mix_split_rows < 0:
+            raise UsageError("--mix-split-rows must be a non-negative row limit")
+        if self.mix_split_rows and self.recipe.name not in ("kimi3", "kimi31"):
+            raise UsageError("--mix-split-rows supports the Kimi K3/K3.1 recipes")
+        if self.candidate_merge_radix and self.recipe.name not in ("kimi3", "kimi31"):
+            raise UsageError("--candidate-merge-radix supports the Kimi K3/K3.1 recipes")
 
     @property
     def world_size(self) -> int:
@@ -432,6 +449,8 @@ class Plan:
             "trellis_prefill_shapes": self.trellis_prefill_shapes,
             "trellis_prefill_table": self.trellis_prefill_table,
             "decode_fusion": self.decode_fusion,
+            "mix_split_rows": self.mix_split_rows,
+            "candidate_merge_radix": self.candidate_merge_radix,
             "speculation": None if self.speculation is None else {
                 "draft_tokens": self.speculation.draft_tokens, "adaptive": self.speculation.adaptive,
                 **({} if self.speculation.method is None else {"method": self.speculation.method}),
@@ -473,6 +492,7 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
         trellis_prefill_shapes: bool = False,
         trellis_prefill_table: str = "0",
         decode_fusion: bool = False,
+        mix_split_rows: int = 0, candidate_merge_radix: bool = False,
         language_model_only: bool = False, mla_compute_mode: str | None = None) -> Plan:
     """Size pages and the prefix cache to the supply; the result may not fit.
 
@@ -538,6 +558,7 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
                 trellis_prefill_shapes=trellis_prefill_shapes,
                 trellis_prefill_table=trellis_prefill_table,
                 decode_fusion=decode_fusion,
+                mix_split_rows=mix_split_rows, candidate_merge_radix=candidate_merge_radix,
                 language_model_only=language_model_only)
     available = plan.supply_bytes - plan.fixed_bytes
     target = min(CACHE_STATES_PER_REQUEST * concurrency, max(1, available // costs.state_row_bytes))
@@ -599,6 +620,7 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
         trellis_prefill_shapes: bool = False,
         trellis_prefill_table: str = "0",
         decode_fusion: bool = False,
+        mix_split_rows: int = 0, candidate_merge_radix: bool = False,
         language_model_only: bool = False, mla_compute_mode: str | None = None) -> Plan:
     """Select GPUs and size the plan, or raise a capacity error that lists working settings.
 
@@ -683,6 +705,7 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
                    trellis_prefill_shapes=trellis_prefill_shapes,
                 trellis_prefill_table=trellis_prefill_table,
                 decode_fusion=decode_fusion,
+                mix_split_rows=mix_split_rows, candidate_merge_radix=candidate_merge_radix,
                    language_model_only=language_model_only,
                    mla_compute_mode=mla_compute_mode)
 
