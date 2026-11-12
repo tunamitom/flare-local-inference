@@ -94,6 +94,55 @@ def _fake_join_shared_expert(source, routed, outputs, workspace, auxiliary_strea
     pass
 
 
+# The L9 dual-wave transport fork/join (fable's capture-compatible execution vehicle):
+# all compute stays traced on the main stream; only the phase's ring reductions and
+# gathers launch on the transport stream, from inside a runtime body that selects it.
+# The join reads the fork's sources (nothing may overwrite them before it), mutates the
+# outputs (consumers follow it) and takes the compute result as a dependency (compilation
+# cannot place it ahead of the compute).
+@torch.library.custom_op("flare::kimi3_fork_transport", mutates_args=("outputs",))
+def _fork_transport(sources: list[torch.Tensor], outputs: list[torch.Tensor], handles: list[int],
+                    transport_stream: int) -> None:
+    from ignition.components.collectives import launch_transport
+    device = sources[0].device
+    main = torch.cuda.current_stream(device)
+    transport = torch.cuda.ExternalStream(transport_stream, device=device)
+    transport.wait_stream(main)
+    with torch.cuda.stream(transport):
+        for source, output, handle in zip(sources, outputs, handles, strict=True):
+            launch_transport(source, output, handle)
+
+
+@_fork_transport.register_fake
+def _fake_fork_transport(sources, outputs, handles, transport_stream) -> None:
+    pass
+
+
+@torch.library.custom_op("flare::kimi3_join_transport", mutates_args=("outputs",))
+def _join_transport(sources: list[torch.Tensor], outputs: list[torch.Tensor],
+                    dependency: list[torch.Tensor], transport_stream: int) -> None:
+    device = outputs[0].device
+    torch.cuda.current_stream(device).wait_stream(torch.cuda.ExternalStream(transport_stream, device=device))
+
+
+@_join_transport.register_fake
+def _fake_join_transport(sources, outputs, dependency, transport_stream) -> None:
+    pass
+
+
+@dataclass(frozen=True)
+class TransportStream:
+    """The dual-wave transport stream's handle as a traced-graph input.
+
+    aot.py's unbacked-sources pattern names only attribute paths ending in
+    ``.stream_handle`` (among others); an attribute like ``comm_stream_handle``
+    (underscore before ``stream_handle``) would be baked into the artifact as a
+    constant pointer — no sharing across ranks, a guard failure on every later
+    boot, a recompile each time. Hence this one-field carrier.
+    """
+    stream_handle: int
+
+
 @dataclass(frozen=True)
 class DecoderStorage:
     scratch: dict
@@ -299,7 +348,11 @@ class PreparedLatentMoE:
                                       self.experts.plan, self.up.plan) if self.route_gather is not None else ())
 
     def phase_down_pack(self, source):
-        """L9 dual-wave: the MoE's compute prologue (router projection, latent down projection)."""
+        """L9 dual-wave: the MoE's compute prologue (router projection, latent down projection).
+
+        Returns the down projection's output: the dependency the phase's join
+        takes so the forked transport cannot be placed before this compute.
+        """
         logits = self.router_projection(source)
         if self.route_gather is not None:
             self.down(source)
@@ -309,33 +362,36 @@ class PreparedLatentMoE:
             self.router_input[:, :logits.shape[1]].copy_(logits)
             self.source.copy_(source.index_select(1, self.hidden_columns))
             self.down(self.source)
+        return self.down.output
 
-    def phase_route_ring(self):
-        """L9 dual-wave: the MoE's transport step (route/latent gathers or the latent reduce)."""
+    def route_ring_launches(self):
+        """L9 dual-wave: the forked transport step (route/latent gathers or the latent reduce).
+
+        ``(operation, source)`` pairs for ``flare::kimi3_fork_transport``; the
+        gathered-logit copy moved to ``phase_router`` (wave A joins the compute
+        side of ``attn_reduce.w1``, wave B of ``mlp_reduce.w0``).
+        """
         if self.route_gather is not None:
-            self.route_gather()
-        else:
-            self.router_gather(self.router_input.view(torch.bfloat16))
-            self.router_output.copy_(self.router_columns)
-            if self.down_gather is not None:
-                self.down_gather(self.down.output)
-            else:
-                self.down_reduce(self.down.output)
+            raise ValueError("the dual wave forks the router and latent gathers, not the decode route gather")
+        return [(self.router_gather, self.router_input.view(torch.bfloat16)),
+                (self.down_gather if self.down_gather is not None else self.down_reduce, self.down.output)]
 
     def phase_router(self):
-        """L9 dual-wave: expert selection on the gathered logits (after phase_route_ring)."""
+        """L9 dual-wave: expert selection on the gathered logits (after the route ring joins)."""
+        self.router_output.copy_(self.router_columns)
         if getattr(self, "router", None) is not None:
             self.router(self.router_logits)
 
     def phase_experts(self):
         return self.experts()
 
-    def phase_expert_reduce(self):
-        """L9 dual-wave: the expert reduce over the ring and the latent norm (RS-norm stays unported)."""
-        self.expert_reduce(self.expert_output)
-        rms_norm_columns(self.latent_sum, self.latent_norm, self.up_input, self.eps, begin=self.latent_begin)
+    def expert_reduce_launches(self):
+        """L9 dual-wave: the forked expert reduce over the ring; the latent norm moved to
+        ``phase_up_combine`` (wave A joins the compute side of ``route_ring.w1``)."""
+        return [(self.expert_reduce, self.expert_output)]
 
     def phase_up_combine(self, shared_out):
+        rms_norm_columns(self.latent_sum, self.latent_norm, self.up_input, self.eps, begin=self.latent_begin)
         self.up(self.up_input)
         self.output.add_(shared_out)
         return self.output
@@ -454,11 +510,14 @@ def dual_wave_alias_phases(dual_layers, *, residual, delta, attn_in, mlp_in, tot
     """Enumerate every ``overlap(comm, comp)`` phase of ``_call_dual_wave`` with its tensors.
 
     F3 (l9-transplant-fable-review.md § mandate 2): each phase returns
-    ``(label, comm, comp, staging_ops)`` where comm and comp are the labelled
-    activation tensors that side reads or writes, and staging_ops counts the
-    phase's ring operations that pad through ``prefill_direct_staging``. The
-    table must stay in step with ``_call_dual_wave``; the F3 tests exercise the
-    checks and the construction-time call asserts the real geometry.
+    ``(label, comm, comp, staging_ops)`` where comm is the phase's forked
+    transport set — derived from ``operation.launches(source)`` so the table
+    cannot drift from what is forked — comp is the labelled activation tensors
+    the compute side reads or writes, and staging_ops counts the phase's ring
+    operations that would pad through ``prefill_direct_staging`` (the decoder
+    asserts zero of them). The table must stay in step with ``_call_dual_wave``;
+    the F3 tests exercise the checks and the construction-time call asserts the
+    real geometry.
     """
 
     def rows(begin, end, delta_tensor, output):
@@ -488,18 +547,39 @@ def dual_wave_alias_phases(dual_layers, *, residual, delta, attn_in, mlp_in, tot
         return {
             "down_pack": [("moe.router_input", module.router_input), ("moe.source", module.source),
                           ("moe.down", module.down.output)],
-            "route_ring": [("moe.router_input", module.router_input), ("moe.gathered", module.gathered_logits),
-                           ("moe.down", module.down.output), ("moe.latent", module.latent)],
             "router_experts": [("moe.router_logits", module.router_logits),
+                               # The moved router-logit copy reads the gathered logits here
+                               # (wave A joins the compute side of attn_reduce.w1, wave B of
+                               # mlp_reduce.w0).
+                               ("moe.gathered", module.gathered_logits),
                                ("moe.expert_output", module.expert_output),
-                               ("moe.routes", module.routes.ids), ("moe.route_weights", module.routes.weights)],
-            "expert_reduce": [("moe.expert_output", module.expert_output), ("moe.latent", module.latent_sum)],
-            "up_combine": [("moe.up_input", module.up_input), ("moe.output", module.output)],
+                               ("moe.routes", module.routes.ids), ("moe.route_weights", module.routes.weights),
+                               ("moe.latent", module.latent)],
+            "up_combine": [# The moved latent norm reads the summed latent here (wave A joins
+                           # the compute side of route_ring.w1).
+                           ("moe.latent", module.latent_sum),
+                           ("moe.up_input", module.up_input), ("moe.output", module.output),
+                           ("moe.shared_down", module.shared.down.output)],
             "shared": mlp_writes(module.shared),
         }
 
-    def staging(*ops):
-        return sum(1 for op in ops if op is not None and getattr(op, "padded", None) is not None)
+    def transport(launches):
+        """The forked transport side of one phase, derived from what the fork launches.
+
+        Built from ``operation.launches(source)``, not a hand-written list, so the
+        table cannot drift from what is forked. Padded (staging-backed) ring
+        operations are refused: their launches raise, and the decoder-level
+        check asserts zero of them.
+        """
+        comm, staged = [], 0
+        for index, (operation, source) in enumerate(launches):
+            if getattr(operation, "padded", None) is not None:
+                staged += 1
+                continue
+            for item_source, item_output, _ in operation.launches(source):
+                comm.append((f"transport{index}.source", item_source))
+                comm.append((f"transport{index}.output", item_output))
+        return comm, staged
 
     phases = []
     mix_a_done = kda_a_done = mix_b_done = False
@@ -516,61 +596,62 @@ def dual_wave_alias_phases(dual_layers, *, residual, delta, attn_in, mlp_in, tot
             comp += kda_writes(attention[1]) + [("waveB.attn_in", attn_in[half:])]
         else:
             comp += [("out_p1", out_p1)]
-        phases.append((f"layer{index}.attn_reduce.w0",
-                       [("out_p0", out_p0), ("tot_a", tot_a)], comp, staging(attn_red_a)))
+        comm, staged = transport([(attn_red_a, out_p0)])
+        phases.append((f"layer{index}.attn_reduce.w0", comm, comp, staged))
         mlp_mode_output = mlp_in[:half]
         if mlp_kind == "dense":
             # attn_reduce.w1 ∥ wave-A dense MLP.
-            phases.append((f"layer{index}.attn_reduce.w1",
-                           [("out_p1", out_p1), ("tot_b", tot_b)],
+            comm, staged = transport([(attn_red_b, out_p1)])
+            phases.append((f"layer{index}.attn_reduce.w1", comm,
                            rows(0, half, tot_a, mlp_mode_output) + [("mlp_in_a", mlp_mode_output)]
-                           + mlp_writes(mlp_spec[1]), staging(attn_red_b)))
+                           + mlp_writes(mlp_spec[1]), staged))
             # mlp_reduce.w0 ∥ wave-B dense MLP.
-            phases.append((f"layer{index}.mlp_reduce.w0",
-                           [("mlp_p0", mlp_p0), ("tot_a", tot_a)],
+            comm, staged = transport([(mlp_red_a, mlp_p0)])
+            phases.append((f"layer{index}.mlp_reduce.w0", comm,
                            rows(half, 2 * half, tot_b, mlp_in[half:]) + [("mlp_in_b", mlp_in[half:])]
-                           + mlp_writes(mlp_spec[2]), staging(mlp_red_a)))
+                           + mlp_writes(mlp_spec[2]), staged))
             # mlp_reduce.w1 ∥ next layer's wave-A mix (and KDA pass).
             next_w, next_kind = dual_layers[index + 1][:2] if index + 1 < n_layers else (None, None)
             comp = rows(0, half, tot_a, attn_in[:half]) + aux(0)
             if next_kind == "kda":
                 comp += kda_writes(dual_layers[index + 1][2][0])
-            phases.append((f"layer{index}.mlp_reduce.w1",
-                           [("mlp_p1", mlp_p1), ("tot_b", tot_b)], comp, staging(mlp_red_b)))
+            comm, staged = transport([(mlp_red_b, mlp_p1)])
+            phases.append((f"layer{index}.mlp_reduce.w1", comm, comp, staged))
             delta_a_rows, delta_b_rows = tot_a, tot_b
             mix_a_done, kda_a_done, mix_b_done = True, next_kind == "kda", False
             continue
         sets_a, sets_b = moe_writes(mlp_spec[1]), moe_writes(mlp_spec[2])
         # route_ring.w0 ∥ wave-A shared experts.
-        phases.append((f"layer{index}.route_ring.w0", sets_a["route_ring"],
-                       sets_a["shared"] + [("mlp_in_a", mlp_mode_output)],
-                       staging(getattr(mlp_spec[1], "down_reduce", None))))
-        # attn_reduce.w1 ∥ wave-A router + experts.
-        phases.append((f"layer{index}.attn_reduce.w1",
-                       [("out_p1", out_p1), ("tot_b", tot_b)], sets_a["router_experts"], staging(attn_red_b)))
+        comm, staged = transport(m_a.route_ring_launches())
+        phases.append((f"layer{index}.route_ring.w0", comm,
+                       sets_a["shared"] + [("mlp_in_a", mlp_mode_output)], staged))
+        # attn_reduce.w1 ∥ wave-A router + experts (incl. the moved gathered-logit copy).
+        comm, staged = transport([(attn_red_b, out_p1)])
+        phases.append((f"layer{index}.attn_reduce.w1", comm, sets_a["router_experts"], staged))
         # expert_reduce.w0 ∥ wave-B mix + down pack.
-        phases.append((f"layer{index}.expert_reduce.w0", sets_a["expert_reduce"],
+        comm, staged = transport(m_a.expert_reduce_launches())
+        phases.append((f"layer{index}.expert_reduce.w0", comm,
                        rows(half, 2 * half, tot_b, mlp_in[half:]) + sets_b["down_pack"]
-                       + [("mlp_in_b", mlp_in[half:])], staging(getattr(mlp_spec[1], "expert_reduce", None))))
-        # route_ring.w1 ∥ wave-A up-combine + wave-B shared experts.
-        phases.append((f"layer{index}.route_ring.w1", sets_b["route_ring"],
-                       sets_a["up_combine"] + sets_b["shared"] + [("mlp_in_b", mlp_in[half:])],
-                       staging(getattr(mlp_spec[2], "down_reduce", None))))
+                       + [("mlp_in_b", mlp_in[half:])], staged))
+        # route_ring.w1 ∥ wave-A up-combine (incl. the moved latent norm) + wave-B shared experts.
+        comm, staged = transport(m_b.route_ring_launches())
+        phases.append((f"layer{index}.route_ring.w1", comm,
+                       sets_a["up_combine"] + sets_b["shared"] + [("mlp_in_b", mlp_in[half:])], staged))
         # mlp_reduce.w0 ∥ wave-B router + experts.
-        phases.append((f"layer{index}.mlp_reduce.w0",
-                       [("mlp_p0", mlp_p0), ("tot_a", tot_a)], sets_b["router_experts"], staging(mlp_red_a)))
+        comm, staged = transport([(mlp_red_a, mlp_p0)])
+        phases.append((f"layer{index}.mlp_reduce.w0", comm, sets_b["router_experts"], staged))
         # expert_reduce.w1 ∥ next layer's wave-A mix.
-        phases.append((f"layer{index}.expert_reduce.w1", sets_b["expert_reduce"],
-                       rows(0, half, tot_a, attn_in[:half]) + aux(0),
-                       staging(getattr(mlp_spec[2], "expert_reduce", None))))
+        comm, staged = transport(m_b.expert_reduce_launches())
+        phases.append((f"layer{index}.expert_reduce.w1", comm,
+                       rows(0, half, tot_a, attn_in[:half]) + aux(0), staged))
         # mlp_reduce.w1 ∥ next layer's wave-A KDA pass.
         next_w, next_kind = dual_layers[index + 1][:2] if index + 1 < n_layers else (None, None)
         comp = []
         if next_kind == "kda":
             comp = kda_writes(dual_layers[index + 1][2][0])
             comp += [("next.attn_in", attn_in[:half])]
-        phases.append((f"layer{index}.mlp_reduce.w1",
-                       [("mlp_p1", mlp_p1), ("tot_b", tot_b)], comp, staging(mlp_red_b)))
+        comm, staged = transport([(mlp_red_b, mlp_p1)])
+        phases.append((f"layer{index}.mlp_reduce.w1", comm, comp, staged))
         delta_a_rows, delta_b_rows = tot_a, tot_b
         mix_a_done, mix_b_done = index + 1 < n_layers, False
     return tuple(phases)
@@ -644,15 +725,22 @@ class DualWaveAliasCheck:
     """
 
     def __init__(self, name):
-        self.name, self.phases, self.violations = name, 0, []
+        self.name, self.phases, self.staging_ops, self.violations = name, 0, 0, []
 
     def phase(self, label, comm, comp, staging_ops=0):
         self.phases += 1
+        self.staging_ops += staging_ops
         hits = assert_phase_disjoint(label, comm, comp)
         assert_single_staging_op(label, staging_ops)
         self.violations.extend(hits)
 
     def finish(self, parents, live):
+        # Zero padded operations per dual decoder: a staging-backed ring operation
+        # would share the one prefill_direct_staging buffer and needs copy passes the
+        # transport fork refuses to carry.
+        if self.staging_ops:
+            raise RuntimeError(f"dual-wave decoder {self.name}: {self.staging_ops} padded ring "
+                               "operations; the schedule requires zero")
         assert_parent_buffers_isolated(parents, live)
         print("[dual-wave-alias] " + json.dumps({"decoder": self.name, "phases": self.phases,
               "assert": "clear" if not self.violations else self.violations}), flush=True)
@@ -919,14 +1007,11 @@ class PreparedDecoder:
             self.delta_a = DeltaMetadata.allocate(1, source.device)
             self.delta_b = DeltaMetadata.allocate(1, source.device)
             self.comm_priority_stream = torch.cuda.Stream(device=source.device, priority=-1)
-            self.comm_stream_handle = self.comm_priority_stream.cuda_stream
-            self.comp_stream_handle = workspace.auxiliary_stream.cuda_stream
-            # G1 capture fix: Dynamo fullgraph capture forbids stream constructors
-            # (ExternalStream.__new__ is skipped-marked), so the wave-split schedule
-            # must reference stream objects built ONCE here at construction. The
-            # handles stay the captured-graph inputs they always were.
-            self.comm_stream = torch.cuda.ExternalStream(self.comm_stream_handle, device=source.device)
-            self.comp_stream = torch.cuda.ExternalStream(self.comp_stream_handle, device=source.device)
+            # G1 capture fix + fable's fork/join vehicle: the transport stream handle is a
+            # traced-graph input (see TransportStream); the compute stream is gone — dual
+            # wave compute runs on the main stream like the serial path. The priority -1
+            # stream is kept (it owns the stream and must outlive the graphs).
+            self.dual_transport = TransportStream(stream_handle=self.comm_priority_stream.cuda_stream)
             self.dual_layers = []
         for index, w in enumerate(weights.layers):
             prefix = f"{name}.layer{index}"
@@ -1168,12 +1253,25 @@ class PreparedDecoder:
         self.head(self.scratch.hidden)
 
     def _call_dual_wave(self, delta, mode, size, eps):
-        """L9 (29aac9e/eb72cab/2d3635f): interleave half-chunk (Wave A [0:H], Wave B [H:2H])
-        SM compute on the auxiliary compute stream with the other wave's ring reductions
-        and gathers on the priority -1 transport stream.
+        """L9 (29aac9e/eb72cab/2d3635f, fable's fork/join vehicle): interleave half-chunk
+        (Wave A [0:H], Wave B [H:2H]) SM compute on the main stream with the other wave's
+        ring reductions and gathers on the priority -1 transport stream.
 
-        The rows of one chunk split into two waves; every wave runs the same per-row
-        arithmetic as the serial path (see the numerics contract in
+        Every ``overlap(launches, compute)`` forks the phase's ring reductions and
+        gathers onto the transport stream from a runtime body
+        (``flare::kimi3_fork_transport``), runs the compute traced and compiled on
+        the main stream exactly as the serial path's compute, and joins at
+        ``flare::kimi3_join_transport``. The fork and join are the capture
+        boundary: no stream object, stream wait or ``current_stream`` call
+        appears in the traced function.
+
+        Compute inside an open fork must launch no transport — the KDA passes,
+        the MLA output halves, the residual mixes and the MoE compute launch
+        none (``attention.pre_output``'s gather runs outside every fork); keep
+        it that way.
+
+        The rows of one chunk split into two waves; every wave runs the same
+        per-row arithmetic as the serial path (see the numerics contract in
         levers/evidence/l9-dualwave/port-map.md) through its own prepared module set.
         """
         half = self.half_tokens
@@ -1202,11 +1300,7 @@ class PreparedDecoder:
         db.num_tokens.copy_(lb[:1])
         db.num_seqs.copy_(act_b.to(torch.int32)[:1])
 
-        main = torch.cuda.current_stream(delta.device)
-        # G1 capture fix: the streams are construction-time objects (their
-        # constructors cannot run inside Dynamo's fullgraph capture).
-        comm = self.comm_stream
-        comp = self.comp_stream
+        transport = self.dual_transport.stream_handle
         res_a = self.residual.substream(0, half)
         res_b = self.residual.substream(half, 2 * half)
         attn_in = self.residual.output
@@ -1215,21 +1309,22 @@ class PreparedDecoder:
         tot_b = self.dual_total_w1[:half]
         n_layers = len(self.dual_layers)
 
-        def on_comp(fn):
-            comp.wait_stream(main)
-            with torch.cuda.stream(comp):
-                fn()
-            main.wait_stream(comp)
-
-        def overlap(comm_fn, comp_fn):
-            comm.wait_stream(main)
-            comp.wait_stream(main)
-            with torch.cuda.stream(comm):
-                comm_fn()
-            with torch.cuda.stream(comp):
-                comp_fn()
-            main.wait_stream(comm)
-            main.wait_stream(comp)
+        def overlap(launches, compute):
+            """Fork the phase's transport launches onto the transport stream, run compute
+            traced on the main stream, join. The fork and join are the capture boundary:
+            their runtime bodies select the transport stream and launch the prepared plans
+            (``flare::kimi3_fork_transport`` / ``flare::kimi3_join_transport``); no stream
+            object or wait appears in the traced function. The join takes the compute's
+            last output tensor so compilation cannot place it ahead of the compute."""
+            sources, outputs, handles = [], [], []
+            for operation, source in launches:
+                for item_source, item_output, handle in operation.launches(source):
+                    sources.append(item_source)
+                    outputs.append(item_output)
+                    handles.append(handle)
+            _fork_transport(sources, outputs, handles, transport)
+            result = compute()
+            _join_transport(sources, outputs, [] if result is None else [result], transport)
 
         def attn_mix_kwargs(idx, w, wave):
             committed, boundary = -(-idx // size), idx % size == 0
@@ -1260,29 +1355,23 @@ class PreparedDecoder:
             committed, boundary = -(-index // size), index % size == 0
             out_p0, out_p1 = attention[2:] if kind == "kda" else attention.out_pads
             if not mix_a_done:
-                on_comp(lambda w=w, index=index, da=delta_a, md=mode: res_a.mix(da, md, **attn_mix_kwargs(index, w, 0)))
+                res_a.mix(delta_a, mode, **attn_mix_kwargs(index, w, 0))
             if kind == "kda":
                 kda_a, kda_b = attention[:2]
                 if not kda_a_done:
-                    on_comp(lambda kda_a=kda_a: kda_a(attn_in[:half]))
+                    kda_a(attn_in[:half])
 
-                def run_kda_wave_b(w=w, index=index, kda_b=kda_b, db=delta_b, md=mode, mix_b_done=mix_b_done):
+                def run_kda_wave_b(w=w, index=index, kda_b=kda_b, mix_b_done=mix_b_done):
                     if not mix_b_done:
-                        res_b.mix(db, md, **attn_mix_kwargs(index, w, 1))
-                    kda_b(attn_in[half:])
-                overlap(
-                    lambda attn_red_a=attn_red_a, out_p0=out_p0: attn_red_a(out_p0),
-                    run_kda_wave_b,
-                )
+                        res_b.mix(delta_b, mode, **attn_mix_kwargs(index, w, 1))
+                    return kda_b(attn_in[half:])
+                overlap([(attn_red_a, out_p0)], run_kda_wave_b)
             else:
                 if not mix_b_done:
-                    on_comp(lambda w=w, index=index, db=delta_b, md=mode: res_b.mix(db, md, **attn_mix_kwargs(index, w, 1)))
+                    res_b.mix(delta_b, mode, **attn_mix_kwargs(index, w, 1))
                 attention.pre_output(attn_in)
-                on_comp(lambda attention=attention: attention.run_out_half(0))
-                overlap(
-                    lambda attn_red_a=attn_red_a, out_p0=out_p0: attn_red_a(out_p0),
-                    lambda attention=attention: attention.run_out_half(1),
-                )
+                attention.run_out_half(0)
+                overlap([(attn_red_a, out_p0)], lambda attention=attention: attention.run_out_half(1))
 
             mlp_mode = REPLACE if boundary else ADD
             mlp_sources = committed + boundary
@@ -1292,32 +1381,22 @@ class PreparedDecoder:
                     res_a.mix(tot_a, mlp_mode, sources=mlp_sources, write=-1,
                               score=w["mlp_res_score"], norm=w["post_attention_layernorm"],
                               eps=eps, output_eps=eps, output=mlp_in[:half])
-                    m_a(mlp_in[:half])
-                overlap(
-                    lambda attn_red_b=attn_red_b, out_p1=out_p1: attn_red_b(out_p1),
-                    run_dense_a,
-                )
+                    return m_a(mlp_in[:half])
+                overlap([(attn_red_b, out_p1)], run_dense_a)
 
                 def run_dense_b(w=w, m_b=m_b):
                     res_b.mix(tot_b, mlp_mode, sources=mlp_sources, write=-1,
                               score=w["mlp_res_score"], norm=w["post_attention_layernorm"],
                               eps=eps, output_eps=eps, output=mlp_in[half:])
-                    m_b(mlp_in[half:])
-                overlap(
-                    lambda mlp_red_a=mlp_red_a, mlp_p0=mlp_p0: mlp_red_a(mlp_p0),
-                    run_dense_b,
-                )
+                    return m_b(mlp_in[half:])
+                overlap([(mlp_red_a, mlp_p0)], run_dense_b)
                 next_idx = index + 1
                 nw, nkind, nattn = self.dual_layers[next_idx][:3]
 
                 def pre_next_a(nw=nw, nkind=nkind, nattn=nattn, next_idx=next_idx):
-                    res_a.mix(tot_a, ADD, **attn_mix_kwargs(next_idx, nw, 0))
-                    if nkind == "kda":
-                        nattn[0](attn_in[:half])
-                overlap(
-                    lambda mlp_red_b=mlp_red_b, mlp_p1=mlp_p1: mlp_red_b(mlp_p1),
-                    pre_next_a,
-                )
+                    mixture = res_a.mix(tot_a, ADD, **attn_mix_kwargs(next_idx, nw, 0))
+                    return nattn[0](attn_in[:half]) if nkind == "kda" else mixture
+                overlap([(mlp_red_b, mlp_p1)], pre_next_a)
                 delta_a, delta_b, mode = tot_a, tot_b, ADD
                 mix_a_done = True
                 kda_a_done = nkind == "kda"
@@ -1325,63 +1404,51 @@ class PreparedDecoder:
                 continue
 
             # MoE layer: the fully overlapped dual-wave pipeline.
-
             def prep_moe_a(w=w, m_a=m_a):
                 res_a.mix(tot_a, mlp_mode, sources=mlp_sources, write=-1,
                           score=w["mlp_res_score"], norm=w["post_attention_layernorm"],
                           eps=eps, output_eps=eps, output=mlp_in[:half])
-                m_a.phase_down_pack(mlp_in[:half])
-            on_comp(prep_moe_a)
+                return m_a.phase_down_pack(mlp_in[:half])
+            prep_moe_a()
 
-            overlap(m_a.phase_route_ring, lambda m_a=m_a: m_a.shared(mlp_in[:half]))
+            overlap(m_a.route_ring_launches(), lambda m_a=m_a: m_a.shared(mlp_in[:half]))
 
             def run_exp_a(m_a=m_a):
                 m_a.phase_router()
-                m_a.phase_experts()
-            overlap(
-                lambda attn_red_b=attn_red_b, out_p1=out_p1: attn_red_b(out_p1),
-                run_exp_a,
-            )
+                return m_a.phase_experts()
+            overlap([(attn_red_b, out_p1)], run_exp_a)
 
             def prep_moe_b(w=w, m_b=m_b):
                 res_b.mix(tot_b, mlp_mode, sources=mlp_sources, write=-1,
                           score=w["mlp_res_score"], norm=w["post_attention_layernorm"],
                           eps=eps, output_eps=eps, output=mlp_in[half:])
-                m_b.phase_down_pack(mlp_in[half:])
-            overlap(m_a.phase_expert_reduce, prep_moe_b)
+                return m_b.phase_down_pack(mlp_in[half:])
+            overlap(m_a.expert_reduce_launches(), prep_moe_b)
 
             def run_up_a_sh_b(m_a=m_a, m_b=m_b):
                 m_a.phase_up_combine(m_a.shared.down.output)
-                m_b.shared(mlp_in[half:])
-            overlap(m_b.phase_route_ring, run_up_a_sh_b)
+                return m_b.shared(mlp_in[half:])
+            overlap(m_b.route_ring_launches(), run_up_a_sh_b)
 
             def run_exp_b(m_b=m_b):
                 m_b.phase_router()
-                m_b.phase_experts()
-            overlap(
-                lambda mlp_red_a=mlp_red_a, mlp_p0=mlp_p0: mlp_red_a(mlp_p0),
-                run_exp_b,
-            )
+                return m_b.phase_experts()
+            overlap([(mlp_red_a, mlp_p0)], run_exp_b)
 
             has_next = index + 1 < n_layers
             if has_next:
                 nw, nkind, nattn = self.dual_layers[index + 1][:3]
-                overlap(
-                    m_b.phase_expert_reduce,
-                    lambda nw=nw, next_idx=index + 1: res_a.mix(tot_a, ADD, **attn_mix_kwargs(next_idx, nw, 0)),
-                )
+                overlap(m_b.expert_reduce_launches(),
+                        lambda nw=nw, next_idx=index + 1: res_a.mix(tot_a, ADD, **attn_mix_kwargs(next_idx, nw, 0)))
             else:
-                overlap(m_b.phase_expert_reduce, lambda: None)
+                overlap(m_b.expert_reduce_launches(), lambda: None)
 
-            on_comp(lambda m_b=m_b: m_b.phase_up_combine(m_b.shared.down.output))
+            m_b.phase_up_combine(m_b.shared.down.output)
             if has_next and nkind == "kda":
-                overlap(
-                    lambda mlp_red_b=mlp_red_b, mlp_p1=mlp_p1: mlp_red_b(mlp_p1),
-                    lambda nkda_a=nattn[0]: nkda_a(attn_in[:half]),
-                )
+                overlap([(mlp_red_b, mlp_p1)], lambda nkda_a=nattn[0]: nkda_a(attn_in[:half]))
                 kda_a_done = True
             else:
-                overlap(lambda mlp_red_b=mlp_red_b, mlp_p1=mlp_p1: mlp_red_b(mlp_p1), lambda: None)
+                overlap([(mlp_red_b, mlp_p1)], lambda: None)
                 kda_a_done = False
             delta_a, delta_b, mode = tot_a, tot_b, ADD
             mix_a_done = has_next

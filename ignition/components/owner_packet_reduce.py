@@ -147,6 +147,19 @@ class PreparedDirectRingAllReduce:
                                         coordinator=coordinator, name=name + '.direct')
         self.packet = packet
 
+    def launches(self, source):
+        """The fork's triples for this ring reduction; padded staging is refused, not carried.
+
+        Every dual-wave half shape divides into whole 256-element rank shards
+        (1,024 / 1,280 / 1,536 rows at 7,168 and 3,584 columns), so the padded
+        path is unreachable there; a padded operation would also share the one
+        ``prefill_direct_staging`` buffer with any other forked launch.
+        """
+        if self.padded is not None:
+            raise ValueError("a padded direct ring reduction cannot ride the transport fork; "
+                             "refusing the staging path instead of carrying it")
+        return self.reduce.launches(source)
+
     def __call__(self, source):
         if self.padded is None:
             return self.reduce(source)

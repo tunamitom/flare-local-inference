@@ -142,6 +142,24 @@ def _fake_all_reduce(source, output, handle):
     pass
 
 
+def launch_transport(source, output, handle):
+    """Launch one prepared reduction or gather on the current stream from inside a runtime body.
+
+    L9 fork/join vehicle: the dual-wave transport fork's runtime body selects the
+    transport stream and launches each prepared plan there. Mirrors the bodies of
+    ``flare::pcie_all_reduce`` and ``flare::pcie_all_gather``.
+    """
+    owner = _OWNERS[handle]
+    if isinstance(owner, PreparedAllGather):
+        _gather_columns(source, output, handle)
+        return
+    if not isinstance(owner, PreparedAllReduce):
+        raise TypeError(f"transport launch needs a prepared reduction or gather: {type(owner).__name__}")
+    from ignition.preparation.startup_tuning import record_consumer
+    record_consumer(owner)
+    owner.launch(source, output)
+
+
 class PreparedAllReduce:
     """One fixed-shape reduction through an established b12x PCIe runtime.
 
@@ -353,6 +371,12 @@ class PreparedAllReduce:
         else:
             self.runtime.all_reduce(source, out=output, plan=self.plan)
 
+    def launches(self, source):
+        """``(source, output, handle)`` triples a transport fork launches for this reduction."""
+        if self.single:
+            raise ValueError("a single-rank reduction is a copy, not a transport launch")
+        return [(source, self.output, self.handle)]
+
     def __call__(self, source):
         if self.single:
             self.output.copy_(source)
@@ -435,6 +459,11 @@ class PreparedChunkedAllGather:
         for (begin, end), part in zip(self.bounds, self.parts, strict=True):
             part(source[begin:end])
         return self.output
+
+    def launches(self, source):
+        """One triple per part: the row chunks launch in order on one stream."""
+        return [(source[begin:end], part.output, part.handle)
+                for (begin, end), part in zip(self.bounds, self.parts, strict=True)]
 
     def run_eager(self, source):
         """Gather on the current stream from inside another eager operation."""
@@ -935,6 +964,12 @@ class PreparedAllGather:
             return self.output
         _all_gather(source, self.output, self.handle)
         return self.output
+
+    def launches(self, source):
+        """``(source, output, handle)`` triples a transport fork launches for this gather."""
+        if self.single:
+            raise ValueError("a single-rank gather is a copy, not a transport launch")
+        return [(source, self.output, self.handle)]
 
     def run_eager(self, source):
         """Gather on the current stream from inside another eager operation."""
