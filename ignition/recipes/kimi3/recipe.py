@@ -11,6 +11,22 @@ from types import MappingProxyType
 from ignition.recipes.declaration import Checkpoint, RankCosts, RankUsage, Recipe, SamplingDefaults, SamplingRange, Speculation
 
 
+# L9 capped expert launches: the W4A16 prefill MoE SM cap stamped beside the
+# other b12x launch switches when the dual-wave schedule is armed (g0san's
+# final figure, 3058229: 170 of 188 SMs during overlapped dual-wave prefill).
+DUAL_WAVE_NONCOOP_PREFILL_SMS = "170"
+
+
+def stamp_dual_wave_launch_env(plan):
+    """Stamp the dual-wave launch switches into the preparation environment.
+
+    The knob's consumer is b12x's W4A16 prefill launch geometry
+    (w4a16_prefill_sms); an unset knob keeps the device's full SM count.
+    """
+    if plan.prefill_dual_wave:
+        os.environ["B12X_W4A16_NONCOOP_PREFILL_SMS"] = DUAL_WAVE_NONCOOP_PREFILL_SMS
+
+
 def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False,
             package_storage=None, ranks=None):
     from . import bootstrap
@@ -60,6 +76,8 @@ def prepare_variant(snapshot, plan, *, bootstrap, draft_repository, draft_revisi
         stream_overlap=plan.stream_overlap, context_parallel=plan.context_parallel,
         mix_split_rows=plan.mix_split_rows,
         score_exchange=plan.score_exchange,
+        prefill_dual_wave=plan.prefill_dual_wave,
+        prefill_dual_wave_pool=plan.prefill_dual_wave_pool,
         prefill_fp8_transport=plan.prefill_fp8_transport,
         prefill_island_reduce=plan.prefill_island_reduce,
         # W3 (R2/R5): plan settings are authoritative; the dig's environment
@@ -83,6 +101,7 @@ def prepare_variant(snapshot, plan, *, bootstrap, draft_repository, draft_revisi
         # launches (B12X_W4A16_PREFILL_TABLE=1|2 at kernel compile time),
         # same stamping contract as the R3 shapes above.
         os.environ["B12X_W4A16_PREFILL_TABLE"] = plan.trellis_prefill_table
+    stamp_dual_wave_launch_env(plan)
     if plan.decode_fusion:
         # W22 rider: the fused decode score/ID pack (bit-equal), stamped
         # before the decode glue prepares.

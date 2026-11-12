@@ -254,6 +254,21 @@ class Plan:
     # them on every rank. Armed by default; --no-score-exchange restores the
     # pair exchange. A plan setting, never an environment switch.
     score_exchange: bool = True
+    # L9 (levers/j-why23-fable-review.md §5, g0san #4): overlap prefill compute
+    # with the copy-engine ring by splitting each prefill chunk's rows into two
+    # waves -- while one wave's attention/MLP/MoE compute runs on the auxiliary
+    # stream, the other wave's ring reductions and gathers run on the priority
+    # -1 transport stream. The schedule builds a second prepared-module set
+    # (per-wave KDA/MLA/MoE modules and half-row reductions) whose added
+    # storage is bounded by ``prefill_dual_wave_pool``, a share of the
+    # preparation memory budget (the second set prices at about 9% of the KV
+    # pool on g0san's rig). Prefill numerics change (split-shape projections);
+    # the recall battery prices that at the gates stage. Default off keeps the
+    # serial prefill path exactly.
+    prefill_dual_wave: bool = False
+    # Upper bound on the dual-wave second prepared-module set's added buffers as
+    # a share of the preparation memory budget (0 < share <= 0.25).
+    prefill_dual_wave_pool: float = 0.09
     # The plan prepares no vision encoder and serves text requests only.
     language_model_only: bool = False
     benchmark_selection: BenchmarkSelection | None = None
@@ -339,6 +354,14 @@ class Plan:
             raise UsageError("--prefill-latent-gather supports the Kimi K3/K3.1 recipes")
         if not self.score_exchange and self.recipe.name not in ("kimi3", "kimi31"):
             raise UsageError("--no-score-exchange supports the Kimi K3/K3.1 recipes")
+        if self.prefill_dual_wave and self.recipe.name not in ("kimi3", "kimi31"):
+            raise UsageError("--prefill-dual-wave supports the Kimi K3/K3.1 recipes")
+        if self.prefill_dual_wave and not self.prefill_dma_ring_rows:
+            raise UsageError("--prefill-dual-wave requires the copy-engine ring (--prefill-dma-ring-rows)")
+        if self.prefill_dual_wave and self.world_size != 8:
+            raise UsageError("--prefill-dual-wave runs on the TP8 copy-engine ring")
+        if (type(self.prefill_dual_wave_pool) is not float or not 0 < self.prefill_dual_wave_pool <= 0.25):
+            raise UsageError("--prefill-dual-wave-pool must be a share in (0, 0.25]")
 
     @property
     def world_size(self) -> int:
@@ -465,6 +488,8 @@ class Plan:
             "mix_split_rows": self.mix_split_rows,
             "prefill_latent_gather": self.prefill_latent_gather,
             "score_exchange": self.score_exchange,
+            "prefill_dual_wave": self.prefill_dual_wave,
+            "prefill_dual_wave_pool": self.prefill_dual_wave_pool,
             "speculation": None if self.speculation is None else {
                 "draft_tokens": self.speculation.draft_tokens, "adaptive": self.speculation.adaptive,
                 **({} if self.speculation.method is None else {"method": self.speculation.method}),
@@ -507,6 +532,7 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
         trellis_prefill_table: str = "0",
         decode_fusion: bool = False,
         mix_split_rows: int = 0, prefill_latent_gather: bool = False, score_exchange: bool = True,
+        prefill_dual_wave: bool = False, prefill_dual_wave_pool: float = 0.09,
         language_model_only: bool = False, mla_compute_mode: str | None = None) -> Plan:
     """Size pages and the prefix cache to the supply; the result may not fit.
 
@@ -575,6 +601,8 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
                 mix_split_rows=mix_split_rows,
                 prefill_latent_gather=prefill_latent_gather,
                 score_exchange=score_exchange,
+                prefill_dual_wave=prefill_dual_wave,
+                prefill_dual_wave_pool=prefill_dual_wave_pool,
                 language_model_only=language_model_only)
     available = plan.supply_bytes - plan.fixed_bytes
     target = min(CACHE_STATES_PER_REQUEST * concurrency, max(1, available // costs.state_row_bytes))
@@ -637,6 +665,7 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
         trellis_prefill_table: str = "0",
         decode_fusion: bool = False,
         mix_split_rows: int = 0, prefill_latent_gather: bool = False, score_exchange: bool = True,
+        prefill_dual_wave: bool = False, prefill_dual_wave_pool: float = 0.09,
         language_model_only: bool = False, mla_compute_mode: str | None = None) -> Plan:
     """Select GPUs and size the plan, or raise a capacity error that lists working settings.
 
@@ -724,6 +753,8 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
                 mix_split_rows=mix_split_rows,
                 prefill_latent_gather=prefill_latent_gather,
                 score_exchange=score_exchange,
+                prefill_dual_wave=prefill_dual_wave,
+                prefill_dual_wave_pool=prefill_dual_wave_pool,
                    language_model_only=language_model_only,
                    mla_compute_mode=mla_compute_mode)
 

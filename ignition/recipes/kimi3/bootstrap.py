@@ -152,12 +152,23 @@ class PreparationConfig:
     # plan setting (the plan's --no-score-exchange), never an environment switch;
     # armed by default. Dropping it restores the pair exchange exactly.
     score_exchange: bool = True
+    # L9 (levers/j-why23-fable-review.md §5): the dual-wave prefill schedule
+    # (compute overlapped with the copy-engine ring; a second prepared-module
+    # set) and the pool cap on that set's added buffers, as a share of the
+    # preparation memory budget. The plan's --prefill-dual-wave /
+    # --prefill-dual-wave-pool settings; default off keeps the serial path.
+    prefill_dual_wave: bool = False
+    prefill_dual_wave_pool: float = 0.09
 
     def __post_init__(self):
         if self.draft_head_quantization not in (None, "mxfp8", "nvfp4"):
             raise ValueError("Kimi draft head conversion must be mxfp8 or nvfp4")
         if self.draft_head_quantization is not None and not self.drafting:
             raise ValueError("Kimi draft head conversion requires draft weights")
+        if type(self.prefill_dual_wave) is not bool:
+            raise ValueError("prefill dual wave must be a boolean")
+        if type(self.prefill_dual_wave_pool) is not float or not 0 < self.prefill_dual_wave_pool <= 0.25:
+            raise ValueError("prefill dual wave pool must be a share in (0, 0.25]")
         if self.speculative_widths and max(self.speculative_widths) > 8:
             raise ValueError("Kimi K3 draft model supports at most seven draft tokens")
         from ignition.components.capacity import image_capacity
@@ -322,10 +333,12 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             ipc=package_storage.peer_storage)
             if shard.world_size in SUPPORTED_WORLD_SIZES and small_rows else None)
         prefill_dma = (create_dma_all_reduce_runtime(group, device, max_tokens=config.prefill_chunk_size,
-            hidden_size=weights.config.hidden, ipc=package_storage.peer_storage)
+            hidden_size=weights.config.hidden, ipc=package_storage.peer_storage,
+            # L9: the dual-wave schedule drives the direct zero-copy ring wire.
+            **({"bf16_direct": True} if config.prefill_dual_wave else {}))
             if dma_rows and dma_rows <= config.prefill_chunk_size else None)
         if prefill_dma is not None:
-            prefill_dma.kimi_bf16_ring = config.prefill_dma_ring_bf16
+            prefill_dma.kimi_bf16_ring = config.prefill_dma_ring_bf16 and not config.prefill_dual_wave
         vocabulary_collective = create_all_gather_runtime(group, device,
             max_rows=max(config.decode_samples, slots * (config.draft_tokens or 1)),
             columns=weights.config.vocabulary, ipc=package_storage.peer_storage)
@@ -522,6 +535,10 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         "local_embedding": cursor.zeros((max_tokens, weights.embedding.shape[1]), torch.bfloat16),
         **({"auxiliary": auxiliary[0]} if drafting else {})})
     prefill_sizes, batch_sizes = prefill_capacities(config.prefill_chunk_size), batch_capacities(config.max_active)
+    # L9 pool-cap knob: the dual-wave second prepared-module set may add at most
+    # prefill_dual_wave_pool of the preparation memory budget (fable priced the
+    # set at about 9% of the KV pool).
+    dual_wave_budget_bytes = int(config.prefill_dual_wave_pool * total_memory) if config.prefill_dual_wave else None
     collectives = dict(runtime=collective, embedding_runtime=embedding_collective, router_runtime=router_collective,
         route_runtime=route_collective, vocabulary_runtime=vocabulary_collective, coordinator=coordinator,
         vision_state=vision_state, context=context, latent_runtimes=latent_runtimes,
@@ -573,7 +590,9 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                             else prefill_collective if mode == "prefill" and prefill_collective is not None
                             else collective),
                             # Speculation's decoders never see the prefill latent gather channel.
-                            latent_gather_runtime=latent_gather_collective if mode == "prefill" else None))
+                            latent_gather_runtime=latent_gather_collective if mode == "prefill" else None,
+                            prefill_dual_wave=config.prefill_dual_wave if mode == "prefill" else False,
+                            dual_wave_budget_bytes=dual_wave_budget_bytes))
                     batch = PreparedBatch(inputs, requests, m, mode=mode, shard=weights.shard, pool=pool,
                         validate_prefill=vision_state.validate_prefill if mode == "prefill" and patches else None,
                         page_tokens=config.page_tokens)

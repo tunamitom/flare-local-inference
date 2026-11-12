@@ -208,6 +208,8 @@ def _export_hosts(args):
                          mix_split_rows=args.mix_split_rows,
                          prefill_latent_gather=args.prefill_latent_gather,
                          score_exchange=not args.no_score_exchange,
+                         prefill_dual_wave=args.prefill_dual_wave,
+                         prefill_dual_wave_pool=args.prefill_dual_wave_pool,
                          language_model_only=args.language_model_only,
                          mla_compute_mode=args.mla_compute_mode)
     collective_mode = collective_tuning_mode(configuration, model, args.collective_tuning)
@@ -301,6 +303,8 @@ def _prepare(args):
                       mix_split_rows=args.mix_split_rows,
                       prefill_latent_gather=args.prefill_latent_gather,
                       score_exchange=not args.no_score_exchange,
+                      prefill_dual_wave=args.prefill_dual_wave,
+                      prefill_dual_wave_pool=args.prefill_dual_wave_pool,
                       language_model_only=args.language_model_only,
                       mla_compute_mode=args.mla_compute_mode)
         indices = planning.format_gpus(gpu.index for gpu in plan.gpus)
@@ -484,6 +488,8 @@ def debug_serve(args) -> int:
                          mix_split_rows=args.mix_split_rows,
                          prefill_latent_gather=args.prefill_latent_gather,
                          score_exchange=not args.no_score_exchange,
+                         prefill_dual_wave=args.prefill_dual_wave,
+                         prefill_dual_wave_pool=args.prefill_dual_wave_pool,
                          language_model_only=args.language_model_only, mla_compute_mode=args.mla_compute_mode)
     collective_mode = collective_tuning_mode(configuration, model, args.collective_tuning)
     plan = replace(plan, compile_workers=compiler_workers(configuration, args.compile_workers), hub_cache=hub_cache,

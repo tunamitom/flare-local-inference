@@ -55,6 +55,8 @@ def derive(configuration: Configuration, model: ResolvedModel, host: Host, *, gp
            mix_split_rows: int = 0,
            prefill_latent_gather: bool = False,
            score_exchange: bool = True,
+           prefill_dual_wave: bool = False,
+           prefill_dual_wave_pool: float = 0.09,
            language_model_only: bool = False,
            compile_workers: int | None = None, tuning_gpus: str | None = None, autotune_effort: str | None = None, collective_tuning: str | None = None, collective_ladder=None,
            image_concurrency: int | None = None, mla_compute_mode: str | None = None,
@@ -83,6 +85,8 @@ def derive(configuration: Configuration, model: ResolvedModel, host: Host, *, gp
         mix_split_rows=mix_split_rows,
         prefill_latent_gather=prefill_latent_gather,
         score_exchange=score_exchange,
+        prefill_dual_wave=prefill_dual_wave,
+        prefill_dual_wave_pool=prefill_dual_wave_pool,
         language_model_only=language_model_only, mla_compute_mode=mla_compute_mode)
     result = replace(result, compile_workers=workers, hub_cache=configuration.directory("hub_cache"),
                      autotune_effort=tuning_effort(configuration, autotune_effort),

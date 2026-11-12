@@ -164,6 +164,8 @@ def run(args):
         mix_split_rows=args.mix_split_rows,
         prefill_latent_gather=args.prefill_latent_gather,
         score_exchange=not args.no_score_exchange,
+        prefill_dual_wave=args.prefill_dual_wave,
+        prefill_dual_wave_pool=args.prefill_dual_wave_pool,
         language_model_only=args.language_model_only,
         mla_compute_mode=args.mla_compute_mode)
     plan = replace(plan, benchmark_selection=BenchmarkSelection(
