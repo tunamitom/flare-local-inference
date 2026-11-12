@@ -251,6 +251,9 @@ class PreparedLatentMoE:
         if "routes" not in buffers:
             buffers["routes"] = RouterScratch.allocate(tokens, device, experts=c["num_experts"], top_k=c["num_experts_per_token"])
         routes = buffers["routes"].rows(tokens)
+        # F3 (l9-transplant-fable-review.md § mandate 2): the router/expert write
+        # set for the dual-wave aliasing assertion at dual-set construction.
+        self.routes = routes
         self.route_gather = self.down_gather = None
         if latent_gather_runtime is not None:
             # Prefill rows project their own latent columns from the full hidden row (the decode row-sharded
@@ -446,6 +449,150 @@ def check_wire_scope(*, prefill_dual_wave, direct_ring, dual_wave):
         raise ValueError("the dual-wave schedule requires the direct-ring runtime")
 
 
+def dual_wave_alias_phases(dual_layers, *, residual, delta, attn_in, mlp_in, tot_a, tot_b,
+                           auxiliary, half):
+    """Enumerate every ``overlap(comm, comp)`` phase of ``_call_dual_wave`` with its tensors.
+
+    F3 (l9-transplant-fable-review.md § mandate 2): each phase returns
+    ``(label, comm, comp, staging_ops)`` where comm and comp are the labelled
+    activation tensors that side reads or writes, and staging_ops counts the
+    phase's ring operations that pad through ``prefill_direct_staging``. The
+    table must stay in step with ``_call_dual_wave``; the F3 tests exercise the
+    checks and the construction-time call asserts the real geometry.
+    """
+
+    def rows(begin, end, delta_tensor, output):
+        labelled = [("prefix", residual.prefix[begin:end]), ("blocks", residual.blocks[begin:end])]
+        if output is not None:
+            labelled.append(("output", output))
+        labelled.append(("delta", delta_tensor))
+        return labelled
+
+    def aux(wave):
+        if auxiliary is None:
+            return []
+        rows_half = auxiliary.shape[0] // 2 if auxiliary.shape[0] >= 2 * half else None
+        view = auxiliary if rows_half is None else (auxiliary[:half] if wave == 0 else auxiliary[half:2 * half])
+        return [("auxiliary", view)]
+
+    def kda_writes(module):
+        found = []
+        _labelled_tensors(getattr(module, "buffers", {}), "kda", found)
+        return found
+
+    def mlp_writes(module):
+        return [("mlp.input", module.input), ("mlp.gate_up", module.gate_up.output),
+                ("mlp.down", module.down.output)]
+
+    def moe_writes(module):
+        return {
+            "down_pack": [("moe.router_input", module.router_input), ("moe.source", module.source),
+                          ("moe.down", module.down.output)],
+            "route_ring": [("moe.router_input", module.router_input), ("moe.gathered", module.gathered_router),
+                           ("moe.down", module.down.output), ("moe.latent", module.latent)],
+            "router_experts": [("moe.router_logits", module.router_logits),
+                               ("moe.expert_output", module.expert_output),
+                               ("moe.routes", module.routes.ids), ("moe.route_weights", module.routes.weights)],
+            "expert_reduce": [("moe.expert_output", module.expert_output), ("moe.latent", module.latent_sum)],
+            "up_combine": [("moe.up_input", module.up_input), ("moe.output", module.output)],
+            "shared": mlp_writes(module.shared),
+        }
+
+    def staging(*ops):
+        return sum(1 for op in ops if op is not None and getattr(op, "padded", None) is not None)
+
+    phases = []
+    mix_a_done = kda_a_done = mix_b_done = False
+    n_layers = len(dual_layers)
+    delta_a_rows, delta_b_rows = delta[:half], delta[half:]
+    for index, (w, kind, attention, mlp_spec, attn_red_a, attn_red_b, mlp_red_a, mlp_red_b) in enumerate(dual_layers):
+        out_p0, out_p1 = attention[2:] if kind == "kda" else attention.out_pads
+        mlp_kind, m_a, m_b, mlp_p0, mlp_p1 = mlp_spec
+        # attn_reduce.w0 ∥ wave-B attention (its mix plus the wave-B pass).
+        comp = rows(half, 2 * half, delta_b_rows if not mix_b_done else tot_b, None) + aux(1)
+        if not mix_b_done:
+            comp += [("waveB.output", attn_in[half:])]
+        if kind == "kda":
+            comp += kda_writes(attention[1]) + [("waveB.attn_in", attn_in[half:])]
+        else:
+            comp += [("out_p1", out_p1)]
+        phases.append((f"layer{index}.attn_reduce.w0",
+                       [("out_p0", out_p0), ("tot_a", tot_a)], comp, staging(attn_red_a)))
+        mlp_mode_output = mlp_in[:half]
+        if mlp_kind == "dense":
+            # attn_reduce.w1 ∥ wave-A dense MLP.
+            phases.append((f"layer{index}.attn_reduce.w1",
+                           [("out_p1", out_p1), ("tot_b", tot_b)],
+                           rows(0, half, tot_a, mlp_mode_output) + [("mlp_in_a", mlp_mode_output)]
+                           + mlp_writes(mlp_spec[1]), staging(attn_red_b)))
+            # mlp_reduce.w0 ∥ wave-B dense MLP.
+            phases.append((f"layer{index}.mlp_reduce.w0",
+                           [("mlp_p0", mlp_p0), ("tot_a", tot_a)],
+                           rows(half, 2 * half, tot_b, mlp_in[half:]) + [("mlp_in_b", mlp_in[half:])]
+                           + mlp_writes(mlp_spec[2]), staging(mlp_red_a)))
+            # mlp_reduce.w1 ∥ next layer's wave-A mix (and KDA pass).
+            next_w, next_kind = dual_layers[index + 1][:2] if index + 1 < n_layers else (None, None)
+            comp = rows(0, half, tot_a, attn_in[:half]) + aux(0)
+            if next_kind == "kda":
+                comp += kda_writes(dual_layers[index + 1][2][0])
+            phases.append((f"layer{index}.mlp_reduce.w1",
+                           [("mlp_p1", mlp_p1), ("tot_b", tot_b)], comp, staging(mlp_red_b)))
+            delta_a_rows, delta_b_rows = tot_a, tot_b
+            mix_a_done, kda_a_done, mix_b_done = True, next_kind == "kda", False
+            continue
+        sets_a, sets_b = moe_writes(mlp_spec[1]), moe_writes(mlp_spec[2])
+        # route_ring.w0 ∥ wave-A shared experts.
+        phases.append((f"layer{index}.route_ring.w0", sets_a["route_ring"],
+                       sets_a["shared"] + [("mlp_in_a", mlp_mode_output)],
+                       staging(getattr(mlp_spec[1], "down_reduce", None))))
+        # attn_reduce.w1 ∥ wave-A router + experts.
+        phases.append((f"layer{index}.attn_reduce.w1",
+                       [("out_p1", out_p1), ("tot_b", tot_b)], sets_a["router_experts"], staging(attn_red_b)))
+        # expert_reduce.w0 ∥ wave-B mix + down pack.
+        phases.append((f"layer{index}.expert_reduce.w0", sets_a["expert_reduce"],
+                       rows(half, 2 * half, tot_b, mlp_in[half:]) + sets_b["down_pack"]
+                       + [("mlp_in_b", mlp_in[half:])], staging(getattr(mlp_spec[1], "expert_reduce", None))))
+        # route_ring.w1 ∥ wave-A up-combine + wave-B shared experts.
+        phases.append((f"layer{index}.route_ring.w1", sets_b["route_ring"],
+                       sets_a["up_combine"] + sets_b["shared"] + [("mlp_in_b", mlp_in[half:])],
+                       staging(getattr(mlp_spec[2], "down_reduce", None))))
+        # mlp_reduce.w0 ∥ wave-B router + experts.
+        phases.append((f"layer{index}.mlp_reduce.w0",
+                       [("mlp_p0", mlp_p0), ("tot_a", tot_a)], sets_b["router_experts"], staging(mlp_red_a)))
+        # expert_reduce.w1 ∥ next layer's wave-A mix.
+        phases.append((f"layer{index}.expert_reduce.w1", sets_b["expert_reduce"],
+                       rows(0, half, tot_a, attn_in[:half]) + aux(0),
+                       staging(getattr(mlp_spec[2], "expert_reduce", None))))
+        # mlp_reduce.w1 ∥ next layer's wave-A KDA pass.
+        next_w, next_kind = dual_layers[index + 1][:2] if index + 1 < n_layers else (None, None)
+        comp = []
+        if next_kind == "kda":
+            comp = kda_writes(dual_layers[index + 1][2][0])
+            comp += [("next.attn_in", attn_in[:half])]
+        phases.append((f"layer{index}.mlp_reduce.w1",
+                       [("mlp_p1", mlp_p1), ("tot_b", tot_b)], comp, staging(mlp_red_b)))
+        delta_a_rows, delta_b_rows = tot_a, tot_b
+        mix_a_done, mix_b_done = index + 1 < n_layers, False
+    return tuple(phases)
+
+
+def _labelled_tensors(value, path, found):
+    """(label, tensor) pairs for every tensor reachable from a buffers structure."""
+    if isinstance(value, torch.Tensor):
+        found.append((path, value))
+    elif isinstance(value, dict):
+        for key, sub in value.items():
+            _labelled_tensors(sub, f"{path}.{key}" if path else str(key), found)
+    elif isinstance(value, (list, tuple)):
+        for index, sub in enumerate(value):
+            _labelled_tensors(sub, f"{path}[{index}]", found)
+    else:
+        state = getattr(value, "__dict__", None)
+        if state is not None:
+            for key, sub in vars(value).items():
+                _labelled_tensors(sub, f"{path}.{key}", found)
+
+
 def dual_wave_extra_bytes(buffers, dual_layers):
     """Bytes the dual-wave second prepared-module set adds beyond the serial decoders.
 
@@ -478,6 +625,86 @@ def dual_wave_extra_bytes(buffers, dual_layers):
         stage = buffers.get(kind, {})
         extra += sum(tensor_bytes(stage.get(key)) for key in ("output_w0", "output_w1"))
     return extra
+
+
+class DualWaveAliasCheck:
+    """F3 in-export gate (l9-transplant-fable-review.md § mandate 2), at dual-set construction.
+
+    The J-fault class applied to the dual wave: the schedule's safety rests on an
+    aliasing argument nobody executes or asserts. This check asserts it. For every
+    ``overlap(comm, comp)`` phase of ``_call_dual_wave`` it takes the labelled
+    activation tensors each side reads or writes and asserts the two sides occupy
+    disjoint storage ranges (sibling stage cursors reuse storage, so name-level
+    disjointness is not enough); it asserts the parent-cursor buffers
+    (``dual_mlp_in``, ``dual_total_w0/w1``, ``prefill_direct_staging``) overlap no
+    other tensor live in the graph — they are safe only because the largest
+    prefill decoder constructs first; and it asserts at most one staging-backed
+    ring operation per phase, since two would share ``prefill_direct_staging``
+    concurrently. Any violation raises before compile.
+    """
+
+    def __init__(self, name):
+        self.name, self.phases, self.violations = name, 0, []
+
+    def phase(self, label, comm, comp, staging_ops=0):
+        self.phases += 1
+        hits = assert_phase_disjoint(label, comm, comp)
+        assert_single_staging_op(label, staging_ops)
+        self.violations.extend(hits)
+
+    def finish(self, parents, live):
+        assert_parent_buffers_isolated(parents, live)
+        print("[dual-wave-alias] " + json.dumps({"decoder": self.name, "phases": self.phases,
+              "assert": "clear" if not self.violations else self.violations}), flush=True)
+        return self.phases
+
+
+def _spans(labelled):
+    """(label, start, end) byte spans for (label, tensor) pairs."""
+    spans = []
+    for label, tensor in labelled:
+        if isinstance(tensor, torch.Tensor) and tensor.numel():
+            spans.append((label, tensor.data_ptr(), tensor.data_ptr() + tensor.numel() * tensor.element_size()))
+    return spans
+
+
+def assert_phase_disjoint(label, comm, comp):
+    """F3.1: the comm side's tensors and the comp side's tensors occupy disjoint storage ranges."""
+    hits = []
+    for comm_label, comm_start, comm_end in _spans(comm):
+        for comp_label, comp_start, comp_end in _spans(comp):
+            if max(comm_start, comp_start) < min(comm_end, comp_end):
+                hits.append(f"{comm_label} overlaps {comp_label}")
+    if hits:
+        raise RuntimeError(f"dual-wave overlap phase {label}: the comm and comp sides share storage: {hits}")
+    return hits
+
+
+def assert_parent_buffers_isolated(parents, live):
+    """F3.2: parent-cursor buffers overlap no tensor live in the same graph."""
+    hits = []
+    for label, start, end in _spans(parents):
+        for other_label, other_start, other_end in _spans(live):
+            if label != other_label and max(start, other_start) < min(end, other_end):
+                hits.append(f"{label} overlaps {other_label}")
+    if hits:
+        raise RuntimeError("dual-wave parent-cursor buffers share storage with graph tensors: " + "; ".join(hits))
+    return hits
+
+
+def assert_single_staging_op(label, staging_ops):
+    """F3.3: at most one staging-backed ring operation per overlap phase.
+
+    Unaligned direct-ring shapes pad through the one shared
+    ``prefill_direct_staging`` buffer; two staging-backed operations in one
+    phase would corrupt each other. The schedule puts exactly one ring
+    operation in each phase; this asserts that stays true.
+    """
+    if type(staging_ops) is not int or staging_ops < 0:
+        raise ValueError("staging operation counts are nonnegative integers")
+    if staging_ops > 1:
+        raise RuntimeError(f"dual-wave overlap phase {label}: {staging_ops} staging-backed ring operations "
+                           "would share prefill_direct_staging concurrently")
 
 
 class SelectionOverlapCheck:
@@ -846,6 +1073,23 @@ class PreparedDecoder:
         self.mlp_input = self.buffers["kda"]["output"][:tokens]
         self.residual = ResidualStream(r["prefix"][:tokens], r["blocks"][:tokens], self.buffers["moe"]["output"][:tokens],
                                       mix_split_rows=mix_split_rows)
+        if self.dual_wave:
+            # F3 (l9-transplant-fable-review.md § mandate 2): assert the aliasing
+            # argument the two-wave schedule rests on, at dual-set construction.
+            alias = DualWaveAliasCheck(name)
+            for label, comm, comp, staging_ops in dual_wave_alias_phases(
+                    self.dual_layers, residual=self.residual, delta=self.local_embedding,
+                    attn_in=self.residual.output, mlp_in=self.dual_mlp_in,
+                    tot_a=self.dual_total_w0[:self.half_tokens], tot_b=self.dual_total_w1[:self.half_tokens],
+                    auxiliary=self.auxiliary, half=self.half_tokens):
+                alias.phase(label, comm, comp, staging_ops)
+            parents = [("dual_mlp_in", self.dual_mlp_in), ("dual_total_w0", self.dual_total_w0),
+                       ("dual_total_w1", self.dual_total_w1)]
+            if "prefill_direct_staging" in self.buffers:
+                parents.append(("prefill_direct_staging", self.buffers["prefill_direct_staging"]))
+            live = []
+            _labelled_tensors(self.buffers, "", live)
+            alias.finish(parents, live)
         self.scoring = None if scoring is None else scoring.prepare(self.residual.output, weights.head,
             vocabulary=weights.config.text["vocab_size"], session=session, coordinator=coordinator, name=name + ".prompt")
         self.head = PreparedVocabularyProjection(scratch.hidden, weights.head, scratch.local_logits, scratch.logits,

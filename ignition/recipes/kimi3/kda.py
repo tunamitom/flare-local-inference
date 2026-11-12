@@ -19,6 +19,9 @@ class PreparedKDA:
                  allocator=None):
         mode = "decode" if mode == "verify" else mode
         self.records, self.state, self.metadata = records, state, metadata
+        # F3 (l9-transplant-fable-review.md § mandate 2): the wave's write set for
+        # the dual-wave aliasing assertion at dual-set construction.
+        self.buffers = buffers
         tokens, hidden = source.shape
         heads, width = state.recurrent.shape[1], state.recurrent.shape[1] * 128
         device = source.device
