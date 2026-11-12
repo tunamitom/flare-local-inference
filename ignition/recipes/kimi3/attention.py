@@ -32,7 +32,7 @@ class PreparedMLA:
     def __init__(self, weights, source, metadata, cache, *, mode, session, name, workspace, buffers, latents=None,
                  coordinator=None, context=None, peers=None, allocator=None, index_cache=None, index_peers=None,
                  eps=1e-6, rotary=None, gated=True, partial_budget_bytes=None, selection=None,
-                 score_exchange=True):
+                 score_exchange=True, dual_wave=False, out_pad_rows=0):
         tokens, hidden = source.shape
         heads = weights["key"].shape[0]
         device = source.device
@@ -77,10 +77,31 @@ class PreparedMLA:
             self.gathered_latents = buffer("gathered_latents", latents.world_size * width, rows=rows)
             self.latent_gather = PreparedChunkedAllGather(self.send, self.gathered_latents, runtime=latents,
                 session=session, coordinator=coordinator, name=name + ".gather_latents")
+        self.dual_wave = bool(dual_wave and mode == "prefill" and tokens % 2 == 0)
         self.projections = {key: prepare_projection(x, weights[key], y, session=session,
             name=name + "." + key, workspace=workspace)
-            for key, x, y in (("latent_gate", source, self.local), ("q_b", self.query_norm, self.query.view(tokens, -1)),
-                             ("output", self.expanded, buffer("output", hidden)))}
+            for key, x, y in (("latent_gate", source, self.local), ("q_b", self.query_norm, self.query.view(tokens, -1)))}
+        if self.dual_wave:
+            # L9 (29aac9e/eb72cab): the two-wave schedule drives the output
+            # projection in half-row passes, each into its own padded output so
+            # the wave reductions need no staging copies.
+            self.half = tokens // 2
+            pad_r = max(self.half, int(out_pad_rows))
+            self.out_pads = (
+                buffer("output_w0", hidden, rows=pad_r)[:pad_r],
+                buffer("output_w1", hidden, rows=pad_r)[:pad_r],
+            )
+            self.out_halves = (
+                prepare_projection(self.expanded[:self.half], weights["output"], self.out_pads[0][:self.half],
+                                   session=session, name=name + ".output.w0", workspace=workspace),
+                prepare_projection(self.expanded[self.half:], weights["output"], self.out_pads[1][:self.half],
+                                   session=session, name=name + ".output.w1", workspace=workspace),
+            )
+        else:
+            out_buf = buffer("output", hidden)
+            self.output_buffer = out_buf
+            self.projections["output"] = prepare_projection(self.expanded, weights["output"], out_buf,
+                                                            session=session, name=name + ".output", workspace=workspace)
         self.shards = ContextShards() if context is None else context.shards
         self.peers = peers
         self.shared_slots = selection is not None and getattr(selection, 'slots', None) is not None
@@ -148,7 +169,8 @@ class PreparedMLA:
             self.combine = PreparedLseReduceScatter(self.partial, self.lse, self.attended, runtime=context.heads,
                 session=session, coordinator=context.coordinator, name=name + ".combine", threads=512, block_limit=8)
 
-    def __call__(self, source):
+    def pre_output(self, source):
+        """Everything through the expanded gate output; the wave passes project it in halves."""
         p, m, shards = self.projections, self.metadata, self.shards
         p["latent_gate"](source)
         if self.latent_gather is not None:
@@ -197,7 +219,15 @@ class PreparedMLA:
         self.expand(self.attended.transpose(0, 1))
         if self.gated:
             sigmoid_gate(self.expanded, self.gate)
-        return p["output"](self.expanded)
+        return self.expanded
+
+    def run_out_half(self, wave: int):
+        sl = slice(0, self.half) if wave == 0 else slice(self.half, 2 * self.half)
+        return self.out_halves[wave](self.expanded[sl])
+
+    def __call__(self, source):
+        self.pre_output(source)
+        return self.projections["output"](self.expanded)
 
 
 class PreparedContextPrefill:
