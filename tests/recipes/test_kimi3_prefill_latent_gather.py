@@ -62,10 +62,13 @@ def test_launch_geometry_reaches_only_the_gather_query():
 
 
 def test_only_prefill_decoders_receive_the_channel():
-    # PreparedDecoder forwards the channel to the MoE only in prefill mode ...
-    (moe,) = _calls(ROOT / "decoder.py", "PreparedLatentMoE")
-    kw = {k.arg: ast.unparse(k.value) for k in moe.keywords}
-    assert kw["latent_gather_runtime"] == "latent_gather_runtime if mode == 'prefill' else None"
+    # PreparedDecoder forwards the channel to every MoE — the serial path and the
+    # dual-wave second set's per-wave modules (prefill decoders only) — in prefill mode ...
+    moes = _calls(ROOT / "decoder.py", "PreparedLatentMoE")
+    assert len(moes) == 3  # serial + dual-wave .moe.w0 / .moe.w1
+    for moe in moes:
+        kw = {k.arg: ast.unparse(k.value) for k in moe.keywords}
+        assert kw["latent_gather_runtime"] == "latent_gather_runtime if mode == 'prefill' else None"
     # ... and the bootstrap hands it only to the main prefill decoders, never through the shared
     # collectives dict that speculation's decoders (decode / verify / draft) receive.
     src = (ROOT / "bootstrap.py").read_text()
