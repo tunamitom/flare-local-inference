@@ -275,12 +275,12 @@ fp_baseline() {
   # fallback (2026-11-12): configs predating the knob carry /0, the J-export
   # ruled config carries /16. The L3-dropped fallback (/0 @757b5140) is the
   # W11 supersede flow: unregistered until its measured fingerprint is recorded.
-  case "$TRELLIS_TABLE/$DECODE_FUSION/$R1_PUSH/$R3_ISLAND/$R3_ACQUIRE/${MIX_SPLIT_ROWS:-0}@$EXPECT_EXPORT_SRC" in
-    2/1/1/1/1/0@ac377ae4) echo "Graphs: 66; kernels: 4904" ;;
-    0/0/0/0/0/0@*) echo "Graphs: 66; kernels: 4967" ;;
-    2/1/1/1/1/0@b4889fe5) echo "Graphs: 66; kernels: 4900" ;;
-    2/1/1/1/1/16@757b5140) echo "Graphs: 66; kernels: 4318" ;;
-    2/1/1/1/1/0@757b5140) echo "Graphs: 66; kernels: 4318" ;;
+  case "$TRELLIS_TABLE/$DECODE_FUSION/$R1_PUSH/$R3_ISLAND/$R3_ACQUIRE/${MIX_SPLIT_ROWS:-0}/${PREFILL_DUAL_WAVE:-0}@$EXPECT_EXPORT_SRC" in
+    2/1/1/1/1/0/0@ac377ae4) echo "Graphs: 66; kernels: 4904" ;;
+    0/0/0/0/0/0/0@*) echo "Graphs: 66; kernels: 4967" ;;
+    2/1/1/1/1/0/0@b4889fe5) echo "Graphs: 66; kernels: 4900" ;;
+    2/1/1/1/1/16/0@757b5140) echo "Graphs: 66; kernels: 4318" ;;
+    2/1/1/1/1/0/0@757b5140) echo "Graphs: 66; kernels: 4318" ;;
     # ──   2/1/1/1/1/16@ad1bdbee  score-exchange export (levers/j-missed-fable-review.md
     # ──                       §2 "If it is exported"; plan setting ARMED by default).
     # ──                       FIRST EXPORT: the round-graph/kernel fingerprint is
@@ -312,7 +312,7 @@ fp_baseline() {
     # uniform on 8 ranks, slab 217.69 / index_slab 49.89 MiB unchanged). A
     # measured deviation still fails the post-export assertion and flags the
     # package instead of passing silently.
-    2/1/1/1/1/16@4b3ca8c5) echo "Graphs: 66; kernels: 4318" ;;
+    2/1/1/1/1/16/0@4b3ca8c5) echo "Graphs: 66; kernels: 4318" ;;
     # score-exchange export (levers/j-missed-fable-review.md §2 "If it is exported",
     # plan setting ARMED): registered from the first armed export
     # gb202-tp8-202611120708 (export-20261112-scorex.log, all 8 ranks uniform):
@@ -325,7 +325,21 @@ fp_baseline() {
     # 0 deltas on the other 44 graphs, 20-row graph 4264 -> 4168, totals
     # 450,003/450,597 -> 447,891/448,485. Slab fingerprints unchanged at
     # 217.69/49.89 MiB. Supersedes the SCOREX-FIRST-EXPORT placeholder.
-    2/1/1/1/1/16@ad1bdbee) echo "Graphs: 66; kernels: 4314" ;;
+    2/1/1/1/1/16/0@ad1bdbee) echo "Graphs: 66; kernels: 4314" ;;
+    # ──   2/1/1/1/1/16/1@*  L9 dual-wave first export (fable
+    # ──                    l9-final-whole-set-fable-review.md §2.2: arm at export
+    # ──                    time with --prefill-dual-wave; knob in EXPORT_ARGS,
+    # ──                    the detached unit's --setenv list, and this registry).
+    # ──                    FIRST EXPORT: the round-graph/kernel fingerprint is
+    # ──                    unknowable before it (the six dual-wave graphs replace
+    # ──                    the serial prefill graphs' contents under the
+    # ──                    fork/join transport vehicle); W11 supersede flow —
+    # ──                    proceed, record the measured fingerprint here and run
+    # ──                    --reassert. Placeholder L9-FIRST-EXPORT registered
+    # ──                    before the export (the post-export assertion flags the
+    # ──                    package by design). Graph catalog: 66 armed (G1
+    # ──                    construction 66/66 with the six dual-wave graphs).
+    2/1/1/1/1/16/1@*) echo "Graphs: 66; kernels: L9-FIRST-EXPORT" ;;
     *) echo "" ;;
   esac
 }
@@ -823,7 +837,7 @@ if [ "$MODE" = --detach ]; then
   sudo -n systemd-run --unit="$unit" --collect --uid=tom --gid=tom \
     --setenv=HOME=/home/tom --setenv=USER=tom --setenv=EXPORT_TS="$TS" --setenv=EXPORT_LOG="$LOG" \
     --setenv=PREFILL_ISLAND="$PREFILL_ISLAND" --setenv=IMAGE_CONCURRENCY="$IMAGE_CONCURRENCY" \
-    --setenv=PYTHONPATH="$PYTHONPATH" --setenv=B12X_W4A16_SMALL_M_SPLITK=1 --setenv=PREFILL_FP8="$PREFILL_FP8" --setenv=SPEC_TOKEN_CAPACITY="$SPEC_TOKEN_CAPACITY" --setenv=REUSE_WEIGHTS="$REUSE_WEIGHTS" \
+    --setenv=PYTHONPATH="$PYTHONPATH" --setenv=B12X_W4A16_SMALL_M_SPLITK=1 --setenv=PREFILL_FP8="$PREFILL_FP8" --setenv=PREFILL_DUAL_WAVE="$PREFILL_DUAL_WAVE" --setenv=SPEC_TOKEN_CAPACITY="$SPEC_TOKEN_CAPACITY" --setenv=REUSE_WEIGHTS="$REUSE_WEIGHTS" \
     --setenv=TRELLIS_TABLE="$TRELLIS_TABLE" --setenv=DECODE_FUSION="$DECODE_FUSION" \
     --setenv=R1_PUSH="$R1_PUSH" --setenv=R3_ISLAND="$R3_ISLAND" --setenv=R3_ACQUIRE="$R3_ACQUIRE" \
     --setenv=LSE_PUSH="$LSE_PUSH" --setenv=MIX_SPLIT_ROWS="$MIX_SPLIT_ROWS" --setenv=PREFILL_LATENT_GATHER="$PREFILL_LATENT_GATHER" \
