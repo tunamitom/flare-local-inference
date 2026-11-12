@@ -316,6 +316,11 @@ run_preflight() {
   # pinned trees whether B12X_A16_SPLITK_REDUCE_PDL enters the dense compile
   # key / re-races the dense selections (CPU; verdict recorded at each run).
   if "$PYV" "$HERE/preflight/pdl-compile-key-probe.py" >&2; then :; else bad=$((bad+1)); fi
+  # L4 prefill latent gather (fable-levers-20261112.md section L4 risk 1): the
+  # new prefill dense shape and gather channel must appear as NEW race/compile-
+  # key entries only; no existing dense selection may re-race (CPU; verdict and
+  # the resolved launch geometry recorded at each run).
+  if "$PYV" "$HERE/preflight/latent-gather-compile-key-probe.py" >&2; then :; else bad=$((bad+1)); fi
   # Plan acceptance + PRE-mode settings vs rulings.
   if "$PYV" "$HERE/plan-dryrun.py" "${DRYRUN_ARGS[@]}" >&2; then
     say "preflight: planner dry-run OK"
