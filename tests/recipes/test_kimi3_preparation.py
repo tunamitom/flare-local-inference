@@ -62,7 +62,7 @@ def test_preparation_preserves_declared_context_above_estimated_physical_capacit
         prefill_island_reduce=False,
         prefill_dma_ring_rows=0, prefill_dma_bf16=False,
         trellis_prefill_shapes=False, trellis_prefill_table="0", decode_fusion=False,
-        mix_split_rows=16, candidate_merge_radix=True,
+        mix_split_rows=16, prefill_latent_gather=False,
         context_parallel=True, language_model_only=True)
     bootstrap = SimpleNamespace(PreparationConfig=config_type,
         prepare_rank=lambda snapshot, config, **kwargs: config)
@@ -73,8 +73,8 @@ def test_preparation_preserves_declared_context_above_estimated_physical_capacit
 
 
 def test_plan_settings_reach_the_preparation_config(config_type, monkeypatch):
-    """The L3/L6 plan settings thread from the plan into PreparationConfig as constructor
-    arguments (never through the process environment)."""
+    """The L3 plan setting threads from the plan into PreparationConfig as a constructor
+    argument (never through the process environment)."""
     from ignition.recipes.kimi3.recipe import prepare_variant
     from ignition.preparation import rank_group
 
@@ -89,13 +89,13 @@ def test_plan_settings_reach_the_preparation_config(config_type, monkeypatch):
         prefill_fp8_transport=False, prefill_island_reduce=False,
         prefill_dma_ring_rows=0, prefill_dma_bf16=False,
         trellis_prefill_shapes=False, trellis_prefill_table="0", decode_fusion=False,
-        mix_split_rows=16, candidate_merge_radix=True,
+        mix_split_rows=16, prefill_latent_gather=False,
         context_parallel=True, language_model_only=True)
     bootstrap = SimpleNamespace(PreparationConfig=config_type,
         prepare_rank=lambda snapshot, config, **kwargs: config)
     prepared = prepare_variant("checkpoint", plan, bootstrap=bootstrap,
         draft_repository="unused", draft_revision="unused", compile_forwards=True,
         kernel_cache=None, progress=None)
-    assert prepared.mix_split_rows == 16 and prepared.candidate_merge_radix is True
+    assert prepared.mix_split_rows == 16
     defaults = config_type()
-    assert defaults.mix_split_rows == 0 and defaults.candidate_merge_radix is False
+    assert defaults.mix_split_rows == 0

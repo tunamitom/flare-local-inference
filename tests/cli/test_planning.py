@@ -202,21 +202,16 @@ def test_prefill_fp8_transport_is_gated_to_kimi_recipes_and_supported_tp():
                       prefill_fp8_transport=True)
 
 
-def test_mix_split_and_candidate_merge_radix_are_recorded_plan_settings():
+def test_mix_split_rows_is_a_recorded_plan_setting():
     kimi = replace(SOLO, name="kimi31")
     options = dict(concurrency=4, reserve_bytes=0, speculation=kimi.speculation)
     exact = planning.plan(kimi, kimi.checkpoints[0], (gpu(0, 95),), selected=(0,), **options)
     assert exact.mix_split_rows == 0 and exact.to_dict()["mix_split_rows"] == 0
-    assert exact.candidate_merge_radix is False and exact.to_dict()["candidate_merge_radix"] is False
     split = planning.plan(kimi, kimi.checkpoints[0], (gpu(0, 95),), selected=(0,), mix_split_rows=16, **options)
-    radix = planning.plan(kimi, kimi.checkpoints[0], (gpu(0, 95),), selected=(0,), candidate_merge_radix=True, **options)
-    assert split.to_dict()["mix_split_rows"] == 16 and radix.to_dict()["candidate_merge_radix"] is True
-    assert replace(split, mix_split_rows=0) == exact and replace(radix, candidate_merge_radix=False) == exact
+    assert split.to_dict()["mix_split_rows"] == 16
+    assert replace(split, mix_split_rows=0) == exact
     with pytest.raises(UsageError, match="--mix-split-rows"):
         planning.plan(SOLO, SOLO.checkpoints[0], (gpu(0, 95),), selected=(0,), mix_split_rows=16,
-                      concurrency=4, reserve_bytes=0, speculation=SOLO.speculation)
-    with pytest.raises(UsageError, match="--candidate-merge-radix"):
-        planning.plan(SOLO, SOLO.checkpoints[0], (gpu(0, 95),), selected=(0,), candidate_merge_radix=True,
                       concurrency=4, reserve_bytes=0, speculation=SOLO.speculation)
     with pytest.raises(UsageError, match="non-negative row limit"):
         planning.plan(kimi, kimi.checkpoints[0], (gpu(0, 95),), selected=(0,), mix_split_rows=-1,

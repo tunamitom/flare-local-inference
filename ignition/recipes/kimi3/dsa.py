@@ -80,7 +80,7 @@ class PreparedDSA:
     def __init__(self, weights, query_residual, key_input, weight_input, query, output, slots,
                  metadata, cache, index_cache, *, context, session, coordinator, name, workspace,
                  buffers, allocator=None, eps=1e-5, mode="decode", latent=None, peers=None, index_peers=None,
-                 selection=None, candidate_merge_radix=False):
+                 selection=None):
         self.prefill = None
         if mode == "prefill" and context is not None and context.prefill_layout == "query_split":
             from .dsa_prefill import PreparedGatheredDSA
@@ -187,7 +187,7 @@ class PreparedDSA:
                 merge = PreparedDistributedTopK(local, scores, selected,
                     world=self.shards.world, rank=self.shards.index, runtime=context.candidates,
                     session=session, coordinator=coordinator, name=stage_name + ".candidates", buffers=cursor,
-                    workspace=workspace, candidate_merge_radix=candidate_merge_radix)
+                    workspace=workspace)
             gather = combine = paired = branch = None
             q, attended = query[begin:end], output[begin:end]
             if self.gathered_context:

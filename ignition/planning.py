@@ -238,11 +238,6 @@ class Plan:
     # environment. Numerics-light: the mixture is within one BF16 ulp, the normalized output
     # within three.
     mix_split_rows: int = 0
-    # L6 (upstream flare #14): compute the candidate-merge cutoff with one exact radix select per
-    # row instead of the row top-k, threshold and cutoff-count kernels (6 -> 4 launches per
-    # merge; bitwise identical selected IDs and order). A plan setting, threaded through the
-    # preparation config to the PreparedCandidateMerge constructor.
-    candidate_merge_radix: bool = False
     # L4 (upstream flare #16): prefill MoE layers compute their own latent
     # columns from the full hidden row with the decode row-sharded
     # latent_down_rows weights and all-gather them, replacing the latent
@@ -333,8 +328,6 @@ class Plan:
             raise UsageError("--mix-split-rows must be a non-negative row limit")
         if self.mix_split_rows and self.recipe.name not in ("kimi3", "kimi31"):
             raise UsageError("--mix-split-rows supports the Kimi K3/K3.1 recipes")
-        if self.candidate_merge_radix and self.recipe.name not in ("kimi3", "kimi31"):
-            raise UsageError("--candidate-merge-radix supports the Kimi K3/K3.1 recipes")
         if self.prefill_latent_gather and self.recipe.name not in ("kimi3", "kimi31"):
             raise UsageError("--prefill-latent-gather supports the Kimi K3/K3.1 recipes")
 
@@ -461,7 +454,6 @@ class Plan:
             "trellis_prefill_table": self.trellis_prefill_table,
             "decode_fusion": self.decode_fusion,
             "mix_split_rows": self.mix_split_rows,
-            "candidate_merge_radix": self.candidate_merge_radix,
             "prefill_latent_gather": self.prefill_latent_gather,
             "speculation": None if self.speculation is None else {
                 "draft_tokens": self.speculation.draft_tokens, "adaptive": self.speculation.adaptive,
@@ -504,7 +496,7 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
         trellis_prefill_shapes: bool = False,
         trellis_prefill_table: str = "0",
         decode_fusion: bool = False,
-        mix_split_rows: int = 0, candidate_merge_radix: bool = False, prefill_latent_gather: bool = False,
+        mix_split_rows: int = 0, prefill_latent_gather: bool = False,
         language_model_only: bool = False, mla_compute_mode: str | None = None) -> Plan:
     """Size pages and the prefix cache to the supply; the result may not fit.
 
@@ -570,7 +562,7 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
                 trellis_prefill_shapes=trellis_prefill_shapes,
                 trellis_prefill_table=trellis_prefill_table,
                 decode_fusion=decode_fusion,
-                mix_split_rows=mix_split_rows, candidate_merge_radix=candidate_merge_radix,
+                mix_split_rows=mix_split_rows,
                 prefill_latent_gather=prefill_latent_gather,
                 language_model_only=language_model_only)
     available = plan.supply_bytes - plan.fixed_bytes
@@ -633,7 +625,7 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
         trellis_prefill_shapes: bool = False,
         trellis_prefill_table: str = "0",
         decode_fusion: bool = False,
-        mix_split_rows: int = 0, candidate_merge_radix: bool = False, prefill_latent_gather: bool = False,
+        mix_split_rows: int = 0, prefill_latent_gather: bool = False,
         language_model_only: bool = False, mla_compute_mode: str | None = None) -> Plan:
     """Select GPUs and size the plan, or raise a capacity error that lists working settings.
 
@@ -718,7 +710,7 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
                    trellis_prefill_shapes=trellis_prefill_shapes,
                 trellis_prefill_table=trellis_prefill_table,
                 decode_fusion=decode_fusion,
-                mix_split_rows=mix_split_rows, candidate_merge_radix=candidate_merge_radix,
+                mix_split_rows=mix_split_rows,
                 prefill_latent_gather=prefill_latent_gather,
                    language_model_only=language_model_only,
                    mla_compute_mode=mla_compute_mode)

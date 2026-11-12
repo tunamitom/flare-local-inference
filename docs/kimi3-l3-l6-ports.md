@@ -1,10 +1,12 @@
-# Kimi decode levers L3 and L6: stream-schedule audit and combination notes
+# Kimi decode lever L3: stream-schedule audit
 
 This records the code-reading stream-schedule audit for the residual mix split (L3,
-upstream flare #11) and the integration note for the candidate-merge radix cutoff (L6,
-upstream flare #14) against L1's candidate-exchange split. Both levers are wired as plan
-settings (`--mix-split-rows`, `--candidate-merge-radix`), never through the process
-environment.
+upstream flare #11). The lever is wired as a plan setting (`--mix-split-rows`), never
+through the process environment.
+
+Note: the candidate-merge radix cutoff (L6) is DELIBERATELY ABSENT from this tree (the
+export ruling holds it out in both forms). Its kernels, plan setting and design notes live
+on the `lever/L3L6-split-radix` branch for a future export.
 
 ## L3 — the split kernel's cross-program spin-wait versus our stream schedule
 
@@ -71,38 +73,8 @@ holding its CTAs) on an auxiliary stream and is being ported alongside this leve
 
 The setting is default-off, so today's schedules are unchanged until that run passes.
 
-## L6 — combining the radix cutoff with L1's candidate-exchange split
+## L6 — held out of this tree
 
-L1's decode-glue transplant includes the split of the DSA candidate exchange (lead commit
-`8b1be5b`, "kimi3: decode DSA exchanges candidate scores and each rank selects its share"):
-the pair exchange — packed (score, global position) pairs gathered and merged by
-`PreparedDistributedTopK` + `PreparedCandidateMerge` — becomes `PreparedScoreExchangeTopK` +
-`PreparedCandidateShare` (score-only exchange; per rank: pack, gather, row top-k, select).
-Interactions with this lever:
-
-1. **Scope.** L6 accelerates `PreparedCandidateMerge` (`flare.candidate_merge` /
-   `flare.candidate_merge_radix`): one exact radix select per row replaces the b12x row
-   top-k, the threshold kernel and the cutoff-count kernel (6 -> 4 launches per merge). If
-   L1's split lands, decode/verification stages stop using that merge at all; the radix then
-   applies only to the pair path that remains for a rank attending over gathered context.
-2. **The share path keeps its own tie rule.** `PreparedCandidateShare` also finds a cutoff
-   with the b12x row top-k, but resolves cutoff ties by rank-then-slot order, not the
-   merge's gathered-position order. `_radix_counts` computes the cutoff exactly and could
-   replace that top-k (one more launch saved), but its greater/tie counts and `-1` fill are
-   the merge's tie contract and cannot be reused as-is. Combining is a new design step
-   against L1's final shape, not an overlay of the two patches.
-3. **Baselines.** L6's bitwise-identical claim is against the default pair merge (upstream:
-   0 differences over 12,188 cases and 120,000 graph replays). The score exchange is not
-   bit-identical to the pair merge in one corner — it drops `-inf`-score candidates the pair
-   merge kept while fewer than K finite candidates existed (the lead commit's own note). If
-   L1 lands, the combined export needs its own equality gate against the baseline the plan
-   names.
-4. **Supersession.** Do not take upstream #10's threshold fold in any combination: #14's
-   radix select supersedes it (it replaces the same three kernels), and the two fight over
-   the merge's contract and launch plan.
-
-Ported form: `--candidate-merge-radix` on the plan, threaded through the preparation config
-to the `PreparedCandidateMerge(radix=...)` constructor argument; default off keeps the
-shipped six-launch merge. Merges wider than 16,384 candidates keep the default contract.
-The upstream environment channel is deliberately not carried; the module reads no
-environment variable (pinned by source-text regression tests).
+See the note above: the export tree carries no radix-cutoff code in any form. The
+L6/L1 combination analysis is preserved on `lever/L3L6-split-radix`
+(`docs/kimi3-l3-l6-ports.md` there).

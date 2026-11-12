@@ -123,9 +123,6 @@ class PreparationConfig:
     # Split the residual mixture across column chunks for streams of at most this many decode rows
     # (the plan's --mix-split-rows setting; 0 keeps one program per row).
     mix_split_rows: int = 0
-    # Compute the candidate-merge cutoff with one exact radix select per row, replacing the row
-    # top-k, threshold and cutoff-count kernels (the plan's --candidate-merge-radix setting).
-    candidate_merge_radix: bool = False
     # P3′ (REVIEW-J4): prefill reductions transport per-row E4M3 through the two-shot
     # channel instead of complete FP32 owner sums over the original BF16 inputs.
     # Default off keeps that exact path byte-identical as the rollback.
@@ -512,7 +509,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     collectives = dict(runtime=collective, embedding_runtime=embedding_collective, router_runtime=router_collective,
         route_runtime=route_collective, vocabulary_runtime=vocabulary_collective, coordinator=coordinator,
         vision_state=vision_state, context=context, latent_runtimes=latent_runtimes,
-        mix_split_rows=config.mix_split_rows, candidate_merge_radix=config.candidate_merge_radix)
+        mix_split_rows=config.mix_split_rows)
     speculation = None
     if drafting:
         from .dspark import SpeculativePreparation

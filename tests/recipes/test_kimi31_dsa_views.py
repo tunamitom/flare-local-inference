@@ -25,8 +25,7 @@ def construct(monkeypatch):
 
     def merge(indices, scores, output, **kwargs):
         return SimpleNamespace(indices=indices, scores=scores, output=output,
-            name=kwargs["name"], buffers=kwargs["buffers"], plan=object(),
-            radix=kwargs.get("candidate_merge_radix", "absent"))
+            name=kwargs["name"], buffers=kwargs["buffers"], plan=object())
 
     def attention(query, cache, output, pages, lengths, starts, **kwargs):
         return SimpleNamespace(query=query, cache=cache, output=output, pages=pages,
@@ -61,15 +60,6 @@ def construct(monkeypatch):
         return op, cache
 
     return build
-
-
-def test_candidate_merge_radix_is_a_constructor_argument(construct):
-    """The L6 plan setting reaches the merge as the PreparedDistributedTopK constructor
-    argument: default off, explicit on."""
-    default, _ = construct(4, 2)
-    assert all(stage[3].radix is False for stage in default.stages if stage[3] is not None)
-    armed, _ = construct(4, 2, candidate_merge_radix=True)
-    assert all(stage[3].radix is True for stage in armed.stages if stage[3] is not None)
 
 
 def _selection_operands(stage):
