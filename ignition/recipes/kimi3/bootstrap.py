@@ -550,9 +550,11 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     # empty (the untested lb = 0 KDA pass cannot execute). Refused shapes stay
     # serial on the shipped wire.
     armed_shapes = set(dual_wave_armed_shapes(prefill_sizes)) if config.prefill_dual_wave else set()
-    # L9 pool-cap knob: the dual-wave second prepared-module set may add at most
-    # prefill_dual_wave_pool of the preparation memory budget (fable priced the
-    # set at about 9% of the KV pool).
+    # L9 pool-cap knob (F7: a reject bar on counted buffers against device memory,
+    # never a share of the KV pool): the dual-wave second prepared-module set's
+    # counted buffers reject at construction above
+    # prefill_dual_wave_pool * total device memory (minimum across ranks).
+    dual_wave_budget_bytes = int(config.prefill_dual_wave_pool * total_memory) if config.prefill_dual_wave else None
     collectives = dict(runtime=collective, embedding_runtime=embedding_collective, router_runtime=router_collective,
         route_runtime=route_collective, vocabulary_runtime=vocabulary_collective, coordinator=coordinator,
         vision_state=vision_state, context=context, latent_runtimes=latent_runtimes,
@@ -576,6 +578,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     count = (len(modes) * (prefill_graph_count(prefill_sizes, scoring) + 4 * len(batch_sizes)) + len(batch_sizes)
              + len(config.speculative_round_shapes) + len(patches))
     with phase(progress, "Construct graph catalog", total=count) as stage:
+        dual_wave_counted_bytes = 0
 
         def add(name, forward, kind, rows, tokens, fields, *, enabled=None, packed_tokens=0):
             if kind == "scored_prefill":
@@ -619,6 +622,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                             latent_gather_runtime=latent_gather_collective if mode == "prefill" else None,
                             prefill_dual_wave=dual,
                             dual_wave_budget_bytes=dual_wave_budget_bytes))
+                    dual_wave_counted_bytes = max(dual_wave_counted_bytes, getattr(decoder, "dual_extra_bytes", 0))
                     batch = PreparedBatch(inputs, requests, m, mode=mode, shard=weights.shard, pool=pool,
                         validate_prefill=vision_state.validate_prefill if mode == "prefill" and patches else None,
                         page_tokens=config.page_tokens)
@@ -757,7 +761,25 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         pages=pages, page_bytes=page_bytes(weights.config), page_tokens=config.page_tokens,
         kv_bytes=pages * page_bytes(weights.config), completion_output_bytes=completion.nbytes, operator_scratch_bytes=arena.nbytes, graphs=len(graphs),
         prefill_capacities=prefill_sizes, free_device_bytes=free, total_device_bytes=total,
-        headroom_bytes=config.headroom_bytes, tuning=tuning, compiled_decoder=config.compile_decoder)
+        headroom_bytes=config.headroom_bytes, tuning=tuning, compiled_decoder=config.compile_decoder,
+        # F7 (l9-transplant-fable-review.md §4): the plan report names the pool
+        # arithmetic honestly — the counted second-set bytes, the reject bar
+        # (prefill_dual_wave_pool x total device memory, minimum across ranks) they
+        # are rejected against at construction, and the resulting KV pool tokens.
+        # The bar never shrinks the set and never reserves pool: it is a reject
+        # bar on counted buffers against device memory, and the pool is whatever
+        # memory remains.
+        dual_wave_counted_bytes=dual_wave_counted_bytes if config.prefill_dual_wave else 0,
+        dual_wave_pool_bar_bytes=dual_wave_budget_bytes or 0,
+        dual_wave_pool_tokens=pages * config.page_tokens,
+        dual_wave_armed_shapes=tuple(sorted(armed_shapes)) if config.prefill_dual_wave else ())
+    if config.prefill_dual_wave:
+        print("[dual-wave] " + json.dumps({"rank": rank,
+              "counted_bytes": dual_wave_counted_bytes,
+              "reject_bar_bytes": dual_wave_budget_bytes,
+              "pool_tokens": pages * config.page_tokens,
+              "pool_share_of_device": round(pages * page_bytes(weights.config) / max(total, 1), 4),
+              "armed_shapes": sorted(armed_shapes)}), flush=True)
     if scoring is not None:
         memory.update(scoring.memory_report())
     if drafting:

@@ -291,10 +291,13 @@ def _preparation_arguments(running, *, model_default="defaults.model"):
     advanced.add_argument("--prefill-dual-wave", action="store_true",
                           help="overlap prefill compute with the copy-engine ring by splitting each"
                                " prefill chunk's rows into two waves (a second prepared-module set;"
-                               " prefill numerics change; Kimi K3/K3.1; default: serial prefill)")
+                               " prefill numerics change; engages at any stream count; serial prefill"
+                               " graphs (1,024/1,536-row chunks) keep the shipped hop ring and are"
+                               " never split; Kimi K3/K3.1; default: serial prefill)")
     advanced.add_argument("--prefill-dual-wave-pool", type=float, default=0.09, metavar="SHARE",
-                          help="upper bound on the dual-wave second prepared-module set's added"
-                               " buffers as a share of the preparation memory budget (default: 0.09)")
+                          help="reject bar on the dual-wave second prepared-module set's counted"
+                               " buffers against total device memory — construction raises above the"
+                               " bar; not a share of the KV pool and not a clamp (default: 0.09)")
     advanced.add_argument("--no-score-exchange", action="store_true",
                           help="drop the sparse-layer candidate-score exchange: gather every rank's"
                                " (score, position) candidate pairs (16,384 bytes per row and rank)"

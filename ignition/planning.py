@@ -267,7 +267,11 @@ class Plan:
     # serial prefill path exactly.
     prefill_dual_wave: bool = False
     # Upper bound on the dual-wave second prepared-module set's added buffers as
-    # a share of the preparation memory budget (0 < share <= 0.25).
+    # a share of total device memory (0 < share <= 0.25): a REJECT BAR on the
+    # counted buffers against device memory, never a share of the KV pool and
+    # never a clamp — construction raises when the count exceeds the bar. The
+    # plan report prints the counted bytes, the bar and the resulting pool
+    # tokens (the pool is whatever memory remains).
     prefill_dual_wave_pool: float = 0.09
     # The plan prepares no vision encoder and serves text requests only.
     language_model_only: bool = False
