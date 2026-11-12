@@ -137,6 +137,18 @@ DECODE_FUSION="${DECODE_FUSION:-1}"
 R1_PUSH="${R1_PUSH:-1}"
 R3_ISLAND="${R3_ISLAND:-1}"
 R3_ACQUIRE="${R3_ACQUIRE:-1}"
+# J-export ruling (levers/j-export-fable-review.md "Export config", 2026-11-12):
+# the three additions to the W23 line. LSE_PUSH arms row 4's reduce-scatter push
+# (B12X_PCIE_DCP_LSE_PUSH_TP8; the wide-row cell at 12/16/20 rows passed with
+# bit-exact output — img-settle/l5-wide-results.json). MIX_SPLIT_ROWS arms L3's
+# split residual mix (timing cell + final-switch hang gate passed — cells/).
+# PREFILL_LATENT_GATHER arms L4's prefill latent gather (block limit unchanged
+# at 8; compile-key probe green — cells/ + the probe re-run under evidence/export).
+# L6 (candidate-merge radix) is NOT in the tree in either form: stripped at
+# 757b5140 per fable's HOLD; the radix branch stays on lever/L3L6-split-radix.
+LSE_PUSH="${LSE_PUSH:-1}"
+MIX_SPLIT_ROWS="${MIX_SPLIT_ROWS:-16}"
+PREFILL_LATENT_GATHER="${PREFILL_LATENT_GATHER:-1}"
 EXPECT_HEAD="${EXPECT_HEAD:-b4889fe5}"          # W23 code tip (MAX_ROWS 20, lever 1)
 EXPECT_FI="${EXPECT_FI:-c3f3912a2}"             # W23 flashinfer tip (top-16 cap 20; J-H: rider (a)+(c) ports reverted)
 # W13 lineage pins (re-pinned at W22): the tree the running serve's package is
@@ -212,6 +224,9 @@ if [ "$PREFILL_ISLAND" = 1 ]; then EXPORT_ARGS+=(--prefill-island-reduce); fi
 # W22: the row-5 direct decode table and the fused-pack rider.
 if [ "$TRELLIS_TABLE" != 0 ]; then EXPORT_ARGS+=(--trellis-prefill-table "$TRELLIS_TABLE"); fi
 if [ "$DECODE_FUSION" = 1 ]; then EXPORT_ARGS+=(--decode-fusion); fi
+# J-export: L3's split mix and L4's prefill latent gather as plan settings.
+if [ "$MIX_SPLIT_ROWS" != 0 ]; then EXPORT_ARGS+=(--mix-split-rows "$MIX_SPLIT_ROWS"); fi
+if [ "$PREFILL_LATENT_GATHER" = 1 ]; then EXPORT_ARGS+=(--prefill-latent-gather); fi
 
 MODE="${1:---check}"
 say() { echo "$*" >&2; }
@@ -239,11 +254,22 @@ chk() { if "$@"; then return 0; else fail=$((fail+1)); return 1; fi; }
 # ──                       five then-new route-step latent_down_rows races left
 # ──                       per-shard compile artifacts in the tail inventory;
 # ──                       with those selections cached the count is uniform.)
+# ──   2/1/1/1/1@757b5140  J-export ruled config (fable
+# ──                       levers/j-export-fable-review.md "Export config": L5
+# ──                       LSE push + L3 mix-split 16 + L4 prefill latent gather,
+# ──                       L6 stripped). FIRST EXPORT: the round-graph/kernel
+# ──                       fingerprint is unknowable before it (L1's fused
+# ──                       programs + the two new levers all move the count);
+# ──                       W11 supersede flow — proceed, record the measured
+# ──                       fingerprint here and run --reassert. Registered
+# ──                       placeholder JEXPORT-FIRST-EXPORT until then (the
+# ──                       post-export assertion flags the package by design).
 fp_baseline() {
   case "$TRELLIS_TABLE/$DECODE_FUSION/$R1_PUSH/$R3_ISLAND/$R3_ACQUIRE@$EXPECT_EXPORT_SRC" in
     2/1/1/1/1@ac377ae4) echo "Graphs: 66; kernels: 4904" ;;
     0/0/0/0/0@*) echo "Graphs: 66; kernels: 4967" ;;
     2/1/1/1/1@b4889fe5) echo "Graphs: 66; kernels: 4900" ;;
+    2/1/1/1/1@757b5140) echo "Graphs: 66; kernels: JEXPORT-FIRST-EXPORT" ;;
     *) echo "" ;;
   esac
 }
@@ -254,6 +280,7 @@ fp_baseline() {
 assert_pre_settings() {
   local bad=0 kv k v
   for kv in TRELLIS_TABLE=2 DECODE_FUSION=1 R1_PUSH=1 R3_ISLAND=1 R3_ACQUIRE=1 \
+            LSE_PUSH=1 MIX_SPLIT_ROWS=16 PREFILL_LATENT_GATHER=1 \
             PREFILL_FP8=0 PREFILL_ISLAND=1 IMAGE_CONCURRENCY=1 RING_ROWS=1024; do
     k="${kv%%=*}"; v="${kv##*=}"
     [ "${!k}" = "$v" ] || { say "PRE-SETTINGS: $k=${!k} deviates from the ruling ($kv) — tp9-jD-review.md §4 / tp9-jE-review.md; consult before export"; bad=$((bad+1)); }
@@ -261,9 +288,16 @@ assert_pre_settings() {
   case "$SPEC_TOKEN_CAPACITY" in 20|24) : ;;
     *) say "PRE-SETTINGS: SPEC_TOKEN_CAPACITY=$SPEC_TOKEN_CAPACITY must be 20 (primary) or 24 (K1 fallback)"; bad=$((bad+1));;
   esac
-  # Row 4's LSE reduce-scatter push stays OFF (speed rule failed).
-  case "${B12X_PCIE_DCP_LSE_PUSH_TP8:-0}" in 0|"") : ;;
-    *) say "PRE-SETTINGS: B12X_PCIE_DCP_LSE_PUSH_TP8=${B12X_PCIE_DCP_LSE_PUSH_TP8} — row 4 stays OFF (J-D §4)"; bad=$((bad+1));;
+  # Row 4's LSE reduce-scatter push: ARMED by the J-export ruling (fable
+  # levers/j-export-fable-review.md §1 L5 — the wide-row cell at 12/16/20 rows
+  # passed bit-exact and faster than pull; the J-D speed-rule failure is dead).
+  # The switch is exported by --run after this preflight, so an UNSET var is
+  # consistent here; assert_settings verifies the recorded export env carries it.
+  case "$LSE_PUSH:${B12X_PCIE_DCP_LSE_PUSH_TP8:-unset}" in
+    1:unset|1:1) : ;;
+    1:*) say "PRE-SETTINGS: LSE_PUSH=1 but B12X_PCIE_DCP_LSE_PUSH_TP8='${B12X_PCIE_DCP_LSE_PUSH_TP8:-}' — the push must be armed (or unset for --run to arm it) (J-export §1)"; bad=$((bad+1));;
+    0:unset|0:0) : ;;
+    *) say "PRE-SETTINGS: LSE_PUSH=$LSE_PUSH with B12X_PCIE_DCP_LSE_PUSH_TP8 set — inconsistent arming"; bad=$((bad+1));;
   esac
   # W23-C rider verdicts (tp9-jG-review.md sections 2/4): all three J-G rider
   # switches stay UNSET. Rider (a) failed its 20-row condition (bit-exact but
@@ -356,6 +390,7 @@ assert_settings() {
   local args_line; args_line=$(grep -m1 '^=== args ' "$log" || true)
   for expected in "--prefill-dma-ring-rows $RING_ROWS" "--prefill-dma-bf16" "--trellis-prefill-shapes" \
                   "--image-concurrency $IMAGE_CONCURRENCY" "--speculative-token-capacity $SPEC_TOKEN_CAPACITY" \
+                  "--mix-split-rows $MIX_SPLIT_ROWS" "--prefill-latent-gather" \
                   "--block-verification"; do
     case " $args_line " in *" $expected "*) : ;;
       *) say "ASSERT: recorded invocation misses '$expected'"; bad=$((bad+1));;
@@ -379,7 +414,7 @@ assert_settings() {
     esac
   fi
   local env_line; env_line=$(grep -m1 '^=== env ' "$log" || true)
-  for pair in "R1_PUSH:B12X_PCIE_DCP_PAIR_PUSH" "R3_ISLAND:B12X_PCIE_DCP_GATHER_ISLAND" "R3_ACQUIRE:B12X_PCIE_DCP_GATHER_ACQUIRE"; do
+  for pair in "R1_PUSH:B12X_PCIE_DCP_PAIR_PUSH" "R3_ISLAND:B12X_PCIE_DCP_GATHER_ISLAND" "R3_ACQUIRE:B12X_PCIE_DCP_GATHER_ACQUIRE" "LSE_PUSH:B12X_PCIE_DCP_LSE_PUSH_TP8"; do
     knob="${pair%%:*}"; envname="${pair##*:}"
     if [ "${!knob}" = 1 ]; then
       case " $env_line " in *"$envname=1"*) : ;;
@@ -390,7 +425,9 @@ assert_settings() {
   # W23-C verdicts: the rider / lever-2 switches must be ABSENT from the
   # recorded export env (J-G section 6 with the rider switches per the W23-C
   # rider-(a) 20-row cell and the rider-(c) dense re-race precondition).
-  for name in B12X_TRELLIS_INKERNEL_ROUTE_PACK B12X_TRELLIS_FLOW_FLAGS B12X_A16_SPLITK_REDUCE_PDL B12X_MXFP8_A16_DECODE_W4_TK64 B12X_MXFP8_A16_DECODE_MAX_ROWS B12X_PCIE_DCP_LSE_PUSH_TP8; do
+  # B12X_PCIE_DCP_LSE_PUSH_TP8 is no longer in this list: the J-export ruling
+  # arms it (asserted present above, like the W22 transport switches).
+  for name in B12X_TRELLIS_INKERNEL_ROUTE_PACK B12X_TRELLIS_FLOW_FLAGS B12X_A16_SPLITK_REDUCE_PDL B12X_MXFP8_A16_DECODE_W4_TK64 B12X_MXFP8_A16_DECODE_MAX_ROWS; do
     case "$env_line" in *"$name="*)
       say "ASSERT: recorded export env sets $name (must be UNSET per the W23-C verdicts / J-D §4)"; bad=$((bad+1));;
     esac
@@ -607,6 +644,12 @@ for name in $(compgen -v | grep -E '^(IGNITION_KIMI_|B12X_)' || true); do
   if [ "$name" = B12X_PCIE_DCP_PAIR_PUSH ] && [ "$R1_PUSH" = 1 ] && [ "${!name}" = 1 ]; then continue; fi
   if [ "$name" = B12X_PCIE_DCP_GATHER_ISLAND ] && [ "$R3_ISLAND" = 1 ] && [ "${!name}" = 1 ]; then continue; fi
   if [ "$name" = B12X_PCIE_DCP_GATHER_ACQUIRE ] && [ "$R3_ACQUIRE" = 1 ] && [ "${!name}" = 1 ]; then continue; fi
+  # J-export: row 4's LSE push rides the LSE_PUSH knob; the compile-key logging
+  # switch is observability-only (it prints b12x cute.compile keys/labels and
+  # changes no compile key or captured behaviour) and carries the LSE launcher
+  # compile-key engagement evidence for the §4 export-log checks.
+  if [ "$name" = B12X_PCIE_DCP_LSE_PUSH_TP8 ] && [ "$LSE_PUSH" = 1 ] && [ "${!name}" = 1 ]; then continue; fi
+  if [ "$name" = B12X_LOG_CUTE_COMPILES ] && [ "${!name}" = 1 ]; then continue; fi
   say "GUARD: unaccounted switch environment ${name}='${!name}' (accounted: B12X_W4A16_SMALL_M_SPLITK=1 and the armed W22 transport switches)"
   env_bad=$((env_bad+1))
 done
@@ -691,6 +734,7 @@ if [ "$MODE" = --detach ]; then
     --setenv=PYTHONPATH="$PYTHONPATH" --setenv=B12X_W4A16_SMALL_M_SPLITK=1 --setenv=PREFILL_FP8="$PREFILL_FP8" --setenv=SPEC_TOKEN_CAPACITY="$SPEC_TOKEN_CAPACITY" --setenv=REUSE_WEIGHTS="$REUSE_WEIGHTS" \
     --setenv=TRELLIS_TABLE="$TRELLIS_TABLE" --setenv=DECODE_FUSION="$DECODE_FUSION" \
     --setenv=R1_PUSH="$R1_PUSH" --setenv=R3_ISLAND="$R3_ISLAND" --setenv=R3_ACQUIRE="$R3_ACQUIRE" \
+    --setenv=LSE_PUSH="$LSE_PUSH" --setenv=MIX_SPLIT_ROWS="$MIX_SPLIT_ROWS" --setenv=PREFILL_LATENT_GATHER="$PREFILL_LATENT_GATHER" \
     -p LimitNOFILE=1048576 -p LimitMEMLOCK=infinity --working-directory="$REPO" \
     /bin/bash "$SELF" --run
   say "detached unit: $unit   log: $LOG   follow: journalctl -u $unit -f / tail -f $LOG"
@@ -714,10 +758,17 @@ W22_SWITCHES=""
 if [ "$R1_PUSH" = 1 ]; then export B12X_PCIE_DCP_PAIR_PUSH=1; W22_SWITCHES="$W22_SWITCHES B12X_PCIE_DCP_PAIR_PUSH=1"; fi
 if [ "$R3_ISLAND" = 1 ]; then export B12X_PCIE_DCP_GATHER_ISLAND=1; W22_SWITCHES="$W22_SWITCHES B12X_PCIE_DCP_GATHER_ISLAND=1"; fi
 if [ "$R3_ACQUIRE" = 1 ]; then export B12X_PCIE_DCP_GATHER_ACQUIRE=1; W22_SWITCHES="$W22_SWITCHES B12X_PCIE_DCP_GATHER_ACQUIRE=1"; fi
-echo "=== env check: B12X_PCIE_DMA_PIECES='${B12X_PCIE_DMA_PIECES:-}' (must be empty) B12X_W4A16_SMALL_M_SPLITK='$B12X_W4A16_SMALL_M_SPLITK' IGNITION_KIMI_PREFILL_DMA_ROWS='${IGNITION_KIMI_PREFILL_DMA_ROWS:-}' W22:$W22_SWITCHES TRELLIS_TABLE=$TRELLIS_TABLE DECODE_FUSION=$DECODE_FUSION"
+# J-export: row 4's LSE reduce-scatter push (fable §1 L5, wide-row cell passed).
+JEXPORT_SWITCHES=""
+if [ "$LSE_PUSH" = 1 ]; then export B12X_PCIE_DCP_LSE_PUSH_TP8=1; JEXPORT_SWITCHES="$JEXPORT_SWITCHES B12X_PCIE_DCP_LSE_PUSH_TP8=1"; fi
+# Observability-only: log every b12x cute.compile key/label (hit or miss) so the
+# export record carries the LSE launcher compile keys per rank (§4 fingerprint).
+export B12X_LOG_CUTE_COMPILES=1
+JEXPORT_SWITCHES="$JEXPORT_SWITCHES B12X_LOG_CUTE_COMPILES=1"
+echo "=== env check: B12X_PCIE_DMA_PIECES='${B12X_PCIE_DMA_PIECES:-}' (must be empty) B12X_W4A16_SMALL_M_SPLITK='$B12X_W4A16_SMALL_M_SPLITK' IGNITION_KIMI_PREFILL_DMA_ROWS='${IGNITION_KIMI_PREFILL_DMA_ROWS:-}' W22:$W22_SWITCHES JEXPORT:$JEXPORT_SWITCHES TRELLIS_TABLE=$TRELLIS_TABLE DECODE_FUSION=$DECODE_FUSION MIX_SPLIT_ROWS=$MIX_SPLIT_ROWS PREFILL_LATENT_GATHER=$PREFILL_LATENT_GATHER"
 { echo "=== export start $(date -Is) tree $(git rev-parse HEAD) flashinfer $(git -C "$FI" rev-parse HEAD) free ${free}G avail ${avail}G"
   echo "=== gpus $GPU_LIST"; echo "=== args ${EXPORT_ARGS[*]}"
-  echo "=== env B12X_W4A16_SMALL_M_SPLITK=1 B12X_PCIE_DMA_PIECES=unset IGNITION_KIMI_PREFILL_DMA_*=unset$W22_SWITCHES TRELLIS_TABLE=$TRELLIS_TABLE DECODE_FUSION=$DECODE_FUSION"; } >>"$LOG"
+  echo "=== env B12X_W4A16_SMALL_M_SPLITK=1 B12X_PCIE_DMA_PIECES=unset IGNITION_KIMI_PREFILL_DMA_*=unset$W22_SWITCHES$JEXPORT_SWITCHES TRELLIS_TABLE=$TRELLIS_TABLE DECODE_FUSION=$DECODE_FUSION MIX_SPLIT_ROWS=$MIX_SPLIT_ROWS PREFILL_LATENT_GATHER=$PREFILL_LATENT_GATHER"; } >>"$LOG"
 "$PYV" -m ignition export "$SNAP" "${EXPORT_ARGS[@]}" >>"$LOG" 2>&1 &
 E=$!
 while kill -0 $E 2>/dev/null; do
