@@ -65,9 +65,11 @@ record("no environment gate", not env_gate,
        "FLARE_KIMI3_PREFILL_DUAL_WAVE absent from decoder.py and bootstrap.py"
        if not env_gate else "UPSTREAM ENV SWITCH STILL PRESENT")
 stamps = recipe_source.count('os.environ["B12X_W4A16_NONCOOP_PREFILL_SMS"]')
-record("the launch knob is the only stamped environment", stamps == 1,
-       f"recipe.py stamps B12X_W4A16_NONCOOP_PREFILL_SMS exactly once (count={stamps});"
-       " it is the capped expert launch knob, stamped only when prefill_dual_wave is armed")
+record("no SM-cap stamp (F4)", stamps == 0,
+       "recipe.py stamps B12X_W4A16_NONCOOP_PREFILL_SMS zero times (F4 removed the stamp;"
+       " the w4a16_prefill_sms reader stays landed in b12x and is re-stamped only on"
+       " armed A/B evidence)" if stamps == 0
+       else f"recipe.py still stamps B12X_W4A16_NONCOOP_PREFILL_SMS (count={stamps})")
 
 # ── 1. identity-chain witnesses (the J-H chain) ───────────────────────────────
 import b12x  # noqa: E402

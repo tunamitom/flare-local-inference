@@ -170,13 +170,22 @@ def test_armed_preparation_selects_the_direct_ring_wire(monkeypatch):
                                                   ipc=None, bf16_direct=True, wire_mode="mx")
 
 
-def test_capped_expert_launch_stamps_only_when_armed(monkeypatch):
+def test_sm_cap_is_not_stamped_armed_or_not(monkeypatch):
+    # F4 (l9-transplant-fable-review.md §5): the B12X_W4A16_NONCOOP_PREFILL_SMS
+    # stamp is gone from the recipe. It is process-wide, so it capped every
+    # prefill expert launch — serial graphs included — for no measured gain, on a
+    # guessed consumer. The knob's reader (b12x w4a16_prefill_sms, flashinfer
+    # test_w4a16_prefill_sms.py) stays landed; the stamp returns only on armed
+    # A/B evidence.
     import os
 
-    from ignition.recipes.kimi3.recipe import DUAL_WAVE_NONCOOP_PREFILL_SMS, stamp_dual_wave_launch_env
+    from ignition.recipes.kimi3 import recipe
+    from ignition.recipes.kimi3.recipe import DUAL_WAVE_NONCOOP_PREFILL_SMS
 
     monkeypatch.delenv("B12X_W4A16_NONCOOP_PREFILL_SMS", raising=False)
-    stamp_dual_wave_launch_env(SimpleNamespace(prefill_dual_wave=False))
-    assert "B12X_W4A16_NONCOOP_PREFILL_SMS" not in os.environ
-    stamp_dual_wave_launch_env(SimpleNamespace(prefill_dual_wave=True))
-    assert os.environ["B12X_W4A16_NONCOOP_PREFILL_SMS"] == DUAL_WAVE_NONCOOP_PREFILL_SMS == "170"
+    assert not hasattr(recipe, "stamp_dual_wave_launch_env"), \
+        "the armed recipe must not stamp the SM cap (F4)"
+    source = open(recipe.__file__).read()
+    assert 'os.environ["B12X_W4A16_NONCOOP_PREFILL_SMS"]' not in source, \
+        "recipe.py must not stamp B12X_W4A16_NONCOOP_PREFILL_SMS (F4)"
+    assert DUAL_WAVE_NONCOOP_PREFILL_SMS == "170"  # the documented value, unstamped

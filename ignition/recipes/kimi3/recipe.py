@@ -11,20 +11,12 @@ from types import MappingProxyType
 from ignition.recipes.declaration import Checkpoint, RankCosts, RankUsage, Recipe, SamplingDefaults, SamplingRange, Speculation
 
 
-# L9 capped expert launches: the W4A16 prefill MoE SM cap stamped beside the
-# other b12x launch switches when the dual-wave schedule is armed (g0san's
-# final figure, 3058229: 170 of 188 SMs during overlapped dual-wave prefill).
+# F4 (l9-transplant-fable-review.md §5): the B12X_W4A16_NONCOOP_PREFILL_SMS
+# stamp is gone from the armed recipe. The knob's reader (b12x w4a16_prefill_sms,
+# lever-l9-fi 83c0f6b3a) stays landed, but the stamp is process-wide — it capped
+# every prefill expert launch (serial graphs included) for no measured gain, on a
+# guessed consumer. Bring the stamp back only on armed A/B evidence.
 DUAL_WAVE_NONCOOP_PREFILL_SMS = "170"
-
-
-def stamp_dual_wave_launch_env(plan):
-    """Stamp the dual-wave launch switches into the preparation environment.
-
-    The knob's consumer is b12x's W4A16 prefill launch geometry
-    (w4a16_prefill_sms); an unset knob keeps the device's full SM count.
-    """
-    if plan.prefill_dual_wave:
-        os.environ["B12X_W4A16_NONCOOP_PREFILL_SMS"] = DUAL_WAVE_NONCOOP_PREFILL_SMS
 
 
 def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False,
@@ -101,7 +93,6 @@ def prepare_variant(snapshot, plan, *, bootstrap, draft_repository, draft_revisi
         # launches (B12X_W4A16_PREFILL_TABLE=1|2 at kernel compile time),
         # same stamping contract as the R3 shapes above.
         os.environ["B12X_W4A16_PREFILL_TABLE"] = plan.trellis_prefill_table
-    stamp_dual_wave_launch_env(plan)
     if plan.decode_fusion:
         # W22 rider: the fused decode score/ID pack (bit-equal), stamped
         # before the decode glue prepares.
