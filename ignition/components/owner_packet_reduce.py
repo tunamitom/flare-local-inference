@@ -98,3 +98,73 @@ class PreparedOwnerPacketAllReduce:
             reduce(packet)
             output[:, first:end].copy_(packet)
         return self.output
+
+
+def direct_aligned_extent(elements, world):
+    """Elements per rank aligned to 256 so two pieces stay 128-element aligned on direct rings.
+
+    L9 (bcc93b3): a direct BF16/FP24 ring reduces shards of 128-element groups;
+    the per-rank extent rounds up to a multiple of 256 elements so a payload
+    split in two ring pieces keeps both pieces group-aligned.
+    """
+    if type(elements) is not int or elements <= 0 or type(world) is not int or world <= 0:
+        raise ValueError("aligned extents require positive element and rank counts")
+    groups = world * 256
+    return -(-elements // groups) * 256
+
+
+class PreparedDirectRingAllReduce:
+    """Zero-copy BF16 reduction on a direct BF16/FP24 copy-engine ring channel.
+
+    L9 (bcc93b3): the channel sums the caller's BF16 matrices in place (or
+    through caller-owned padded BF16 staging when the extent is unaligned),
+    with no FP32 owner packets. Input and output may be exact aliases or
+    disjoint; unaligned shapes copy through `staging`, which must be disjoint
+    caller-owned BF16 storage of at least `direct_aligned_extent(elements,
+    world) * world` elements. Calls sharing the channel serialize.
+    """
+
+    def __init__(self, source, output, *, runtime, session, coordinator, name, staging=None):
+        if not isinstance(runtime, DmaAllReduce) or not getattr(runtime, "direct_mode", ""):
+            raise ValueError("a direct ring reduction requires a channel with bf16_direct or fp24_ring")
+        if (source.ndim != 2 or source.numel() == 0 or source.dtype != torch.bfloat16
+                or output.shape != source.shape or output.dtype != source.dtype
+                or source.device != output.device or not source.is_contiguous() or not output.is_contiguous()):
+            raise ValueError("a direct ring reduction requires matching contiguous BF16 matrices")
+        world, elements = runtime.world_size, source.numel()
+        extent = direct_aligned_extent(elements, world)
+        self.output, self.elements, self.padded = output, elements, None
+        if extent * world == elements:
+            self.reduce = PreparedAllReduce(source, output, runtime=runtime, session=session,
+                                            coordinator=coordinator, name=name + '.direct')
+            return
+        if (staging is None or staging.device != source.device or staging.dtype != source.dtype
+                or not staging.is_contiguous() or staging.numel() < extent * world):
+            raise ValueError("unaligned direct ring reductions require caller-owned padded BF16 staging")
+        self.padded = staging[: extent * world]
+        packet = self.padded.view(world, extent)
+        self.reduce = PreparedAllReduce(packet, packet, runtime=runtime, session=session,
+                                        coordinator=coordinator, name=name + '.direct')
+        self.packet = packet
+
+    def __call__(self, source):
+        if self.padded is None:
+            return self.reduce(source)
+        self.padded[: self.elements].copy_(source.view(-1))
+        self.reduce(self.packet)
+        self.output.view(-1).copy_(self.padded[: self.elements])
+        return self.output
+
+
+def copy_engine_reduction(source, output, *, runtime, workspace=None, staging=None,
+                          session=None, coordinator=None, name="reduction"):
+    """The copy-engine ring reduction for this channel: direct ring or FP32 owner packets.
+
+    L9: the dual-wave schedule drives the direct ring's zero-copy reduction;
+    other channels keep the exact owner-packet sums.
+    """
+    if getattr(runtime, "direct_mode", ""):
+        return PreparedDirectRingAllReduce(source, output, runtime=runtime, session=session,
+                                           coordinator=coordinator, name=name, staging=staging)
+    return PreparedOwnerPacketAllReduce(source, output, workspace=workspace, runtime=runtime,
+                                        session=session, coordinator=coordinator, name=name)

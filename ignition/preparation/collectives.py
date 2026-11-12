@@ -160,16 +160,28 @@ def create_result_broadcast_runtime(group, device, *, layouts, ipc=None):
 
 
 def create_dma_all_reduce_runtime(group, device, *, max_tokens, hidden_size, ipc=None, element_bytes=2,
-                                 wire_mode=None):
-    """Allocate a b12x copy-engine ring for prefill reductions in caller-owned shared storage."""
+                                 wire_mode=None, bf16_direct=False, fp24_ring=False):
+    """Allocate a b12x copy-engine ring for prefill reductions in caller-owned shared storage.
+
+    L9 (bcc93b3): `bf16_direct` and `fp24_ring` select the zero-copy direct ring
+    wire (FP32 or per-element IEEE binary24 intermediate payloads) that the
+    dual-wave schedule drives; both take two-byte activations without a
+    compressed wire.
+    """
     from b12x.comm.pcie import DmaAllReduce
 
     if any(type(value) is not int or value <= 0 for value in (max_tokens, hidden_size)):
         raise ValueError("all-reduce capacities must be positive integers")
     if element_bytes not in (2, 4):
         raise ValueError("all-reduce storage must use two- or four-byte elements")
+    if type(bf16_direct) is not bool or type(fp24_ring) is not bool or (bf16_direct and fp24_ring):
+        raise ValueError("bf16_direct and fp24_ring are mutually exclusive booleans")
+    if (bf16_direct or fp24_ring) and (wire_mode is not None or element_bytes != 2):
+        raise ValueError("direct BF16/FP24 rings take two-byte activations without a compressed wire")
     return DmaAllReduce(exchange_group=group, device=device, max_bytes=max_tokens * hidden_size * element_bytes,
-                        ipc=ipc, fp8=wire_mode)
+                        ipc=ipc, fp8=wire_mode,
+                        **({"bf16_direct": True} if bf16_direct else {}),
+                        **({"fp24_ring": True} if fp24_ring else {}))
 
 
 def create_head_exchange(group, device, *, max_rows, heads, head_dim, query_head_dim=None, ipc=None):
