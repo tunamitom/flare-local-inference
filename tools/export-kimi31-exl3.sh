@@ -266,11 +266,15 @@ chk() { if "$@"; then return 0; else fail=$((fail+1)); return 1; fi; }
 # ──                       launches; slab fingerprints unchanged at
 # ──                       217.69/49.89 MiB.
 fp_baseline() {
-  case "$TRELLIS_TABLE/$DECODE_FUSION/$R1_PUSH/$R3_ISLAND/$R3_ACQUIRE@$EXPECT_EXPORT_SRC" in
-    2/1/1/1/1@ac377ae4) echo "Graphs: 66; kernels: 4904" ;;
-    0/0/0/0/0@*) echo "Graphs: 66; kernels: 4967" ;;
-    2/1/1/1/1@b4889fe5) echo "Graphs: 66; kernels: 4900" ;;
-    2/1/1/1/1@757b5140) echo "Graphs: 66; kernels: 4318" ;;
+  # Registry key extended with the mix-split dimension at the J-export L3-dropped
+  # fallback (2026-11-12): configs predating the knob carry /0, the J-export
+  # ruled config carries /16. The L3-dropped fallback (/0 @757b5140) is the
+  # W11 supersede flow: unregistered until its measured fingerprint is recorded.
+  case "$TRELLIS_TABLE/$DECODE_FUSION/$R1_PUSH/$R3_ISLAND/$R3_ACQUIRE/${MIX_SPLIT_ROWS:-0}@$EXPECT_EXPORT_SRC" in
+    2/1/1/1/1/0@ac377ae4) echo "Graphs: 66; kernels: 4904" ;;
+    0/0/0/0/0/0@*) echo "Graphs: 66; kernels: 4967" ;;
+    2/1/1/1/1/0@b4889fe5) echo "Graphs: 66; kernels: 4900" ;;
+    2/1/1/1/1/16@757b5140) echo "Graphs: 66; kernels: 4318" ;;
     *) echo "" ;;
   esac
 }
@@ -281,11 +285,20 @@ fp_baseline() {
 assert_pre_settings() {
   local bad=0 kv k v
   for kv in TRELLIS_TABLE=2 DECODE_FUSION=1 R1_PUSH=1 R3_ISLAND=1 R3_ACQUIRE=1 \
-            LSE_PUSH=1 MIX_SPLIT_ROWS=16 PREFILL_LATENT_GATHER=1 \
+            LSE_PUSH=1 PREFILL_LATENT_GATHER=1 \
             PREFILL_FP8=0 PREFILL_ISLAND=1 IMAGE_CONCURRENCY=1 RING_ROWS=1024; do
     k="${kv%%=*}"; v="${kv##*=}"
     [ "${!k}" = "$v" ] || { say "PRE-SETTINGS: $k=${!k} deviates from the ruling ($kv) — tp9-jD-review.md §4 / tp9-jE-review.md; consult before export"; bad=$((bad+1)); }
   done
+  # L3's mix-split rows: 16 is the ruled value; 0 is the pre-authorized fallback
+  # (levers/j-export-fable-review.md §4 "If a gate fails": one graph-only export
+  # dropping the first suspect — triggered by the gate-3 decode-cell failure
+  # 2026-11-12, CUDA IMA at 4-stream 128k, first suspect L3 per the table).
+  case "$MIX_SPLIT_ROWS" in
+    16) : ;;
+    0) say "PRE-SETTINGS: MIX_SPLIT_ROWS=0 — L3 DROPPED under the §4 pre-authorized fallback (gate-3 failure 2026-11-12; first suspect L3). Fingerprint unregistered: record the measured 'Graphs: N; kernels: M' in fp_baseline() and run --reassert after the export." ;;
+    *) say "PRE-SETTINGS: MIX_SPLIT_ROWS=$MIX_SPLIT_ROWS must be 16 (ruled) or 0 (§4 pre-authorized L3 drop)"; bad=$((bad+1));;
+  esac
   case "$SPEC_TOKEN_CAPACITY" in 20|24) : ;;
     *) say "PRE-SETTINGS: SPEC_TOKEN_CAPACITY=$SPEC_TOKEN_CAPACITY must be 20 (primary) or 24 (K1 fallback)"; bad=$((bad+1));;
   esac
@@ -314,6 +327,13 @@ assert_pre_settings() {
     say "PRE-SETTINGS: fingerprint baseline registered for $key@$EXPECT_EXPORT_SRC: $(fp_baseline)"
   else
     case "$key@$EXPECT_EXPORT_SRC" in
+      2/1/1/1/1@757b5140)
+        if [ "$MIX_SPLIT_ROWS" = 0 ]; then
+          # J-export §4 pre-authorized fallback (L3 dropped after the gate-3
+          # failure, 2026-11-12): the L3-dropped kernel fingerprint is
+          # unknowable before the export — W11 supersede flow.
+          say "PRE-SETTINGS: WARNING — $key@$EXPECT_EXPORT_SRC with MIX_SPLIT_ROWS=0 is the §4 pre-authorized L3-dropped fallback with no registered fingerprint baseline; after the export record the memory-report fingerprint in fp_baseline and run --reassert"
+        fi ;;
       2/1/1/1/1@b4889fe5)
         # W23 ruled config, first export: the compiled kernel count is
         # unknowable before it (lever 1 swaps the route path at rows 9..20).
@@ -391,12 +411,24 @@ assert_settings() {
   local args_line; args_line=$(grep -m1 '^=== args ' "$log" || true)
   for expected in "--prefill-dma-ring-rows $RING_ROWS" "--prefill-dma-bf16" "--trellis-prefill-shapes" \
                   "--image-concurrency $IMAGE_CONCURRENCY" "--speculative-token-capacity $SPEC_TOKEN_CAPACITY" \
-                  "--mix-split-rows $MIX_SPLIT_ROWS" "--prefill-latent-gather" \
+                  "--prefill-latent-gather" \
                   "--block-verification"; do
     case " $args_line " in *" $expected "*) : ;;
       *) say "ASSERT: recorded invocation misses '$expected'"; bad=$((bad+1));;
     esac
   done
+  # L3's mix-split rows: asserted present at the ruled value; asserted ABSENT
+  # when MIX_SPLIT_ROWS=0 (the §4 pre-authorized L3 drop).
+  if [ "$MIX_SPLIT_ROWS" != 0 ]; then
+    case " $args_line " in *" --mix-split-rows $MIX_SPLIT_ROWS "*) : ;;
+      *) say "ASSERT: recorded invocation misses '--mix-split-rows $MIX_SPLIT_ROWS'"; bad=$((bad+1));;
+    esac
+  else
+    case " $args_line " in *" --mix-split-rows "*)
+      say "ASSERT: recorded invocation carries --mix-split-rows but MIX_SPLIT_ROWS=0 (§4 L3 drop)"; bad=$((bad+1));;
+    *) : ;;
+    esac
+  fi
   if [ "$PREFILL_ISLAND" = 1 ]; then
     case " $args_line " in *--prefill-island-reduce*) : ;;
       *) say "ASSERT: recorded invocation misses --prefill-island-reduce"; bad=$((bad+1));;
@@ -686,6 +718,8 @@ chk test "$TRELLIS_TABLE" = 0 -o "$TRELLIS_TABLE" = 1 -o "$TRELLIS_TABLE" = 2 \
   || say "GUARD: TRELLIS_TABLE $TRELLIS_TABLE must be 0, 1 or 2"
 chk test "$DECODE_FUSION" = 0 -o "$DECODE_FUSION" = 1 \
   || say "GUARD: DECODE_FUSION $DECODE_FUSION must be 0 or 1"
+chk test "$MIX_SPLIT_ROWS" = 0 -o "$MIX_SPLIT_ROWS" = 16 \
+  || say "GUARD: MIX_SPLIT_ROWS $MIX_SPLIT_ROWS must be 16 (ruled) or 0 (§4 pre-authorized L3 drop)"
 for knob in R1_PUSH R3_ISLAND R3_ACQUIRE; do
   val="${!knob}"
   chk test "$val" = 0 -o "$val" = 1 || say "GUARD: $knob $val must be 0 or 1"
