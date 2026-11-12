@@ -257,19 +257,20 @@ chk() { if "$@"; then return 0; else fail=$((fail+1)); return 1; fi; }
 # ──   2/1/1/1/1@757b5140  J-export ruled config (fable
 # ──                       levers/j-export-fable-review.md "Export config": L5
 # ──                       LSE push + L3 mix-split 16 + L4 prefill latent gather,
-# ──                       L6 stripped). FIRST EXPORT: the round-graph/kernel
-# ──                       fingerprint is unknowable before it (L1's fused
-# ──                       programs + the two new levers all move the count);
-# ──                       W11 supersede flow — proceed, record the measured
-# ──                       fingerprint here and run --reassert. Registered
-# ──                       placeholder JEXPORT-FIRST-EXPORT until then (the
-# ──                       post-export assertion flags the package by design).
+# ──                       L6 stripped). Registered from the first J-export
+# ──                       package gb202-tp8-202611120130 (export-
+# ──                       20261112-jexport.log, all 8 ranks uniform): 4318
+# ──                       kernels, -582 vs W23's 4900 — L1's fused decode
+# ──                       programs (the 518-node round-graph cut), L3's mix
+# ──                       split and L4's gather branch net out the remaining
+# ──                       launches; slab fingerprints unchanged at
+# ──                       217.69/49.89 MiB.
 fp_baseline() {
   case "$TRELLIS_TABLE/$DECODE_FUSION/$R1_PUSH/$R3_ISLAND/$R3_ACQUIRE@$EXPECT_EXPORT_SRC" in
     2/1/1/1/1@ac377ae4) echo "Graphs: 66; kernels: 4904" ;;
     0/0/0/0/0@*) echo "Graphs: 66; kernels: 4967" ;;
     2/1/1/1/1@b4889fe5) echo "Graphs: 66; kernels: 4900" ;;
-    2/1/1/1/1@757b5140) echo "Graphs: 66; kernels: JEXPORT-FIRST-EXPORT" ;;
+    2/1/1/1/1@757b5140) echo "Graphs: 66; kernels: 4318" ;;
     *) echo "" ;;
   esac
 }
