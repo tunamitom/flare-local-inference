@@ -921,6 +921,12 @@ class PreparedDecoder:
             self.comm_priority_stream = torch.cuda.Stream(device=source.device, priority=-1)
             self.comm_stream_handle = self.comm_priority_stream.cuda_stream
             self.comp_stream_handle = workspace.auxiliary_stream.cuda_stream
+            # G1 capture fix: Dynamo fullgraph capture forbids stream constructors
+            # (ExternalStream.__new__ is skipped-marked), so the wave-split schedule
+            # must reference stream objects built ONCE here at construction. The
+            # handles stay the captured-graph inputs they always were.
+            self.comm_stream = torch.cuda.ExternalStream(self.comm_stream_handle, device=source.device)
+            self.comp_stream = torch.cuda.ExternalStream(self.comp_stream_handle, device=source.device)
             self.dual_layers = []
         for index, w in enumerate(weights.layers):
             prefix = f"{name}.layer{index}"
@@ -1197,8 +1203,10 @@ class PreparedDecoder:
         db.num_seqs.copy_(act_b.to(torch.int32)[:1])
 
         main = torch.cuda.current_stream(delta.device)
-        comm = torch.cuda.ExternalStream(self.comm_stream_handle, device=delta.device)
-        comp = torch.cuda.ExternalStream(self.comp_stream_handle, device=delta.device)
+        # G1 capture fix: the streams are construction-time objects (their
+        # constructors cannot run inside Dynamo's fullgraph capture).
+        comm = self.comm_stream
+        comp = self.comp_stream
         res_a = self.residual.substream(0, half)
         res_b = self.residual.substream(half, 2 * half)
         attn_in = self.residual.output
