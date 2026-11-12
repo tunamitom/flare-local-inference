@@ -276,6 +276,15 @@ fp_baseline() {
     2/1/1/1/1/0@b4889fe5) echo "Graphs: 66; kernels: 4900" ;;
     2/1/1/1/1/16@757b5140) echo "Graphs: 66; kernels: 4318" ;;
     2/1/1/1/1/0@757b5140) echo "Graphs: 66; kernels: 4318" ;;
+    # J-fault fix export (levers/j-fault-fable-review.md §2/§3.2): the fix moves
+    # the hoist's four tables to private torch.zeros storage and rides the §3.1
+    # in-export overlap gate — no graph node, kernel or compile key changes, so
+    # the ruled config's fingerprint is identical to the reference package
+    # gb202-tp8-202611120130 by contract (value measured there: 4318 kernels
+    # uniform on 8 ranks, slab 217.69 / index_slab 49.89 MiB unchanged). A
+    # measured deviation still fails the post-export assertion and flags the
+    # package instead of passing silently.
+    2/1/1/1/1/16@4b3ca8c5) echo "Graphs: 66; kernels: 4318" ;;
     *) echo "" ;;
   esac
 }
