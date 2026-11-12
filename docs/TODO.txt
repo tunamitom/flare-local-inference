@@ -192,3 +192,12 @@
     MoE, GLM KDA/MLA, and other attention consumers with their checkpoints.
     Qwen3.8 dense layer1 output exposed BF16 atomic replay errors beyond the
     shared operator bounds. Checkpoint coverage for these other consumers remains pending.
+
+[ ] The shipped hop ring (_run_prepared in flashinfer pcie_dma.py) has the same
+    unordered structure the direct ring died on: a rank's wait for hop k and its
+    own send of hop k are independent nodes with no event edge. Eager execution
+    and the shipped replay shapes have a long clean record, but a captured graph
+    executor that serializes the wait first deadlocks every rank on unsent flags
+    (the L9 queued-replay stall; the direct ring's fix is one published[] event
+    edge in _run_direct_bf16, f6fdadc53). Apply the same publish-to-wait edge if
+    the hop ring ever enters a captured multi-node graph with queued replays.
