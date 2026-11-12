@@ -276,7 +276,28 @@ fp_baseline() {
     2/1/1/1/1/0@b4889fe5) echo "Graphs: 66; kernels: 4900" ;;
     2/1/1/1/1/16@757b5140) echo "Graphs: 66; kernels: 4318" ;;
     2/1/1/1/1/0@757b5140) echo "Graphs: 66; kernels: 4318" ;;
-    # J-fault fix export (levers/j-fault-fable-review.md §2/§3.2): the fix moves
+    # ──   2/1/1/1/1/16@ad1bdbee  score-exchange export (levers/j-missed-fable-review.md
+    # ──                       §2 "If it is exported"; plan setting ARMED by default).
+    # ──                       FIRST EXPORT: the round-graph/kernel fingerprint is
+    # ──                       unknowable before it (the armed default exits the
+    # ──                       flare.candidate_merge family's 6 per-stage functions
+    # ──                       from the 22 decode/verify graphs and enters the
+    # ──                       flare.candidate_share family + the
+    # ──                       ignition::pack_candidate_keys launcher); W11 supersede
+    # ──                       flow — proceed, record the measured fingerprint here
+    # ──                       and run --reassert. Registered placeholder
+    # ──                       SCOREX-FIRST-EXPORT until then (the post-export
+    # ──                       assertion flags the package by design). The graph
+    # ──                       catalog is shape-determined and unchanged at 66.
+    # ──                       Derived census expectations (recorded, checked
+    # ──                       per-graph after the export): the pair chain
+    # ──                       _pack_pairs+_count+_compact+row-topk+_threshold+
+    # ──                       _counts+_select = 7 nodes x 24 sparse stages leaves
+    # ──                       each decode/verify graph; the share chain
+    # ──                       _pack_keys+row-topk+_select_share = 3 nodes x 24
+    # ──                       enters (+ the gather-wire substitution on the
+    # ──                       selections channel, measured from the delta).
+    # ──   2/1/1/1/1/16@4b3ca8c5  J-fault fix export (levers/j-fault-fable-review.md §2/§3.2): the fix moves
     # the hoist's four tables to private torch.zeros storage and rides the §3.1
     # in-export overlap gate — no graph node, kernel or compile key changes, so
     # the ruled config's fingerprint is identical to the reference package
@@ -285,6 +306,8 @@ fp_baseline() {
     # measured deviation still fails the post-export assertion and flags the
     # package instead of passing silently.
     2/1/1/1/1/16@4b3ca8c5) echo "Graphs: 66; kernels: 4318" ;;
+    # score-exchange first export: the designed placeholder above; W11 supersede flow.
+    2/1/1/1/1/16@ad1bdbee) echo "Graphs: 66; kernels: SCOREX-FIRST-EXPORT" ;;
     *) echo "" ;;
   esac
 }
