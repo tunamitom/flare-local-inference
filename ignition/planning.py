@@ -247,6 +247,13 @@ class Plan:
     # verification and draft graphs are unchanged. Default off keeps the
     # shipped prefill arithmetic byte-identical as the rollback.
     prefill_latent_gather: bool = False
+    # J-missed §2 (upstream 8b1be5b): decode and verification rows of a sparse
+    # layer exchange one FP32 score per candidate slot (8,192 bytes per row and
+    # rank) and each rank selects its own share of the global top-2,048,
+    # instead of gathering (score, position) pairs (16,384 bytes) and merging
+    # them on every rank. Armed by default; --no-score-exchange restores the
+    # pair exchange. A plan setting, never an environment switch.
+    score_exchange: bool = True
     # The plan prepares no vision encoder and serves text requests only.
     language_model_only: bool = False
     benchmark_selection: BenchmarkSelection | None = None
@@ -330,6 +337,8 @@ class Plan:
             raise UsageError("--mix-split-rows supports the Kimi K3/K3.1 recipes")
         if self.prefill_latent_gather and self.recipe.name not in ("kimi3", "kimi31"):
             raise UsageError("--prefill-latent-gather supports the Kimi K3/K3.1 recipes")
+        if not self.score_exchange and self.recipe.name not in ("kimi3", "kimi31"):
+            raise UsageError("--no-score-exchange supports the Kimi K3/K3.1 recipes")
 
     @property
     def world_size(self) -> int:
@@ -455,6 +464,7 @@ class Plan:
             "decode_fusion": self.decode_fusion,
             "mix_split_rows": self.mix_split_rows,
             "prefill_latent_gather": self.prefill_latent_gather,
+            "score_exchange": self.score_exchange,
             "speculation": None if self.speculation is None else {
                 "draft_tokens": self.speculation.draft_tokens, "adaptive": self.speculation.adaptive,
                 **({} if self.speculation.method is None else {"method": self.speculation.method}),
@@ -496,7 +506,7 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
         trellis_prefill_shapes: bool = False,
         trellis_prefill_table: str = "0",
         decode_fusion: bool = False,
-        mix_split_rows: int = 0, prefill_latent_gather: bool = False,
+        mix_split_rows: int = 0, prefill_latent_gather: bool = False, score_exchange: bool = True,
         language_model_only: bool = False, mla_compute_mode: str | None = None) -> Plan:
     """Size pages and the prefix cache to the supply; the result may not fit.
 
@@ -564,6 +574,7 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
                 decode_fusion=decode_fusion,
                 mix_split_rows=mix_split_rows,
                 prefill_latent_gather=prefill_latent_gather,
+                score_exchange=score_exchange,
                 language_model_only=language_model_only)
     available = plan.supply_bytes - plan.fixed_bytes
     target = min(CACHE_STATES_PER_REQUEST * concurrency, max(1, available // costs.state_row_bytes))
@@ -625,7 +636,7 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
         trellis_prefill_shapes: bool = False,
         trellis_prefill_table: str = "0",
         decode_fusion: bool = False,
-        mix_split_rows: int = 0, prefill_latent_gather: bool = False,
+        mix_split_rows: int = 0, prefill_latent_gather: bool = False, score_exchange: bool = True,
         language_model_only: bool = False, mla_compute_mode: str | None = None) -> Plan:
     """Select GPUs and size the plan, or raise a capacity error that lists working settings.
 
@@ -712,6 +723,7 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
                 decode_fusion=decode_fusion,
                 mix_split_rows=mix_split_rows,
                 prefill_latent_gather=prefill_latent_gather,
+                score_exchange=score_exchange,
                    language_model_only=language_model_only,
                    mla_compute_mode=mla_compute_mode)
 

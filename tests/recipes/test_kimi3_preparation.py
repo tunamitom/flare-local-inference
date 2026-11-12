@@ -62,7 +62,7 @@ def test_preparation_preserves_declared_context_above_estimated_physical_capacit
         prefill_island_reduce=False,
         prefill_dma_ring_rows=0, prefill_dma_bf16=False,
         trellis_prefill_shapes=False, trellis_prefill_table="0", decode_fusion=False,
-        mix_split_rows=16, prefill_latent_gather=False,
+        mix_split_rows=16, prefill_latent_gather=False, score_exchange=True,
         context_parallel=True, language_model_only=True)
     bootstrap = SimpleNamespace(PreparationConfig=config_type,
         prepare_rank=lambda snapshot, config, **kwargs: config)
@@ -89,7 +89,7 @@ def test_plan_settings_reach_the_preparation_config(config_type, monkeypatch):
         prefill_fp8_transport=False, prefill_island_reduce=False,
         prefill_dma_ring_rows=0, prefill_dma_bf16=False,
         trellis_prefill_shapes=False, trellis_prefill_table="0", decode_fusion=False,
-        mix_split_rows=16, prefill_latent_gather=False,
+        mix_split_rows=16, prefill_latent_gather=False, score_exchange=False,
         context_parallel=True, language_model_only=True)
     bootstrap = SimpleNamespace(PreparationConfig=config_type,
         prepare_rank=lambda snapshot, config, **kwargs: config)
@@ -97,5 +97,8 @@ def test_plan_settings_reach_the_preparation_config(config_type, monkeypatch):
         draft_repository="unused", draft_revision="unused", compile_forwards=True,
         kernel_cache=None, progress=None)
     assert prepared.mix_split_rows == 16
+    # J-missed §2: the score exchange threads the same way and is armed by default.
+    assert prepared.score_exchange is False
     defaults = config_type()
     assert defaults.mix_split_rows == 0
+    assert defaults.score_exchange is True

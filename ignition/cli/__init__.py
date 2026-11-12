@@ -288,6 +288,13 @@ def _preparation_arguments(running, *, model_default="defaults.model"):
                                " results: one FP32 full-K dot product rounded to BF16 once per latent"
                                " value, better relative error to float64; prefill graphs only;"
                                " Kimi K3/K3.1)")
+    advanced.add_argument("--no-score-exchange", action="store_true",
+                          help="drop the sparse-layer candidate-score exchange: gather every rank's"
+                               " (score, position) candidate pairs (16,384 bytes per row and rank)"
+                               " and merge the global top-2,048 on every rank instead of exchanging"
+                               " one FP32 score per slot (8,192 bytes) and selecting this rank's"
+                               " share of the selection (decode and verification rows; equivalent"
+                               " for finite scores; Kimi K3/K3.1; default: exchange armed)")
     advanced.add_argument("--language-model-only", action="store_true",
                           help="prepare no vision encoder and reject images; its weights and scratch become KV"
                                " pages (recipes with a separable encoder; default: the recipe's image support)")

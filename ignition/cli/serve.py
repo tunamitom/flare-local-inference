@@ -207,6 +207,7 @@ def _export_hosts(args):
                          decode_fusion=args.decode_fusion,
                          mix_split_rows=args.mix_split_rows,
                          prefill_latent_gather=args.prefill_latent_gather,
+                         score_exchange=not args.no_score_exchange,
                          language_model_only=args.language_model_only,
                          mla_compute_mode=args.mla_compute_mode)
     collective_mode = collective_tuning_mode(configuration, model, args.collective_tuning)
@@ -299,6 +300,7 @@ def _prepare(args):
                       decode_fusion=args.decode_fusion,
                       mix_split_rows=args.mix_split_rows,
                       prefill_latent_gather=args.prefill_latent_gather,
+                      score_exchange=not args.no_score_exchange,
                       language_model_only=args.language_model_only,
                       mla_compute_mode=args.mla_compute_mode)
         indices = planning.format_gpus(gpu.index for gpu in plan.gpus)
@@ -481,6 +483,7 @@ def debug_serve(args) -> int:
                          expert_scale_compression=args.expert_scale_compression, online_mxfp8=args.online_mxfp8,
                          mix_split_rows=args.mix_split_rows,
                          prefill_latent_gather=args.prefill_latent_gather,
+                         score_exchange=not args.no_score_exchange,
                          language_model_only=args.language_model_only, mla_compute_mode=args.mla_compute_mode)
     collective_mode = collective_tuning_mode(configuration, model, args.collective_tuning)
     plan = replace(plan, compile_workers=compiler_workers(configuration, args.compile_workers), hub_cache=hub_cache,

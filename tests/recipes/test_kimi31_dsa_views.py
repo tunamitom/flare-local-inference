@@ -39,6 +39,7 @@ def construct(monkeypatch):
 
     monkeypatch.setattr(dsa, "prepare_projection", lambda *args, **kwargs: None)
     monkeypatch.setattr(dsa, "PreparedFP8Indexer", selector)
+    monkeypatch.setattr(dsa, "PreparedScoreExchangeTopK", merge)
     monkeypatch.setattr(dsa, "PreparedDistributedTopK", merge)
     monkeypatch.setattr(dsa, "PreparedDenseMLA", attention)
     monkeypatch.setattr(dsa, "PreparedAllGather", collective)
@@ -47,7 +48,8 @@ def construct(monkeypatch):
 
     def build(rows, world=2, **settings):
         context = None if world == 1 else SimpleNamespace(
-            shards=ContextShards.on(0, world, "cpu"), candidates=object(), heads=object())
+            shards=ContextShards.on(0, world, "cpu"), selections=object(), candidates=object(),
+            heads=object())
         cache = torch.zeros((2, 128, RECORD_BYTES), dtype=torch.float8_e4m3fn)
         op = dsa.PreparedDSA(
             {"index_query": None, "index_norm": torch.ones(128), "index_bias": torch.zeros(128)},

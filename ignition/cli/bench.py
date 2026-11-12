@@ -163,6 +163,7 @@ def run(args):
         decode_fusion=args.decode_fusion,
         mix_split_rows=args.mix_split_rows,
         prefill_latent_gather=args.prefill_latent_gather,
+        score_exchange=not args.no_score_exchange,
         language_model_only=args.language_model_only,
         mla_compute_mode=args.mla_compute_mode)
     plan = replace(plan, benchmark_selection=BenchmarkSelection(

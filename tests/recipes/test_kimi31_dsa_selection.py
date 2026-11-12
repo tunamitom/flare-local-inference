@@ -88,13 +88,14 @@ def test_hoisted_buffers_are_allocated_from_the_variant_cursor():
         assert end <= later_start or later_end <= start, "hoisted buffer overlaps this variant's later allocation"
 
 
-def _construct_shared(monkeypatch, rows, world):
+def _construct_shared(monkeypatch, rows, world, score_exchange=True):
     def selector(query, weights, cache, pages, lengths, active, output, **kwargs):
         return SimpleNamespace(query=query, weights=weights, cache=cache, pages=pages,
             lengths=lengths, active=active, output=output, scores=kwargs["scores"])
 
     def merge(indices, scores, output, **kwargs):
-        return SimpleNamespace(indices=indices, scores=scores, output=output)
+        return SimpleNamespace(indices=indices, scores=scores, output=output, runtime=kwargs["runtime"],
+                               name=kwargs["name"])
 
     def attention(query, cache, output, pages, lengths, starts, **kwargs):
         return SimpleNamespace(query=query, cache=cache, output=output, pages=pages,
@@ -108,6 +109,7 @@ def _construct_shared(monkeypatch, rows, world):
 
     monkeypatch.setattr(dsa, "prepare_projection", lambda *args, **kwargs: None)
     monkeypatch.setattr(dsa, "PreparedFP8Indexer", selector)
+    monkeypatch.setattr(dsa, "PreparedScoreExchangeTopK", merge)
     monkeypatch.setattr(dsa, "PreparedDistributedTopK", merge)
     monkeypatch.setattr(dsa, "PreparedDenseMLA", attention)
     monkeypatch.setattr(dsa, "PreparedAllGather", collective)
@@ -122,7 +124,7 @@ def _construct_shared(monkeypatch, rows, world):
         lengths=torch.zeros((rows,), dtype=torch.int32),
         active=torch.zeros((-(-rows // selection_rows),), dtype=torch.int32))
     context = None if world == 1 else SimpleNamespace(
-        shards=ContextShards.on(0, world, "cpu"), candidates=object(), heads=object())
+        shards=ContextShards.on(0, world, "cpu"), selections=SELECTIONS, candidates=CANDIDATES, heads=object())
     op = dsa.PreparedDSA(
         {"index_query": None, "index_norm": torch.ones(128), "index_bias": torch.zeros(128)},
         torch.zeros((rows, 8)), torch.zeros((rows, 128)), torch.zeros((rows, 32)),
@@ -130,8 +132,13 @@ def _construct_shared(monkeypatch, rows, world):
         torch.zeros((rows, 1, 512), dtype=torch.bfloat16), torch.zeros(rows, dtype=torch.int64), metadata,
         torch.zeros((2, 128, RECORD_BYTES), dtype=torch.float8_e4m3fn),
         torch.zeros((4, 64 * 132), dtype=torch.uint8), context=context,
-        session=None, coordinator=None, name="attention", workspace=None, buffers={}, selection=shared)
+        session=None, coordinator=None, name="attention", workspace=None, buffers={}, selection=shared,
+        score_exchange=score_exchange)
     return op, shared, capacity
+
+
+SELECTIONS = object()
+CANDIDATES = object()
 
 
 @pytest.mark.parametrize("rows,world", [(8, 9), (33, 9), (96, 9), (8, 1)])
@@ -143,6 +150,21 @@ def test_layer_binds_shared_selection_slices(monkeypatch, rows, world):
         assert torch.equal(selector.pages, shared.pages[begin:end])
         assert torch.equal(selector.lengths, shared.lengths[begin:end])
         assert torch.equal(selector.active, shared.active[stage:stage + 1])
+        if world == 1:
+            assert merge is None
+        else:
+            # Decode rows exchange candidate scores on the channel that gathers 2 * k BF16 columns per rank.
+            assert merge.runtime is SELECTIONS and merge.name == f"attention.rows{begin}.candidate_scores"
+            assert merge.output.shape == (end - begin, dsa.TOPK)
+
+
+@pytest.mark.parametrize("rows,world", [(8, 9), (33, 9)])
+def test_no_score_exchange_keeps_the_pair_form(monkeypatch, rows, world):
+    # The plan setting's rollback (--no-score-exchange): every rank merges the gathered
+    # (score, position) pairs on the 4 * k BF16-columns-per-rank channel, as before the port.
+    op, shared, capacity = _construct_shared(monkeypatch, rows, world, score_exchange=False)
+    for begin, end, selector, merge, quantized, gather, attention, combine, lse, paired, branch in op.stages:
+        assert merge.runtime is CANDIDATES and merge.name == f"attention.rows{begin}.candidates"
 
 
 @interpreted
@@ -216,6 +238,7 @@ def test_query_gather_branch_starts_after_the_exchange_and_joins_before_attentio
     monkeypatch.setattr(dsa, "ScratchArena", FakeArena)
     monkeypatch.setattr(dsa, "prepare_projection", project)
     monkeypatch.setattr(dsa, "PreparedFP8Indexer", _Selector)
+    monkeypatch.setattr(dsa, "PreparedScoreExchangeTopK", _Merge)
     monkeypatch.setattr(dsa, "PreparedDistributedTopK", _Merge)
     monkeypatch.setattr(dsa, "PreparedDenseMLA", _Attention)
     monkeypatch.setattr(dsa, "PreparedAllGather", _Collective)
@@ -225,8 +248,8 @@ def test_query_gather_branch_starts_after_the_exchange_and_joins_before_attentio
     monkeypatch.setattr(dsa, "_join_dsa_query_branch", join)
     monkeypatch.setattr(dsa.dense_mla, "Caps", lambda **kwargs: SimpleNamespace(**kwargs))
     rows, world = 8, 2
-    context = SimpleNamespace(shards=ContextShards.on(0, world, "cpu"), candidates=object(),
-                              heads=object())
+    context = SimpleNamespace(shards=ContextShards.on(0, world, "cpu"), selections=SELECTIONS,
+                              candidates=CANDIDATES, heads=object())
     metadata = SimpleNamespace(positions=torch.arange(rows, dtype=torch.int64),
         token_page_table=torch.zeros((rows, 2), dtype=torch.int32))
     op = dsa.PreparedDSA(

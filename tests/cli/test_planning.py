@@ -218,6 +218,22 @@ def test_mix_split_rows_is_a_recorded_plan_setting():
                       concurrency=4, reserve_bytes=0, speculation=kimi.speculation)
 
 
+def test_score_exchange_is_an_armed_by_default_plan_setting():
+    # J-missed §2 (upstream 8b1be5b): the candidate-score exchange is armed by default and
+    # dropped with --no-score-exchange — a recorded plan setting like --mix-split-rows.
+    kimi = replace(SOLO, name="kimi31")
+    options = dict(concurrency=4, reserve_bytes=0, speculation=kimi.speculation)
+    armed = planning.plan(kimi, kimi.checkpoints[0], (gpu(0, 95),), selected=(0,), **options)
+    assert armed.score_exchange is True and armed.to_dict()["score_exchange"] is True
+    dropped = planning.plan(kimi, kimi.checkpoints[0], (gpu(0, 95),), selected=(0,), score_exchange=False,
+                            **options)
+    assert dropped.score_exchange is False and dropped.to_dict()["score_exchange"] is False
+    assert replace(dropped, score_exchange=True) == armed
+    with pytest.raises(UsageError, match="--no-score-exchange"):
+        planning.plan(SOLO, SOLO.checkpoints[0], (gpu(0, 95),), selected=(0,), score_exchange=False,
+                      concurrency=4, reserve_bytes=0, speculation=SOLO.speculation)
+
+
 def test_prefill_island_reduce_is_gated_to_kimi_recipes_and_supported_tp():
     kimi = replace(SOLO, name="kimi31")
     exact = derive(model=kimi, gpus=[gpu(index, 95) for index in range(4)], selected=(0, 1, 2, 3))

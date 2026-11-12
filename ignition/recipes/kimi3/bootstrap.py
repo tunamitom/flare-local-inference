@@ -144,6 +144,14 @@ class PreparationConfig:
     # Default off keeps the shipped prefill arithmetic byte-identical as the
     # rollback. Decode, verification and draft graphs are unchanged either way.
     prefill_latent_gather: bool = False
+    # J-missed §2 (upstream 8b1be5b): decode and verification rows of a sparse
+    # layer exchange one FP32 score per candidate slot (8,192 bytes per row and
+    # rank) and each rank selects its own share of the global top-2,048
+    # (PreparedScoreExchangeTopK + PreparedCandidateShare), instead of gathering
+    # (score, position) pairs (16,384 bytes) and merging them on every rank. A
+    # plan setting (the plan's --no-score-exchange), never an environment switch;
+    # armed by default. Dropping it restores the pair exchange exactly.
+    score_exchange: bool = True
 
     def __post_init__(self):
         if self.draft_head_quantization not in (None, "mxfp8", "nvfp4"):
@@ -379,6 +387,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             heads = weights.config.text["num_attention_heads"]
             sparse = "dsa" in weights.config.layers
             selection_rows = min(max_tokens, SELECTION_ROWS)
+            prefill_selection_rows = min(32, (config.prefill_chunk_size + shard.world_size - 1) // shard.world_size)
             draft_rows = (request_capacity(config.max_active) * config.draft_tokens
                           if isinstance(weights.config.draft, LatentDSparkConfig) and drafting else 0)
             context = ContextParallel(ContextShards.on(rank, shard.world_size, device),
@@ -387,12 +396,19 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                                            query_head_dim=RECORD_BYTES, ipc=package_storage.peer_storage),
                 coordinator=coordinator,
                 peers=pool.share_pages(package_storage, group), slab=None,
+                # The pair exchange channel: a rank that attends over gathered context, or a plan
+                # that dropped the score exchange (--no-score-exchange). Armed, the bootstrap does
+                # not allocate it (8b1be5b): the pair form remains for a gathered-context rank.
                 candidates=(create_all_gather_runtime(group, device, max_rows=selection_rows,
-                    columns=4 * TOPK * shard.world_size, ipc=package_storage.peer_storage) if sparse else None),
+                    columns=4 * TOPK * shard.world_size, ipc=package_storage.peer_storage)
+                    if sparse and not config.score_exchange else None),
                 prefill_layout="query_split" if sparse else "dcp",
                 index_peers=pool.share_pages(package_storage, group, suffix=".index") if sparse else None,
+                # Prefill gathers selected positions on this channel, and decode and verification
+                # the candidate scores of their rows: 2 * TOPK BF16 columns per rank either way.
                 selections=(create_all_gather_runtime(group, device,
-                    max_rows=min(32, (config.prefill_chunk_size + shard.world_size - 1) // shard.world_size),
+                    max_rows=max(selection_rows, prefill_selection_rows) if config.score_exchange
+                        else prefill_selection_rows,
                     columns=2 * TOPK * shard.world_size, ipc=package_storage.peer_storage) if sparse else None))
             from ignition.components.weights import OutputPartitionedBF16Weight
             if any(isinstance(layer["attention"].get("index_query"), OutputPartitionedBF16Weight)
@@ -509,7 +525,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     collectives = dict(runtime=collective, embedding_runtime=embedding_collective, router_runtime=router_collective,
         route_runtime=route_collective, vocabulary_runtime=vocabulary_collective, coordinator=coordinator,
         vision_state=vision_state, context=context, latent_runtimes=latent_runtimes,
-        mix_split_rows=config.mix_split_rows)
+        mix_split_rows=config.mix_split_rows, score_exchange=config.score_exchange)
     speculation = None
     if drafting:
         from .dspark import SpeculativePreparation

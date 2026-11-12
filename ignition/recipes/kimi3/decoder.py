@@ -402,7 +402,7 @@ class PreparedDecoder:
 
     def __init__(self, weights, scratch, metadata, pool, *, mode, runtime, vocabulary_runtime, embedding_runtime, router_runtime, vision_state,
                  coordinator, session, name, workspace, buffers, kda_records=None, route_runtime=None, context=None,
-                 latent_runtimes=(), scoring=None, mix_split_rows=0,
+                 latent_runtimes=(), scoring=None, mix_split_rows=0, score_exchange=True,
                  latent_gather_runtime=None):
         # Verification records its candidate rows; other modes ignore records.
         if mode not in ("prefill", "decode", "verify") or mode == "verify" and kda_records is None:
@@ -506,6 +506,7 @@ class PreparedDecoder:
                             index_peers=(context.index_peers.get(index)
                                          if context is not None and context.index_peers is not None else None),
                             selection=self.selection,
+                            score_exchange=score_exchange,
                             coordinator=coordinator,
                             # The smallest latent exchange that carries the step, else the largest in chunks.
                             latents=next((r for r in latent_runtimes if source.shape[0] <= r.max_batch_size),
