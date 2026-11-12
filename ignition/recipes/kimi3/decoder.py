@@ -378,15 +378,24 @@ def _scratch_spans(value, path, found):
 def dual_wave_prefill_enabled(*, setting, mode, direct_ring, workspace, tokens, request_count,
                               auxiliary_layers, auxiliary_source):
     """The L9 dual-wave gate (29aac9e/eb72cab/2d3635f): True when this prefill decoder
-    splits its rows into two waves. Large even chunks, one live request, the direct
-    ring and an overlapping workspace (the auxiliary compute stream) are required;
-    drafts' auxiliary features must tap the attention input (the schedule preserves
-    that tap order). Every other decoder keeps the serial path."""
+    splits its rows into two waves. Large even chunks, the direct ring and an
+    overlapping workspace (the auxiliary compute stream) are required; drafts'
+    auxiliary features must tap the attention input (the schedule preserves that
+    tap order). Every other decoder keeps the serial path.
+
+    F6 (l9-transplant-fable-review.md §6): the single-request term is an
+    assertion, not a gate — prefill graphs always carry one live request per
+    replay, and the dual wave engages at any stream count (concurrent prefill
+    streams interleave whole graph replays; no two requests ever share one).
+    """
+    if (setting and mode == "prefill" and tokens >= 2048 and tokens % 512 == 0
+            and request_count != 1):
+        raise ValueError("a prefill graph carries one live request per replay; "
+                         f"got {request_count} (the dual wave is not a per-request gate)")
     return bool(
         setting and mode == "prefill" and direct_ring
         and workspace is not None and workspace.overlap
         and tokens >= 2048 and tokens % 512 == 0
-        and request_count == 1
         and (not auxiliary_layers or auxiliary_source == "attention_input")
     )
 

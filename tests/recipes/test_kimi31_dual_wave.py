@@ -93,9 +93,19 @@ def test_dual_wave_gate_selects_the_schedule_exactly_where_intended():
     assert dual_wave_prefill_enabled(**{**full, "tokens": 1024}) is False
     for broken in ({"setting": False}, {"mode": "decode"}, {"mode": "verify"}, {"direct_ring": False},
                    {"workspace": None}, {"workspace": _FlatArena()}, {"tokens": 2304},
-                   {"tokens": 2047}, {"request_count": 0}, {"request_count": 2},
-                   {"auxiliary_layers": (3,), "auxiliary_source": "residual_output"}):
+                   {"tokens": 2047}, {"auxiliary_layers": (3,), "auxiliary_source": "residual_output"}):
         assert dual_wave_prefill_enabled(**{**full, **broken}) is False, broken
+    # F6 (l9-transplant-fable-review.md §6): the single-request term is an
+    # assertion, not a gate — the dual wave engages at any stream count, and a
+    # prefill graph that somehow carried another request count must fail loudly
+    # instead of silently keeping the serial path.
+    for wrong in (0, 2, -1):
+        try:
+            dual_wave_prefill_enabled(**{**full, "request_count": wrong})
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"accepted request_count {wrong}")
     # Auxiliary features tapping the attention input keep the schedule.
     assert dual_wave_prefill_enabled(**{**full, "auxiliary_layers": (3,),
                                         "auxiliary_source": "attention_input"}) is True
