@@ -227,6 +227,11 @@ if [ "$DECODE_FUSION" = 1 ]; then EXPORT_ARGS+=(--decode-fusion); fi
 # J-export: L3's split mix and L4's prefill latent gather as plan settings.
 if [ "$MIX_SPLIT_ROWS" != 0 ]; then EXPORT_ARGS+=(--mix-split-rows "$MIX_SPLIT_ROWS"); fi
 if [ "$PREFILL_LATENT_GATHER" = 1 ]; then EXPORT_ARGS+=(--prefill-latent-gather); fi
+# L9 final review: `prefill_dual_wave` arms the dual-wave prefill schedule (fork/join
+# transport vehicle + the f6fdadc53 event-edge ring). PREFILL_DUAL_WAVE=1 arms it for
+# the test export; 0 is the rollback boundary back to the single-wave schedule.
+PREFILL_DUAL_WAVE="${PREFILL_DUAL_WAVE:-0}"
+if [ "$PREFILL_DUAL_WAVE" = 1 ]; then EXPORT_ARGS+=(--prefill-dual-wave); fi
 
 MODE="${1:---check}"
 say() { echo "$*" >&2; }
