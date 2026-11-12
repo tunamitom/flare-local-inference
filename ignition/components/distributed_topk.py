@@ -87,6 +87,107 @@ def _pack_score_id_pairs_fake(local, indices, scores, rank, world):
     pass
 
 
+@triton.jit
+def _pack_keys(Indices, Scores, Keys, row_stride, TOPK: tl.constexpr, BLOCK: tl.constexpr):
+    # One key per candidate slot: the score of a candidate, -inf for a slot without one. A NaN
+    # score does not compare greater than -inf, so it never reaches the row top-k.
+    row = tl.program_id(0)
+    block = tl.program_id(1)
+    columns = block * BLOCK + tl.arange(0, BLOCK)
+    mask = columns < TOPK
+    index = tl.load(Indices + row * row_stride + columns, mask=mask, other=-1)
+    score = tl.load(Scores + row * row_stride + columns, mask=mask, other=-float('inf'))
+    live = (index >= 0) & (score > -float('inf'))
+    tl.store(Keys + row * TOPK + columns, tl.where(live, score, -float('inf')), mask=mask)
+
+
+def _pack_keys_reference(keys, indices, scores):
+    """CPU semantics of ``_pack_keys``: the same select/copy arithmetic.
+
+    A slot without a candidate (``index < 0``) and a candidate whose score is
+    ``-inf`` or NaN both pack as ``-inf``: a NaN score does not compare greater
+    than ``-inf``, exactly as the kernel's ``score > -inf`` test.
+    """
+    live = (indices >= 0) & (scores > -torch.inf)
+    keys.copy_(torch.where(live, scores, -torch.inf))
+
+
+@torch.library.custom_op("ignition::pack_candidate_keys", mutates_args=("keys",))
+def pack_candidate_keys(keys: torch.Tensor, indices: torch.Tensor, scores: torch.Tensor) -> None:
+    """One compiled kernel writing this rank's candidate keys (``_pack_local_keys``).
+
+    Writes one FP32 score per candidate slot straight into the operator's
+    existing ``keys`` cursor buffer: it allocates nothing and re-views no
+    storage across element sizes. The CUDA body launches ``_pack_keys`` (one
+    kernel = one round-graph node per call); the CPU body runs the same
+    arithmetic for the CPU tests.
+    """
+    if (indices.stride() != (indices.shape[1], 1) or scores.stride() != indices.stride()
+            or keys.stride() != (keys.shape[1], 1)):
+        raise ValueError("key packing requires contiguous int32/FP32 candidate rows and FP32 keys")
+    if keys.is_cuda:
+        rows, topk = indices.shape
+        torch.library.wrap_triton(_pack_keys)[(rows, triton.cdiv(topk, 1024))](
+            indices, scores, keys, indices.stride(0), topk, 1024, num_warps=4)
+    else:
+        _pack_keys_reference(keys, indices, scores)
+
+
+@pack_candidate_keys.register_fake
+def _pack_candidate_keys_fake(keys, indices, scores):
+    pass
+
+
+def _pack_local_keys(indices, scores, keys):
+    """Write this rank's candidate keys for the score exchange."""
+    rows, topk = indices.shape
+    if (indices.dtype != torch.int32 or scores.dtype != torch.float32 or scores.shape != indices.shape
+            or indices.stride(0) != scores.stride(0) or indices.stride(1) != 1 or scores.stride(1) != 1
+            or keys.dtype != torch.float32 or keys.shape != (rows, topk) or not keys.is_contiguous()):
+        raise ValueError("key packing requires matching int32/FP32 candidate rows and contiguous FP32 keys")
+    pack_candidate_keys(keys, indices, scores)
+
+
+class PreparedScoreExchangeTopK:
+    """Each rank's share of the global top-k, from an exchange of scores only.
+
+    The ranks gather one FP32 score per candidate slot, half of what score/ID pairs take, and
+    each selects among its own candidates (PreparedCandidateShare). The output row holds the
+    global positions of this rank's selected candidates and -1 elsewhere: for finite scores the
+    rows of PreparedDistributedTopK restricted to this rank, which is all a consumer that maps
+    the selection to its own records reads. `runtime` gathers 2 * k BF16 columns per rank.
+    """
+
+    def __init__(self, indices, scores, output, *, world, rank, runtime, session, coordinator,
+                 name, buffers, workspace):
+        from ignition.components.candidate_share import PreparedCandidateShare
+
+        if (indices.ndim != 2 or indices.dtype != torch.int32 or scores.shape != indices.shape
+                or scores.dtype != torch.float32 or output.shape != indices.shape or output.dtype != indices.dtype
+                or world < 2 or rank.shape != (1,) or rank.dtype != torch.int64):
+            raise ValueError("distributed top-k requires matching int32 positions, FP32 scores and a rank tensor")
+        rows, self.topk = indices.shape
+        self.indices, self.scores, self.output = indices, scores, output
+        self.keys = buffers.zeros((rows, self.topk), torch.float32)
+        self.gathered = buffers.zeros((rows, world * self.topk), torch.float32)
+        self.share = PreparedCandidateShare(self.gathered, indices, scores, rank, output, world=world,
+            session=session, workspace=workspace, name=name + ".share")
+        self.collective = PreparedAllGather(self.keys, self.gathered, runtime=runtime, session=session,
+            coordinator=coordinator, name=name)
+
+    def collect(self):
+        _pack_local_keys(self.indices, self.scores, self.keys)
+        self.collective(self.keys)
+
+    def merge_result(self):
+        self.share()
+        return self.output
+
+    def __call__(self):
+        self.collect()
+        return self.merge_result()
+
+
 class PreparedDistributedTopK:
     """Merge each rank's local top-k into global logical positions.
 
