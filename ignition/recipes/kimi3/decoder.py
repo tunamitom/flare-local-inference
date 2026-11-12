@@ -357,6 +357,10 @@ class PreparedLatentMoE:
         if self.route_gather is not None:
             self.down(source)
         elif self.down_gather is not None:
+            # The router gather gathers `router_input`; without this copy it
+            # gathers zeros and every row routes to the same experts (the
+            # L9 final-review defect).
+            self.router_input[:, :logits.shape[1]].copy_(logits)
             self.down(source)
         else:
             self.router_input[:, :logits.shape[1]].copy_(logits)
