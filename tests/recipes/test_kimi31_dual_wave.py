@@ -18,7 +18,8 @@ import pytest
 from ignition import planning
 from ignition.errors import UsageError
 from ignition.recipes.declaration import Checkpoint, RankCosts, Recipe, SamplingDefaults
-from ignition.recipes.kimi3.decoder import dual_wave_extra_bytes, dual_wave_prefill_enabled
+from ignition.recipes.kimi3.decoder import (check_wire_scope, dual_wave_armed_shapes, dual_wave_extra_bytes,
+                                            dual_wave_prefill_enabled, dual_wave_shape_enabled)
 
 GIB, MIB = 1 << 30, 1 << 20
 
@@ -109,6 +110,57 @@ def test_dual_wave_gate_selects_the_schedule_exactly_where_intended():
     # Auxiliary features tapping the attention input keep the schedule.
     assert dual_wave_prefill_enabled(**{**full, "auxiliary_layers": (3,),
                                         "auxiliary_source": "attention_input"}) is True
+
+
+def test_dual_wave_shape_side_mirrors_the_gate_for_wire_binding():
+    # F2 (l9-transplant-fable-review.md finding 3): bootstrap binds the direct
+    # ring with exactly this predicate, so the decoder's wire-scope check and the
+    # gate cannot disagree about which graphs split.
+    assert dual_wave_shape_enabled(True, 3072, workspace=_Arena()) is True
+    assert dual_wave_shape_enabled(True, 2048, workspace=_Arena()) is True
+    for broken in (dict(setting=False, tokens=3072, workspace=_Arena()),
+                   dict(setting=True, tokens=1536, workspace=_Arena()),
+                   dict(setting=True, tokens=2304, workspace=_Arena()),
+                   dict(setting=True, tokens=3072, workspace=None),
+                   dict(setting=True, tokens=3072, workspace=_FlatArena()),
+                   dict(setting=True, tokens=3072, workspace=_Arena(), auxiliary_layers=(3,),
+                        auxiliary_source="residual_output")):
+        assert dual_wave_shape_enabled(**broken) is False, broken
+    assert dual_wave_shape_enabled(True, 3072, workspace=_Arena(), auxiliary_layers=(3,),
+                                  auxiliary_source="attention_input") is True
+
+
+def test_wire_scope_fires_when_the_direct_ring_binds_a_serial_graph():
+    # F2: the direct-ring runtime binds only dual-wave decoders.
+    check_wire_scope(prefill_dual_wave=True, direct_ring=True, dual_wave=True)
+    check_wire_scope(prefill_dual_wave=False, direct_ring=False, dual_wave=False)
+    check_wire_scope(prefill_dual_wave=True, direct_ring=False, dual_wave=False)
+    for wrong in (dict(prefill_dual_wave=True, direct_ring=True, dual_wave=False),
+                  dict(prefill_dual_wave=False, direct_ring=True, dual_wave=False),
+                  dict(prefill_dual_wave=True, direct_ring=False, dual_wave=True)):
+        try:
+            check_wire_scope(**wrong)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"accepted {wrong}")
+
+
+def test_wave_b_active_is_guaranteed_at_plan_time():
+    # F5 (l9-transplant-fable-review.md §6): a dual-wave shape arms only with a
+    # prepared prefill shape of at least half its rows and strictly below them, so
+    # smallest-fit scheduling never replays the shape's graph with wave B empty
+    # (the untested lb = 0 KDA pass). Refused shapes stay serial.
+    ladder = (128, 256, 512, 1024, 1536, 2048, 2560, 3072, 3584, 4096)
+    assert dual_wave_armed_shapes(ladder) == (2048, 2560, 3072, 3584, 4096)
+    # A shape whose only smaller shapes are under half its rows is refused.
+    assert dual_wave_armed_shapes((1024, 2048, 3072)) == (2048, 3072)
+    assert dual_wave_armed_shapes((2048, 3072)) == (3072,)
+    assert dual_wave_armed_shapes((2048,)) == ()
+    # 512-multiples below 2,048 rows never split; odd ladders arm nothing.
+    assert dual_wave_armed_shapes((1024, 1536, 2048)) == (2048,)
+    assert dual_wave_armed_shapes((100, 2500)) == ()
+    assert dual_wave_armed_shapes(()) == ()
 
 
 def test_pool_cap_bounds_the_second_prepared_module_set():

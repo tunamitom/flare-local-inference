@@ -375,6 +375,37 @@ def _scratch_spans(value, path, found):
             _scratch_spans(sub, f"{path}[{index}]", found)
 
 
+def dual_wave_shape_enabled(setting, tokens, *, workspace, auxiliary_layers=(), auxiliary_source=None):
+    """The shape/setting side of the L9 dual-wave gate.
+
+    F5 (l9-transplant-fable-review.md §6): the caller must separately guarantee
+    wave B is active for the shape (dual_wave_armed_shapes); this term only
+    answers whether the setting and geometry allow the split at all. Bootstrap
+    mirrors exactly this predicate to decide which decoders bind the direct-ring
+    wire (F2).
+    """
+    return bool(
+        setting and workspace is not None and workspace.overlap
+        and tokens >= 2048 and tokens % 512 == 0
+        and (not auxiliary_layers or auxiliary_source == "attention_input")
+    )
+
+
+def dual_wave_armed_shapes(prefill_sizes):
+    """F5: the prefill shapes the dual wave may arm.
+
+    A dual-wave graph replays only when the chunk does not fit a smaller prepared
+    shape (smallest-fit scheduling). Requiring a prepared shape of at least half
+    the rows and strictly below them means every replay of the shape's graph
+    carries more than half its rows, so wave B (rows [half, size)) is never empty
+    and the untested ``lb = 0`` KDA pass cannot execute. Shapes without such a
+    catch shape stay serial (refused, not crashed).
+    """
+    return tuple(shape for shape in prefill_sizes
+                 if shape >= 2048 and shape % 512 == 0
+                 and any(shape / 2 <= catch < shape for catch in prefill_sizes))
+
+
 def dual_wave_prefill_enabled(*, setting, mode, direct_ring, workspace, tokens, request_count,
                               auxiliary_layers, auxiliary_source):
     """The L9 dual-wave gate (29aac9e/eb72cab/2d3635f): True when this prefill decoder
@@ -398,6 +429,21 @@ def dual_wave_prefill_enabled(*, setting, mode, direct_ring, workspace, tokens, 
         and tokens >= 2048 and tokens % 512 == 0
         and (not auxiliary_layers or auxiliary_source == "attention_input")
     )
+
+
+def check_wire_scope(*, prefill_dual_wave, direct_ring, dual_wave):
+    """F2 (l9-transplant-fable-review.md finding 3): the wire is scoped to the split.
+
+    When armed, serial prefill decoders keep the shipped hop-ring runtime
+    (kimi_bf16_ring); only dual-wave decoders bind the direct-ring runtime. A
+    direct-ring serial graph would pay the wire's +12..44 % reduction penalty for
+    nothing, so binding one is a construction error.
+    """
+    if direct_ring and not dual_wave:
+        raise ValueError("the direct-ring runtime binds only dual-wave decoders; "
+                         "this graph is serial and must keep the shipped hop-ring runtime")
+    if dual_wave and not direct_ring:
+        raise ValueError("the dual-wave schedule requires the direct-ring runtime")
 
 
 def dual_wave_extra_bytes(buffers, dual_layers):
@@ -626,6 +672,10 @@ class PreparedDecoder:
             tokens=tokens, request_count=metadata.lengths.numel(),
             auxiliary_layers=self.auxiliary_layers,
             auxiliary_source=(config.draft.auxiliary_source if config.draft is not None else None))
+        # F2 (l9-transplant-fable-review.md finding 3): the direct-ring wire binds
+        # only dual-wave decoders; serial prefill graphs keep the shipped hop-ring
+        # runtime even when the plan is armed.
+        check_wire_scope(prefill_dual_wave=prefill_dual_wave, direct_ring=direct_ring, dual_wave=self.dual_wave)
         if self.dual_wave:
             self.half_tokens = tokens // 2
             # Pad half-reductions to whole rank shards ((pad_r * hidden) % (world * 256) == 0)

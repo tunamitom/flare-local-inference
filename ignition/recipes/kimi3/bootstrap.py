@@ -50,7 +50,8 @@ from ignition.progress import phase
 from .config import PAGE_TOKENS, LatentDSparkConfig
 from ignition.recipes.kimi31.dflash_config import DFlash2Config
 from .contract import prepare as prepare_contract
-from .decoder import DecoderStorage, PreparedDecoder, Scratch, latent_gather_supported, retained_auxiliary_rows
+from .decoder import (DecoderStorage, PreparedDecoder, Scratch, dual_wave_armed_shapes, dual_wave_shape_enabled,
+                      latent_gather_supported, retained_auxiliary_rows)
 from .pool import ContinuationPool, continuation_layout, page_bytes
 from .weights import ModelWeights
 from .vision import (PATCH_CAPACITIES, FEATURES, HIDDEN, PreparedVision, VisionInputs, VisionScratch,
@@ -333,12 +334,21 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             ipc=package_storage.peer_storage)
             if shard.world_size in SUPPORTED_WORLD_SIZES and small_rows else None)
         prefill_dma = (create_dma_all_reduce_runtime(group, device, max_tokens=config.prefill_chunk_size,
-            hidden_size=weights.config.hidden, ipc=package_storage.peer_storage,
-            # L9: the dual-wave schedule drives the direct zero-copy ring wire.
-            **({"bf16_direct": True} if config.prefill_dual_wave else {}))
+            hidden_size=weights.config.hidden, ipc=package_storage.peer_storage)
             if dma_rows and dma_rows <= config.prefill_chunk_size else None)
         if prefill_dma is not None:
-            prefill_dma.kimi_bf16_ring = config.prefill_dma_ring_bf16 and not config.prefill_dual_wave
+            # F2 (l9-transplant-fable-review.md finding 3): serial prefill decoders
+            # keep the shipped hop-ring runtime, armed or not.
+            prefill_dma.kimi_bf16_ring = config.prefill_dma_ring_bf16
+        # F2: the direct zero-copy ring wire binds ONLY the dual-wave decoders; a
+        # serial graph on it would pay the wire's +12..44 % reduction penalty for
+        # nothing (the 1,024/1,536-row serial graphs gain no overlap).
+        prefill_dma_direct = (create_dma_all_reduce_runtime(group, device, max_tokens=config.prefill_chunk_size,
+            hidden_size=weights.config.hidden, ipc=package_storage.peer_storage, bf16_direct=True)
+            if config.prefill_dual_wave and prefill_dma is not None else None)
+        if config.prefill_dual_wave and prefill_dma_direct is None:
+            raise ValueError("the dual-wave schedule requires the copy-engine ring runtime "
+                             "(prefill_dma_ring_rows) at TP8")
         vocabulary_collective = create_all_gather_runtime(group, device,
             max_rows=max(config.decode_samples, slots * (config.draft_tokens or 1)),
             columns=weights.config.vocabulary, ipc=package_storage.peer_storage)
@@ -535,10 +545,14 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         "local_embedding": cursor.zeros((max_tokens, weights.embedding.shape[1]), torch.bfloat16),
         **({"auxiliary": auxiliary[0]} if drafting else {})})
     prefill_sizes, batch_sizes = prefill_capacities(config.prefill_chunk_size), batch_capacities(config.max_active)
+    # F5 (l9-transplant-fable-review.md §6): only shapes whose smallest-fit ladder
+    # catches every half-row-or-smaller chunk arm the dual wave, so wave B is never
+    # empty (the untested lb = 0 KDA pass cannot execute). Refused shapes stay
+    # serial on the shipped wire.
+    armed_shapes = set(dual_wave_armed_shapes(prefill_sizes)) if config.prefill_dual_wave else set()
     # L9 pool-cap knob: the dual-wave second prepared-module set may add at most
     # prefill_dual_wave_pool of the preparation memory budget (fable priced the
     # set at about 9% of the KV pool).
-    dual_wave_budget_bytes = int(config.prefill_dual_wave_pool * total_memory) if config.prefill_dual_wave else None
     collectives = dict(runtime=collective, embedding_runtime=embedding_collective, router_runtime=router_collective,
         route_runtime=route_collective, vocabulary_runtime=vocabulary_collective, coordinator=coordinator,
         vision_state=vision_state, context=context, latent_runtimes=latent_runtimes,
@@ -562,6 +576,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     count = (len(modes) * (prefill_graph_count(prefill_sizes, scoring) + 4 * len(batch_sizes)) + len(batch_sizes)
              + len(config.speculative_round_shapes) + len(patches))
     with phase(progress, "Construct graph catalog", total=count) as stage:
+
         def add(name, forward, kind, rows, tokens, fields, *, enabled=None, packed_tokens=0):
             if kind == "scored_prefill":
                 forward = PreparedScoredPrefill(forward, requests, inputs)
@@ -582,16 +597,27 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                     name = f"{kind}{capacity}" + (suffix if mode == "prefill" else "")
                     m = metadata[name] = Metadata.allocate(capacity, rows, blocks, device)
                     scratch = (prefill_storage if mode == "prefill" else decode_storage).rows(capacity, rows)
+                    # F2 + F5: the direct-ring runtime binds exactly the shapes the
+                    # dual wave arms; every other prefill graph keeps the shipped
+                    # hop-ring runtime. The decision mirrors dual_wave_prefill_enabled's
+                    # shape side so the decoder's wire-scope check cannot disagree.
+                    aux_layers = (config.draft.auxiliary_layers
+                                  if (mode_weights.draft is not None and config.draft is not None) else ())
+                    aux_source = config.draft.auxiliary_source if config.draft is not None else None
+                    dual = (mode == "prefill" and capacity in armed_shapes
+                            and dual_wave_shape_enabled(config.prefill_dual_wave, capacity, workspace=arena,
+                                                        auxiliary_layers=aux_layers, auxiliary_source=aux_source))
                     decoder = PreparedDecoder(mode_weights, scratch, m, pool, mode=mode,
                         scoring=scoring if kind == "scored_prefill" else None,
                         session=session, name=name, workspace=arena, buffers=decoder_buffers,
                         **dict(collectives, runtime=(
-                            prefill_dma if mode == "prefill" and prefill_dma is not None and capacity >= dma_rows
+                            (prefill_dma_direct if dual else prefill_dma)
+                            if mode == "prefill" and prefill_dma is not None and capacity >= dma_rows
                             else prefill_collective if mode == "prefill" and prefill_collective is not None
                             else collective),
                             # Speculation's decoders never see the prefill latent gather channel.
                             latent_gather_runtime=latent_gather_collective if mode == "prefill" else None,
-                            prefill_dual_wave=config.prefill_dual_wave if mode == "prefill" else False,
+                            prefill_dual_wave=dual,
                             dual_wave_budget_bytes=dual_wave_budget_bytes))
                     batch = PreparedBatch(inputs, requests, m, mode=mode, shard=weights.shard, pool=pool,
                         validate_prefill=vision_state.validate_prefill if mode == "prefill" and patches else None,
@@ -690,7 +716,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     capture_catalog = {name: forwards[name] for name in capture_order}
     try:
         with contextlib.ExitStack() as communication:
-            for channel in (prefill_collective, prefill_dma):
+            for channel in (prefill_collective, prefill_dma, prefill_dma_direct):
                 if channel is not None:
                     communication.enter_context(channel.capture())
             graphs, compiled = capture_forwards(capture_catalog, signatures, session=session, device=device,
@@ -748,6 +774,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         close_resources=(*(() if scoring is None else (scoring,)),
                          *(() if prefill_collective is None else (prefill_collective,)),
                          *(() if prefill_dma is None else (prefill_dma,)),
+                         *(() if prefill_dma_direct is None else (prefill_dma_direct,)),
                          *(() if context is None or context.index_exchange is None else
                            (context.index_exchange, context.paired_queries))),
         export_zero_ranges=(*(() if scoring is None else scoring.zero_ranges()),
@@ -761,6 +788,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         resources=(scoring, weights, pool, requests, inputs, admission, commands, arena, forwards, prefill_storage, context,
                    decode_storage, metadata, compiled, stream, graph_pool, session, coordinator, collective,
                    vocabulary_collective, embedding_collective, router_collective, route_collective, prefill_collective, prefill_dma,
+                   prefill_dma_direct,
                    latent_gather_collective,
                    vision_inputs, vision_prefill, vision_state, vision_storage, deferred_pool, scratch_pool, shared_scratch, graph_buffers,
                    speculation, context_collective, markov_collective, latent_runtimes,
