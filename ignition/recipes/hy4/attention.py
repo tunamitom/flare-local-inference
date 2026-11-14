@@ -342,7 +342,10 @@ class Hy4LayerAttention:
         """
         first, last = self.sharding.head_range
         wuv = self.expand_wuv[first:last] if local else self.expand_wuv
-        return torch.einsum("rhd,hvd->rhv", out, wuv.float()).to(out.dtype)
+        # fp32 accumulation whatever the partial's dtype: the real sparse-MLA
+        # wire carries BF16 partials (the DCP merge returns a BF16 head shard),
+        # while the CPU reference partials are fp32.
+        return torch.einsum("rhd,hvd->rhv", out.float(), wuv.float()).to(out.dtype)
 
     # --- prepared plans (no JIT at run time) -------------------------------
     def bind_plan_book(self, book):
@@ -581,7 +584,7 @@ class Hy4LayerAttention:
                                                  fold_sink=fold_sink)
             provenance = SparseMLAProvenance(sink_folded=bool(fold_sink and sink is not None))
         if expand:
-            output = torch.einsum("rhd,hvd->rhv", output, self.expand_wuv.float()).to(q_absorbed.dtype)
+            output = torch.einsum("rhd,hvd->rhv", output.float(), self.expand_wuv.float()).to(q_absorbed.dtype)
         return SparseMLAOutput(output=output, lse=lse if return_lse else None, provenance=provenance)
 
     def fold_sink(self, out, lse, *, call_shape=None):

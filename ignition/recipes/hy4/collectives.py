@@ -58,6 +58,17 @@ __all__ = [
 LSE_BASE = "base2"
 
 
+def _trace(message):
+    """HY4_GATE_TRACE=1: one flushed marker per transport collective (hang
+    diagnosis at the call sites; permanent code stays silent)."""
+    import os
+    import time
+
+    if os.environ.get("HY4_GATE_TRACE"):
+        print(f"[transport-trace r{os.environ.get('RANK', 0)} t+{time.monotonic():.1f}s] {message}",
+              flush=True)
+
+
 class Collectives:
     """The injected interface (structural — any object with these members).
 
@@ -557,14 +568,18 @@ class PcieDcpTransport:
         world_size = dist.get_world_size(group=process_group)
         pools = {}
         for width in sorted(set(query_widths)):
+            _trace(f"PCIeDCPA2APool gather width={width}")
             pools[(width, "gather")] = PCIeDCPA2APool.from_process_group(
                 process_group=process_group, device=device,
                 max_batch_size=max_rows, total_heads=total_heads,
                 head_dim=width, query_head_dim=width, single_channel=True)
+            _trace(f"PCIeDCPA2APool gather width={width} done")
+        _trace(f"PCIeDCPA2APool partials width={value_width}")
         pools[(value_width, "partials")] = PCIeDCPA2APool.from_process_group(
             process_group=process_group, device=device,
             max_batch_size=max_rows, total_heads=total_heads,
             head_dim=value_width, query_head_dim=value_width, single_channel=True)
+        _trace(f"PCIeDCPA2APool partials width={value_width} done")
         return cls(group=process_group, device=device, pools=pools,
                    rank=rank, world_size=world_size, total_heads=total_heads)
 
@@ -665,12 +680,21 @@ class PcieDcpTransport:
 
     # -- the SimulatedDcpTransport call surfaces ---------------------------
 
+    @staticmethod
+    def _wire(tensor):
+        """The DCP kernels' wire dtype (BF16 partials / FP16; the FP32 gate body
+        stages through the production wire and is restored on return)."""
+        return tensor.to(torch.bfloat16) if tensor.dtype == torch.float32 else tensor
+
     def all_gather_heads(self, local_input, out=None, *, plan=None):
         rows, _, width = (int(v) for v in local_input.shape)
         plan = self._lookup("all_gather_heads", rows, width, "")
         pool = self._pools[(width, "gather")]
-        return pool.for_stream().all_gather_heads(
-            local_input.contiguous(), out, plan=plan)
+        _trace(f"all_gather_heads rows={rows} width={width}")
+        result = pool.for_stream().all_gather_heads(
+            self._wire(local_input.contiguous()), None if out is None else self._wire(out), plan=plan)
+        _trace(f"all_gather_heads rows={rows} width={width} done")
+        return result.to(local_input.dtype) if out is None else out
 
     def lse_reduce_scatter(self, partial_output, partial_lse, out=None, *, plan=None,
                            lse_base=LSE_BASE, partials_sink_folded=None, return_lse=False):
@@ -681,10 +705,18 @@ class PcieDcpTransport:
                 "(the sink never enters the merge; D6)")
         plan = self._lookup("lse_reduce_scatter", rows, width, lse_base)
         pool = self._pools[(width, "partials")]
-        return pool.for_stream().lse_reduce_scatter(
-            partial_output.contiguous(), partial_lse.contiguous(), out,
+        _trace(f"lse_reduce_scatter rows={rows} width={width} base={lse_base}")
+        wire_dtype = partial_output.dtype
+        result = pool.for_stream().lse_reduce_scatter(
+            self._wire(partial_output.contiguous()), partial_lse.float().contiguous(),
+            None if out is None else self._wire(out),
             plan=plan, lse_base=lse_base,
             partials_sink_folded=partials_sink_folded, return_lse=return_lse)
+        _trace(f"lse_reduce_scatter rows={rows} width={width} base={lse_base} done")
+        if return_lse:
+            merged, merged_lse = result
+            return merged.to(wire_dtype), merged_lse
+        return result.to(wire_dtype)
 
     def exchange_scores(self, offers, *, plan=None):
         return self._gather_all(offers)
@@ -697,25 +729,31 @@ class PcieDcpTransport:
     def all_reduce(self, value):
         import torch.distributed as dist
 
+        _trace(f"all_reduce shape={tuple(value.shape)}")
         host = value.contiguous().cpu()
         dist.all_reduce(host, op=dist.ReduceOp.SUM, group=self.group)
+        _trace(f"all_reduce shape={tuple(value.shape)} done")
         return host.to(value.device)
 
     def all_gather(self, value):
         import torch.distributed as dist
 
+        _trace(f"all_gather shape={tuple(value.shape)}")
         host = value.contiguous().cpu()
         taken = [torch.empty_like(host) for _ in range(self.world_size)]
         dist.all_gather(taken, host, group=self.group)
+        _trace(f"all_gather shape={tuple(value.shape)} done")
         return torch.cat([t.to(value.device) for t in taken], dim=-1)
 
     def _gather_all(self, value):
         """Every rank's copy of `value`, in rank order (the control-group wire)."""
         import torch.distributed as dist
 
+        _trace(f"gather_all shape={tuple(value.shape)}")
         host = value.contiguous().cpu()
         taken = [torch.empty_like(host) for _ in range(self.world_size)]
         dist.all_gather(taken, host, group=self.group)
+        _trace(f"gather_all shape={tuple(value.shape)} done")
         return tuple(t.to(value.device) for t in taken)
 
     def _lookup(self, surface, rows, width, lse_base):
