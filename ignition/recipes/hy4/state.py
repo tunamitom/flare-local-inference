@@ -68,7 +68,12 @@ class IhcBoundary:
         self.magnitude = config.text["hc_magnitude"] if magnitude is None else magnitude
         self.hc_eps = config.text["hc_eps"]
         self.norm_eps = config.text["rms_norm_eps"]
-        self.plan = plan  # b12x Plan bound at prepare time (CUDA)
+        self.plan = plan  # b12x Plan bound at prepare time (CUDA): the fused `post_pre`
+        # A plan pins ONE invocation (`execution prepares post_pre, not pre`),
+        # so the two single-op entries carry their own plans; unbound they take
+        # the operator's lazy default (the CPU path never binds any).
+        self.pre_plan = None
+        self.post_plan = None
 
     def _reference(self):
         from b12x.norm.mhc import ihc
@@ -83,7 +88,7 @@ class IhcBoundary:
 
             return ihc.run_pre(streams, w.fn, w.scale, w.base,
                                magnitude=self.magnitude, hc_eps=self.hc_eps, norm_eps=self.norm_eps,
-                               plan=self.plan)  # prepared plan: no JIT at run time
+                               plan=self.pre_plan)  # prepared plan: no JIT at run time
         ihc = self._reference()
         return ihc.ihc_pre_reference(streams, w.fn, w.scale, w.base,
                                      magnitude=self.magnitude, hc_eps=self.hc_eps, norm_eps=self.norm_eps)
@@ -94,7 +99,7 @@ class IhcBoundary:
         if self.device.type == "cuda":
             from b12x.norm.mhc import ihc
 
-            return ihc.run_post(branch, streams, post, plan=self.plan)
+            return ihc.run_post(branch, streams, post, plan=self.post_plan)
         ihc = self._reference()
         return ihc.ihc_post_reference(branch, streams, post)
 
@@ -394,12 +399,40 @@ def _moe_state(builder, prefix, *, dense=False):
     if loader._packed:
         # Materialize through the loader session when the raw `_sources` entry
         # is a declared (meta) placeholder on GPU (see `weights.expert_stacks`).
+        # The fused tensors hold EVERY routed expert's intermediate width; only
+        # this rank's `sharding.expert_range` channels are resident (the same
+        # slicing the BF16 branch applies below) — materializing whole fused
+        # tensors overruns the card at full shape (w13: the 8-rank construction
+        # OOMed at 91.7 GiB mid-experts loading 3 GiB all-expert tensors).
+        # `load_tensor(extent=)` keeps the transfer over the checkpoint's byte
+        # ranges; the fused [gate; up] row axis splits into the rank's two
+        # half-ranges and re-fuses to [E, 2 * local, hidden // 2].
+        first, last = sharding.expert_range
+        inter = c["moe_intermediate_size"]
+        half = (slice(None), slice(first, last), slice(None))
+        half_up = (slice(None), slice(inter + first, inter + last), slice(None))
+        down_extent = (slice(None), slice(None), slice(first // 2, last // 2))
+        down_scale_extent = (slice(None), slice(None), slice(first // 16, last // 16))
+
+        def load_sliced(name, extent):
+            source = loader._sources[name]
+            return loader.load_tensor(name, extent=extent) \
+                if getattr(source, "is_meta", False) else source[extent]
+
+        import torch as _torch
         packed_sources = {}
-        for name in loader._sources:
-            if name.startswith(expert_prefix + ".") and name.rsplit(".", 1)[-1] \
-                    in ("weight", "weight_scale", "weight_scale_2"):
-                source = loader._sources[name]
-                packed_sources[name] = loader.load_tensor(name) if getattr(source, "is_meta", False) else source
+        for projection in ("gate_up_proj", "down_proj"):
+            for suffix in ("weight", "weight_scale", "weight_scale_2"):
+                name = f"{expert_prefix}.{projection}.{suffix}"
+                if projection == "gate_up_proj" and suffix != "weight_scale_2":
+                    packed_sources[name] = _torch.cat(
+                        (load_sliced(name, half), load_sliced(name, half_up)), dim=1)
+                elif projection == "down_proj" and suffix == "weight":
+                    packed_sources[name] = load_sliced(name, down_extent)
+                elif projection == "down_proj" and suffix == "weight_scale":
+                    packed_sources[name] = load_sliced(name, down_scale_extent)
+                else:  # per-expert gains: whole first axis
+                    packed_sources[name] = load_sliced(name, (slice(None),))
         routed = ReferenceRoutedExperts.from_packed(
             packed_sources, expert_prefix, swiglu_limit=c["swiglu_limit"])
         builder.used.update(packed_sources)

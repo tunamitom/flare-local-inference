@@ -109,8 +109,11 @@ class ReferenceRoutedExperts:
 
     @classmethod
     def from_packed(cls, packed, prefix, *, swiglu_limit):
+        # Keyed `projection.suffix` (matching `expert_weights`/`experts`) —
+        # bare-suffix keys collide across projections and the down stack would
+        # silently shadow the fused gate/up stack.
         return cls(swiglu_limit=swiglu_limit,
-                   packed={suffix: packed[f"{prefix}.{projection}.{suffix}"]
+                   packed={f"{projection}.{suffix}": packed[f"{prefix}.{projection}.{suffix}"]
                            for projection in ("gate_up_proj", "down_proj")
                            for suffix in ("weight", "weight_scale", "weight_scale_2")})
 

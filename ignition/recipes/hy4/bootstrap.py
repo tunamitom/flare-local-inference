@@ -184,18 +184,34 @@ class PreparedHy4Rank:
         caps = ihc.Caps(device=self.device,
                         max_tokens=max(self.settings.prefill_chunk_size, self.settings.request_capacity),
                         hidden_size=self.model_config.hidden)
+        # A plan pins ONE invocation, so `pre` and the fused `post_pre` bind
+        # separate plans.  Every boundary shares the config-level magnitudes
+        # and epsilons, so one plan per operation serves all of them (the
+        # single-op `post` entry keeps the operator's lazy default).
+        shared_plans = {}
+
+        def plan_for(operation, boundary):
+            key = (operation, boundary.magnitude, boundary.hc_eps, boundary.norm_eps)
+            if key not in shared_plans:
+                invocation = {"operation": operation, "magnitude": boundary.magnitude,
+                              "hc_eps": boundary.hc_eps, "norm_eps": boundary.norm_eps}
+                if operation == "post_pre":
+                    invocation.update({"layernorm_eps": c["rms_norm_eps"], "has_norm_weight": True,
+                                       "norm_weight_dtype": "float32"})
+                shared_plans[key] = ihc.plan(caps, invocation=invocation)
+            return shared_plans[key]
+
         for layer in self.weights.layers:
             for boundary in (layer.attn_ihc, layer.ffn_ihc):
-                boundary.plan = ihc.plan(caps, invocation={
-                    "operation": "post_pre", "magnitude": boundary.magnitude,
-                    "hc_eps": boundary.hc_eps, "norm_eps": boundary.norm_eps,
-                    "layernorm_eps": c["rms_norm_eps"], "has_norm_weight": True,
-                    "norm_weight_dtype": "float32"})
+                boundary.plan = plan_for("post_pre", boundary)
+                boundary.pre_plan = plan_for("pre", boundary)
         for layer_id, cell in self.selections.items():
             if cell.kind == "full":
+                # `physical_caps` pins `topk`/`max_q_rows`/`output_index_space`
+                # from the IndexCache itself (passing them again raises).
                 cell.caps = self.index_cache.physical_caps(
                     layer_id, num_q_heads=self.model_config.text["index_n_heads"],
-                    max_page_table_width=self.cache.capacity, topk=c["index_topk"])
+                    max_page_table_width=self.cache.capacity)
         return self
 
 

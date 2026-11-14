@@ -394,8 +394,11 @@ class Hy4LayerAttention:
         from b12x.attention import sparse_mla
 
         caps = sparse_mla.Caps(
-            device=self.device, num_q_heads=self.heads, max_q_rows=shape.rows,
-            max_width=self.config.text["index_topk"], softmax_scale=self.scaling,
+            device=self.device, num_q_heads=self.heads,
+            # Queries flatten to rows * tokens (the sink-fold geometry's
+            # `batch`), so the plan's row capacity covers the whole call shape.
+            max_q_rows=shape.rows * shape.tokens, max_width=self.config.text["index_topk"],
+            softmax_scale=self.scaling,
             head_dim=self.kv_lora + self.qk_rope, v_head_dim=self.kv_lora,
             kv_dtype=self.weights.kv_b_proj.dtype, model_type=sparse_mla.ModelType.GLM_NSA,
             cache_record_bytes=self.kv_lora + self.qk_rope + 80,
@@ -679,7 +682,12 @@ class Hy4LayerAttention:
         if cache_lengths is None:
             cache_lengths = counts.new_full((rows,), selected.shape[1])
         binding = sparse_mla.bind(plan, scratch=scratch, q=q_absorbed.to(torch.bfloat16),
-                                  kv_cache=latent_table, selected_indices=selected,
+                                  # The Hy4 cache is the flat physical-slot table
+                                  # (`output_index_space="physical"`); the kernel
+                                  # contract takes it as one batch of rows.
+                                  kv_cache=latent_table.unsqueeze(0) if latent_table.ndim == 2
+                                  else latent_table,
+                                  selected_indices=selected,
                                   cache_lengths=cache_lengths,
                                   selected_lengths=counts,
                                   attention_sink=self.weights.sink if fold_sink else None)
