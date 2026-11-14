@@ -743,7 +743,11 @@ class PcieDcpTransport:
         taken = [torch.empty_like(host) for _ in range(self.world_size)]
         dist.all_gather(taken, host, group=self.group)
         _trace(f"all_gather shape={tuple(value.shape)} done")
-        return torch.cat([t.to(value.device) for t in taken], dim=-1)
+        # Cat on the host and move ONCE: moving each shard first then catting
+        # holds 2x the full-vocab result on GPU (world x shard + the cat) —
+        # at 1024 prefill rows that is ~1 GiB of eager transient per chunk.
+        # Same bytes, one device transfer instead of world+1.
+        return torch.cat(taken, dim=-1).to(value.device)
 
     def _gather_all(self, value):
         """Every rank's copy of `value`, in rank order (the control-group wire)."""
