@@ -189,6 +189,20 @@ class PreparedHy4Rank:
         # and epsilons, so one plan per operation serves all of them (the
         # single-op `post` entry keeps the operator's lazy default).
         shared_plans = {}
+        # The `post_pre` plan pins the folded RMSNorm operand's dtype and the
+        # first real forward refuses any drift ("iHC normalization dtype
+        # changed"). The layers' norms load in the checkpoint's storage dtype
+        # (BF16 in this export — `weights.kept_fp32` never upgrades the
+        # layernorms), so declare what the body passes (`components/mhc.py`'s
+        # pattern: `str(weights.norm.dtype)`), never an assumed FP32.
+        norm_dtypes = {str(t.dtype).removeprefix("torch.")
+                       for layer in self.weights.layers
+                       for t in (layer.input_norm, layer.post_attention_norm)}
+        if len(norm_dtypes) != 1:
+            raise ValueError(
+                "the shared iHC post_pre plan needs one RMSNorm dtype across "
+                f"the layers, got {sorted(norm_dtypes)}")
+        norm_weight_dtype = norm_dtypes.pop()
 
         def plan_for(operation, boundary):
             key = (operation, boundary.magnitude, boundary.hc_eps, boundary.norm_eps)
@@ -197,7 +211,7 @@ class PreparedHy4Rank:
                               "hc_eps": boundary.hc_eps, "norm_eps": boundary.norm_eps}
                 if operation == "post_pre":
                     invocation.update({"layernorm_eps": c["rms_norm_eps"], "has_norm_weight": True,
-                                       "norm_weight_dtype": "float32"})
+                                       "norm_weight_dtype": norm_weight_dtype})
                 shared_plans[key] = ihc.plan(caps, invocation=invocation)
             return shared_plans[key]
 
