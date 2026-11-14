@@ -126,7 +126,10 @@ class ReferenceRoutedExperts:
     def _dequant(self, packed_rows, scales, gain):
         """The `contract.py` packing read back: E2M1 nibbles x block scales x gain."""
         codes = packed_rows.to(torch.int64)
-        table = torch.tensor(self._E2M1, dtype=torch.float32)
+        # The lookup table must live with the codes (the serve runs this
+        # reference path on CUDA; a CPU table raises "indices should be either
+        # on cpu or on the same device as the indexed tensor").
+        table = torch.tensor(self._E2M1, dtype=torch.float32, device=packed_rows.device)
         low = table[codes & 7] * torch.where((codes & 8) != 0, -1.0, 1.0)
         high = table[(codes >> 4) & 7] * torch.where((codes & 128) != 0, -1.0, 1.0)
         values = torch.stack((low, high), dim=-1).flatten(-2)
