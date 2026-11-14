@@ -97,9 +97,19 @@ def checkpoint_names(config, *, mtp=True, packed=False):
 
 
 # W1 gate d: the packed export is only loadable when its export_report.json
-# proves a complete, verified build. The bound is the official MSE census bar
-# (the real experts measure 0.0812; max scaling reads 0.0951 and is refused).
-EXPORT_MAX_RELATIVE_ERROR = 0.0815
+# proves a complete, verified build. The bound separates MSE-built packages
+# from RTN/broken ones: max scaling reads 0.0951 and is refused.
+#
+# W13 correction (evidence, full preview build of 2026-11-14): 0.0815 was set
+# from sampled expectations ("the real experts measure 0.0812") and the tiny
+# model's max (0.0814). The full 59,904-matrix census (78x256x3) measures mean
+# 0.08120, median 0.08121, max 0.08286 — 32 matrices (0.05%) sit above 0.0815.
+# Those are genuine per-block-MSE floors, not build defects: the exhaustive
+# 126-code sweep reproduces the same census on the worst matrices with the
+# windowed search missing 0/786,432 blocks, and the legacy (unordered-sum)
+# builder computes the identical 0.082911 on the worst matrix. The bar moves
+# to 0.0835 — still 0.012 below the RTN census it must refuse.
+EXPORT_MAX_RELATIVE_ERROR = 0.0835
 
 
 def verify_export_package(snapshot, config):
@@ -111,7 +121,8 @@ def verify_export_package(snapshot, config):
 
     - ``export_report.json`` exists and shows ``byte_verified``, the full
       78x256x3 matrix census (every block x expert x projection) and
-      ``census_max_relative`` <= 0.0815;
+      ``census_max_relative`` <= ``EXPORT_MAX_RELATIVE_ERROR`` (0.0835; the
+      W13 full-model measurement — see the constant's comment);
     - the report counts window-edge scale choices for ALL experts (coverage
       per block and projection, not just the audited expert);
     - ``model.safetensors.index.json`` was written last (mtime at or after the
