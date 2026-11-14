@@ -62,6 +62,7 @@ include = ["ignition*"]
 "ignition.recipes.step5" = ["assets/*"]
 "ignition.recipes.muse_spark" = ["assets/*"]
 "ignition.recipes.minimax_m3" = ["assets/*"]
+"ignition.recipes.hy4" = ["assets/*"]
 
 [tool.pytest.ini_options]
 addopts = "--import-mode=importlib"
