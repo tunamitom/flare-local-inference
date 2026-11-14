@@ -55,6 +55,18 @@ class Hy4Cache:
     `dtype` (BF16 — the GLM_NSA FP8 record's decoded form — unless a caller
     overrides it for a full-precision dry run).
 
+    Fused record cache (the engine contract, M2): with `fused_records=True`
+    (CUDA only) each latent layer stores the fused 656-byte FP8 record the
+    sparse-MLA kernels read (`LATENT_RECORD_BYTES` = 512 E4M3 nope + 16 B
+    inline fp32 scales + 128 B raw BF16 RoPE), produced by the
+    `sparse_mla.concat_and_cache_glm_next_mla` record writer — `write_latent`
+    routes through it and `latents(layer)` returns the fused table (the form
+    `_attend_cuda` binds). `decode_latents(layer)` unpacks the decoded
+    576-dim BF16 twin on demand (diagnostics only — the engine never keeps a
+    decoded copy resident; the record contract is 656 B, not 1,152 B).
+    The index-key table keeps its decoded BF16 form in this window (its FP8
+    paged writer is separate work).
+
     Context parallelism (D1, amendment 2): token position `p` of a request row
     is owned by rank `p % world` at local index `p // world` — flashinfer's
     interleaved rule (`dsa_indexer.selection_handback.rank_local_slots`; the
@@ -78,6 +90,9 @@ class Hy4Cache:
     dtype: torch.dtype = torch.bfloat16
     world: int = 1
     rank: int = 0
+    records: dict = field(default_factory=dict)   # layer -> fused uint8 records
+    writer_plan: object = None                    # the prepared `plan_cache_writer`
+    page_size: int = 64                           # fused-record page geometry
 
     def __post_init__(self):
         if type(self.world) is not int or self.world < 1:
@@ -91,14 +106,31 @@ class Hy4Cache:
 
     @classmethod
     def allocate(cls, config, rows, capacity, device, *, draft=False, dtype=torch.bfloat16,
-                 world=1, rank=0):
+                 world=1, rank=0, fused_records=False, page_size=64):
         c = config.text
         cache = cls(config=config, rows=rows, capacity=capacity, device=device, dtype=dtype,
-                    world=world, rank=rank)
+                    world=world, rank=rank, page_size=page_size)
         layers = config.layers + int(draft)
         width = c["kv_lora_rank"] + c["qk_rope_head_dim"]
-        for layer in range(layers):
-            cache.latent[layer] = torch.zeros((rows * cache.local_capacity, width), dtype=dtype, device=device)
+        if fused_records:
+            # The engine contract (M2): fused 656-byte FP8 records only — the
+            # decoded BF16 twin is never resident (it would double the record
+            # cost: 1,152 B vs the 656 B contract). CUDA only: the record
+            # writer is a GPU kernel.
+            from .config import LATENT_RECORD_BYTES
+
+            if device.type != "cuda":
+                raise ValueError("fused record caches run on CUDA (the record writer is a kernel)")
+            if dtype != torch.bfloat16:
+                raise ValueError("the fused record writer consumes BF16 latent rows")
+            slots = rows * cache.local_capacity
+            pages = -(-slots // page_size)   # ceil; the flat slot space stays rows*capacity
+            for layer in range(layers):
+                cache.records[layer] = torch.zeros((pages, page_size, LATENT_RECORD_BYTES),
+                                                   dtype=torch.uint8, device=device)
+        else:
+            for layer in range(layers):
+                cache.latent[layer] = torch.zeros((rows * cache.local_capacity, width), dtype=dtype, device=device)
         for owner in (*config.full_indexer_layers, *( (config.layers,) if draft else () )):
             cache.index[owner] = torch.zeros((rows * cache.local_capacity, c["index_head_dim"]),
                                             dtype=dtype, device=device)
@@ -143,8 +175,41 @@ class Hy4Cache:
         return (row_of.long() * self.local_capacity)
 
     def write_latent(self, layer, tokens, positions, latent):
-        """Store this layer's latent records at the tokens' OWNED physical slots."""
+        """Store this layer's latent records at the tokens' OWNED physical slots.
+
+        Fused record caches (CUDA) route through the `concat_and_cache_glm_next_mla`
+        record writer — the same paged FP8 writer contract the sparse-MLA
+        readers consume (`_GLM_NSA_RECORD_BYTES` per record).
+        """
+        if layer in self.records:
+            positions = positions.long()
+            slots = self._slots(tokens, positions)   # bounds-checked over every position
+            keep = self.owner(positions) == self.rank
+            if bool(keep.any()):
+                self._write_records(layer, latent[keep], slots[keep])
+            return
         self._store(self.latent[layer], tokens, positions, latent)
+
+    def _write_records(self, layer, values, slots):
+        """One writer call over the kept rows (skipped slots are negative)."""
+        from b12x.attention import sparse_mla
+
+        if self.writer_plan is None:
+            self.writer_plan = self._make_writer_plan()
+        sparse_mla.concat_and_cache_glm_next_mla(
+            values.to(torch.bfloat16).contiguous(), self.records[layer],
+            slots.to(torch.int64).contiguous(), plan=self.writer_plan)
+
+    def _make_writer_plan(self):
+        """Declare the fused-record writer plan (prepared on first use)."""
+        from b12x.attention import sparse_mla
+
+        cache = next(iter(self.records.values()))
+        c = self.config.text
+        kv_c = torch.zeros((1, c["kv_lora_rank"] + c["qk_rope_head_dim"]),
+                           dtype=torch.bfloat16, device=self.device)
+        slots = torch.zeros((1,), dtype=torch.int64, device=self.device)
+        return sparse_mla.plan_cache_writer(kv_c, cache, slots)
 
     def write_index_keys(self, owner, tokens, positions, keys):
         self._store(self.index[owner], tokens, positions, keys)
@@ -179,7 +244,26 @@ class Hy4Cache:
         return self.slots_for(tokens) + local_index
 
     def latents(self, layer):
+        """This layer's cache table: fused 656-byte records when the cache is
+        fused (the `_attend_cuda` bind form), the decoded BF16 table otherwise."""
+        if layer in self.records:
+            return self.records[layer]
         return self.latent[layer]
+
+    def decode_latents(self, layer):
+        """Decode the fused records back to [slots, kv_lora + rope] BF16.
+
+        Diagnostics only (the golden/diff surfaces): the engine keeps no
+        decoded copy resident. Scales decode `e4m3 * fp32_scale`, RoPE is the
+        raw BF16 tail — `b12x...reference.unpack_mla_kv_cache_reference`.
+        """
+        if layer not in self.records:
+            return self.latent[layer]
+        from b12x.attention._shared.mla.reference import unpack_mla_kv_cache_reference
+
+        pages, page_size, _ = self.records[layer].shape
+        flat = self.records[layer].reshape(pages * page_size, 1, -1)
+        return unpack_mla_kv_cache_reference(flat)[:, 0]
 
     def key_table(self, owner):
         return self.index[owner]

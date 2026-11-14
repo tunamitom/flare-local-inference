@@ -400,7 +400,10 @@ class Hy4LayerAttention:
             max_q_rows=shape.rows * shape.tokens, max_width=self.config.text["index_topk"],
             softmax_scale=self.scaling,
             head_dim=self.kv_lora + self.qk_rope, v_head_dim=self.kv_lora,
-            kv_dtype=self.weights.kv_b_proj.dtype, model_type=sparse_mla.ModelType.GLM_NSA,
+            # The engine contract is the fused 656-byte FP8 record (uint8 byte
+            # record: 512 E4M3 nope + 16 B inline fp32 scales + 128 B raw BF16
+            # RoPE) — the record `concat_and_cache_glm_next_mla` writes.
+            kv_dtype=torch.uint8, model_type=sparse_mla.ModelType.GLM_NSA,
             cache_record_bytes=self.kv_lora + self.qk_rope + 80,
             mode=shape.mla_mode, return_lse=True, lse_scale="base2", has_attention_sink=True)
         return sparse_mla.plan(caps)
@@ -659,6 +662,17 @@ class Hy4LayerAttention:
         from b12x.attention import sparse_mla
 
         rows = q_absorbed.shape[0]
+        record_bytes = self.config.text["kv_lora_rank"] + self.config.text["qk_rope_head_dim"] + 80
+        # The kernel reads the FUSED 656-byte FP8 record (`Hy4Cache` with
+        # `fused_records=True` writes it through `concat_and_cache_glm_next_mla`);
+        # a decoded BF16 table is the device-agnostic twin and cannot bind.
+        if (latent_table is None or latent_table.dtype != torch.uint8
+                or int(latent_table.shape[-1]) != record_bytes):
+            got = "None" if latent_table is None else f"{latent_table.dtype}, width {int(latent_table.shape[-1])}"
+            raise ValueError(
+                f"the CUDA sparse-MLA bind needs the fused {record_bytes}-byte FP8 record "
+                f"cache (uint8) written by concat_and_cache_glm_next_mla — got {got}; "
+                "allocate the cache with fused_records=True")
         plan = self._mla_plan_for(call_shape)
         key = (call_shape.name, call_shape.rows, call_shape.tokens) if call_shape is not None else "lazy"
         if plan is None:
@@ -666,8 +680,8 @@ class Hy4LayerAttention:
                 device=self.device, num_q_heads=self.heads, max_q_rows=rows,
                 max_width=selected.shape[1], softmax_scale=self.scaling,
                 head_dim=self.kv_lora + self.qk_rope, v_head_dim=self.kv_lora,
-                kv_dtype=latent_table.dtype, model_type=sparse_mla.ModelType.GLM_NSA,
-                cache_record_bytes=self.config.text["kv_lora_rank"] + self.config.text["qk_rope_head_dim"] + 80,
+                kv_dtype=torch.uint8, model_type=sparse_mla.ModelType.GLM_NSA,
+                cache_record_bytes=record_bytes,
                 mode="decode", return_lse=True, lse_scale="base2", has_attention_sink=True)
             plan = sparse_mla.plan(caps)
             self._mla = plan

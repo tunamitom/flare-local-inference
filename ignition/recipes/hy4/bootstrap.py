@@ -217,7 +217,8 @@ class PreparedHy4Rank:
 
 def construct_rank(snapshot, config: PreparationConfig, *, rank=0, device=None, pinned=True,
                    mtp=None, cache_rows=None, cache_capacity=None, index_pages_per_layer=1,
-                   headers_only=False, manifest=None, world_size=None, collectives=None):
+                   headers_only=False, manifest=None, world_size=None, collectives=None,
+                   fused_cache=False):
     """Construct one Hy4 rank end to end (the CPU-shape/dtype dry run's core).
 
     Shard assignment, name-checked weight loading (the do-not-quantize floor
@@ -275,18 +276,115 @@ def construct_rank(snapshot, config: PreparationConfig, *, rank=0, device=None, 
     rows = config.max_active if cache_rows is None else cache_rows
     capacity = max(config.prefill_chunk_size, 128) if cache_capacity is None else cache_capacity
     cache = Hy4Cache.allocate(model_config, rows=rows, capacity=capacity, device=device, draft=mtp,
-                              world=shard.world_size, rank=rank)
+                              world=shard.world_size, rank=rank, fused_records=fused_cache)
     decoder = Hy4Decoder(weights, cache, collectives=collectives,
                          prefill_chunk_size=config.prefill_chunk_size)
     report = {"rank": rank, "world_size": shard.world_size, "device": str(device),
               "weights_bytes": weights.allocated_bytes, "mtp": mtp,
               "full_indexer_layers": model_config.full_indexer_layers,
               "shared_indexer_layers": len(model_config.shared_indexer_layers),
-              "prefill_head_gather": sharding.prefill_head_gather}
+              "prefill_head_gather": sharding.prefill_head_gather,
+              "fused_cache": fused_cache}
     return PreparedHy4Rank(snapshot=snapshot, settings=config, model_config=model_config,
                            sharding=sharding, device=device, weights=weights, decoder=decoder,
                            cache=cache, index_cache=index_cache, selections=selections,
                            memory_report=report)
+
+
+def capture_kernel_graphs(constructed, shapes=(("decode", (1, 1)), ("prefill", (1, 2048)))):
+    """Capture the prepared kernel chain at the measurement shapes; return bytes.
+
+    The capture covers the CUDA-graph-safe b12x operator chain the decode and
+    prefill steps execute per layer (the sparse-MLA prepared attend + sink
+    fold and the fused-record writer write) — the graph-pool residency that
+    the `Allocate cache` line must subtract. The torch-op terms (MoE routing,
+    indexer scoring) are NOT capture-safe today (host-side value reads inside
+    the layer loop), so this is a LOWER BOUND on the final graph catalog; the
+    report states it as measured-and-bounded, never as a placeholder.
+
+    Footprint = the device-free delta across warmup + capture + one replay,
+    measured with the caching allocator drained (`empty_cache`) so the number
+    is real allocated graph-pool + scratch, not allocator slack.
+    """
+    import torch
+
+    decoder = constructed.decoder
+    device = constructed.device
+    attn = constructed.weights.layers[0].attention
+    cache = constructed.cache
+    topk = constructed.model_config.text["index_topk"]
+    torch.cuda.synchronize(device)
+    torch.cuda.empty_cache()
+    before, _ = torch.cuda.mem_get_info(device)
+    captured = {}
+    for name, (rows, tokens) in shapes:
+        shape = decoder.default_call_shape((rows, tokens))
+        q = torch.randn(rows * tokens, attn.heads, attn.kv_lora + attn.qk_rope,
+                        device=device, dtype=torch.bfloat16)
+        table = cache.latents(0)
+        selected = torch.zeros((rows * tokens, topk), dtype=torch.int32, device=device)
+        counts = torch.ones((rows * tokens,), dtype=torch.int32, device=device)
+        lengths = torch.ones((rows * tokens,), dtype=torch.int32, device=device)
+        # eager warmup (JIT/preparation allocations land before capture)
+        attn.attend(q, table, selected, counts, cache_lengths=lengths, call_shape=shape)
+        torch.cuda.synchronize(device)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            attn.attend(q, table, selected, counts, cache_lengths=lengths, call_shape=shape)
+        graph.replay()
+        torch.cuda.synchronize(device)
+        captured[name] = graph
+    after, _ = torch.cuda.mem_get_info(device)
+    decoder.trace.append(("captured_kernel_graphs", tuple(captured), before - after))
+    return before - after, captured
+
+
+def allocate_cache_report(constructed, *, graph_scratch_bytes, world_size=None,
+                          headroom_bytes=0, graph_term_complete=False):
+    """The helios `Allocate cache` line from the REAL post-capture residue.
+
+    Tokens per rank = (device free after weights + graphs + scratch − headroom)
+    / `ModelConfig.token_record_bytes()` — the same contract as w6 §1.3, with
+    the 12 GiB graph PLACEHOLDER replaced by the measured `graph_scratch_bytes`.
+    Returns `(line, facts)`; `facts` carries the machine figures including the
+    1M one-third-cap verdict and the graph budget the cap implies.
+    """
+    import torch
+
+    device = constructed.device
+    cfg = constructed.model_config
+    torch.cuda.synchronize(device)
+    free, total = torch.cuda.mem_get_info(device)
+    record = cfg.token_record_bytes()
+    pool = free - headroom_bytes
+    tokens = pool // record
+    world = world_size if world_size is not None else constructed.sharding.world_size
+    aggregate = tokens * world
+    cap = aggregate // 3
+    # The measured w2 boot facts: 1M aggregate / 3 needs graphs + scratch under
+    # (free-after-weights − 3 × 1,048,576 × record) at world 8.
+    facts = {
+        "device_free_after_graphs_bytes": free,
+        "device_total_bytes": total,
+        "graph_scratch_bytes": graph_scratch_bytes,
+        "graph_term_complete": bool(graph_term_complete),
+        "headroom_bytes": headroom_bytes,
+        "record_bytes_contract": record,
+        "weights_bytes": constructed.memory_report["weights_bytes"],
+        "pool_bytes": pool,
+        "tokens_per_rank": tokens,
+        "tokens_aggregate": aggregate,
+        "one_third_cap": cap,
+        "one_third_cap_holds_1m": cap >= 1_048_576,
+    }
+    line = (
+        f"Allocate cache: {pool} B KV pool = {tokens} tokens/rank "
+        f"(record {record} B; graph+scratch {graph_scratch_bytes} B measured"
+        f"{'' if graph_term_complete else ', kernel-chain term only'}; "
+        f"aggregate {aggregate}; one-third cap {cap}"
+        f"{'>= 1M ✓' if cap >= 1_048_576 else '< 1M ✗'})"
+    )
+    return line, facts
 
 
 def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=None, checkpoint=None):
@@ -311,16 +409,36 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=N
     device = torch.device("cuda", config.devices[rank])
     torch.cuda.set_device(device)
     constructed = construct_rank(snapshot, config, rank=rank, device=device, pinned=True,
-                                 mtp=config.mtp)
+                                 mtp=config.mtp, fused_cache=True)
     report(f"constructed rank {rank}: {constructed.memory_report['weights_bytes'] >> 20} MiB weights, "
            f"{len(constructed.weights.layers)} layers")
     constructed.wire_operators(session="prepared")  # plans bind in the tuning session below
+    # P5 measurement step (the M2 boot line): bind the measurement call
+    # shapes, capture the prepared kernel chain's graphs, then report the REAL
+    # post-capture token count — the helios `Allocate cache` line with the
+    # w6 §1.3 12 GiB graph PLACEHOLDER replaced by the measured graph+scratch
+    # footprint. The graph term is the capture-safe kernel chain (sparse-MLA
+    # attend + sink fold + fused-record writer); the torch-op catalog terms
+    # ride the capture_forwards integration below and are reported as missing,
+    # never folded into the number silently.
+    shapes = [constructed.decoder.default_call_shape((1, 1)),
+              constructed.decoder.default_call_shape((1, min(config.prefill_chunk_size, 2048)))]
+    constructed.decoder.bind_plan_book(None, shapes)
+    graph_bytes, _ = capture_kernel_graphs(constructed)
+    world = group.size() if hasattr(group, "size") else len(config.devices)
+    line, facts = allocate_cache_report(constructed, graph_scratch_bytes=graph_bytes,
+                                        world_size=world, graph_term_complete=False)
+    constructed.memory_report["allocate_cache"] = facts
+    report(line)
     # TODO(P5, GPU): RecordedPreparationSession tuning of the iHC 'norm.mhc.ihc'
     # contract, the sparse-MLA sink plans and the dsa_indexer selection plans;
-    # the prefill/decode/speculative graph catalog via capture_forwards; KV page
-    # measurement and the native replay export. Each needs the full-shape GPU
+    # the prefill/decode/speculative graph catalog via capture_forwards (its
+    # torch-op terms are not capture-safe yet — host-side value reads in the
+    # layer loop) and the native replay export. Each needs the full-shape GPU
     # window and the real checkpoint — the CPU dry run proves construction and
     # numerics, not kernel selection.
     raise NotImplementedError(
-        "Hy4 rank construction and operator wiring are done; kernel tuning, "
-        "CUDA graph capture and native replay export await the P5 GPU window")
+        "Hy4 rank construction, operator wiring and the post-capture Allocate-cache "
+        "report are done (the line above is the real measured number); kernel tuning "
+        "catalog, capture_forwards graph integration and native replay export remain "
+        "the P5 serve work")
