@@ -108,13 +108,13 @@ class Hy4WeightLoader(DirectWeightLoader):
     """
 
     def __init__(self, manifest, device, *, shard=None, progress=None, prefixes=None, mtp=True,
-                 expert_scale_compression=None):
+                 expert_scale_compression=None, pinned=True):
         super().__init__(manifest, device, prefixes=prefixes, progress=progress)
         from .config import ModelConfig
 
         if expert_scale_compression not in (None, "csf"):
             raise ValueError("Hy4 expert scale compression must be None or 'csf'")
-        self.config = ModelConfig.load(manifest.snapshot)
+        self.config = ModelConfig.load(manifest.snapshot, pinned=pinned)
         self.shard, self.mtp = shard, mtp
         self.expert_scale_compression = expert_scale_compression
 
@@ -361,3 +361,62 @@ class Hy4WeightLoader(DirectWeightLoader):
         if tuple(source.shape) != (self.config.vocabulary, self.config.hidden):
             raise ValueError(f"{name}: expected the vocabulary projection")
         return self.load_tensor(name, dtype=torch.float32)
+
+
+class _CpuWeightSession:
+    """CPU stand-in for `b12x.loader.DirectWeightSession`: copy in-process."""
+
+    def __init__(self):
+        self.payload_bytes = 0
+
+    def __call__(self, destination, source):
+        destination.copy_(source)
+        self.payload_bytes += destination.numel() * destination.element_size()
+        return True
+
+    def flush(self):
+        pass
+
+    def stats(self):
+        return {}
+
+
+def cpu_dry_run(loader):
+    """Context manager populating `loader._sources` from the checkpoint on CPU.
+
+    `DirectWeightLoader.__enter__` requires CUDA (the b12x streaming session);
+    the rank-construction dry run reads every selected tensor into CPU memory
+    instead, so construction, tensor-name coverage and the dtype policy run
+    end to end without a GPU. GPU-only packing (`flashinfer.fp4_quantize`,
+    `b12x.moe.prepare_weights`) is deliberately not reached: CPU construction
+    routes experts through the reference path
+    (`moe.ReferenceRoutedExperts`), whose numerics are the contract's own.
+    """
+    import contextlib
+
+    from safetensors import safe_open
+
+    @contextlib.contextmanager
+    def open_sources():
+        if loader._stack is not None or loader._session is not None:
+            raise RuntimeError("weight loader context is already open")
+        selected = loader._selected_names()
+        shards = {}
+        for name in selected:
+            shards.setdefault(loader.manifest.tensors[name].shard, []).append(name)
+        sources = {}
+        for shard, names in shards.items():
+            with safe_open(loader.manifest.snapshot / shard, framework="pt", device="cpu") as handle:
+                for name in names:
+                    sources[name] = handle.get_tensor(name)
+        loader._sources = sources
+        loader._session = _CpuWeightSession()
+        loader._stack = ()  # marks the loader open for `_require_open`
+        try:
+            yield loader
+        finally:
+            loader._sources = {}
+            loader._session = None
+            loader._stack = None
+
+    return open_sources()

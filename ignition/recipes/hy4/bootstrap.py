@@ -2,18 +2,30 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Preparation settings for a Hy4 tensor-parallel rank.
+"""Per-rank Hy4 construction and preparation.
 
-The recipe constructs and validates this configuration from checkpoint
-metadata on CPU. Per-rank decoder preparation — the iHC operator, sink
-plumbing, shared selection, and gated MLA — is not implemented yet and raises
-from `prepare_rank`.
+`construct_rank` builds one rank end to end on any device: shard assignment,
+the 78-layer body (21 full-indexer / 57 shared-selection layers), the 4-stream
+iHC state, gated sparse-MLA attention with sinks, the W4A16 routed MoE and the
+MTP draft — wired to the b12x operators' contracts (`norm.mhc.ihc`,
+`sparse_mla` sink provenance, `dsa_indexer` / `IndexCache` shared selection).
+It runs on CPU against the reference package's `tiny-hy4`
+(`weights.cpu_dry_run`) and on GPU against the real checkpoint.
+
+`prepare_rank` is the GPU preparation entry `recipe.prepare` drives: it
+constructs, then stops at the kernel-tuning / CUDA-graph-capture / native-replay
+boundary, which needs GPU hardware and the P5 full-shape window (explicitly
+marked below). Everything before that boundary is real code, exercised by the
+CPU dry run and the recipe tests.
 """
 
 from dataclasses import dataclass
 from pathlib import Path
 
-from .config import PAGE_TOKENS
+from ignition.components.parallel import TensorParallelShard
+
+from .config import PAGE_TOKENS, ModelConfig
+from .shard import Hy4Sharding
 
 
 @dataclass(frozen=True)
@@ -110,13 +122,166 @@ class PreparationConfig:
         return PAGE_TOKENS * len(self.devices)
 
 
-def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=None, checkpoint=None):
-    """Load, tune, and capture one Hy4 rank.
+def selection_cells(config, device, *, max_q_rows, index_pages_per_layer=1):
+    """The shared-selection `IndexCache` and its per-layer cells.
 
-    Not implemented: the decoder body (torch-op iHC, sinks, shared selection,
-    gated MLA with interleaved RoPE) and the operator deltas it needs are future
-    work. `recipe.prepare` reaches this only on GPUs.
+    21 `full` cells (0, 1, 5, ..., 77) own `[max_q_rows, topk]` selection
+    buffers and index-key pages; the 57 `shared` cells resolve to their owner's
+    buffers by `data_ptr`; the MTP block's own indexer is one more `full` cell
+    at layer `config.layers`. Under context parallelism the cross-rank
+    selection exchange then runs 21 times per step, not 78
+    (`IndexCache.selection_exchange_count`).
     """
+    from b12x.attention.dsa_indexer.index_cache import IndexCache, IndexerLayer, hy4_indexer_layers
+
+    from .attention import SelectionCell
+
+    layers = list(hy4_indexer_layers(config.layers, full_layer_ids=config.full_indexer_layers))
+    if config.draft_layers:
+        layers.append(IndexerLayer(config.layers, "full", config.layers))
+    cache = IndexCache(tuple(layers), device=device, topk=config.text["index_topk"],
+                       max_q_rows=max_q_rows, index_pages_per_layer=index_pages_per_layer)
+    cells = {layer.layer_id: SelectionCell(layer.layer_id, layer.kind, layer.owner_id, cache)
+             for layer in layers}
+    return cache, cells
+
+
+@dataclass
+class PreparedHy4Rank:
+    """One constructed rank: state, decoder entry points, and operator wiring."""
+
+    snapshot: Path
+    settings: "PreparationConfig"
+    model_config: object
+    sharding: object
+    device: object
+    weights: object
+    decoder: object
+    cache: object
+    index_cache: object
+    selections: dict
+    memory_report: dict
+
+    def wire_operators(self, *, session=None):
+        """Bind the b12x operator plans this rank's forwards execute.
+
+        GPU-only (b12x plans lower through `PreparationSession` and Triton
+        warmup): the iHC `norm.mhc.ihc` TuningContract per boundary
+        (`B12XIHCCaps` -> `ihc.plan`), the sparse-MLA plans with their sinks
+        (`sparse_mla.plan`, `has_attention_sink=True`), and the full layers'
+        `dsa_indexer` plans in physical slot space (`IndexCache.physical_caps`)
+        with `PreparedSelectionHandback` pinned for the CP hand-back. On CPU
+        the same contracts execute through the torch-op references the
+        operators are tuned against (`state.IhcBoundary`, `attention`).
+        """
+        if session is None:
+            return self  # the CPU dry run keeps the torch-op wiring
+        import torch
+
+        from b12x.norm.mhc import ihc
+
+        c = self.model_config.text
+        caps = ihc.Caps(device=self.device,
+                        max_tokens=max(self.settings.prefill_chunk_size, self.settings.request_capacity),
+                        hidden_size=self.model_config.hidden)
+        for layer in self.weights.layers:
+            for boundary in (layer.attn_ihc, layer.ffn_ihc):
+                boundary.plan = ihc.plan(caps, invocation={
+                    "operation": "post_pre", "magnitude": boundary.magnitude,
+                    "hc_eps": boundary.hc_eps, "norm_eps": boundary.norm_eps,
+                    "layernorm_eps": c["rms_norm_eps"], "has_norm_weight": True,
+                    "norm_weight_dtype": "float32"})
+        for layer_id, cell in self.selections.items():
+            if cell.kind == "full":
+                cell.caps = self.index_cache.physical_caps(
+                    layer_id, num_q_heads=self.model_config.text["index_n_heads"],
+                    max_page_table_width=self.cache.capacity, topk=c["index_topk"])
+        return self
+
+
+def construct_rank(snapshot, config: PreparationConfig, *, rank=0, device=None, pinned=True,
+                   mtp=None, cache_rows=None, cache_capacity=None, index_pages_per_layer=1):
+    """Construct one Hy4 rank end to end (the CPU-shape/dtype dry run's core).
+
+    Shard assignment, name-checked weight loading (the do-not-quantize floor
+    enforced), the iHC/sink/shared-selection/gated-MLA wiring and a working
+    `Hy4Decoder` with its `prefill` / `decode_step` / `draft_step` entries.
+    `device` defaults to CPU; pass a CUDA device for the real checkpoint
+    (`pinned=True`). Every checkpoint tensor is consumed exactly once — an
+    unmatched or leftover name raises instead of being dropped.
+    """
+    import torch
+
+    from .decoder import Hy4Cache, Hy4Decoder
+    from .state import build_model_state
+    from .weights import Hy4WeightLoader, cpu_dry_run
+
+    snapshot = Path(snapshot).expanduser().resolve()
+    model_config = ModelConfig.load(snapshot, pinned=pinned)
+    shard = TensorParallelShard(rank, len(config.devices))
+    sharding = Hy4Sharding(model_config, shard)
+    if device is None:
+        device = torch.device("cpu")
+    device = torch.device(device)
+    mtp = config.mtp if mtp is None else mtp
+    max_q_rows = max(config.prefill_chunk_size, config.request_capacity)
+    index_cache, selections = selection_cells(model_config, device, max_q_rows=max_q_rows,
+                                             index_pages_per_layer=index_pages_per_layer)
+    from ignition.preparation.checkpoint import inspect_indexed_checkpoint
+
+    manifest = inspect_indexed_checkpoint(snapshot)
+    loader = Hy4WeightLoader(manifest, device, shard=shard, mtp=mtp, pinned=pinned,
+                             expert_scale_compression=config.expert_scale_compression)
+    sources = loader if device.type == "cuda" else cpu_dry_run(loader)
+    with sources:
+        weights = build_model_state(loader, model_config, sharding, selections=selections, mtp=mtp)
+    rows = config.max_active if cache_rows is None else cache_rows
+    capacity = max(config.prefill_chunk_size, 128) if cache_capacity is None else cache_capacity
+    cache = Hy4Cache.allocate(model_config, rows=rows, capacity=capacity, device=device, draft=mtp)
+    decoder = Hy4Decoder(weights, cache)
+    report = {"rank": rank, "world_size": shard.world_size, "device": str(device),
+              "weights_bytes": weights.allocated_bytes, "mtp": mtp,
+              "full_indexer_layers": model_config.full_indexer_layers,
+              "shared_indexer_layers": len(model_config.shared_indexer_layers),
+              "prefill_head_gather": sharding.prefill_head_gather}
+    return PreparedHy4Rank(snapshot=snapshot, settings=config, model_config=model_config,
+                           sharding=sharding, device=device, weights=weights, decoder=decoder,
+                           cache=cache, index_cache=index_cache, selections=selections,
+                           memory_report=report)
+
+
+def prepare_rank(snapshot, config, *, rank, group, progress=None, core_storage=None, checkpoint=None):
+    """Load, wire, tune, and capture one Hy4 rank on its supervised GPU.
+
+    Construction and operator wiring are `construct_rank` (tested end to end on
+    CPU against `tiny-hy4`). What remains here is genuinely GPU-bound and
+    belongs to the P5 full-shape window: the `RecordedPreparationSession`
+    kernel tuning over the iHC / sparse-MLA / indexer plans, the graph catalog
+    (`capture_forwards` over the prefill/decode/speculative entries), the KV
+    page measurement, and the native replay export. They are marked, not
+    stubbed over — `recipe.prepare` cannot serve until P5 lands.
+    """
+    def report(message):
+        if progress is not None:
+            progress(message)
+
+    import torch
+
+    if torch.device("cuda", config.devices[rank]).type != "cuda" or not torch.cuda.is_available():
+        raise ValueError("Hy4 rank preparation runs on CUDA; use construct_rank for the CPU dry run")
+    device = torch.device("cuda", config.devices[rank])
+    torch.cuda.set_device(device)
+    constructed = construct_rank(snapshot, config, rank=rank, device=device, pinned=True,
+                                 mtp=config.mtp)
+    report(f"constructed rank {rank}: {constructed.memory_report['weights_bytes'] >> 20} MiB weights, "
+           f"{len(constructed.weights.layers)} layers")
+    constructed.wire_operators(session="prepared")  # plans bind in the tuning session below
+    # TODO(P5, GPU): RecordedPreparationSession tuning of the iHC 'norm.mhc.ihc'
+    # contract, the sparse-MLA sink plans and the dsa_indexer selection plans;
+    # the prefill/decode/speculative graph catalog via capture_forwards; KV page
+    # measurement and the native replay export. Each needs the full-shape GPU
+    # window and the real checkpoint — the CPU dry run proves construction and
+    # numerics, not kernel selection.
     raise NotImplementedError(
-        "Hy4 rank preparation is not implemented; the recipe validates "
-        "geometry, weight metadata, and the export contract only")
+        "Hy4 rank construction and operator wiring are done; kernel tuning, "
+        "CUDA graph capture and native replay export await the P5 GPU window")

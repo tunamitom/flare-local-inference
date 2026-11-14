@@ -37,16 +37,75 @@ LATENT_RECORD_BYTES = 656
 INDEX_RECORD_BYTES = 132
 
 
-def _require(config, name, expected):
+def _require(config, name, expected, *, pin=True):
     value = config.get(name)
-    if value != expected:
+    if pin and value != expected:
         raise ValueError(f"Hy4 preparation requires {name}={expected!r}; checkpoint has {value!r}")
 
 
-def _require_in(config, name, choices):
+def _require_in(config, name, choices, *, pin=True):
     value = config.get(name)
-    if value not in choices:
+    if pin and value not in choices:
         raise ValueError(f"Hy4 preparation requires {name} in {choices!r}; checkpoint has {value!r}")
+
+
+def _smoke_relations(config):
+    """Structural Hy4 invariants at any geometry (the tiny-parity path).
+
+    `from_dict(config, pinned=False)` accepts reduced geometries (the reference
+    package's `tiny-hy4`) but never a structural drift: the iHC 4-stream form,
+    the gated-MLA geometry relations, the IndexCache full/shared pattern and the
+    dense-then-sparse MLP pattern are checked exactly as the pinned path checks
+    their production values.
+    """
+    for name in ("hidden_size", "num_hidden_layers", "vocab_size", "intermediate_size",
+                 "q_lora_rank", "kv_lora_rank", "moe_intermediate_size", "n_routed_experts",
+                 "num_experts_per_tok", "index_n_heads", "index_head_dim", "index_topk",
+                 "num_attention_heads", "num_key_value_heads", "head_dim",
+                 "qk_head_dim", "qk_nope_head_dim", "qk_rope_head_dim", "v_head_dim"):
+        if type(config.get(name)) is not int or config[name] <= 0:
+            raise ValueError(f"Hy4 smoke geometry requires positive integer {name}")
+    layers = config["num_hidden_layers"]
+    c = config
+    if (c["qk_nope_head_dim"] + c["qk_rope_head_dim"] != c["qk_head_dim"]
+            or c["head_dim"] != c["qk_rope_head_dim"]
+            or c["num_attention_heads"] % c["num_key_value_heads"]
+            or c["num_experts_per_tok"] > c["n_routed_experts"]):
+        raise ValueError("Hy4 attention/MoE geometry must preserve rotary pairs, KV groups and top-k bounds")
+    if not (c.get("use_mla") and c.get("gated_mla") and c.get("use_dsa") and c.get("enable_ihc")
+            and c.get("learnable_sink") and not c.get("tie_word_embeddings")):
+        raise ValueError("Hy4 requires gated MLA, DSA, iHC and learnable sinks, untied")
+    if c.get("hc_mult") != 4 or c.get("hc_eps", 0) <= 0 or c.get("hc_magnitude", 0) <= 0:
+        raise ValueError("Hy4 iHC requires hc_mult=4 with positive eps and magnitude")
+    if c.get("n_shared_experts") != 1 or c.get("swiglu_limit", 0) <= 0 or c.get("routed_scaling_factor", 0) <= 0:
+        raise ValueError("Hy4 MoE requires one shared expert and positive clamp/scaling")
+    if type(c.get("num_nextn_predict_layers")) is not int or c["num_nextn_predict_layers"] < 1:
+        raise ValueError("Hy4 requires at least one MTP predictor layer")
+    rope = c.get("rope_parameters")
+    if not isinstance(rope, dict) or "rope_theta" not in rope or "rope_type" not in rope:
+        raise ValueError("Hy4 requires rope_parameters with rope_theta and rope_type")
+    indexer = c.get("indexer_types")
+    expected_indexer = ["full" if layer in FULL_INDEXER_LAYERS else "shared" for layer in range(layers)]
+    if indexer != expected_indexer:
+        raise ValueError(
+            "Hy4 requires the exact indexer_types list: full layers 0, 1, then every fourth from 5; "
+            f"checkpoint differs at {[i for i, (a, b) in enumerate(zip(expected_indexer, indexer or ())) if a != b][:8]}")
+    if c.get("mlp_layer_types") != ["dense"] + ["sparse"] * (layers - 1):
+        raise ValueError("Hy4 requires mlp_layer_types dense at layer 0 and sparse elsewhere")
+    if not (isinstance(c.get("layer_types"), list) and len(c["layer_types"]) == layers
+            and set(c["layer_types"]) <= {"deepseek_sparse_attention", "indexed_attention"}):
+        raise ValueError("Hy4 requires one uniform sparse-attention layer_types list")
+
+
+# Structural flags the checkpoint's `config.json` carries at full size but the
+# HF `HYV4Config` class supplies as defaults; the smoke path fills them so the
+# decoder body can rely on one effective config either way.
+SMOKE_DEFAULTS = {
+    "use_mla": True, "gated_mla": True, "gating_type": "elementwise", "use_dsa": True,
+    "enable_ihc": True, "learnable_sink": True, "learnable_sink_init": 0.0,
+    "enable_lm_head_fp32": True, "mtp_loss_factor": 0.1, "bitwise_backward_align": False,
+    "num_nextn_predict_layers": 1,
+}
 
 
 @dataclass(frozen=True)
@@ -56,13 +115,31 @@ class ModelConfig:
     text: dict
 
     @classmethod
-    def load(cls, snapshot):
-        return cls.from_dict(json.loads((Path(snapshot) / "config.json").read_text()))
+    def load(cls, snapshot, *, pinned=True):
+        return cls.from_dict(json.loads((Path(snapshot) / "config.json").read_text()), pinned=pinned)
 
     @classmethod
-    def from_dict(cls, config):
+    def from_dict(cls, config, *, pinned=True):
+        """Validate a Hy4 `config.json`.
+
+        `pinned=True` (the serving path) demands the exact production geometry
+        of `tencent/Hy4-preview` at revision `705d81ee`. `pinned=False` is the
+        smoke/tiny path: it fills HF's structural defaults and validates the
+        same Hy4 structural invariants at reduced geometry (`_smoke_relations`)
+        — for the reference package's `tiny-hy4` rank-construction dry-run.
+        """
         if not isinstance(config, dict):
             raise ValueError("Hy4 preparation requires a JSON object config")
+        if pinned:
+            cls._validate_pinned(config)
+            return cls(config)
+        effective = {name: value for name, value in SMOKE_DEFAULTS.items() if name not in config}
+        effective.update(config)
+        _smoke_relations(effective)
+        return cls(effective)
+
+    @classmethod
+    def _validate_pinned(cls, config):
         # Identity.
         _require(config, "architectures", ["HYV4ForCausalLM"])
         _require(config, "model_type", "hy_v4")
@@ -142,7 +219,6 @@ class ModelConfig:
         _require(config, "eos_token_id", 120025)
         _require(config, "pad_token_id", 120002)
         _require_in(config, "transformers_version", ("5.16.2",))
-        return cls(config)
 
     @property
     def layers(self):
@@ -171,7 +247,9 @@ class ModelConfig:
     @property
     def full_indexer_layers(self):
         """Layers that run the indexer and own the only index-key pages."""
-        return FULL_INDEXER_LAYERS
+        layers = tuple(i for i, kind in enumerate(self.text["indexer_types"]) if kind == "full")
+        assert len(self.text["indexer_types"]) != 78 or layers == FULL_INDEXER_LAYERS
+        return layers
 
     @property
     def shared_indexer_layers(self):
