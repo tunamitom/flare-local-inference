@@ -260,7 +260,8 @@ def construct_rank(snapshot, config: PreparationConfig, *, rank=0, device=None, 
     capacity = max(config.prefill_chunk_size, 128) if cache_capacity is None else cache_capacity
     cache = Hy4Cache.allocate(model_config, rows=rows, capacity=capacity, device=device, draft=mtp,
                               world=shard.world_size, rank=rank)
-    decoder = Hy4Decoder(weights, cache, collectives=collectives)
+    decoder = Hy4Decoder(weights, cache, collectives=collectives,
+                         prefill_chunk_size=config.prefill_chunk_size)
     report = {"rank": rank, "world_size": shard.world_size, "device": str(device),
               "weights_bytes": weights.allocated_bytes, "mtp": mtp,
               "full_indexer_layers": model_config.full_indexer_layers,

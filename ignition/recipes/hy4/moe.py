@@ -41,6 +41,35 @@ class RouterWeights:
 
 
 @dataclass(frozen=True)
+class PackedMoEInputProjections:
+    """One GEMM for the MoE's same-input projections (packed at load).
+
+    The consult7 §5 bake-in: the router `gate` and the shared expert's
+    `gate_proj`/`up_proj` all consume the MoE input `x`, so their rows pack
+    into one matrix — one `x @ packed.T` reads `x` once (`down_proj` reads the
+    intermediate, not `x`). Pure layout; built at weight-load time.
+    """
+
+    packed: torch.Tensor   # [experts + 2 * inter_local, hidden]
+    slices: dict           # name -> (first, last)
+
+    @classmethod
+    def build(cls, router, shared):
+        gate_rows = router.gate.shape[0]
+        inter = shared.gate_proj.shape[0]
+        packed = torch.cat((router.gate, shared.gate_proj, shared.up_proj), dim=0).contiguous()
+        return cls(packed=packed, slices={
+            "router": (0, gate_rows),
+            "shared_gate": (gate_rows, gate_rows + inter),
+            "shared_up": (gate_rows + inter, gate_rows + 2 * inter),
+        })
+
+    def rows(self, name):
+        first, last = self.slices[name]
+        return self.packed[first:last]
+
+
+@dataclass(frozen=True)
 class DenseMlpWeights:
     """A dense gated MLP (layer-0 FFN / shared expert), intermediate-sharded."""
 
@@ -143,12 +172,17 @@ class MoEBlock:
     config: ModelConfig
     device: torch.device
     _prepared: object = None  # GPU wiring (PreparedRouter + PreparedRoutedExperts)
+    packed_input: object = None    # `PackedMoEInputProjections` (packed at load)
+    overlap_applied: bool = False  # did the shared expert overlap the routed experts?
 
     def route(self, x):
         """(router_logits, topk_weights, topk_indices): sigmoid + bias, top-k, renorm, scale."""
+        logits = x.float() @ self.router.gate.float().T
+        return self._route_from_logits(logits)
+
+    def _route_from_logits(self, logits):
         c = self.config.text
         experts, top_k = self.router.experts, c["num_experts_per_tok"]
-        logits = x.float() @ self.router.gate.float().T
         scores = torch.sigmoid(logits)
         choice = scores + self.router.correction_bias.float()
         if c["n_group"] > 1:  # the general group contract; Hy4 runs n_group == 1
@@ -164,14 +198,57 @@ class MoEBlock:
             topk_weights = topk_weights / (topk_weights.sum(-1, keepdim=True) + 1e-20)
         return logits, topk_weights * c["routed_scaling_factor"], topk_indices
 
-    def forward(self, x):
-        """Routed mixture + shared expert (`HYV4MoE.forward`)."""
-        _, topk_weights, topk_indices = self.route(x)
+    def _shared_forward(self, x, shared_gate=None, shared_up=None):
+        """The shared expert (unclamped SwiGLU), optionally from packed projections."""
+        if shared_gate is None or shared_up is None:
+            return self.shared.forward(x)
+        return (torch.nn.functional.silu(shared_gate) * shared_up) @ self.shared.down_proj.T
+
+    def _routed_forward(self, x, topk_indices, topk_weights):
         if self.device.type == "cuda" and self._prepared is not None:
-            routed = self._prepared(x, ids=topk_indices, weights=topk_weights)
+            return self._prepared(x, ids=topk_indices, weights=topk_weights)
+        return self.routed.forward(x, topk_indices, topk_weights)
+
+    def forward(self, x, *, overlap_shared=False):
+        """Routed mixture + shared expert (`HYV4MoE.forward`).
+
+        The consult7 §5 bake-in "shared expert overlapped with routed
+        experts": with `overlap_shared` (decode graphs — a per-graph-family
+        property) the shared expert runs on a side stream while the routed
+        experts execute, joined before the add. Prefill graphs pass
+        `overlap_shared=False` (consult8 §6: overlap is a property of the
+        graph family). On CPU the two run sequentially with
+        `overlap_applied` recording the placement decision. Router + shared
+        `gate`/`up` read `x` once through the load-time packed projection
+        when present.
+        """
+        packed = self.packed_input
+        if packed is not None:
+            # One packed weight at load; per-projection GEMMs over its rows —
+            # bitwise the same as the loose weights (content gates are exact).
+            logits = (x.float() @ packed.rows("router").float().T)
+            shared_gate = x @ packed.rows("shared_gate").T
+            shared_up = x @ packed.rows("shared_up").T
+            _, topk_weights, topk_indices = self._route_from_logits(logits)
         else:
-            routed = self.routed.forward(x, topk_indices, topk_weights)
-        return routed + self.shared.forward(x)
+            shared_gate = shared_up = None
+            _, topk_weights, topk_indices = self.route(x)
+        overlap = bool(overlap_shared) and self.device.type == "cuda"
+        self.overlap_applied = bool(overlap_shared)
+        if overlap:
+            side = getattr(self, "_shared_stream", None)
+            if side is None:
+                side = torch.cuda.Stream()
+                self._shared_stream = side
+            joined = torch.cuda.Event()
+            with torch.cuda.stream(side):
+                shared = self._shared_forward(x, shared_gate, shared_up)
+            joined.record(side)
+            routed = self._routed_forward(x, topk_indices, topk_weights)
+            torch.cuda.current_stream().wait_event(joined)
+            return routed + shared
+        routed = self._routed_forward(x, topk_indices, topk_weights)
+        return routed + self._shared_forward(x, shared_gate, shared_up)
 
 
 class DenseBlock:
@@ -180,5 +257,6 @@ class DenseBlock:
     def __init__(self, weights: DenseMlpWeights, device):
         self.weights, self.device = weights, device
 
-    def forward(self, x):
+    def forward(self, x, *, overlap_shared=False):
+        # No shared/routed split here — the overlap flag is a no-op.
         return self.weights.forward(x)

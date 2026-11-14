@@ -21,13 +21,15 @@ lands"). The two are bit-comparable by construction; the CPU path is what the
 tiny dry run executes.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import torch
 
-from .attention import AttentionWeights, Hy4LayerAttention, IndexerWeights, SelectionCell
+from .attention import (AttentionWeights, Hy4LayerAttention, IndexerWeights,
+                        PackedInputProjections, SelectionCell)
 from .config import ModelConfig
-from .moe import DenseBlock, DenseMlpWeights, MoEBlock, ReferenceRoutedExperts, RouterWeights
+from .moe import (DenseBlock, DenseMlpWeights, MoEBlock, PackedMoEInputProjections,
+                  ReferenceRoutedExperts, RouterWeights)
 from .shard import Hy4Sharding
 from .weights import kept_fp32
 
@@ -80,7 +82,8 @@ class IhcBoundary:
             from b12x.norm.mhc import ihc
 
             return ihc.run_pre(streams, w.fn, w.scale, w.base,
-                               magnitude=self.magnitude, hc_eps=self.hc_eps, norm_eps=self.norm_eps)
+                               magnitude=self.magnitude, hc_eps=self.hc_eps, norm_eps=self.norm_eps,
+                               plan=self.plan)  # prepared plan: no JIT at run time
         ihc = self._reference()
         return ihc.ihc_pre_reference(streams, w.fn, w.scale, w.base,
                                      magnitude=self.magnitude, hc_eps=self.hc_eps, norm_eps=self.norm_eps)
@@ -91,7 +94,7 @@ class IhcBoundary:
         if self.device.type == "cuda":
             from b12x.norm.mhc import ihc
 
-            return ihc.run_post(branch, streams, post)
+            return ihc.run_post(branch, streams, post, plan=self.plan)
         ihc = self._reference()
         return ihc.ihc_post_reference(branch, streams, post)
 
@@ -109,7 +112,7 @@ class IhcBoundary:
             return ihc.run_post_pre(branch, streams, prev_post, w.fn, w.scale, w.base,
                                     magnitude=nxt.magnitude, hc_eps=nxt.hc_eps,
                                     norm_eps=nxt.norm_eps, norm_weight=norm_weight,
-                                    layernorm_eps=self.norm_eps)
+                                    layernorm_eps=self.norm_eps, plan=self.plan)
         ihc = self._reference()
         w = nxt.weights
         return ihc.ihc_post_pre_reference(branch, streams, prev_post, w.fn, w.scale, w.base,
@@ -318,9 +321,12 @@ def _attention_state(builder, layer, prefix, selection):
                          row_range=sharding.q_b_rows)
     kv_a = builder.linear(f"{attn}.kv_a_proj_with_mqa", (c["kv_lora_rank"] + c["qk_rope_head_dim"], hidden))
     kv_a_norm = builder.norm(f"{attn}.kv_a_layernorm.weight", c["kv_lora_rank"])
+    # `kv_b_proj` loads REPLICATED — whole on every rank (consult8 §5's `kv_b`
+    # two-wirings: the prefill graphs gather UNABSORBED queries and absorb +
+    # expand LOCALLY over ALL heads; decode keeps the owner-side absorb and
+    # reads only `sharding.head_range`'s rows).
     kv_b = builder.linear(f"{attn}.kv_b_proj",
-                          (config.heads * (c["qk_nope_head_dim"] + c["v_head_dim"]), c["kv_lora_rank"]),
-                          row_range=sharding.kv_b_rows)
+                          (config.heads * (c["qk_nope_head_dim"] + c["v_head_dim"]), c["kv_lora_rank"]))
     o_proj = builder.linear(f"{attn}.o_proj", (hidden, config.heads * c["v_head_dim"]),
                             column_range=sharding.o_proj_columns)
     gate = builder.linear(f"{attn}.linear_gate", (config.heads * c["v_head_dim"], hidden),
@@ -343,10 +349,16 @@ def _attention_state(builder, layer, prefix, selection):
         for name, tensor in (("wq_b", indexer.wq_b), ("wk", indexer.wk)):
             if tensor.dtype != torch.bfloat16:
                 raise ValueError(f"{ip}.{name}: indexer projections stay BF16")
+    attention_weights = AttentionWeights(
+        q_a_proj=q_a, q_a_norm=q_a_norm, q_b_proj=q_b, kv_a_proj=kv_a,
+        kv_a_norm=kv_a_norm, kv_b_proj=kv_b, o_proj=o_proj, gate_proj=gate,
+        sink=sink, indexer=indexer)
+    # The consult7 §5 bake-in "packed same-input projections at load": one
+    # GEMM for `q_a_proj` + `kv_a_proj` + `linear_gate` + the indexer `wk`.
+    attention_weights = replace(
+        attention_weights, packed_input=PackedInputProjections.build(attention_weights))
     return Hy4LayerAttention(
-        weights=AttentionWeights(q_a_proj=q_a, q_a_norm=q_a_norm, q_b_proj=q_b, kv_a_proj=kv_a,
-                                 kv_a_norm=kv_a_norm, kv_b_proj=kv_b, o_proj=o_proj, gate_proj=gate,
-                                 sink=sink, indexer=indexer),
+        weights=attention_weights,
         config=config, sharding=sharding, selection=selection, device=builder.loader.device)
 
 
@@ -396,7 +408,9 @@ def _moe_state(builder, prefix, *, dense=False):
                   f"{expert_prefix}.down_proj.weight": stacks[f"{expert_prefix}.down_proj.weight"][:, :, first:last]}
         routed = ReferenceRoutedExperts.from_bf16(sliced, expert_prefix, swiglu_limit=c["swiglu_limit"])
     return MoEBlock(router=router, shared=shared, routed=routed, config=config,
-                    device=loader.device)
+                    device=loader.device,
+                    # consult7 §5: router + shared gate/up pack at load.
+                    packed_input=PackedMoEInputProjections.build(router, shared))
 
 
 def build_model_state(loader, config, sharding, *, selections, mtp=True):

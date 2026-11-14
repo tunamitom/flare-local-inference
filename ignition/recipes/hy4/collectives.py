@@ -25,8 +25,11 @@ the eager world-1 path, the W6 CPU simulation and the W7 GPU path:
 The CPU simulation (`SimulatedGroup`) runs W ranks of the same body in
 lockstep — one thread per rank, barrier-synchronized exchanges combined over
 the simulated ranks in rank order — which is the W6 gates' instrument. The
-GPU implementation over `PCIeDCPA2A` is W7's (TODO hooks below name the
-primitives per collective); the body is identical either way.
+GPU implementation (`PcieDcpCollectives` over the real `PCIeDCPA2A` /
+`PCIeDCPTopKOwnerExchange` b12x transport, prepared plans only) is W7's; the
+body is identical either way. `SimulatedDcpTransport` is the CPU twin of the
+transport's call surfaces, so the wired `PcieDcpCollectives` path is what the
+2-rank CPU gates run.
 
 LSE convention: Hy4 partials are base 2 (`sparse_mla` `lse_scale="base2"`,
 the sink folded exactly once after the merge), so `lse_reduce` always states
@@ -44,6 +47,11 @@ __all__ = [
     "SimulatedGroup",
     "SimulatedCollectives",
     "merge_candidate_topk",
+    "scores_only_threshold",
+    "check_scores_only_exactness",
+    "select_own_candidates",
+    "SimulatedDcpTransport",
+    "PcieDcpCollectives",
 ]
 
 LSE_BASE = "base2"
@@ -134,9 +142,12 @@ def merge_candidate_topk(candidates, topk):
     `dsa_indexer.tiled_topk.merge_tiled_topk_candidates` (its `chunks` axis is
     the ranks). Returns `(values, positions)` `[rows, topk]` in GLOBAL
     positions (`-inf` / `-1` padding survives the merge and drops in the
-    hand-back). Ties resolve as `torch.topk` resolves them on the single
-    rank's `select` — the W6 gate-b tie cases are constructed so the selected
-    set is tie-order independent.
+    hand-back). `torch.topk`'s tie order is unspecified and layout-dependent,
+    so it does NOT reproduce the single rank's `select` pick when the top-k cut
+    lands inside a score plateau (the tiny indexer's relu makes exact 0.0
+    plateaus): the W6 gate-b tie cases are constructed so the selected set is
+    tie-order independent there, and content gates verify any plateau swap as
+    an exact score tie (`test_hy4_w7_wiring`'s tie-aware content gate).
     """
     from b12x.attention.dsa_indexer.tiled_topk import merge_tiled_topk_candidates
 
@@ -220,16 +231,24 @@ class SimulatedCollectives:
         self.world_size = group.world_size
         self.rank = rank
         self.lse_base = LSE_BASE
+        # Selection-exchange policy (the W7 bake-ins): `"candidates"` is the
+        # exact full-candidate merge (the W6 gate instrument); `"scores-only"`
+        # is the baked wire contract — only score words cross and each rank
+        # selects its own keys (see `scores_only_threshold`). The W6 gate-b
+        # exactness test overrides `local_offer` to the full selection width.
+        self.exchange_mode = "candidates"
+        self.local_offer = None
 
     def all_gather_heads(self, q_local):
-        # TODO(W7, GPU): `PCIeDCPA2A.all_gather_heads` (pcie_dcp_a2a:1331-1340).
+        # GPU: `PcieDcpCollectives.all_gather_heads` -> `PCIeDCPA2A.all_gather_heads`
+        # (pcie_dcp_a2a:1331-1340) with its prepared plan.
         taken = self.group._exchange(self.rank, q_local.contiguous())
         return torch.cat(taken, dim=1)
 
     def lse_reduce(self, out_partial, lse_partial, *, partials_sink_folded):
-        # TODO(W7, GPU): `PCIeDCPA2A.lse_reduce_scatter` fused reduce-scatter
+        # GPU: `PcieDcpCollectives.lse_reduce` -> `PCIeDCPA2A.lse_reduce_scatter`
         # (pcie_dcp_a2a:308-324) — partials over ALL heads in, this rank's
-        # contiguous head shard out.
+        # contiguous head shard out. This is the exact math either way.
         from b12x.comm.pcie import lse_reduce_scatter_reference
 
         taken = self.group._exchange(
@@ -248,7 +267,8 @@ class SimulatedCollectives:
         return merged, merged_lse
 
     def all_reduce(self, value):
-        # TODO(W7, GPU): the TP all-reduce (NCCL/one-shot over the TP group).
+        # GPU: `PcieDcpCollectives.all_reduce` (the TP all-reduce — NCCL or the
+        # one-shot PCIe reduce over the TP group).
         taken = self.group._exchange(self.rank, value.contiguous())
         return torch.stack(taken, dim=0).sum(dim=0)
 
@@ -274,9 +294,307 @@ class SimulatedCollectives:
         return torch.cat(taken, dim=-1)
 
     def merge_topk(self, candidate_scores, candidate_positions, *, topk):
-        # TODO(W7, GPU): `pcie_dcp_topk` candidate exchange into each row
-        # owner, then `merge_tiled_topk_candidates`.
+        """`"candidates"`: the exact full-candidate merge. `"scores-only"`: the
+        baked wire contract — only score words cross (`exchange_scores`) and
+        each rank selects its own keys above the global k-th score.
+        """
+        if self.exchange_mode == "scores-only":
+            offers = exchange_scores(self.group, self.rank, candidate_scores, self.local_offer)
+            return scores_only_selection(
+                offers, candidate_scores, candidate_positions,
+                topk=topk, world=self.world_size, rank=self.rank, local_offer=self.local_offer)
+        if self.exchange_mode != "candidates":
+            raise ValueError(f"unknown selection exchange mode {self.exchange_mode!r}")
         taken = self.group._exchange(
             self.rank, (candidate_scores.contiguous(), candidate_positions.contiguous())
         )
         return merge_candidate_topk(taken, topk)
+
+
+# --------------------------------------------------------------------------
+# the scores-only selection exchange (consult7 §5, consult8 §5)
+# --------------------------------------------------------------------------
+def exchange_scores(group, rank, candidate_scores, local_offer):
+    """The wire: each rank's top-`local_offer` SCORES per row, nothing else.
+
+    "Scores-only selection exchange (each rank needs only the global k-th
+    score and its own keys)" — key material and foreign positions never move;
+    each rank keeps its own candidates (`candidate_scores` /
+    `candidate_positions` stay local). `local_offer=None` offers the full
+    candidate width (the W6 gate-b override: 2,048-selection equality).
+    Returns the per-rank offers in rank order, each `[rows, offer]` sorted
+    descending with `-inf` padding.
+    """
+    rows, width = candidate_scores.shape
+    offer = width if local_offer is None else min(int(local_offer), width)
+    return group._exchange(rank, candidate_scores[:, :offer].contiguous())
+
+
+def scores_only_threshold(offers, topk):
+    """Per row: `(threshold, above)` — the global k-th score and the count above it.
+
+    `offers` is the per-rank `[rows, offer]` score offers in rank order. The
+    threshold is the topk-th largest offered score; `above` is how many
+    offered scores are strictly greater (so `topk - above` slots remain for
+    the threshold plateau). Padding `-inf` never counts.
+    """
+    stacked = torch.stack([offer.float() for offer in offers], dim=0)  # [world, rows, offer]
+    thresholds, aboves = [], []
+    for row in range(stacked.shape[1]):
+        values = stacked[:, row].flatten()
+        values = values[torch.isfinite(values)].sort(descending=True).values
+        total = int(values.numel())
+        if total <= topk:
+            thresholds.append(float("-inf"))
+            aboves.append(total)
+            continue
+        thresholds.append(float(values[topk - 1]))
+        above = int((values > values[topk - 1]).sum())
+        aboves.append(above)
+    return thresholds, aboves
+
+
+def check_scores_only_exactness(thresholds, local_offer, candidate_scores):
+    """The exactness guard: the offer must not truncate at the cut.
+
+    Each rank guards its OWN truncation from its own keys (the wire carries
+    only scores): if its first UN-offered candidate reaches that row's global
+    k-th score, un-offered keys might clear the threshold and the selection
+    would not equal the global top-k (the W6 gate-b 2,048-selection equality).
+    Raise instead of returning an inexact selection — the fix is a wider offer
+    (`local_offer` up to the full width).
+    """
+    if local_offer is None:
+        return  # full-width offer: nothing is ever truncated
+    rows, width = candidate_scores.shape
+    if width <= int(local_offer):
+        return  # everything this rank has was offered
+    for row in range(rows):
+        first_unoffered = float(candidate_scores[row, int(local_offer)])
+        if first_unoffered >= thresholds[row]:
+            raise ValueError(
+                f"scores-only offer truncated the selection at row {row}: the first "
+                f"un-offered score {first_unoffered} reaches the global k-th score "
+                f"{thresholds[row]}; widen local_offer (up to the full width) — "
+                "the selection must equal the global top-k exactly (W6 gate b)")
+
+
+def select_own_candidates(offers, candidate_scores, candidate_positions, *, topk, world, rank,
+                          local_offer, thresholds=None, aboves=None):
+    """This rank's own keys in the global top-k, from the k-th score alone.
+
+    Keys with score strictly above the threshold are all in; the threshold
+    plateau fills in deterministic (rank, position) order — rank-major, each
+    rank's tied keys in ascending global position — so every rank derives the
+    same cut from the exchanged scores and its own keys. Returns
+    `(values, positions)` `[rows, topk]` with `-inf` / `-1` padding.
+
+    The plateau order is world-DEPENDENT by construction: the scores-only wire
+    carries no positions (consult8 §5's baked exchange), so global-position
+    order is not derivable across ranks. When the cut lands inside a plateau
+    the W-rank set may therefore differ from the world-1 `torch.topk` pick —
+    a tie-order artifact of an exactly tied cut, not a selection error; the
+    content gates verify such swaps as exact score ties.
+    """
+    if thresholds is None:
+        thresholds, aboves = scores_only_threshold(offers, topk)
+    rows, width = candidate_scores.shape
+    out_values = candidate_scores.new_full((rows, topk), float("-inf"), dtype=torch.float32)
+    out_positions = torch.full((rows, topk), -1, dtype=torch.int64, device=candidate_scores.device)
+    for row in range(rows):
+        threshold = thresholds[row]
+        values = candidate_scores[row].float()
+        positions = candidate_positions[row].long()
+        plateau = torch.isfinite(values) & (values == threshold)
+        # Global plateau fill order: (rank, ascending global position). This
+        # rank's plateau keys in ascending position; earlier ranks fill first.
+        plateau_positions = positions[plateau]
+        plateau_values = values[plateau]
+        order = plateau_positions.argsort()
+        plateau_positions, plateau_values = plateau_positions[order], plateau_values[order]
+        earlier = 0
+        for other in range(rank):
+            other_plateau = int((offers[other][row] == threshold).sum()) \
+                if float("-inf") != threshold else 0
+            earlier += other_plateau
+        budget = topk - (aboves[row] if aboves is not None else 0)
+        mine = max(0, min(int(plateau_positions.numel()), budget - earlier))
+        keep = torch.isfinite(values) & (values > threshold)
+        kept_values = values[keep]
+        kept_positions = positions[keep]
+        fill_values = torch.cat((kept_values, plateau_values[:mine]))
+        fill_positions = torch.cat((kept_positions, plateau_positions[:mine]))
+        count = min(topk, int(fill_values.numel()))
+        if count:
+            sort = fill_values[:count].sort(descending=True).indices
+            out_values[row, :count] = fill_values[:count][sort].to(out_values.dtype)
+            out_positions[row, :count] = fill_positions[:count][sort]
+    return out_values, out_positions.to(torch.int32)
+
+
+def scores_only_selection(offers, candidate_scores, candidate_positions, *, topk, world, rank,
+                          local_offer):
+    """The full scores-only merge for one rank: threshold, guard, own keys."""
+    thresholds, aboves = scores_only_threshold(offers, topk)
+    check_scores_only_exactness(thresholds, local_offer, candidate_scores)
+    return select_own_candidates(
+        offers, candidate_scores, candidate_positions, topk=topk, world=world, rank=rank,
+        local_offer=local_offer, thresholds=thresholds, aboves=aboves)
+
+
+# --------------------------------------------------------------------------
+# the W7 transport wiring: the real b12x DCP primitives
+# --------------------------------------------------------------------------
+class SimulatedDcpTransport:
+    """CPU twin of the `PCIeDCPA2A` / `PCIeDCPTopKOwnerExchange` call surfaces.
+
+    Implements exactly the surfaces `PcieDcpCollectives` consumes —
+    `all_gather_heads(local_input, out, *, plan)`,
+    `lse_reduce_scatter(partial_output, partial_lse, out, *, plan, lse_base,
+    partials_sink_folded, return_lse)` and `exchange_scores(offers, plan)` —
+    over a `SimulatedGroup`, with the shipped math
+    (`lse_reduce_scatter_reference`, rank-major head concat). This is what
+    makes the wired `PcieDcpCollectives` path runnable in the 2-rank CPU
+    gates against world 1.
+    """
+
+    def __init__(self, group):
+        self.group = group
+        self.rank = None  # bound per SimulatedCollectives-style rank handle
+
+    def bind(self, rank):
+        bound = SimulatedDcpTransport(self.group)
+        bound.rank = rank
+        return bound
+
+    def all_gather_heads(self, local_input, out=None, *, plan):
+        taken = self.group._exchange(self.rank, local_input.contiguous())
+        gathered = torch.cat(taken, dim=1)
+        return gathered if out is None else out.copy_(gathered)
+
+    def lse_reduce_scatter(self, partial_output, partial_lse, out=None, *, plan, lse_base,
+                           partials_sink_folded=None, return_lse=False):
+        from b12x.comm.pcie import lse_reduce_scatter_reference
+
+        taken = self.group._exchange(
+            self.rank, (partial_output.contiguous(), partial_lse.contiguous()))
+        stacked_out = torch.stack([value for value, _ in taken], dim=0)
+        stacked_lse = torch.stack([value for _, value in taken], dim=0)
+        merged, merged_lse = lse_reduce_scatter_reference(
+            stacked_out, stacked_lse, self.rank, lse_base=lse_base, return_lse=True,
+            partials_sink_folded=partials_sink_folded)
+        if out is not None:
+            out.copy_(merged)
+            merged = out
+        return (merged, merged_lse) if return_lse else merged
+
+    def exchange_scores(self, offers, *, plan):
+        return self.group._exchange(self.rank, offers.contiguous())
+
+    def stage_candidates(self, local_indices, local_scores, local_counts=None, *, plan):
+        """The `pcie_dcp_topk` owner-plane surface: candidate packs in rank order."""
+        taken = self.group._exchange(
+            self.rank, (local_scores.contiguous(), local_indices.contiguous()))
+        return taken
+
+    def all_reduce(self, value):
+        taken = self.group._exchange(self.rank, value.contiguous())
+        return torch.stack(taken, dim=0).sum(dim=0)
+
+    def all_gather(self, value):
+        taken = self.group._exchange(self.rank, value.contiguous())
+        return torch.cat(taken, dim=-1)
+
+
+class PcieDcpCollectives:
+    """The W7 collectives: the real b12x transport through the `Collectives` protocol.
+
+    Wires the recipe's TODO hooks to the shipped primitives — `all_gather_heads`
+    and `lse_reduce_scatter` (`PCIeDCPA2A`, pcie_dcp_a2a:1331-1340 / 308-324),
+    the selection exchange over the `pcie_dcp_topk` owner planes, and the TP
+    all-reduce — through PREPARED PLANS ONLY (`KernelPlanBook`; no JIT at run
+    time). The LSE contract is base 2 with `partials_sink_folded` declared
+    into the merge; the sink never enters the merge (the ONE post-merge fold
+    is `PreparedSinkFold` in `attention.fold_sink`) — passing
+    `attention_sink` here instead would double-fold and is rejected loudly.
+
+    The selection exchange runs the baked scores-only contract by default
+    (each rank needs only the global k-th score and its own keys; the exact
+    top-k is guarded by `check_scores_only_exactness`). `exchange_mode=
+    "candidates"` runs the exact full-candidate merge instead (the W6 gate-b
+    instrument).
+
+    `transport` exposes the call surfaces (`SimulatedDcpTransport` on CPU;
+    `PcieDcpTransport` wraps `PCIeDCPA2A` + `PCIeDCPTopKOwnerExchange` on
+    GPU), so the same wiring is what the CPU gates and the GPU serve run.
+    """
+
+    def __init__(self, *, rank, world_size, transport, plans=None,
+                 exchange_mode="scores-only", local_offer=None):
+        if not 0 <= rank < world_size:
+            raise ValueError(f"rank must be in [0, {world_size}), got {rank!r}")
+        self.rank = rank
+        self.world_size = world_size
+        self.transport = transport.bind(rank) if hasattr(transport, "bind") else transport
+        self.plans = plans  # KernelPlanBook (prepared plans per call shape)
+        self.exchange_mode = exchange_mode
+        self.local_offer = local_offer
+        self.lse_base = LSE_BASE
+
+    def _plan(self, kernel, shape, *tensors):
+        """The prepared plan for (kernel, call shape); `shape=None` shares one plan."""
+        if self.plans is None:
+            return None
+        if shape is None:
+            return self.plans.shared(kernel)
+        return self.plans.plan_for(shape, kernel)
+
+    def all_gather_heads(self, q_local, *, call_shape=None):
+        """`[rows, heads // world, width]` -> `[rows, heads, width]` (rank-major)."""
+        return self.transport.all_gather_heads(
+            q_local.contiguous(), plan=self._plan("all_gather_heads", call_shape))
+
+    def lse_reduce(self, out_partial, lse_partial, *, partials_sink_folded, call_shape=None):
+        """Base-2 fused reduce-scatter over ALL heads -> this rank's head shard."""
+        merged, merged_lse = self.transport.lse_reduce_scatter(
+            out_partial.contiguous(), lse_partial.contiguous(),
+            plan=self._plan("lse_reduce_scatter", call_shape),
+            lse_base=self.lse_base, partials_sink_folded=partials_sink_folded, return_lse=True)
+        return merged, merged_lse
+
+    def all_reduce(self, value):
+        return self.transport.all_reduce(value.contiguous())
+
+    def embed_lookup(self, token_ids, embed, *, vocabulary_range):
+        first, last = vocabulary_range
+        inside = (token_ids >= first) & (token_ids < last)
+        out = embed.new_zeros((int(token_ids.numel()), int(embed.shape[1])))
+        if bool(inside.any()):
+            out[inside] = embed[token_ids[inside] - first]
+        return self.all_reduce(out)
+
+    def gather_logits(self, logits, *, vocabulary_range):
+        first, last = vocabulary_range
+        if int(logits.shape[-1]) != last - first:
+            raise ValueError(
+                f"logits width {int(logits.shape[-1])} != the shard's "
+                f"vocabulary range {vocabulary_range}")
+        # Vocabulary shards are contiguous rank-major partitions, so rank
+        # order is vocab order (the sampler's all-gather).
+        return self.transport.all_gather(logits.contiguous())
+
+    def merge_topk(self, candidate_scores, candidate_positions, *, topk):
+        if self.exchange_mode == "scores-only":
+            offers = self.transport.exchange_scores(
+                candidate_scores[:, :self.local_offer].contiguous() if self.local_offer
+                else candidate_scores.contiguous(),
+                plan=self._plan("selection_exchange", None))
+            return scores_only_selection(
+                offers, candidate_scores, candidate_positions,
+                topk=topk, world=self.world_size, rank=self.rank, local_offer=self.local_offer)
+        if self.exchange_mode != "candidates":
+            raise ValueError(f"unknown selection exchange mode {self.exchange_mode!r}")
+        candidates = self.transport.stage_candidates(
+            candidate_positions.contiguous(), candidate_scores.contiguous(), None,
+            plan=self._plan("selection_exchange", None))
+        return merge_candidate_topk(candidates, topk)

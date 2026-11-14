@@ -108,6 +108,50 @@ class SparseMLAOutput:
 
 
 @dataclass(frozen=True)
+class PackedInputProjections:
+    """One GEMM for every projection reading the same layer input (packed at load).
+
+    The consult7 §5 bake-in "packed same-input projections at load time":
+    `q_a_proj`, `kv_a_proj`, `linear_gate` and the indexer `wk` all consume the
+    layer input `x`, so their weight rows concatenate into ONE matrix and the
+    forward runs one `x @ packed.T` instead of four reads of `x`. Pure layout:
+    each output row is the same dot product as the separate GEMM. Built by
+    `pack_same_input_projections` at weight-load time.
+    """
+
+    packed: torch.Tensor    # [q_lora + kv_lora+rope + heads*v + index_head_dim, hidden]
+    slices: dict            # name -> (first, last) rows of `packed`
+
+    @classmethod
+    def build(cls, weights):
+        parts, slices, first = [], {}, 0
+        items = [("q_a_proj", weights.q_a_proj), ("kv_a_proj", weights.kv_a_proj),
+                 ("linear_gate", weights.gate_proj)]
+        if weights.indexer is not None:
+            items.append(("indexer_wk", weights.indexer.wk))
+        for name, tensor in items:
+            parts.append(tensor)
+            slices[name] = (first, first + tensor.shape[0])
+            first += tensor.shape[0]
+        return cls(packed=torch.cat(parts, dim=0).contiguous(), slices=slices)
+
+    def rows(self, name):
+        first, last = self.slices[name]
+        return self.packed[first:last]
+
+
+@dataclass(frozen=True)
+class LayerProjections:
+    """One layer call's projections out of the packed same-input GEMM."""
+
+    q_resid: torch.Tensor
+    q: torch.Tensor            # absorbed or unabsorbed query, per the wiring
+    latent: torch.Tensor
+    index_keys: torch.Tensor | None
+    gate_raw: torch.Tensor     # `x @ linear_gate.T`, pre-sigmoid
+
+
+@dataclass(frozen=True)
 class IndexerWeights:
     """The lightning indexer of one `full` layer (or the MTP block).
 
@@ -144,6 +188,7 @@ class AttentionWeights:
     gate_proj: torch.Tensor       # [heads_local * v, hidden] (`linear_gate`)
     sink: torch.Tensor            # [heads_local] FP32 (`learnable_sink_param`)
     indexer: IndexerWeights | None  # None on `shared` layers
+    packed_input: PackedInputProjections | None = None  # same-input pack (load time)
 
     @property
     def heads(self):
@@ -166,9 +211,14 @@ class Hy4LayerAttention:
     device: torch.device
     _mla: object = field(default=None, repr=False)
     _indexer_plan: object = field(default=None, repr=False)
+    _mla_plans: dict = field(default_factory=dict, repr=False)
+    _plan_book: object = field(default=None, repr=False)
+    _sink_folds: dict = field(default_factory=dict, repr=False)
 
     def __post_init__(self):
         c = self.config.text
+        self._active_call_shape = None
+        self._packed_gate = None
         self.hidden = self.config.hidden
         self.heads = self.weights.heads
         self.qk_nope = c["qk_nope_head_dim"]
@@ -183,18 +233,26 @@ class Hy4LayerAttention:
         # within each head's row block — slicing "all heads' keys then all
         # heads' values" only ever got head 0 right (consult3 finding B), and
         # contradicts `shard.kv_b_rows`, which slices whole-head blocks.
-        per_head = self.weights.kv_b_proj.view(self.heads, self.qk_nope + self.v_head, self.kv_lora)
+        # `kv_b_proj` is REPLICATED (consult8 §5's `kv_b` two-wirings): the
+        # tensors are all heads here, and the DECODE wiring reads only this
+        # rank's head rows (`absorb_queries` / `expand_output` slice
+        # `sharding.head_range` — decode's weight reads do not change).
+        per_head = self.weights.kv_b_proj.view(-1, self.qk_nope + self.v_head, self.kv_lora)
         self.absorb_wuk = per_head[:, :self.qk_nope]
         self.expand_wuv = per_head[:, self.qk_nope:]
 
     # --- projection --------------------------------------------------------
 
-    def project(self, x, positions):
+    def project(self, x, positions, *, absorb=True):
         """(q_resid, absorbed query [rows,heads,kv_lora+rope], latent [rows,kv_lora+rope]).
 
         The absorbed query is `q_nope @ W_UK` per head (512-wide at production
         geometry) concatenated with the rotated `q_rot` (64) — the 576-wide
-        `sparse_mla` query of the GLM_NSA contract.
+        `sparse_mla` query of the GLM_NSA contract. `absorb=False` returns
+        the UNABSORBED query `[rows, heads, qk_nope + qk_rope]` instead — the
+        prefill graph wiring gathers unabsorbed queries and absorbs + expands
+        LOCALLY (consult8 §5's `kv_b` two-wirings); decode graphs keep the
+        owner-side absorb here and read no extra weights.
         """
         w = self.weights
         q_resid = rms_norm(x @ w.q_a_proj.T, w.q_a_norm, self.config.text["rms_norm_eps"])
@@ -205,11 +263,159 @@ class Hy4LayerAttention:
         k_pass = rms_norm(kv_pass, w.kv_a_norm, self.config.text["rms_norm_eps"])
         k_rot = apply_interleaved_rope(k_rot, positions, rope_dim=self.qk_rope, theta=self.rope_theta)
         latent = torch.cat((k_pass, k_rot), dim=-1)  # [rows, kv_lora + rope] — the cache record
+        if not absorb:
+            return q_resid, q, latent
         # Absorb W_UK into the query: q_nope @ W_UK (per head) puts the nope
         # block in latent space, so scoring runs against the raw latent record.
-        absorbed_nope = torch.einsum("rhi,hio->rho", q[..., :self.qk_nope], self.absorb_wuk)
-        q_absorbed = torch.cat((absorbed_nope, q[..., self.qk_nope:]), dim=-1)
-        return q_resid, q_absorbed, latent
+        # Owner-side: this rank's head shard only (the decode wiring — the
+        # weight reads stay this rank's `kv_b_proj` rows).
+        return q_resid, self.absorb_queries(q), latent
+
+    def project_packed(self, x, positions, *, absorb=True, with_index_keys=False):
+        """All same-input projections of one layer call from ONE packed weight.
+
+        Packed at load (`AttentionWeights.packed_input`): `q_a_proj` +
+        `kv_a_proj` + `linear_gate` + the indexer `wk` live in ONE contiguous
+        matrix the forward reads. The per-projection GEMMs run over the packed
+        ROWS (`x @ packed.rows(name).T`) — same shapes, same values, bitwise
+        the same results as the separate weights: the golden content gates
+        hash selections and must not drift, and fusing the launches is not the
+        lever at one row anyway (consult7 §6: launch-count hunting). Without
+        packing this falls back to the loose weights (identical math). The
+        `gate_raw` output is stashed for `gate_and_project` (which keeps its
+        two-argument contract) keyed on the input's storage.
+        """
+        w = self.weights
+        packed = w.packed_input
+        if packed is None:
+            q_resid, q, latent = self.project(x, positions, absorb=absorb)
+            index_keys = self.prepare_index_keys(x, positions) if with_index_keys else None
+            gate_raw = x @ w.gate_proj.T.to(x.dtype)
+            self._packed_gate = (x.data_ptr(), gate_raw)
+            return LayerProjections(q_resid, q, latent, index_keys, gate_raw)
+        q_a_raw = x @ packed.rows("q_a_proj").T
+        kv_raw = x @ packed.rows("kv_a_proj").T
+        gate_raw = x @ packed.rows("linear_gate").T.to(x.dtype)
+        q_resid = rms_norm(q_a_raw, w.q_a_norm, self.config.text["rms_norm_eps"])
+        q = (q_resid @ w.q_b_proj.T).view(-1, self.heads, self.qk_nope + self.qk_rope)
+        q = apply_interleaved_rope(q, positions, rope_dim=self.qk_rope, theta=self.rope_theta)
+        kv_pass, k_rot = kv_raw[:, :self.kv_lora], kv_raw[:, self.kv_lora:]
+        k_pass = rms_norm(kv_pass, w.kv_a_norm, self.config.text["rms_norm_eps"])
+        k_rot = apply_interleaved_rope(k_rot, positions, rope_dim=self.qk_rope, theta=self.rope_theta)
+        latent = torch.cat((k_pass, k_rot), dim=-1)
+        q_out = q if not absorb else self.absorb_queries(q)
+        index_keys = None
+        if with_index_keys:
+            # Through `prepare_index_keys` — the single key-prep entry point
+            # (a wrong-rotation mutant wraps this method and must stay live).
+            index_keys = self.prepare_index_keys(x, positions)
+        self._packed_gate = (x.data_ptr(), gate_raw)
+        return LayerProjections(q_resid, q_out, latent, index_keys, gate_raw)
+
+    def absorb_queries(self, q_unabsorbed):
+        """`q_nope @ W_UK` per head over the query's head axis (the local absorb).
+
+        The prefill wiring gathers UNABSORBED queries and runs this locally
+        for ALL gathered heads (with `kv_b_proj` replicated — consult8 §5);
+        `project(absorb=True)` runs it owner-side for this rank's head shard.
+        """
+        heads = int(q_unabsorbed.shape[1])
+        first, last = self.sharding.head_range
+        if heads == self.heads:
+            wuk = self.absorb_wuk[first:last]
+        elif heads == self.absorb_wuk.shape[0]:
+            wuk = self.absorb_wuk
+        else:
+            raise ValueError(
+                f"absorb_queries: {heads} heads is neither this rank's shard "
+                f"({self.heads}) nor the full head count ({self.absorb_wuk.shape[0]})")
+        absorbed_nope = torch.einsum("rhi,hio->rho", q_unabsorbed[..., :self.qk_nope], wuk)
+        return torch.cat((absorbed_nope, q_unabsorbed[..., self.qk_nope:]), dim=-1)
+
+    def expand_output(self, out, *, local=True):
+        """`W_UV` expansion of a latent-space attention output (per head).
+
+        `local=True` expands this rank's contiguous head shard (the
+        post-merge output); `local=False` expands every head (the prefill
+        wiring's local expand over gathered heads).
+        """
+        first, last = self.sharding.head_range
+        wuv = self.expand_wuv[first:last] if local else self.expand_wuv
+        return torch.einsum("rhd,hvd->rhv", out, wuv.float()).to(out.dtype)
+
+    # --- prepared plans (no JIT at run time) -------------------------------
+    def bind_plan_book(self, book):
+        """Attach the rank's `KernelPlanBook` (from `wire_operators`)."""
+        self._plan_book = book
+
+    def prepare_plans(self, shapes, *, device=None):
+        """Bind one `sparse_mla` plan per call shape, plus the sink fold.
+
+        The one-row decode plan is NOT the verification-rows plan (consult7
+        §5: "a one-row decode graph distinct from the verification graph") —
+        each `CallShape` gets its own `sparse_mla.plan` (`Caps.mode` =
+        shape.mla_mode: decode / verify / extend). On CUDA these are the real
+        b12x plans; on CPU the book records the bound shape (the torch-op
+        reference needs no lower). Once a plan book is bound, `attend` refuses
+        a call shape with no prepared plan — there is no JIT at run time.
+        """
+        from .wiring import KernelPlanBook
+
+        self._plan_book = self._plan_book or KernelPlanBook()
+        for shape in shapes:
+            plan = self._make_mla_plan(shape)
+            self._mla_plans[(shape.name, shape.rows, shape.tokens)] = plan
+            self._plan_book.bind(shape, "sparse_mla", plan)
+            if self.weights.sink is not None:
+                # The fold geometry is the call shape's flattened query rows:
+                # [rows*tokens, heads, kv_lora] out + [rows*tokens, heads] LSE
+                # (placeholder operands pin the plan).
+                batch = shape.rows * shape.tokens
+                out = self.weights.sink.new_zeros(
+                    (batch, self.heads, self.kv_lora), dtype=self.weights.q_b_proj.dtype)
+                lse = self.weights.sink.new_zeros((batch, self.heads))
+                fold = self._make_sink_fold(out, lse)
+                self._sink_folds[(shape.name, shape.rows, shape.tokens)] = fold
+                self._plan_book.bind(shape, "sink_fold", fold)
+        return self
+
+    def _make_mla_plan(self, shape):
+        if self.device.type != "cuda":
+            return ("reference-sparse-mla", shape.name, shape.rows, shape.tokens, shape.mla_mode)
+        from b12x.attention import sparse_mla
+
+        caps = sparse_mla.Caps(
+            device=self.device, num_q_heads=self.heads, max_q_rows=shape.rows,
+            max_width=self.config.text["index_topk"], softmax_scale=self.scaling,
+            head_dim=self.kv_lora + self.qk_rope, v_head_dim=self.kv_lora,
+            kv_dtype=self.weights.kv_b_proj.dtype, model_type=sparse_mla.ModelType.GLM_NSA,
+            cache_record_bytes=self.kv_lora + self.qk_rope + 80,
+            mode=shape.mla_mode, return_lse=True, lse_scale="base2", has_attention_sink=True)
+        return sparse_mla.plan(caps)
+
+    def _mla_plan_for(self, call_shape):
+        """The prepared plan for `call_shape`; no plan book -> legacy lazy plan."""
+        if call_shape is not None:
+            key = (call_shape.name, call_shape.rows, call_shape.tokens)
+            if key in self._mla_plans:
+                return self._mla_plans[key]
+        if self._plan_book is not None:
+            if call_shape is None:
+                raise RuntimeError(
+                    "a prepared plan book is bound: attend must state its call "
+                    "shape (decode one-row, verify rows or prefill) — there is "
+                    "no JIT at run time")
+            raise RuntimeError(
+                f"no prepared sparse_mla plan for call shape {call_shape.name} "
+                f"(rows={call_shape.rows}, tokens={call_shape.tokens}); wire_operators "
+                "binds one plan per call shape — there is no JIT at run time")
+        return self._mla  # legacy: built lazily in `_attend_cuda`
+
+    def _make_sink_fold(self, out, lse):
+        """The ONE post-merge sink fold's prepared plan (`prepare_sink_fold`)."""
+        from b12x.comm.pcie.api import prepare_sink_fold
+
+        return prepare_sink_fold(out=out, lse=lse, sink=self.weights.sink, lse_base="base2")
 
     # --- selection ---------------------------------------------------------
 
@@ -225,7 +431,11 @@ class Hy4LayerAttention:
         iw = self.weights.indexer
         if iw is None:
             raise ValueError("shared layers prepare no index keys")
-        k = (x @ iw.wk.T).float()
+        # The packed same-input weight supplies `wk` when present (same rows,
+        # bitwise the same GEMM); the loose tensor otherwise.
+        packed = self.weights.packed_input
+        wk = iw.wk if packed is None else packed.rows("indexer_wk")
+        k = (x @ wk.T).float()
         k = layer_norm(k, iw.k_norm_weight, iw.k_norm_bias, self.config.text["rms_norm_eps"])
         return apply_interleaved_rope(k, positions, rope_dim=self.config.text["qk_rope_head_dim"],
                                      theta=self.rope_theta)
@@ -278,7 +488,8 @@ class Hy4LayerAttention:
         if width < topk:
             scores = torch.cat((scores, scores.new_full((rows, topk - width), float("-inf"))), dim=-1)
         columns = torch.cat((torch.arange(width, device=self.device, dtype=torch.int64) * world + rank,
-                             torch.full((topk - width,), -1, device=self.device, dtype=torch.int64)))
+                             torch.full((max(topk - width, 0),), -1, device=self.device,
+                                        dtype=torch.int64)))
         values, indices = scores.topk(topk, dim=-1)
         picked = torch.where(torch.isfinite(values), columns[indices],
                              torch.full_like(indices, -1, dtype=torch.int64))
@@ -329,13 +540,16 @@ class Hy4LayerAttention:
     # --- attention ---------------------------------------------------------
 
     def attend(self, q_absorbed, latent_table, selected, counts, *, return_lse=True,
-               cache_lengths=None, fold_sink=True, expand=True):
+               cache_lengths=None, fold_sink=True, expand=True, call_shape=None):
         """Sparse gated MLA against the selected latent records.
 
         Wires `sparse_mla.plan -> bind -> run` (with `attention_sink`) on CUDA;
         the torch-op reference on CPU. Both surface the same provenance.
         `cache_lengths` is each row's KV length (the `sparse_mla` `cache_lengths`
-        operand); it defaults to the selection width.
+        operand); it defaults to the selection width. `call_shape` selects the
+        PREPARED plan (one per call shape — the one-row decode plan is not the
+        verification-rows plan); with a plan book bound, an unprepared shape
+        raises (no JIT at run time).
 
         World 1 (`fold_sink=True`, `expand=True`): the per-head sink folds per
         call and the output expands through `W_UV` — the eager path, the
@@ -352,9 +566,11 @@ class Hy4LayerAttention:
         sink = self.weights.sink
         if self.device.type == "cuda":
             output, lse, binding = self._attend_cuda(q_absorbed, latent_table, selected, counts,
-                                                     fold_sink=fold_sink, cache_lengths=cache_lengths)
+                                                     fold_sink=fold_sink, cache_lengths=cache_lengths,
+                                                     call_shape=call_shape)
             provenance = SparseMLAProvenance.from_binding(binding)
         else:
+            plan = self._mla_plan_for(call_shape)  # the no-JIT check runs on CPU too
             output, lse = self._attend_reference(q_absorbed, latent_table, selected, counts,
                                                  fold_sink=fold_sink)
             provenance = SparseMLAProvenance(sink_folded=bool(fold_sink and sink is not None))
@@ -362,20 +578,34 @@ class Hy4LayerAttention:
             output = torch.einsum("rhd,hvd->rhv", output, self.expand_wuv.float()).to(q_absorbed.dtype)
         return SparseMLAOutput(output=output, lse=lse if return_lse else None, provenance=provenance)
 
-    def fold_sink(self, out, lse):
+    def fold_sink(self, out, lse, *, call_shape=None):
         """The ONE post-merge sink fold (D2): `out *= sigmoid(lse - sink); lse = logaddexp(lse, sink)`.
 
         `PreparedSinkFold` (`b12x.comm.pcie.prepare_sink_fold`) on this rank's
         head-shard sink and the base-2 merged LSE, run exactly once after
-        `Collectives.lse_reduce`. Folding per shard instead is the double-fold
-        defect the merge's `partials_sink_folded` guard rejects (gate c's
-        sink-per-rank mutant).
+        `Collectives.lse_reduce`. The prepared plan is pinned per call shape
+        at `prepare_plans` time (CUDA-graph safe, allocation-free `run`);
+        folding per shard instead is the double-fold defect the merge's
+        `partials_sink_folded` guard rejects (gate c's sink-per-rank mutant).
         """
-        from b12x.comm.pcie.api import prepare_sink_fold
-
-        sink = self.weights.sink
-        prepared = prepare_sink_fold(out=out, lse=lse, sink=sink, lse_base="base2")
-        return prepared.run(out, lse, sink)
+        prepared = None
+        call_shape = call_shape if call_shape is not None else self._active_call_shape
+        if call_shape is not None:
+            prepared = self._sink_folds.get((call_shape.name, call_shape.rows, call_shape.tokens))
+        if prepared is not None and (int(prepared.batch), int(prepared.heads), int(prepared.head_dim)) != \
+                (int(out.shape[0]), int(out.shape[1]), int(out.shape[2])):
+            prepared = None  # stale geometry (an unpinned call) — rebind below
+        if prepared is None:
+            if self._plan_book is not None:
+                raise RuntimeError(
+                    "no prepared sink-fold plan for this call shape; prepare_plans "
+                    "binds one per call shape — there is no JIT at run time")
+            prepared = self._sink_folds.get("lazy")
+            if prepared is None or (int(prepared.batch), int(prepared.heads), int(prepared.head_dim)) != \
+                    (int(out.shape[0]), int(out.shape[1]), int(out.shape[2])):
+                prepared = self._make_sink_fold(out, lse)
+                self._sink_folds["lazy"] = prepared
+        return prepared.run(out, lse, self.weights.sink)
 
     def _attend_reference(self, q_absorbed, latent_table, selected, counts, *, fold_sink=True):
         """The eager sparse-MLA contract in torch (latent-space output)."""
@@ -403,18 +633,22 @@ class Hy4LayerAttention:
         return out_latent, lse.float()
 
     def _attend_cuda(self, q_absorbed, latent_table, selected, counts, *, fold_sink=True,
-                     cache_lengths=None):
+                     cache_lengths=None, call_shape=None):
         """`sparse_mla.plan -> bind -> run` on CUDA with sink provenance.
 
         `fold_sink=False` (the CP partial) binds WITHOUT `attention_sink`, so
         `Binding.sink_folded` is False and the post-merge `PreparedSinkFold`
         owns the one fold. The kernel emits the latent-space value output
-        (`Caps.v_head_dim == kv_lora_rank`), which `attend` expands.
+        (`Caps.v_head_dim == kv_lora_rank`), which `attend` expands. The plan
+        is the call shape's PREPARED plan (bound by `prepare_plans` — one per
+        shape, no JIT at run time); without a plan book this keeps the legacy
+        lazy single plan.
         """
         from b12x.attention import sparse_mla
 
         rows = q_absorbed.shape[0]
-        if self._mla is None:
+        plan = self._mla_plan_for(call_shape)
+        if plan is None:
             caps = sparse_mla.Caps(
                 device=self.device, num_q_heads=self.heads, max_q_rows=rows,
                 max_width=selected.shape[1], softmax_scale=self.scaling,
@@ -422,10 +656,11 @@ class Hy4LayerAttention:
                 kv_dtype=latent_table.dtype, model_type=sparse_mla.ModelType.GLM_NSA,
                 cache_record_bytes=self.config.text["kv_lora_rank"] + self.config.text["qk_rope_head_dim"] + 80,
                 mode="decode", return_lse=True, lse_scale="base2", has_attention_sink=True)
-            self._mla = sparse_mla.plan(caps)
+            plan = sparse_mla.plan(caps)
+            self._mla = plan
         if cache_lengths is None:
             cache_lengths = counts.new_full((rows,), selected.shape[1])
-        binding = sparse_mla.bind(self._mla, scratch=self._scratch(), q=q_absorbed.to(torch.bfloat16),
+        binding = sparse_mla.bind(plan, scratch=self._scratch(), q=q_absorbed.to(torch.bfloat16),
                                   kv_cache=latent_table, selected_indices=selected,
                                   cache_lengths=cache_lengths,
                                   selected_lengths=counts,
@@ -438,8 +673,22 @@ class Hy4LayerAttention:
         raise NotImplementedError("sparse-MLA scratch is sized by the b12x PreparationSession at prepare time")
 
     def gate_and_project(self, attn_output, x):
-        """Elementwise per-head gate (`gated_mla`, `gating_type=elementwise`) then `o_proj`."""
-        gate = torch.sigmoid(x @ self.weights.gate_proj.T.to(x.dtype))
+        """Elementwise per-head gate (`gated_mla`, `gating_type=elementwise`) then `o_proj`.
+
+        The gate projection comes from the packed same-input GEMM when this
+        call's `project_packed` stashed it (same `x` storage); otherwise it is
+        computed here as always. The two-argument contract is load-bearing (a
+        gate-after-o_proj mutant replaces this method), so the packed result
+        travels out of band.
+        """
+        gate_raw = None
+        stashed = getattr(self, "_packed_gate", None)
+        if stashed is not None and stashed[0] == x.data_ptr():
+            gate_raw = stashed[1]
+            self._packed_gate = None
+        if gate_raw is None:
+            gate_raw = x @ self.weights.gate_proj.T.to(x.dtype)
+        gate = torch.sigmoid(gate_raw)
         gated = attn_output * gate.view(attn_output.shape[0], self.heads, self.v_head)
         return gated.reshape(gated.shape[0], -1).contiguous() @ self.weights.o_proj.T
 
@@ -503,6 +752,34 @@ class SelectionCell:
         target.fill_(-1)
         target[:, :width].copy_(slots.to(target.dtype))
         counts[:rows].copy_(live.to(counts.dtype))
+
+    def fill_visible(self, visible, slot_base, *, world=1, rank=0):
+        """The short-context bypass selection: every VISIBLE OWNED key, no indexer.
+
+        At context <= top-k the global top-k selection IS the whole visible
+        prefix (consult7 §5: "the short-context bypass of indexer and
+        exchange") — the same SET `write_selection` + the hand-back produce
+        over the scored path. Under context parallelism each rank fills its
+        OWNED local slots (`j * world + rank < visible`, the interleaved
+        ownership rule) — a slot past the row's visible prefix would alias a
+        not-yet-written record.
+        """
+        selected, counts = self.cache.selected(self.layer_id), self.cache.counts(self.layer_id)
+        rows = int(visible.shape[0])
+        width = int(selected.shape[1])
+        target = selected[:rows]
+        target.fill_(-1)
+        for row in range(rows):
+            vis = int(visible[row])
+            live = 0 if vis <= rank else min((vis - rank + world - 1) // world, width)
+            if live:
+                target[row, :live] = (int(slot_base[row]) + torch.arange(
+                    live, device=target.device)).to(target.dtype)
+        lives = torch.where(visible > rank,
+                            torch.div(visible - rank + world - 1, world, rounding_mode="floor"),
+                            torch.zeros_like(visible)).clamp_max(width)
+        counts[:rows].copy_(lives.to(counts.dtype))
+        return target, counts[:rows]
 
     def handback(self, merged, *, world_size, rank, slot_map=None, prepared=None):
         """Cross-rank selection hand-back into the owner's buffers (D3).

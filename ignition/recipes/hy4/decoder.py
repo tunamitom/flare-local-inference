@@ -41,6 +41,7 @@ import torch
 from .attention import SelectionCell, rms_norm
 from .config import ModelConfig
 from .state import Hy4ModelWeights
+from .wiring import DECODE_ONE_ROW, SCHEDULE, chunk_plan, prefill_shape, verify_shape
 
 
 @dataclass
@@ -218,7 +219,8 @@ class Hy4Decoder:
     full-precision dry run passes FP32 with a matching `Hy4Cache` dtype.
     """
 
-    def __init__(self, weights: Hy4ModelWeights, cache: Hy4Cache, *, compute_dtype=None, collectives=None):
+    def __init__(self, weights: Hy4ModelWeights, cache: Hy4Cache, *, compute_dtype=None,
+                 collectives=None, prefill_chunk_size=None):
         from .collectives import SoloCollectives
 
         self.weights = weights
@@ -226,6 +228,7 @@ class Hy4Decoder:
         self.config = weights.config
         self.device = weights.device
         self.compute_dtype = torch.bfloat16 if compute_dtype is None else compute_dtype
+        self.prefill_chunk_size = prefill_chunk_size
         if collectives is None:
             if cache.world != 1:
                 raise ValueError(
@@ -239,23 +242,81 @@ class Hy4Decoder:
         self.collectives = collectives
         self._row_lengths = {}
         self._draft_positions = {}
+        self.trace = []          # the wiring trace the W7 gates read
+        self.plan_book = None    # the `KernelPlanBook` (bound by wire_operators)
+
+    # --- W7 wiring ---------------------------------------------------------
+    def default_call_shape(self, shape):
+        """The call shape of a `(rows, tokens)` forward.
+
+        One token per row is the decode family: the ONE-ROW decode shape at
+        rows == 1, the distinct verification-rows shape above it. Prompt
+        tokens are the prefill family (`prefill_shape`).
+        """
+        rows, width = shape
+        if width == 1:
+            return DECODE_ONE_ROW if rows == 1 else verify_shape(rows)
+        return prefill_shape(rows, width)
+
+    def bind_plan_book(self, book, shapes):
+        """Wire prepared plans (from `wire_operators`) into every layer.
+
+        One `sparse_mla` plan per call shape plus the sink folds; from here
+        the body refuses unprepared call shapes (no JIT at run time).
+        """
+        self.plan_book = book
+        for layer in self.weights.layers:
+            layer.attention.bind_plan_book(book)
+            layer.attention.prepare_plans(shapes)
+        return self
 
     # --- entry points ------------------------------------------------------
 
-    def prefill(self, token_ids, *, request_rows=None, state=None):
+    def prefill(self, token_ids, *, request_rows=None, state=None, call_shape=None):
         """Chunked prefill: `token_ids` [rows, tokens] continues the rows' prompts.
 
-        Chunks are at most `prefill_chunk_size` tokens per row; the loop is the
-        same one `decode_step` runs, with every query token attending over its
-        causal cache length.
+        Chunks are at most `prefill_chunk_size` tokens per row, cut by
+        `wiring.chunk_plan` — DETERMINISTIC and LENGTH-ONLY (consult8 §5:
+        "deterministic, length-only chunking"; K3.1 fixed a 21 % TTFT bump at
+        one prompt length this way). The chunk boundaries depend on the token
+        counts and the chunk size and nothing else — never on token ids,
+        scores or iteration order (the chunk-position nondeterminism mutant
+        fails exactly this). The loop is the same one `decode_step` runs, with
+        every query token attending over its causal cache length; per-chunk
+        row positions advance inside the call and the caller's `complete`
+        bookkeeping is unchanged.
         """
-        return self.forward(token_ids, request_rows=request_rows, state=state)
+        rows, width = int(token_ids.shape[0]), int(token_ids.shape[1])
+        chunk = self.prefill_chunk_size
+        if not chunk or width <= chunk:
+            return self.forward(token_ids, request_rows=request_rows, state=state,
+                                call_shape=call_shape)
+        spans = sorted({(start, stop) for _, start, stop in chunk_plan([width] * rows, chunk)})
+        row_ids = self._rows(token_ids, request_rows).tolist()
+        saved = {row: self._row_lengths.get(row, 0) for row in row_ids}
+        parts = []
+        for start, stop in spans:
+            for row in row_ids:
+                self._row_lengths[row] = saved[row] + start
+            self.trace.append(("chunk", start, stop))
+            parts.append(self.forward(token_ids[:, start:stop], request_rows=request_rows,
+                                      state=state,
+                                      call_shape=self.default_call_shape((rows, stop - start))))
+        for row, base in saved.items():
+            self._row_lengths[row] = base
+        return torch.cat(parts, dim=1)
 
-    def decode_step(self, token_ids, *, request_rows=None, state=None):
-        """One decode step: `token_ids` [rows, 1] appends to the rows' contexts."""
+    def decode_step(self, token_ids, *, request_rows=None, state=None, call_shape=None):
+        """One decode step: `token_ids` [rows, 1] appends to the rows' contexts.
+
+        Rows == 1 is the one-row decode shape; more rows is the distinct
+        verification-rows shape (consult7 §5: one-row decode graphs never
+        share a capture with the verification graph).
+        """
         if token_ids.shape[1] != 1:
             raise ValueError("decode_step advances one token per row")
-        return self.forward(token_ids, request_rows=request_rows, state=state)
+        return self.forward(token_ids, request_rows=request_rows, state=state,
+                            call_shape=call_shape)
 
     def draft_absorb(self, next_tokens, prev_hidden, *, request_rows=None, cache=None):
         """Teacher-forced prompt absorption into the draft KV (finding F fix).
@@ -350,7 +411,8 @@ class Hy4Decoder:
             positions, cache, visible, token_rows=token_rows)
         return hidden, attended, selected
 
-    def forward(self, token_ids, *, request_rows=None, state=None, return_hidden=False):
+    def forward(self, token_ids, *, request_rows=None, state=None, return_hidden=False,
+                call_shape=None):
         """The real body loop: iHC streams -> 78 gated sparse-MLA layers -> head.
 
         Returns FP32 logits over this rank's vocabulary shard. `request_rows`
@@ -359,9 +421,20 @@ class Hy4Decoder:
         `hidden_post` [rows, tokens, hidden] is the POST-`model.norm` hidden
         (the MTP feed and the lm_head pre-image), `hidden_pre` the pre-norm
         `hc_head` output (diagnostics / the pre-norm-feed mutant only).
+        `call_shape` is the forward's fixed shape and graph-family wiring
+        (`wiring.CallShape`); it defaults to `default_call_shape` and is
+        recorded in `self.trace` for the wiring gates.
         """
         if token_ids.ndim != 2:
             raise ValueError("token_ids must be [rows, tokens]")
+        if call_shape is None:
+            call_shape = self.default_call_shape(token_ids.shape)
+        if (call_shape.rows, call_shape.tokens) != tuple(token_ids.shape):
+            raise ValueError(
+                f"call shape {call_shape.name} (rows={call_shape.rows}, "
+                f"tokens={call_shape.tokens}) does not match the forward's "
+                f"{tuple(token_ids.shape)}")
+        self.trace.append(("call_shape", call_shape))
         rows = self._rows(token_ids, request_rows)
         positions = self._positions(token_ids.shape, rows)
         token_rows = self._token_rows(token_ids.shape, rows)
@@ -385,13 +458,17 @@ class Hy4Decoder:
                     mlp_out, streams.streams, post, layer.attn_ihc,
                     norm_weight=layer.input_norm)
             attn_out = self.collectives.all_reduce(
-                self._attention(layer, y, positions, token_rows, visible))  # D4 (o_proj shard)
+                self._attention(layer, y, positions, token_rows, visible,
+                                call_shape=call_shape))  # D4 (o_proj shard)
             streams.streams, post, y = layer.attn_ihc.post_pre(
                 attn_out, streams.streams, post, layer.ffn_ihc,
                 norm_weight=layer.post_attention_norm)
             # D4: the MoE/dense-FFN outputs are intermediate-sharded partial
-            # sums (the layer-0 dense FFN is `mlp.forward` at layer 0).
-            mlp_out = self.collectives.all_reduce(layer.mlp.forward(y))
+            # sums (the layer-0 dense FFN is `mlp.forward` at layer 0). The
+            # shared-expert overlap is a per-graph-family decision (consult7 §5
+            # / consult8 §6): decode graphs overlap, prefill graphs do not.
+            mlp_out = self.collectives.all_reduce(
+                layer.mlp.forward(y, overlap_shared=call_shape.overlap_shared_expert))
             previous_ffn = layer.ffn_ihc
         streams.streams = previous_ffn.post(mlp_out, streams.streams, post)
         hidden = self.weights.hc_head.merge(streams.streams)
@@ -440,7 +517,7 @@ class Hy4Decoder:
     def _token_rows(self, shape, rows):
         return rows.reshape(-1, 1).expand(shape[0], shape[1]).reshape(-1)
 
-    def _attention(self, layer, y, positions, token_rows, visible):
+    def _attention(self, layer, y, positions, token_rows, visible, *, call_shape):
         """One layer's attention: world 1 today's path, world > 1 the CP shape (D2/D3).
 
         CP (amendment 1): full layers offer local top-k candidates over their
@@ -451,33 +528,68 @@ class Hy4Decoder:
         over this rank's record shard, the base-2 LSE reduce-scatter returning
         this rank's head shard, and ONE post-merge sink fold
         (`PreparedSinkFold`) before `W_UV` expansion and the gated `o_proj`.
+
+        The W7 bake-ins are per GRAPH FAMILY (consult7 §5 / consult8 §6): the
+        query gather moves ABORBED queries on decode graphs (owner-side
+        absorb — no extra weight reads) and UNABSORBED queries on prefill
+        graphs (absorb + expand locally, the `kv_b` two-wirings); decode
+        graphs run the selection path on a second stream (recorded in
+        `self.trace` from `wiring.StreamSchedule`) and take the short-context
+        bypass (no indexer, no exchange at context <= top-k).
         """
         attn = layer.attention
-        slot_base = self.cache.slots_for(token_rows)
-        q_resid, q_local, latent = attn.project(y, positions)
+        attn._active_call_shape = call_shape
+        family = call_shape.family
+        schedule = SCHEDULE[family]
+        topk = self.config.text["index_topk"]
+        world, rank = self.collectives.world_size, self.collectives.rank
+        # The `kv_b` two-wirings (consult8 §5): decode keeps the owner-side
+        # absorb (weight reads stay this rank's shard rows); prefill gathers
+        # UNABSORBED queries and absorbs + expands locally.
+        local_absorb_after_gather = world > 1 and call_shape.query_wiring == "unabsorbed-local-absorb"
+        bundle = attn.project_packed(y, positions, absorb=not local_absorb_after_gather,
+                                     with_index_keys=attn.weights.indexer is not None)
+        q_resid, q_local, latent = bundle.q_resid, bundle.q, bundle.latent
         self.cache.write_latent(layer.index, token_rows, positions, latent)
         if attn.weights.indexer is not None:
-            keys = attn.prepare_index_keys(y, positions)
-            self.cache.write_index_keys(layer.index, token_rows, positions, keys)
+            self.cache.write_index_keys(layer.index, token_rows, positions, bundle.index_keys)
         owner = attn.selection.owner_id
-        world, rank = self.collectives.world_size, self.collectives.rank
+        slot_base = self.cache.slots_for(token_rows)
         if world == 1:
             selected, counts = attn.select(y, q_resid, positions, visible,
                                           self.cache.key_table(owner), slot_base)
-            attended = attn.attend(q_local, self.cache.latents(layer.index), selected, counts)
+            attended = attn.attend(q_local, self.cache.latents(layer.index), selected, counts,
+                                  call_shape=call_shape)
             return attn.gate_and_project(attended.output, y)
-        if attn.selection.kind == "full":
-            scores, candidates = attn.local_candidates(
-                y, q_resid, positions, visible, self.cache.key_table(owner), slot_base,
-                world=world, rank=rank)
-            _, merged = self.collectives.merge_topk(
-                scores, candidates, topk=self.config.text["index_topk"])
-            attn.selection.handback(merged, world_size=world, rank=rank,
-                                    slot_map=self.cache.local_slot_map(token_rows))
+        short = call_shape.short_context_bypass and call_shape.is_decode_graph \
+            and int(visible.max()) <= topk
+        if short:
+            # The short-context bypass: at context <= top-k the global top-k is
+            # every visible key — no indexer, no selection exchange.
+            self.trace.append(("selection_bypass", family, int(visible.max()), topk))
+            attn.selection.fill_visible(visible, slot_base, world=world, rank=rank)
+        else:
+            if attn.selection.kind == "full":
+                self.trace.append(("selection_exchange",
+                                   schedule.placement("selection_exchange", family)))
+                scores, candidates = attn.local_candidates(
+                    y, q_resid, positions, visible, self.cache.key_table(owner), slot_base,
+                    world=world, rank=rank)
+                _, merged = self.collectives.merge_topk(
+                    scores, candidates, topk=self.config.text["index_topk"])
+                attn.selection.handback(merged, world_size=world, rank=rank,
+                                        slot_map=self.cache.local_slot_map(token_rows))
         selected, counts = attn.selection.buffers(rows=y.shape[0])
+        self.trace.append(("query_exchange", schedule.placement("query_exchange", family),
+                           call_shape.query_wiring, int(q_local.shape[-1])))
         q_all = self.collectives.all_gather_heads(q_local)   # all heads per call (D2)
+        if local_absorb_after_gather:
+            # Prefill wiring: the gathered queries are UNABSORBED; W_UK applies
+            # locally over ALL gathered heads (replicated `kv_b_proj`).
+            q_all = attn.absorb_queries(q_all)
         partial = attn.attend(q_all, self.cache.latents(layer.index), selected, counts,
-                              fold_sink=False, expand=False)  # sink unbound
+                              fold_sink=False, expand=False,  # sink unbound
+                              call_shape=call_shape)
         # D6: the partials' provenance goes into the merge
         # (`partials_sink_folded=provenance.sink_folded`, `lse_base="base2"`).
         out, lse = self.collectives.lse_reduce(
@@ -485,8 +597,8 @@ class Hy4Decoder:
         out, lse = attn.fold_sink(out, lse)   # the ONE sink fold, after the merge
         # `W_UV` expansion over this rank's head shard (a per (row, head) scale
         # commutes with the fold; the latent-space partials cannot expand on a
-        # foreign head — `kv_b_proj` is head-sharded).
-        out = torch.einsum("rhd,hvd->rhv", out, attn.expand_wuv.float()).to(y.dtype)
+        # foreign head — `kv_b_proj` is head-sharded for the decode wiring).
+        out = attn.expand_output(out).to(y.dtype)
         return attn.gate_and_project(out, y)
 
     def append(self, rows, count=1):
