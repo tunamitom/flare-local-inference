@@ -6,8 +6,8 @@
 
 CPU only: no checkpoint tensors are read. The tests reproduce the recipe's
 declared byte figures from the parameter census independently, check the plan's
-anchors (the ~2.9 GB per-rank TP8 replication gap, the 55.6 GiB floor, the
-~0.15 GiB-per-rank CSF expansion scratch), prove `planning.fit` accepts
+anchors (the replication gap per rank at TP8 — the pre-`kv_b` ~2.9 GB plus the
+`kv_b` two-wirings' 1.87 GiB, the 55.6 GiB floor, the ~0.15 GiB-per-rank CSF expansion scratch), prove `planning.fit` accepts
 `--expert-scale-compression csf` for this recipe, and trace the loader's
 `scale_compression`/`scale_scratch` pass-through into both packing entry
 points (the Step-5 call-site pattern).
@@ -51,6 +51,9 @@ def independent_arithmetic(model):
     stored_bf16, stored_fp32 = model.stored_parameter_counts()
 
     # Packed experts, kept-FP32 upgrades, everything else at storage dtype.
+    # `packed` counts every tensor ONCE at resident dtype regardless of
+    # placement; `kv_b_proj` of the target layers additionally rides whole on
+    # every rank (the `kv_b` two-wirings) — added to `replicated` below.
     expert_params = census["mlp.experts"]
     packed = (expert_params // 2 + expert_params // 16 + moe * e * 8
               + (stored_bf16 - expert_params) * 2 + stored_fp32 * 4
@@ -58,6 +61,7 @@ def independent_arithmetic(model):
 
     replicated = (
         blocks * (ql * h + (kv + rope) * h + ql + kv + 2 * h) * 2  # q/kv down-projections and layernorms
+        + layers * heads * (nope + vd) * kv * 2    # kv_b_proj (replicated — the `kv_b` two-wirings)
         + h * 2 + blocks * heads * 4                               # model.norm and the FP32 sinks
         + moe * (e * h * 2 + e * 4)                                # router gate and FP32 correction biases
         + indexers * ((32 * 128) * ql * 2 + 128 * h * 2 + 32 * h * 4 + 256 * 4)  # indexer, FP32 at load
@@ -99,10 +103,15 @@ def test_byte_arithmetic_reproduces_the_declared_figures(model):
         "csf": checkpoint.device_bytes - savings}
     assert checkpoint.stored_bytes == hy4_recipe.STORED_BYTES
 
-    # Plan anchors: the replication gap the old TP8 figure missed, the 55.6 GiB
-    # floor, and the CSF delta per rank at TP8.
+    # Plan anchors: the replication gap the old TP8 figure missed (now the
+    # pre-`kv_b` 2.9 GB plus the `kv_b` two-wirings' 1.87 GiB per rank), the
+    # 55.6 GiB floor, and the CSF delta per rank at TP8.
     gap = 7 * arithmetic["replicated_bytes"] // 8
-    assert 2_800_000_000 < gap < 3_000_000_000  # "roughly 2.9 GB per rank at TP8"
+    old_gap = 7 * 3_339_223_924 // 8       # the pre-`kv_b` replicated set
+    kv_b_gap = 7 * 2_290_089_984 // 8      # `kv_b_proj`'s target-layer rows
+    assert 2_800_000_000 < old_gap < 3_000_000_000  # "roughly 2.9 GB per rank at TP8"
+    assert 1.86 * GIB < kv_b_gap < 1.88 * GIB       # "+1.87 GiB per rank" (consult8 §3)
+    assert gap == old_gap + kv_b_gap == 4_925_649_669
     native = hy4_recipe.RECIPE.weights_bytes(checkpoint, 8, hy4_recipe.RECIPE.speculation)
     csf = hy4_recipe.RECIPE.weights_bytes(checkpoint, 8, hy4_recipe.RECIPE.speculation, "csf")
     assert native > 55.6 * GIB + gap                    # 55.6 GiB was a floor

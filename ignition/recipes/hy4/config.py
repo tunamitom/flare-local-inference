@@ -346,7 +346,8 @@ class ModelConfig:
           `q_a_proj`/`kv_a_proj_with_mqa` down-projections, the whole indexer,
           the router `gate` and correction bias, every norm, the learnable
           sinks, and the iHC streams (`fn`/`base`/`scale`, `hc_head`) replicate;
-          `q_b_proj`, `kv_b_proj`, `o_proj`, `linear_gate`, the experts, the
+          `kv_b_proj` replicates too with the `kv_b` two-wirings (consult8 §5).
+          `q_b_proj`, `o_proj`, `linear_gate`, the experts, the
           shared experts, the dense layer-0 FFN, `eh_proj`, the embedding and
           the FP32 head shard. (If the embedding and FP32 head do not shard,
           every rank pays 4,454,141,952 bytes more.)
@@ -376,12 +377,17 @@ class ModelConfig:
         upgrades = (v * h + indexers * 32 * h + indexers * 2 * 128 + e + heads) * 2
         expert_params = census["mlp.experts"]
         packed_experts = expert_params * 4 // 8 + expert_params // 16 + moe_blocks * e * 2 * 4
+        # `kv_b_proj` of the target layers is replicated (the `kv_b`
+        # two-wirings) — placement only: `packed_resident` counts every tensor
+        # once at resident dtype regardless of placement, and `replicated`
+        # carries the whole matrix on every rank.
         packed_resident = (packed_experts + (stored_bf16 - expert_params) * 2
                            + stored_fp32 * 4 + upgrades)
 
         replicated = (
             blocks * ql * h * 2                    # q_a_proj
             + blocks * (kv + rope) * h * 2         # kv_a_proj_with_mqa
+            + self.layers * heads * (nope + vd) * kv * 2  # kv_b_proj (replicated — the `kv_b` two-wirings)
             + blocks * ql * 2 + blocks * kv * 2    # q_a/kv_a layernorms
             + blocks * h * 2 * 2                   # input/post_attention layernorms
             + h * 2                                # model.norm

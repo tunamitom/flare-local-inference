@@ -33,7 +33,12 @@ from .config import INDEX_RECORD_BYTES, LATENT_RECORD_BYTES, PAGE_TOKENS
 # experts stay BF16, `lm_head` becomes FP32; the indexer `weights_proj`/
 # `k_norm` and the MTP block's correction bias and sink join the FP32 upgrade).
 STORED_BYTES = 1_560_008_337_568
-# Every tensor once at its resident dtype (packed experts, FP32 upgrades).
+# Every tensor once at its resident dtype (packed experts, FP32 upgrades) —
+# placement-independent, so the `kv_b` two-wirings do not move this figure.
+# `kv_b_proj`'s target-layer rows (2,290,089,984 B) join `REPLICATED_BYTES`
+# with the `kv_b` two-wirings (consult8 §5): prefill gathers unabsorbed queries
+# and absorbs + expands locally over ALL heads, so every rank carries the whole
+# matrix; decode keeps the owner-side absorb and reads only its head rows.
 PACKED_RESIDENT_BYTES = 477_937_464_180
 # Resident bytes every tensor-parallel rank carries whole: the `q_a_proj`/
 # `kv_a_proj_with_mqa` down-projections, the whole indexer, the router `gate`
@@ -41,12 +46,15 @@ PACKED_RESIDENT_BYTES = 477_937_464_180
 # MTP norms (`config.ModelConfig.packed_byte_arithmetic` derives the exact
 # figure). `device_bytes` counts each replicated tensor once **per rank** at
 # the primary TP8 world: seven extra copies on top of the one-copy sum, of
-# which 7/8 — 2,921,820,934 bytes, "roughly 2.9 GB per rank" — the old TP8
-# estimate was missing. At TP16 the replicated share of this figure is a floor
+# which 7/8 — 4,925,649,669 bytes per rank — is the replication gap the old
+# TP8 estimate missed: 2,921,820,934 bytes ("roughly 2.9 GB per rank",
+# consult2 plan item 21) for the pre-`kv_b` set plus 2,003,828,736 bytes for
+# the `kv_b` two-wirings ("+1.87 GiB per rank", consult8 §3). At TP16 the
+# replicated share of this figure is a floor
 # (the world-16 sum would add eight more copies); measured per-rank costs
 # replace the estimate after the first full-shape export. If the embedding and
 # the FP32 head turn out unsharded, add 4,454,141,952 bytes per rank.
-REPLICATED_BYTES = 3_339_223_924
+REPLICATED_BYTES = 5_629_313_908
 DEVICE_BYTES = PACKED_RESIDENT_BYTES + 7 * REPLICATED_BYTES
 # The MTP block: one packed 256-expert MoE plus its attention, indexer, iHC-free
 # norms and the `eh_proj` embedding/hidden merge.

@@ -130,8 +130,8 @@ class Hy4Sharding:
     def replicated(self, name):
         """True when every rank holds a whole copy of checkpoint tensor `name`."""
         shardable = (
-            name.endswith(".q_b_proj.weight") or name.endswith(".kv_b_proj.weight")
-            or name.endswith(".o_proj.weight") or name.endswith(".linear_gate.weight")
+            name.endswith(".q_b_proj.weight") or name.endswith(".o_proj.weight")
+            or name.endswith(".linear_gate.weight")
             or ".mlp.experts." in name or ".mlp.shared_experts." in name
             or name.endswith((".mlp.gate_proj.weight", ".mlp.up_proj.weight", ".mlp.down_proj.weight"))
             or name in ("lm_head.weight", "model.embed_tokens.weight")
