@@ -96,6 +96,85 @@ def checkpoint_names(config, *, mtp=True, packed=False):
     return frozenset(names)
 
 
+# W1 gate d: the packed export is only loadable when its export_report.json
+# proves a complete, verified build. The bound is the official MSE census bar
+# (the real experts measure 0.0812; max scaling reads 0.0951 and is refused).
+EXPORT_MAX_RELATIVE_ERROR = 0.0815
+
+
+def verify_export_package(snapshot, config):
+    """Refuse a packed W4A16 export that cannot prove a complete, verified run.
+
+    The per-expert builder once wrote ``index.json`` before verification and the
+    report and used mode-0600 shards, so a crashed run looked complete. The
+    loader now requires the evidence (W1 gate d):
+
+    - ``export_report.json`` exists and shows ``byte_verified``, the full
+      78x256x3 matrix census (every block x expert x projection) and
+      ``census_max_relative`` <= 0.0815;
+    - the report counts window-edge scale choices for ALL experts (coverage
+      per block and projection, not just the audited expert);
+    - ``model.safetensors.index.json`` was written last (mtime at or after the
+      shards, the config and the report);
+    - every shard is mode 0644.
+    """
+    from pathlib import Path
+
+    snapshot = Path(snapshot)
+    problems = []
+    report_path = snapshot / "export_report.json"
+    report = None
+    if not report_path.is_file():
+        problems.append("export_report.json is missing")
+    else:
+        try:
+            report = json.loads(report_path.read_text())
+        except ValueError as exc:
+            problems.append(f"export_report.json does not parse: {exc}")
+    if report is not None:
+        if report.get("byte_verified") is not True:
+            problems.append("export_report.json does not show byte_verified")
+        expected = (config.layers - 1 + config.draft_layers) * config.experts * 3
+        census = report.get("census")
+        if report.get("packed_matrices") != expected or not isinstance(census, dict) or len(census) != expected:
+            problems.append(f"export_report.json shows "
+                            f"{report.get('packed_matrices')} of {expected} packed matrices")
+        max_error = report.get("census_max_relative")
+        if not isinstance(max_error, (int, float)) or not 0 <= max_error <= EXPORT_MAX_RELATIVE_ERROR:
+            problems.append(f"census_max_relative {max_error!r} exceeds {EXPORT_MAX_RELATIVE_ERROR}")
+        counts = report.get("window_edge_counts")
+        if not isinstance(counts, dict):
+            problems.append("export_report.json has no window-edge counts")
+        else:
+            for prefix in contract.quantized_source_names(config):
+                entry = counts.get(prefix)
+                if not isinstance(entry, dict):
+                    problems.append(f"window-edge counts missing for {prefix}")
+                    continue
+                for projection in ("gate_proj", "up_proj", "down_proj"):
+                    per_expert = entry.get(projection)
+                    if (not isinstance(per_expert, list) or len(per_expert) != config.experts
+                            or any(not isinstance(count, int) or count < 0 for count in per_expert)):
+                        problems.append(f"window-edge counts of {prefix}.{projection} do not cover "
+                                        f"all {config.experts} experts")
+    index_path = snapshot / "model.safetensors.index.json"
+    shards = sorted(snapshot.glob("model-*.safetensors"))
+    if not index_path.is_file():
+        problems.append("model.safetensors.index.json is missing (the index is written last)")
+    elif shards:
+        latest = max([shard.stat().st_mtime_ns for shard in shards]
+                     + [report_path.stat().st_mtime_ns if report_path.is_file() else 0,
+                        (snapshot / "config.json").stat().st_mtime_ns])
+        if index_path.stat().st_mtime_ns < latest:
+            problems.append("model.safetensors.index.json was not written last")
+    for shard in shards:
+        if shard.stat().st_mode & 0o777 != 0o644:
+            problems.append(f"{shard.name}: mode {shard.stat().st_mode & 0o777:04o}, expected 0644")
+    if problems:
+        raise ValueError("refusing packed Hy4 export: " + "; ".join(problems))
+    return report
+
+
 class Hy4WeightLoader(DirectWeightLoader):
     """Direct transfers for a Hy4 checkpoint, packing or slicing routed experts.
 
@@ -140,6 +219,8 @@ class Hy4WeightLoader(DirectWeightLoader):
         return bool(self.quantization)
 
     def _selected_names(self):
+        if self._packed:
+            verify_export_package(self.manifest.metadata_path, self.config)
         packed = self._packed
         inventory = checkpoint_names(self.config, mtp=True, packed=packed)
         expected = checkpoint_names(self.config, mtp=self.mtp, packed=packed)
