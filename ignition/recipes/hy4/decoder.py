@@ -670,8 +670,25 @@ class Hy4Decoder:
                     world=world, rank=rank)
                 _, merged = self.collectives.merge_topk(
                     scores, candidates, topk=self.config.text["index_topk"])
-                attn.selection.handback(merged, world_size=world, rank=rank,
-                                        slot_map=self.cache.local_slot_map(token_rows))
+                # `local_slot_map`'s `[rows, local_capacity]` table is pure
+                # arithmetic (slot = row_base + p // world) and the hand-back
+                # only ever reads its `[rows, topk]` picks — materializing the
+                # whole table costs 1.5 GiB of int64 at 1024 prefill rows (the
+                # 2k-cell OOM). Shift each row's global positions by
+                # `world * row_base` (ownership `p % world` is unchanged and
+                # `p // world` becomes the physical slot — the map's exact
+                # gather value) and hand back with no table, preserving the
+                # table's `-1` padding and out-of-range guard by hand.
+                pos = merged
+                base = self.cache.slots_for(token_rows).reshape(-1, 1)
+                local = pos.clamp(min=0) // world
+                bounded = (pos < 0) | (local < self.cache.local_capacity)
+                shifted = torch.where(pos >= 0, pos.to(torch.int64) + world * base,
+                                      pos.to(torch.int64))  # `-1` padding stays -1
+                mapped = torch.where(bounded, shifted,
+                                     torch.full_like(shifted, -1)).to(pos.dtype)
+                attn.selection.handback(mapped, world_size=world, rank=rank,
+                                        slot_map=None)
         selected, counts = attn.selection.buffers(rows=y.shape[0])
         self.trace.append(("query_exchange", schedule.placement("query_exchange", family),
                            call_shape.query_wiring, int(q_local.shape[-1])))
