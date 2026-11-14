@@ -206,7 +206,8 @@ def construct_rank(snapshot, config: PreparationConfig, *, rank=0, device=None, 
 
     Shard assignment, name-checked weight loading (the do-not-quantize floor
     enforced), the iHC/sink/shared-selection/gated-MLA wiring and a working
-    `Hy4Decoder` with its `prefill` / `decode_step` / `draft_step` entries.
+    `Hy4Decoder` with its `prefill` / `decode_step` / `draft_absorb` /
+    `draft_step` entries.
     `device` defaults to CPU; pass a CUDA device for the real checkpoint
     (`pinned=True`). Every checkpoint tensor is consumed exactly once — an
     unmatched or leftover name raises instead of being dropped.

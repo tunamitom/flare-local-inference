@@ -290,6 +290,7 @@ def test_ihc_pre_post_swap_mutant_changes_the_forward(fresh):
 
 
 def test_mtp_draft_runs_and_is_absent_without_speculation(constructed, tiny_available):
+    from ignition.recipes.hy4.attention import rms_norm
     from ignition.recipes.hy4.bootstrap import PreparationConfig, construct_rank
     from ignition.recipes.hy4.decoder import Hy4Cache, Hy4Decoder
 
@@ -299,11 +300,18 @@ def test_mtp_draft_runs_and_is_absent_without_speculation(constructed, tiny_avai
     tokens = torch.tensor([[3, 7, 11, 5]])
     logits = decoder.prefill(tokens)
     decoder.complete([0], tokens)
-    # prev_hidden is the target's pre-`model.norm` hidden: the state rows keep it.
-    prev_hidden = decoder.weights.hc_head.merge(
-        torch.randn(1, 4, rank.model_config.hidden, dtype=torch.bfloat16))
-    draft = decoder.draft_step(torch.tensor([[9]]), prev_hidden)
+    # prev_hidden is the target's POST-`model.norm` hidden (finding F): the
+    # state rows keep exactly that tensor.
+    prev_hidden = rms_norm(decoder.weights.hc_head.merge(
+        torch.randn(1, 4, rank.model_config.hidden, dtype=torch.bfloat16)),
+        decoder.weights.norm, rank.model_config.text["rms_norm_eps"])
+    draft, hidden = decoder.draft_step(torch.tensor([[9]]), prev_hidden)
     assert draft.shape == (1, rank.model_config.vocabulary) and torch.isfinite(draft).all()
+    assert hidden.shape == (1, rank.model_config.hidden)
+    # A second chained step consumes the returned hidden and advances position.
+    draft2, hidden2 = decoder.draft_step(torch.tensor([[10]]), hidden)
+    assert draft2.shape == (1, rank.model_config.vocabulary) and torch.isfinite(draft2).all()
+    assert decoder._draft_positions[0] == 2
 
     settings = PreparationConfig(devices=(0,), mtp=False)
     plain = construct_rank(TINY, settings, rank=0, pinned=False, mtp=False,

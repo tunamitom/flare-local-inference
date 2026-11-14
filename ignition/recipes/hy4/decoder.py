@@ -9,8 +9,13 @@ sparse MLA with per-head sinks, the IndexCache shared-selection cell (full
 layers run the indexer once per group; shared layers bind the owner's buffer),
 and the routed MoE. `prefill` and `decode_step` are the plan's entry points
 (`prefill_chunk_size`-sized chunks; one token per row per step) and share one
-layer loop. `draft_step` runs the MTP block against the target's pre-norm
-hidden.
+layer loop. The MTP entries run the draft block against the target's POST-
+`model.norm` hidden (`norm(hc_head(streams))` — the engines and transformers
+5.23.0's `MTPCandidateGenerator` feed exactly that tensor; see `mtp.py`'s
+module docstring for the file/line evidence): `draft_absorb` writes the
+prompt's rows into the draft KV (prompt absorption), then chained
+`draft_step`s hand their returned hidden back and advance positions
+(`hy4/mtp.py`, `decoder.draft_step`).
 
 Caches (`Hy4Cache`) are the device-agnostic twin of the paged GPU caches: one
 latent record per token per layer (the 656-byte GLM_NSA record's 576 live
@@ -22,10 +27,11 @@ records flow through `sparse_mla.concat_and_cache_glm_next_mla` and the
 `dsa_indexer` paged FP8 writer instead.
 
 State rows (`StreamState`) follow the recipe's `RankCosts.state_row_bytes`
-contract: 4 x hidden BF16 streams + the hidden `hnorm` consumes + a consumed
-token counter per row. Streams are per-token (each token's row starts at its
-embedding replicated over the 4 streams, `HYV4Model.forward`), so speculative
-capacity multiplies rows, not their width.
+contract: 4 x hidden BF16 streams + the hidden `hnorm` consumes (the POST-
+`model.norm` hidden — finding F) + a consumed token counter per row. Streams
+are per-token (each token's row starts at its embedding replicated over the 4
+streams, `HYV4Model.forward`), so speculative capacity multiplies rows, not
+their width.
 """
 
 from dataclasses import dataclass, field
@@ -110,11 +116,12 @@ class StreamState:
     """One rank's 4-stream state rows (the `state_row_bytes` contract).
 
     `rows` speculative-capacity rows, each `[4, hidden]` BF16 streams plus the
-    single-stream hidden `hnorm` consumes and the consumed-token counter.
+    single-stream hidden `hnorm` consumes (the POST-`model.norm` hidden, per
+    the finding-F convention) and the consumed-token counter.
     """
 
     streams: torch.Tensor   # [rows, 4, hidden] BF16
-    hidden: torch.Tensor    # [rows, hidden] BF16
+    hidden: torch.Tensor    # [rows, hidden] BF16 (post-`model.norm`)
     count: torch.Tensor     # [rows] int64
 
     @classmethod
@@ -154,6 +161,7 @@ class Hy4Decoder:
         self.device = weights.device
         self.compute_dtype = torch.bfloat16 if compute_dtype is None else compute_dtype
         self._row_lengths = {}
+        self._draft_positions = {}
 
     # --- entry points ------------------------------------------------------
 
@@ -172,30 +180,101 @@ class Hy4Decoder:
             raise ValueError("decode_step advances one token per row")
         return self.forward(token_ids, request_rows=request_rows, state=state)
 
-    def draft_step(self, next_tokens, prev_hidden, *, request_rows=None, cache=None):
-        """One MTP draft step (`hy4_mtp` semantics); returns draft logits.
+    def draft_absorb(self, next_tokens, prev_hidden, *, request_rows=None, cache=None):
+        """Teacher-forced prompt absorption into the draft KV (finding F fix).
 
-        `next_tokens` [rows, 1] are the drafted continuations, `prev_hidden`
-        [rows, hidden] the target's pre-`model.norm` hidden (`hc_head` output).
+        `next_tokens` [rows, k] are the SHIFTED prompt tokens (row t holds the
+        token at t+1), `prev_hidden` [rows, k, hidden] the target's POST-
+        `model.norm` hidden per row (`norm(hc_head(streams))` — the state rows
+        keep exactly that tensor). The MTP writes its draft KV/index rows at
+        the prompt's own positions so later draft steps attend over the prompt
+        (transformers candidate_generator.py:1427 runs the MTP over the full
+        prompt; the pre-fix recipe left zeros at every prompt position).
+        Returns (logits [rows, k, V], hidden [rows, k, H], selected [rows, k,
+        topk]); each row's draft cursor advances to cover the absorbed rows, so
+        chained `draft_step`s continue at the next position.
         """
-        draft = self.weights.draft
-        if draft is None:
+        if next_tokens.ndim != 2 or prev_hidden.ndim != 3:
+            raise ValueError("draft_absorb needs next_tokens [rows, k] and "
+                             "prev_hidden [rows, k, hidden]")
+        if next_tokens.shape[:2] != prev_hidden.shape[:2]:
+            raise ValueError("next_tokens and prev_hidden must agree on [rows, k]")
+        if self.weights.draft is None:
             raise ValueError("no MTP draft block is prepared")
-        cache = self.cache if cache is None else cache
         rows = self._rows(next_tokens, request_rows)
-        positions = self._positions(next_tokens.shape, rows)
+        k = next_tokens.shape[1]
+        starts = torch.tensor([self._draft_positions.get(int(r), 0) for r in rows.tolist()],
+                              dtype=torch.long, device=self.device)
+        # The absorption runs in select-sized chunks — the row-wise top-k lands
+        # in the shared selection cell's `[max_q_rows, topk]` buffer, and the
+        # real prefill path chunks the same way (`prefill_chunk_size` tokens per
+        # row). Rows within a chunk attend causally through their cache slots,
+        # so chunking is batching only: identical outputs, no re-computation of
+        # written records (write-once draft KV — the W5 cache-diff decision).
+        limit = int(getattr(self.weights.draft.attention.selection.cache,
+                            "max_q_rows", k))
+        outs, sels = [], []
+        for lo in range(0, k, limit):
+            hi = min(lo + limit, k)
+            positions = (starts.reshape(-1, 1)
+                         + torch.arange(lo, hi, device=self.device)).reshape(-1)
+            hidden, _, selected = self._draft(next_tokens[:, lo:hi], prev_hidden[:, lo:hi],
+                                              positions, rows, cache)
+            outs.append(hidden.reshape(next_tokens.shape[0], hi - lo, -1))
+            # snapshot: `select` hands back the selection cell's LIVE buffer
+            # (shared with `sparse_mla.bind`), and the next chunk's
+            # `write_selection` (or any later step's) overwrites it in place.
+            sels.append(selected.reshape(next_tokens.shape[0], hi - lo, -1).clone())
+        hidden = torch.cat(outs, dim=1)
+        selected = torch.cat(sels, dim=1)
+        for row, start in zip(rows.tolist(), starts.tolist()):
+            self._draft_positions[row] = start + k
+        logits = hidden.reshape(-1, hidden.shape[-1]).float() @ self.weights.head.T
+        return (logits.reshape(next_tokens.shape[0], k, -1), hidden, selected)
+
+    def draft_step(self, next_tokens, prev_hidden, *, request_rows=None, cache=None):
+        """One chained MTP draft step; returns (logits [rows, V], hidden [rows, H]).
+
+        `next_tokens` [rows, 1] is the drafted continuation token, `prev_hidden`
+        [rows, hidden] the PREVIOUS step's RETURNED hidden (post
+        `final_layernorm` — what the engines chain), or the target's post-
+        `model.norm` hidden for the first step after absorption. The step runs
+        at the row's draft cursor (absorbed rows plus chained steps) and
+        advances it by one: chained steps walk positions forward and hand their
+        hidden back (transformers modeling_layers.py:524-558).
+        """
+        if next_tokens.shape[1] != 1:
+            raise ValueError("draft_step advances one token per row")
+        if self.weights.draft is None:
+            raise ValueError("no MTP draft block is prepared")
+        rows = self._rows(next_tokens, request_rows)
+        starts = torch.tensor([self._draft_positions.get(int(r), 0) for r in rows.tolist()],
+                              dtype=torch.long, device=self.device)
+        hidden, _, _ = self._draft(next_tokens, prev_hidden, starts, rows, cache)
+        for row, start in zip(rows.tolist(), starts.tolist()):
+            self._draft_positions[row] = start + 1
+        return hidden.float() @ self.weights.head.T, hidden
+
+    def _draft(self, next_tokens, prev_hidden, positions, rows, cache):
+        """Shared draft body: embed, run the block at `positions`; (hidden, attended, selected)."""
+        cache = self.cache if cache is None else cache
         token_rows = self._token_rows(next_tokens.shape, rows)
         visible = positions + 1
         next_embeds = self.weights.embed[next_tokens.reshape(-1)].to(self.compute_dtype)
-        hidden, _ = draft.forward(next_embeds, prev_hidden, positions, cache, visible,
-                                  token_rows=token_rows)
-        return hidden.float() @ self.weights.head.T
+        hidden, attended, selected = self.weights.draft.forward(
+            next_embeds, prev_hidden.to(self.compute_dtype).reshape(-1, prev_hidden.shape[-1]),
+            positions, cache, visible, token_rows=token_rows)
+        return hidden, attended, selected
 
-    def forward(self, token_ids, *, request_rows=None, state=None):
+    def forward(self, token_ids, *, request_rows=None, state=None, return_hidden=False):
         """The real body loop: iHC streams -> 78 gated sparse-MLA layers -> head.
 
         Returns FP32 logits over this rank's vocabulary shard. `request_rows`
-        maps each input row to its cache row (default: identity).
+        maps each input row to its cache row (default: identity). With
+        `return_hidden=True` returns `(logits, hidden_post, hidden_pre)`:
+        `hidden_post` [rows, tokens, hidden] is the POST-`model.norm` hidden
+        (the MTP feed and the lm_head pre-image), `hidden_pre` the pre-norm
+        `hc_head` output (diagnostics / the pre-norm-feed mutant only).
         """
         if token_ids.ndim != 2:
             raise ValueError("token_ids must be [rows, tokens]")
@@ -225,13 +304,23 @@ class Hy4Decoder:
             previous_ffn = layer.ffn_ihc
         streams.streams = previous_ffn.post(mlp_out, streams.streams, post)
         hidden = self.weights.hc_head.merge(streams.streams)
-        streams.hidden = hidden
-        if state is not None:
-            state.hidden[:hidden.shape[0]] = hidden
-            state.count[:hidden.shape[0]] += token_ids.shape[1]
         normed = rms_norm(hidden, self.weights.norm, self.config.text["rms_norm_eps"])
+        # The state rows keep the POST-`model.norm` hidden — the exact tensor
+        # the MTP's `hnorm` consumes (finding F; vLLM vllm_hy4_model.py:403,
+        # SGLang sgl_hunyuan_v4.py:734, transformers candidate_generator.py:1418
+        # all feed `model_outputs.hidden_states[-1]` == `norm(hc_head(...))`).
+        streams.hidden = normed
+        if state is not None:
+            state.hidden[:normed.shape[0]] = normed
+            state.count[:normed.shape[0]] += token_ids.shape[1]
         logits = normed.float() @ self.weights.head.T
-        return logits.reshape(token_ids.shape[0], token_ids.shape[1], -1)
+        logits = logits.reshape(token_ids.shape[0], token_ids.shape[1], -1)
+        if return_hidden:
+            rows, width = token_ids.shape
+            return (logits,
+                    normed.reshape(rows, width, -1),
+                    hidden.reshape(rows, width, -1))
+        return logits
 
     # --- internals ---------------------------------------------------------
 
@@ -293,5 +382,8 @@ class Hy4Decoder:
         """
         if not hasattr(self, "_row_lengths"):
             self._row_lengths = {}
+        if not hasattr(self, "_draft_positions"):
+            self._draft_positions = {}
         for row in rows:
             self._row_lengths.pop(int(row), None)
+            self._draft_positions.pop(int(row), None)
