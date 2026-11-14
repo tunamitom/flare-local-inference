@@ -51,6 +51,7 @@ __all__ = [
     "check_scores_only_exactness",
     "select_own_candidates",
     "SimulatedDcpTransport",
+    "PcieDcpTransport",
     "PcieDcpCollectives",
 ]
 
@@ -504,6 +505,227 @@ class SimulatedDcpTransport:
     def all_gather(self, value):
         taken = self.group._exchange(self.rank, value.contiguous())
         return torch.cat(taken, dim=-1)
+
+
+# ------------------------------------------------------------------------
+# the W7 GPU transport: the real b12x PCIe DCP surfaces
+# ------------------------------------------------------------------------
+class PcieDcpTransport:
+    """GPU transport over the real b12x PCIe DCP kernels (W7 gate c / P5).
+
+    `PCIeDCPA2APool` carries the two CP-attention exchanges — the head
+    all-gather of projected queries and the base-2 fused `lse_reduce_scatter`
+    — through PREPARED PLANS ONLY (`_dcp_preparation` queries and plans; no
+    JIT at run time).  The sink never enters the merge (`partials_sink_folded`
+    is declared into the run; the one fold is `PreparedSinkFold` after it).
+    The call surfaces are exactly `SimulatedDcpTransport`'s, so
+    `PcieDcpCollectives` rides either transport and the body is unchanged.
+
+    The TP reductions and vocabulary gathers (`all_reduce`, `all_gather`) and
+    the selection wires (`exchange_scores`, `stage_candidates`) ride the
+    caller's torch.distributed control group here: the `pcie_dcp_topk` owner
+    planes partition ROWS across owners while the Hy4 body needs every row's
+    merged top-k on every rank (`SelectionCell.handback` runs per rank), and
+    the scores-only wire's real-kernel unit cost is measured separately
+    (c1-unit-costs.md §5: 7.88 us at world 8).  What rides which path is
+    recorded in `surfaces()`.
+    """
+
+    def __init__(self, *, group, device, pools, rank, world_size, total_heads):
+        self.group = group
+        self.device = torch.device(device)
+        self.rank = rank
+        self.world_size = world_size
+        self.total_heads = int(total_heads)
+        self._pools = pools            # {(width, kind): pool}
+        self._plans = {}               # (surface, rows, width, lse_base) -> plan
+        self._prepared = 0
+
+    # -- construction ------------------------------------------------------
+
+    @classmethod
+    def from_process_group(cls, process_group, device, *, total_heads, query_widths,
+                           value_width, max_rows):
+        """One channel pool per wire geometry (the query gather's absorbed and
+        unabsorbed widths, and the 512-wide latent partials)."""
+        from b12x.comm.pcie.pcie_dcp_a2a import PCIeDCPA2APool
+
+        import torch.distributed as dist
+
+        device = torch.device(device)
+        rank = dist.get_rank(group=process_group)
+        world_size = dist.get_world_size(group=process_group)
+        pools = {}
+        for width in sorted(set(query_widths)):
+            pools[(width, "gather")] = PCIeDCPA2APool.from_process_group(
+                process_group=process_group, device=device,
+                max_batch_size=max_rows, total_heads=total_heads,
+                head_dim=width, query_head_dim=width, single_channel=True)
+        pools[(value_width, "partials")] = PCIeDCPA2APool.from_process_group(
+            process_group=process_group, device=device,
+            max_batch_size=max_rows, total_heads=total_heads,
+            head_dim=value_width, query_head_dim=value_width, single_channel=True)
+        return cls(group=process_group, device=device, pools=pools,
+                   rank=rank, world_size=world_size, total_heads=total_heads)
+
+    def bind(self, rank):
+        if rank != self.rank:
+            raise ValueError(f"transport is rank {self.rank}, cannot bind rank {rank}")
+        return self
+
+    def surfaces(self):
+        """What rides the real DCP kernels versus the control group."""
+        return {
+            "all_gather_heads": "PCIeDCPA2APool.all_gather_heads (prepared plans)",
+            "lse_reduce_scatter": "PCIeDCPA2APool.lse_reduce_scatter (prepared plans, base-2)",
+            "all_reduce": "torch.distributed control group (unit costs: c1-unit-costs.md §5)",
+            "all_gather": "torch.distributed control group",
+            "exchange_scores": "torch.distributed control group",
+            "stage_candidates": "torch.distributed control group",
+        }
+
+    def close(self):
+        for pool in self._pools.values():
+            pool.close()
+        self._pools = {}
+
+    # -- prepared plans (no JIT at run time) -------------------------------
+
+    def prepare_gather(self, session, rows, width, *, name=None):
+        """Prepare the head all-gather plan for `rows` at query width `width`."""
+        from b12x.comm.pcie import _dcp_preparation as preparation
+        from b12x.preparation import CollectiveRequirement
+
+        key = ("all_gather_heads", int(rows), int(width), "")
+        if key in self._plans:
+            return self._plans[key]
+        pool = self._pools[(int(width), "gather")]
+        runtime = pool.for_stream()
+        inp = torch.zeros((rows, self._total_heads_local(), width),
+                          dtype=torch.bfloat16, device=self.device)
+        out = torch.empty((rows, self._total_heads(), width),
+                          dtype=torch.bfloat16, device=self.device)
+        call = dict(local_input=inp, out=out)
+        query = preparation.query_from_runtime(
+            runtime, surface="DcpAllToAll.all_gather_heads", call=call)
+        plan = preparation.plan(query, runtime=runtime)
+        label = name or f"gather-{rows}-{width}"
+        session.prepare(
+            (plan.request(
+                name=label,
+                collective=CollectiveRequirement(key=label, ranks=tuple(range(self.world_size))),
+                prepare_call=lambda state: preparation.prepare_call(state, **call),
+            ),),
+            coordinator=lambda progress: progress.ready_collectives[0].key
+            if progress.ready_collectives else None,
+        )
+        self._plans[key] = plan
+        self._prepared += 1
+        return plan
+
+    def prepare_lse(self, session, rows, width, *, lse_base=LSE_BASE):
+        """Prepare the fused LSE reduce-scatter plan (`width`-wide latent values)."""
+        from b12x.comm.pcie import _dcp_preparation as preparation
+        from b12x.preparation import CollectiveRequirement
+
+        key = ("lse_reduce_scatter", int(rows), int(width), lse_base)
+        if key in self._plans:
+            return self._plans[key]
+        pool = self._pools[(int(width), "partials")]
+        runtime = pool.for_stream()
+        partial = torch.zeros((rows, self._total_heads(), width),
+                              dtype=torch.bfloat16, device=self.device)
+        lse = torch.zeros((rows, self._total_heads()), device=self.device)
+        out = torch.empty((rows, self._total_heads() // self.world_size, width),
+                          dtype=torch.bfloat16, device=self.device)
+        call = dict(partial_output=partial, partial_lse=lse, out=out,
+                    lse_base=lse_base, partials_sink_folded=False)
+        query = preparation.query_from_runtime(
+            runtime, surface="DcpAllToAll.lse_reduce_scatter", call=call)
+        plan = preparation.plan(query, runtime=runtime)
+        label = f"lse-{rows}-{width}-{lse_base}"
+        session.prepare(
+            (plan.request(
+                name=label,
+                collective=CollectiveRequirement(key=label, ranks=tuple(range(self.world_size))),
+                prepare_call=lambda state: preparation.prepare_call(state, **call),
+            ),),
+            coordinator=lambda progress: progress.ready_collectives[0].key
+            if progress.ready_collectives else None,
+        )
+        self._plans[key] = plan
+        self._prepared += 1
+        return plan
+
+    def _total_heads(self):
+        return self.total_heads
+
+    def _total_heads_local(self):
+        return self.total_heads // self.world_size
+
+    # -- the SimulatedDcpTransport call surfaces ---------------------------
+
+    def all_gather_heads(self, local_input, out=None, *, plan=None):
+        rows, _, width = (int(v) for v in local_input.shape)
+        plan = self._lookup("all_gather_heads", rows, width, "")
+        pool = self._pools[(width, "gather")]
+        return pool.for_stream().all_gather_heads(
+            local_input.contiguous(), out, plan=plan)
+
+    def lse_reduce_scatter(self, partial_output, partial_lse, out=None, *, plan=None,
+                           lse_base=LSE_BASE, partials_sink_folded=None, return_lse=False):
+        rows, heads, width = (int(v) for v in partial_output.shape)
+        if partials_sink_folded is None:
+            raise ValueError(
+                "lse_reduce_scatter requires declared partials_sink_folded "
+                "(the sink never enters the merge; D6)")
+        plan = self._lookup("lse_reduce_scatter", rows, width, lse_base)
+        pool = self._pools[(width, "partials")]
+        return pool.for_stream().lse_reduce_scatter(
+            partial_output.contiguous(), partial_lse.contiguous(), out,
+            plan=plan, lse_base=lse_base,
+            partials_sink_folded=partials_sink_folded, return_lse=return_lse)
+
+    def exchange_scores(self, offers, *, plan=None):
+        return self._gather_all(offers)
+
+    def stage_candidates(self, local_indices, local_scores, local_counts=None, *, plan=None):
+        scores = self._gather_all(local_scores)
+        indices = self._gather_all(local_indices)
+        return tuple(zip(scores, indices))
+
+    def all_reduce(self, value):
+        import torch.distributed as dist
+
+        host = value.contiguous().cpu()
+        dist.all_reduce(host, op=dist.ReduceOp.SUM, group=self.group)
+        return host.to(value.device)
+
+    def all_gather(self, value):
+        import torch.distributed as dist
+
+        host = value.contiguous().cpu()
+        taken = [torch.empty_like(host) for _ in range(self.world_size)]
+        dist.all_gather(taken, host, group=self.group)
+        return torch.cat([t.to(value.device) for t in taken], dim=-1)
+
+    def _gather_all(self, value):
+        """Every rank's copy of `value`, in rank order (the control-group wire)."""
+        import torch.distributed as dist
+
+        host = value.contiguous().cpu()
+        taken = [torch.empty_like(host) for _ in range(self.world_size)]
+        dist.all_gather(taken, host, group=self.group)
+        return tuple(t.to(value.device) for t in taken)
+
+    def _lookup(self, surface, rows, width, lse_base):
+        key = (surface, int(rows), int(width), lse_base)
+        if key not in self._plans:
+            raise RuntimeError(
+                f"no prepared {surface!r} plan for rows={rows}, width={width}, "
+                f"lse_base={lse_base!r}; plans bind before the run — there is "
+                "no JIT at run time")
+        return self._plans[key]
 
 
 class PcieDcpCollectives:

@@ -212,6 +212,7 @@ class Hy4LayerAttention:
     _mla: object = field(default=None, repr=False)
     _indexer_plan: object = field(default=None, repr=False)
     _mla_plans: dict = field(default_factory=dict, repr=False)
+    _mla_scratch: dict = field(default_factory=dict, repr=False)
     _plan_book: object = field(default=None, repr=False)
     _sink_folds: dict = field(default_factory=dict, repr=False)
 
@@ -366,6 +367,11 @@ class Hy4LayerAttention:
             plan = self._make_mla_plan(shape)
             self._mla_plans[(shape.name, shape.rows, shape.tokens)] = plan
             self._plan_book.bind(shape, "sparse_mla", plan)
+            if self.device.type == "cuda":
+                # Caller-owned scratch for the prepared plan (`plan.scratch_specs`)
+                # — allocated once per call shape at prepare time, never inside a
+                # step or a graph capture (no JIT at run time).
+                self._mla_scratch[(shape.name, shape.rows, shape.tokens)] = self._allocate_scratch(plan)
             if self.weights.sink is not None:
                 # The fold geometry is the call shape's flattened query rows:
                 # [rows*tokens, heads, kv_lora] out + [rows*tokens, heads] LSE
@@ -648,6 +654,7 @@ class Hy4LayerAttention:
 
         rows = q_absorbed.shape[0]
         plan = self._mla_plan_for(call_shape)
+        key = (call_shape.name, call_shape.rows, call_shape.tokens) if call_shape is not None else "lazy"
         if plan is None:
             caps = sparse_mla.Caps(
                 device=self.device, num_q_heads=self.heads, max_q_rows=rows,
@@ -658,9 +665,17 @@ class Hy4LayerAttention:
                 mode="decode", return_lse=True, lse_scale="base2", has_attention_sink=True)
             plan = sparse_mla.plan(caps)
             self._mla = plan
+            self._mla_scratch["lazy"] = self._allocate_scratch(plan)
+        scratch = self._mla_scratch.get(key)
+        if scratch is None and plan is self._mla:
+            scratch = self._mla_scratch.get("lazy")
+        if scratch is None:
+            raise RuntimeError(
+                "no prepared sparse-MLA scratch for this call shape; prepare_plans "
+                "allocates one per call shape — there is no JIT at run time")
         if cache_lengths is None:
             cache_lengths = counts.new_full((rows,), selected.shape[1])
-        binding = sparse_mla.bind(plan, scratch=self._scratch(), q=q_absorbed.to(torch.bfloat16),
+        binding = sparse_mla.bind(plan, scratch=scratch, q=q_absorbed.to(torch.bfloat16),
                                   kv_cache=latent_table, selected_indices=selected,
                                   cache_lengths=cache_lengths,
                                   selected_lengths=counts,
@@ -669,8 +684,19 @@ class Hy4LayerAttention:
         output, lse = result
         return output, lse, binding
 
-    def _scratch(self):
-        raise NotImplementedError("sparse-MLA scratch is sized by the b12x PreparationSession at prepare time")
+    @staticmethod
+    def _allocate_scratch(plan):
+        """One caller-owned scratch buffer per prepared plan (`plan.scratch_specs`).
+
+        The b12x sparse-MLA contract is eager plan -> bind -> kernel over a
+        caller-owned scratch tensor sized at prepare time (`b12x.attention.
+        sparse_mla._scratch`); nothing allocates inside a step or a capture.
+        """
+        specs = plan.scratch_specs()
+        if len(specs) != 1:
+            raise ValueError(f"sparse-MLA scratch expects one buffer, got {len(specs)}")
+        spec = specs[0]
+        return torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
 
     def gate_and_project(self, attn_output, x):
         """Elementwise per-head gate (`gated_mla`, `gating_type=elementwise`) then `o_proj`.

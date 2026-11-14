@@ -285,8 +285,18 @@ class Hy4WeightLoader(DirectWeightLoader):
         count = c["n_routed_experts"]
         import torch
 
+        # Materialize through the loader session (`load_tensor`) when the raw
+        # `_sources` entry is a DECLARED placeholder (meta until transferred):
+        # on the GPU construction path consuming it raw leaves the routed
+        # experts as META tensors — a meta matmul then silently returns garbage
+        # (the P5 integration gate caught exactly this).  Resident tensors (the
+        # CPU dry run) are consumed as-is.
         fused = self._sources[f"{prefix}.gate_up_proj"]
         down = self._sources[f"{prefix}.down_proj"]
+        if getattr(fused, "is_meta", False):
+            fused = self.load_tensor(f"{prefix}.gate_up_proj")
+        if getattr(down, "is_meta", False):
+            down = self.load_tensor(f"{prefix}.down_proj")
         if fused.shape != (count, 2 * inter, hidden) or fused.dtype != torch.bfloat16:
             raise ValueError(f"{prefix}.gate_up_proj: storage disagrees with fused BF16 expert geometry")
         if down.shape != (count, hidden, inter) or down.dtype != torch.bfloat16:

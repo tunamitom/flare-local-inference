@@ -392,12 +392,17 @@ def _moe_state(builder, prefix, *, dense=False):
                                 column_range=sharding.expert_range))
     expert_prefix = f"{prefix}.experts"
     if loader._packed:
+        # Materialize through the loader session when the raw `_sources` entry
+        # is a declared (meta) placeholder on GPU (see `weights.expert_stacks`).
+        packed_sources = {}
+        for name in loader._sources:
+            if name.startswith(expert_prefix + ".") and name.rsplit(".", 1)[-1] \
+                    in ("weight", "weight_scale", "weight_scale_2"):
+                source = loader._sources[name]
+                packed_sources[name] = loader.load_tensor(name) if getattr(source, "is_meta", False) else source
         routed = ReferenceRoutedExperts.from_packed(
-            {name: loader._sources[name] for name in loader._sources
-             if name.startswith(expert_prefix + ".") and name.rsplit(".", 1)[-1]
-             in ("weight", "weight_scale", "weight_scale_2")},
-            expert_prefix, swiglu_limit=c["swiglu_limit"])
-        builder.used.update(name for name in loader._sources if name.startswith(expert_prefix + "."))
+            packed_sources, expert_prefix, swiglu_limit=c["swiglu_limit"])
+        builder.used.update(packed_sources)
     else:
         for projection in ("gate_up_proj", "down_proj"):
             builder.take(f"{expert_prefix}.{projection}")
