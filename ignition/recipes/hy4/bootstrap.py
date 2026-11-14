@@ -201,7 +201,7 @@ class PreparedHy4Rank:
 
 def construct_rank(snapshot, config: PreparationConfig, *, rank=0, device=None, pinned=True,
                    mtp=None, cache_rows=None, cache_capacity=None, index_pages_per_layer=1,
-                   headers_only=False, manifest=None):
+                   headers_only=False, manifest=None, world_size=None, collectives=None):
     """Construct one Hy4 rank end to end (the CPU-shape/dtype dry run's core).
 
     Shard assignment, name-checked weight loading (the do-not-quantize floor
@@ -211,6 +211,11 @@ def construct_rank(snapshot, config: PreparationConfig, *, rank=0, device=None, 
     `device` defaults to CPU; pass a CUDA device for the real checkpoint
     (`pinned=True`). Every checkpoint tensor is consumed exactly once — an
     unmatched or leftover name raises instead of being dropped.
+
+    `world_size` overrides the serving world (`len(config.devices)`, the 1/8/16
+    declaration) — the W6 CPU simulation builds 2- and 8-rank worlds from the
+    same constructor. A world > 1 needs `collectives` (the injected
+    `hy4/collectives.Collectives`, e.g. `SimulatedGroup.collectives(rank)`).
 
     `headers_only=True` is the header dry run (consult3 gate c): construction
     completes from the checkpoint's shard HEADERS — names, shapes, dtypes,
@@ -227,7 +232,7 @@ def construct_rank(snapshot, config: PreparationConfig, *, rank=0, device=None, 
 
     snapshot = Path(snapshot).expanduser().resolve()
     model_config = ModelConfig.load(snapshot, pinned=pinned)
-    shard = TensorParallelShard(rank, len(config.devices))
+    shard = TensorParallelShard(rank, len(config.devices) if world_size is None else world_size)
     sharding = Hy4Sharding(model_config, shard)
     if device is None:
         device = torch.device("cpu")
@@ -253,8 +258,9 @@ def construct_rank(snapshot, config: PreparationConfig, *, rank=0, device=None, 
         weights = build_model_state(loader, model_config, sharding, selections=selections, mtp=mtp)
     rows = config.max_active if cache_rows is None else cache_rows
     capacity = max(config.prefill_chunk_size, 128) if cache_capacity is None else cache_capacity
-    cache = Hy4Cache.allocate(model_config, rows=rows, capacity=capacity, device=device, draft=mtp)
-    decoder = Hy4Decoder(weights, cache)
+    cache = Hy4Cache.allocate(model_config, rows=rows, capacity=capacity, device=device, draft=mtp,
+                              world=shard.world_size, rank=rank)
+    decoder = Hy4Decoder(weights, cache, collectives=collectives)
     report = {"rank": rank, "world_size": shard.world_size, "device": str(device),
               "weights_bytes": weights.allocated_bytes, "mtp": mtp,
               "full_indexer_layers": model_config.full_indexer_layers,

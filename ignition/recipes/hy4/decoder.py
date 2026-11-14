@@ -53,6 +53,19 @@ class Hy4Cache:
     block's records sit at layer `config.layers`. Records are stored at
     `dtype` (BF16 — the GLM_NSA FP8 record's decoded form — unless a caller
     overrides it for a full-precision dry run).
+
+    Context parallelism (D1, amendment 2): token position `p` of a request row
+    is owned by rank `p % world` at local index `p // world` — flashinfer's
+    interleaved rule (`dsa_indexer.selection_handback.rank_local_slots`; the
+    primitive is the contract, and D8 asserts the equality in code). `capacity`
+    is the row's GLOBAL position count (1,024 positions per shared page at
+    CP8); each rank stores `capacity // world` LOCAL slots per row — page `k`'s
+    owned positions land at local slots `[128k, 128(k+1))` on every rank (for
+    those `p`, `p // world` runs over exactly `[128k, 128k + 128)`). Record
+    compute stays replicated — every rank computes every record and
+    `write_latent` / `write_index_keys` KEEP only their owned positions, so
+    there is no write-time collective at all. World 1 keeps every position and
+    `local == owner slot == position` (the eager path, unchanged).
     """
 
     config: ModelConfig
@@ -62,47 +75,98 @@ class Hy4Cache:
     latent: dict = field(default_factory=dict)
     index: dict = field(default_factory=dict)
     dtype: torch.dtype = torch.bfloat16
+    world: int = 1
+    rank: int = 0
+
+    def __post_init__(self):
+        if type(self.world) is not int or self.world < 1:
+            raise ValueError(f"cache world must be a positive int, got {self.world!r}")
+        if type(self.rank) is not int or not 0 <= self.rank < self.world:
+            raise ValueError(f"cache rank must be in [0, {self.world}), got {self.rank!r}")
+        if type(self.capacity) is not int or self.capacity < 0 or self.capacity % self.world:
+            raise ValueError(
+                f"cache capacity {self.capacity} must be a nonnegative multiple of the world "
+                f"({self.world}) — capacity counts GLOBAL positions, storage is in local slots")
 
     @classmethod
-    def allocate(cls, config, rows, capacity, device, *, draft=False, dtype=torch.bfloat16):
+    def allocate(cls, config, rows, capacity, device, *, draft=False, dtype=torch.bfloat16,
+                 world=1, rank=0):
         c = config.text
-        cache = cls(config=config, rows=rows, capacity=capacity, device=device, dtype=dtype)
+        cache = cls(config=config, rows=rows, capacity=capacity, device=device, dtype=dtype,
+                    world=world, rank=rank)
         layers = config.layers + int(draft)
         width = c["kv_lora_rank"] + c["qk_rope_head_dim"]
         for layer in range(layers):
-            cache.latent[layer] = torch.zeros((rows * capacity, width), dtype=dtype, device=device)
+            cache.latent[layer] = torch.zeros((rows * cache.local_capacity, width), dtype=dtype, device=device)
         for owner in (*config.full_indexer_layers, *( (config.layers,) if draft else () )):
-            cache.index[owner] = torch.zeros((rows * capacity, c["index_head_dim"]),
+            cache.index[owner] = torch.zeros((rows * cache.local_capacity, c["index_head_dim"]),
                                             dtype=dtype, device=device)
         return cache
 
+    # --- ownership (D1, amendment 2) --------------------------------------
+
+    @property
+    def local_capacity(self):
+        """Local slots per request row (= `capacity` at world 1)."""
+        return self.capacity // self.world
+
+    def owner(self, positions):
+        """Rank owning each token position: `position % world` (the interleaved rule)."""
+        return torch.as_tensor(positions, device=self.device).long() % self.world
+
+    def local(self, positions):
+        """The owning rank's local slot index: `position // world`."""
+        return torch.as_tensor(positions, device=self.device).long() // self.world
+
+    def local_slot_map(self, rows_for):
+        """Per-row local-index -> physical-slot table for the selection hand-back (D3).
+
+        `rows_for` maps each query row to its request row; request row `r`'s
+        local index `j` lives at slot `r * local_capacity + j`. The map is PER
+        ROW — one shared map would hand every query row's picks back into row
+        zero's cache (the `selection_handback.py` fix-on-the-way; gate b fails
+        on a batch of two without it).
+        """
+        base = self.slots_for(rows_for).reshape(-1, 1)
+        offsets = torch.arange(self.local_capacity, device=self.device, dtype=torch.long)
+        return base + offsets.reshape(1, -1)
+
+    # --- slots and writes -------------------------------------------------
+
     @property
     def slot_base(self):
-        return (torch.arange(self.rows, device=self.device, dtype=torch.long) * self.capacity)
+        return (torch.arange(self.rows, device=self.device, dtype=torch.long) * self.local_capacity)
 
     def slots_for(self, row_of):
         """Each token's row slot base (`row_of` maps token -> request row)."""
-        return (row_of.long() * self.capacity)
+        return (row_of.long() * self.local_capacity)
 
     def write_latent(self, layer, tokens, positions, latent):
-        """Store this layer's latent records at the tokens' physical slots."""
-        self.latent[layer][self._slots(tokens, positions)] = latent.to(self.latent[layer].dtype)
+        """Store this layer's latent records at the tokens' OWNED physical slots."""
+        self._store(self.latent[layer], tokens, positions, latent)
 
     def write_index_keys(self, owner, tokens, positions, keys):
-        self.index[owner][self._slots(tokens, positions)] = keys.to(self.index[owner].dtype)
+        self._store(self.index[owner], tokens, positions, keys)
+
+    def _store(self, table, tokens, positions, values):
+        positions = positions.long()
+        slots = self._slots(tokens, positions)   # bounds-checked over every position
+        keep = (positions % self.world) == self.rank   # store only owned records (D1)
+        table[slots[keep]] = values.to(table.dtype)[keep]
 
     def _slots(self, tokens, positions):
         """Physical slots for `positions`, refusing writes past the row.
 
-        The slot is `row * capacity + position`, so a position >= `capacity`
-        lands in the NEXT row's records — silently, at the default capacity of
-        4,096 (consult3 W4). A row is `capacity` positions long; anything
-        beyond raises instead of aliasing another request's cache.
+        The slot is `row * local_capacity + position // world`, so a position
+        >= `capacity` lands in the NEXT row's records — silently, at the
+        default capacity of 4,096 (consult3 W4). A row is `capacity` GLOBAL
+        positions long; anything beyond raises instead of aliasing another
+        request's cache.
         """
         positions = positions.long()
         if bool((positions < 0).any()) or bool((positions >= self.capacity).any()):
             raise IndexError(f"cache position out of range: a row holds {self.capacity} slots")
-        return self.slots_for(tokens) + positions
+        return self.slots_for(tokens) + self.local(positions)
 
     def latents(self, layer):
         return self.latent[layer]
@@ -154,12 +218,25 @@ class Hy4Decoder:
     full-precision dry run passes FP32 with a matching `Hy4Cache` dtype.
     """
 
-    def __init__(self, weights: Hy4ModelWeights, cache: Hy4Cache, *, compute_dtype=None):
+    def __init__(self, weights: Hy4ModelWeights, cache: Hy4Cache, *, compute_dtype=None, collectives=None):
+        from .collectives import SoloCollectives
+
         self.weights = weights
         self.cache = cache
         self.config = weights.config
         self.device = weights.device
         self.compute_dtype = torch.bfloat16 if compute_dtype is None else compute_dtype
+        if collectives is None:
+            if cache.world != 1:
+                raise ValueError(
+                    "a context-parallel rank needs an injected Collectives "
+                    "(W6 SimulatedGroup / W7 PCIeDCPA2A wiring)")
+            collectives = SoloCollectives()
+        if (collectives.world_size, collectives.rank) != (cache.world, cache.rank):
+            raise ValueError(
+                f"collectives identity ({collectives.rank}/{collectives.world_size}) "
+                f"disagrees with the cache ({cache.rank}/{cache.world})")
+        self.collectives = collectives
         self._row_lengths = {}
         self._draft_positions = {}
 
@@ -258,6 +335,13 @@ class Hy4Decoder:
     def _draft(self, next_tokens, prev_hidden, positions, rows, cache):
         """Shared draft body: embed, run the block at `positions`; (hidden, attended, selected)."""
         cache = self.cache if cache is None else cache
+        if cache.world != 1:
+            # D7: MTP is out of the P5 diff — the draft block follows the same
+            # CP rules (records at layer 78 + `_DRAFT_PAGE_BYTES` pages, local
+            # candidates -> exchange -> hand-back, head gather -> partial ->
+            # reduce-scatter -> one sink fold) when MTP serving lands, not now.
+            raise NotImplementedError(
+                "the MTP draft block has no context-parallel path yet (W6 D7: out of P5 scope)")
         token_rows = self._token_rows(next_tokens.shape, rows)
         visible = positions + 1
         next_embeds = self.weights.embed[next_tokens.reshape(-1)].to(self.compute_dtype)
@@ -282,7 +366,11 @@ class Hy4Decoder:
         positions = self._positions(token_ids.shape, rows)
         token_rows = self._token_rows(token_ids.shape, rows)
         visible = positions + 1  # each query's causal cache length
-        embeds = self.weights.embed[token_ids.reshape(-1)].to(self.compute_dtype)
+        # Vocabulary-sharded embedding (D5): masked lookup over this rank's
+        # shard + all-reduce (identity at world 1).
+        embeds = self.collectives.embed_lookup(
+            token_ids.reshape(-1), self.weights.embed,
+            vocabulary_range=self.weights.sharding.vocabulary_range).to(self.compute_dtype)
         streams = StreamState.begin(embeds)
         if state is not None:
             state.streams[:streams.streams.shape[0]] = streams.streams
@@ -296,11 +384,14 @@ class Hy4Decoder:
                 streams.streams, post, y = previous_ffn.post_pre(
                     mlp_out, streams.streams, post, layer.attn_ihc,
                     norm_weight=layer.input_norm)
-            attn_out = self._attention(layer, y, positions, token_rows, visible)
+            attn_out = self.collectives.all_reduce(
+                self._attention(layer, y, positions, token_rows, visible))  # D4 (o_proj shard)
             streams.streams, post, y = layer.attn_ihc.post_pre(
                 attn_out, streams.streams, post, layer.ffn_ihc,
                 norm_weight=layer.post_attention_norm)
-            mlp_out = layer.mlp.forward(y)
+            # D4: the MoE/dense-FFN outputs are intermediate-sharded partial
+            # sums (the layer-0 dense FFN is `mlp.forward` at layer 0).
+            mlp_out = self.collectives.all_reduce(layer.mlp.forward(y))
             previous_ffn = layer.ffn_ihc
         streams.streams = previous_ffn.post(mlp_out, streams.streams, post)
         hidden = self.weights.hc_head.merge(streams.streams)
@@ -314,7 +405,11 @@ class Hy4Decoder:
             state.hidden[:normed.shape[0]] = normed
             state.count[:normed.shape[0]] += token_ids.shape[1]
         logits = normed.float() @ self.weights.head.T
-        logits = logits.reshape(token_ids.shape[0], token_ids.shape[1], -1)
+        # D5: logits come back per vocabulary shard; all-gather to the sampler
+        # (identity at world 1).
+        logits = self.collectives.gather_logits(
+            logits.reshape(token_ids.shape[0], token_ids.shape[1], -1),
+            vocabulary_range=self.weights.sharding.vocabulary_range)
         if return_hidden:
             rows, width = token_ids.shape
             return (logits,
@@ -346,18 +441,53 @@ class Hy4Decoder:
         return rows.reshape(-1, 1).expand(shape[0], shape[1]).reshape(-1)
 
     def _attention(self, layer, y, positions, token_rows, visible):
+        """One layer's attention: world 1 today's path, world > 1 the CP shape (D2/D3).
+
+        CP (amendment 1): full layers offer local top-k candidates over their
+        OWN key table, the selection exchange merges the W ranks' candidates
+        into one global top-2048 per query row and `SelectionCell.handback`
+        maps it to this rank's local selection (per-row slot map); then the
+        head all-gather of projected queries, the all-heads sinkless partial
+        over this rank's record shard, the base-2 LSE reduce-scatter returning
+        this rank's head shard, and ONE post-merge sink fold
+        (`PreparedSinkFold`) before `W_UV` expansion and the gated `o_proj`.
+        """
         attn = layer.attention
         slot_base = self.cache.slots_for(token_rows)
-        q_resid, q_absorbed, latent = attn.project(y, positions)
+        q_resid, q_local, latent = attn.project(y, positions)
         self.cache.write_latent(layer.index, token_rows, positions, latent)
         if attn.weights.indexer is not None:
             keys = attn.prepare_index_keys(y, positions)
             self.cache.write_index_keys(layer.index, token_rows, positions, keys)
         owner = attn.selection.owner_id
-        selected, counts = attn.select(y, q_resid, positions, visible,
-                                      self.cache.key_table(owner), slot_base)
-        attended = attn.attend(q_absorbed, self.cache.latents(layer.index), selected, counts)
-        return attn.gate_and_project(attended.output, y)
+        world, rank = self.collectives.world_size, self.collectives.rank
+        if world == 1:
+            selected, counts = attn.select(y, q_resid, positions, visible,
+                                          self.cache.key_table(owner), slot_base)
+            attended = attn.attend(q_local, self.cache.latents(layer.index), selected, counts)
+            return attn.gate_and_project(attended.output, y)
+        if attn.selection.kind == "full":
+            scores, candidates = attn.local_candidates(
+                y, q_resid, positions, visible, self.cache.key_table(owner), slot_base,
+                world=world, rank=rank)
+            _, merged = self.collectives.merge_topk(
+                scores, candidates, topk=self.config.text["index_topk"])
+            attn.selection.handback(merged, world_size=world, rank=rank,
+                                    slot_map=self.cache.local_slot_map(token_rows))
+        selected, counts = attn.selection.buffers(rows=y.shape[0])
+        q_all = self.collectives.all_gather_heads(q_local)   # all heads per call (D2)
+        partial = attn.attend(q_all, self.cache.latents(layer.index), selected, counts,
+                              fold_sink=False, expand=False)  # sink unbound
+        # D6: the partials' provenance goes into the merge
+        # (`partials_sink_folded=provenance.sink_folded`, `lse_base="base2"`).
+        out, lse = self.collectives.lse_reduce(
+            partial.output, partial.lse, partials_sink_folded=partial.provenance.sink_folded)
+        out, lse = attn.fold_sink(out, lse)   # the ONE sink fold, after the merge
+        # `W_UV` expansion over this rank's head shard (a per (row, head) scale
+        # commutes with the fold; the latent-space partials cannot expand on a
+        # foreign head — `kv_b_proj` is head-sharded).
+        out = torch.einsum("rhd,hvd->rhv", out, attn.expand_wuv.float()).to(y.dtype)
+        return attn.gate_and_project(out, y)
 
     def append(self, rows, count=1):
         """Advance the rows' consumed-token counters after a committed step."""

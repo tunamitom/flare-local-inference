@@ -239,6 +239,9 @@ class Hy4LayerAttention:
         buffer. `visible` is each token's causal cache length and `slot_base`
         its row's first physical slot (top-k picks are within-row positions,
         stored as absolute slots). Returns the cell's `(selected, counts)`.
+        This is the world-1 path (queries and records on one rank); under
+        context parallelism the decoder runs `local_candidates` -> the
+        selection exchange -> `SelectionCell.handback` instead (D3).
         """
         cell = self.selection
         if cell is None:
@@ -254,7 +257,34 @@ class Hy4LayerAttention:
         cell.write_selection(indices, visible, slot_base)
         return cell.buffers(rows=x.shape[0])
 
-    def index_scores(self, x, q_resid, positions, visible, key_table, slot_base):
+    def local_candidates(self, x, q_resid, positions, visible, key_table, slot_base, *, world, rank):
+        """This rank's local top-k candidates over its OWN key table (D3).
+
+        Returns `(candidate_scores [rows, topk] FP32, candidate_positions
+        [rows, topk] int32 GLOBAL)` — exactly `topk` wide, the
+        `merge_tiled_topk_candidates` candidate contract — padded `-inf` / `-1`
+        past each token's owned live keys. Score column `j` is the global
+        position `j * world + rank` (the interleaved ownership rule, amendment
+        2), so the candidate merge compares global positions across ranks; a
+        candidate whose score was masked to `-inf` is offered as `-1` and
+        drops in the hand-back (never a not-yet-visible record).
+        """
+        if self.weights.indexer is None:
+            raise ValueError("full layer lacks indexer weights")
+        scores = self.index_scores(x, q_resid, positions, visible, key_table, slot_base,
+                                  world=world, rank=rank)
+        topk = self.config.text["index_topk"]
+        rows, width = scores.shape
+        if width < topk:
+            scores = torch.cat((scores, scores.new_full((rows, topk - width), float("-inf"))), dim=-1)
+        columns = torch.cat((torch.arange(width, device=self.device, dtype=torch.int64) * world + rank,
+                             torch.full((topk - width,), -1, device=self.device, dtype=torch.int64)))
+        values, indices = scores.topk(topk, dim=-1)
+        picked = torch.where(torch.isfinite(values), columns[indices],
+                             torch.full_like(indices, -1, dtype=torch.int64))
+        return values.to(torch.float32), picked.to(torch.int32)
+
+    def index_scores(self, x, q_resid, positions, visible, key_table, slot_base, *, world=1, rank=0):
         """Dense causal indexer logits [rows, width] over the key cache.
 
         The reference contract (`HYV4Indexer.forward`, `dsa_indexer`'s
@@ -262,70 +292,125 @@ class Hy4LayerAttention:
         combined with `weights_proj(x) * n_heads^-0.5 * head_dim^-0.5` (the
         weight projection consumes the layer input `x`, the query projection
         the `q_resid`), keys rotated at write time, queries at prepare time.
-        `visible` is each token's causal cache length (within-row positions
-        0 .. visible-1), `slot_base` the row's first physical slot.
+        `visible` is each token's causal cache length (within-row GLOBAL
+        positions 0 .. visible-1), `slot_base` the row's first physical slot.
+
+        Context parallelism (world > 1): the key table holds only the rank's
+        OWNED keys — global position `p` at local index `p // world`
+        (amendment 2) — so the score row covers the token's owned live keys
+        (`p < visible`, `p % world == rank`) and score column `j` is global
+        position `j * world + rank`. The indexer is replicated and rank
+        invariant (never head-sharded — §2), so the local scores equal the
+        single-rank scores of the same positions.
         """
         iw = self.weights.indexer
         c = self.config.text
         n_heads, head_dim = iw.heads, iw.head_dim
         q = (q_resid @ iw.wq_b.T).view(-1, n_heads, head_dim)
         q = apply_interleaved_rope(q, positions, rope_dim=c["qk_rope_head_dim"], theta=self.rope_theta)
-        width = int(visible.max())
+        # Owned live keys per query token (world 1: every position is owned).
+        owned = torch.div((visible.long() - rank).clamp_min(0) + world - 1, world,
+                          rounding_mode="floor")
+        width = int(owned.max()) if owned.numel() else 0
         rows = int(q.shape[0])
         keys = key_table.new_zeros((rows, width, key_table.shape[-1]))
         for row in range(rows):
-            live = int(visible[row])
-            keys[row, :live] = key_table[int(slot_base[row]):int(slot_base[row]) + live]
+            live = int(owned[row])
+            if live:
+                keys[row, :live] = key_table[int(slot_base[row]):int(slot_base[row]) + live]
         scores = torch.relu(torch.einsum("rhd,rwd->rhw", q.float(), keys.float()))
         weights = (x.float() @ iw.weights_proj.float().T) * (n_heads ** -0.5) * (head_dim ** -0.5)
         logits = torch.einsum("rh,rhw->rw", weights, scores)
-        # Causal masking over the token's visible cache length (`visible` counts
-        # the entries each query may attend to, within-row positions 0..visible-1).
-        causal = torch.arange(width, device=self.device).reshape(1, width) < visible.reshape(-1, 1)
+        # Causal masking over the token's owned live keys (world 1: `owned` is
+        # exactly the visible cache length).
+        causal = torch.arange(width, device=self.device).reshape(1, width) < owned.reshape(-1, 1)
         return logits.masked_fill(~causal, float("-inf"))
 
     # --- attention ---------------------------------------------------------
 
-    def attend(self, q_absorbed, latent_table, selected, counts, *, return_lse=True, cache_lengths=None):
+    def attend(self, q_absorbed, latent_table, selected, counts, *, return_lse=True,
+               cache_lengths=None, fold_sink=True, expand=True):
         """Sparse gated MLA against the selected latent records.
 
         Wires `sparse_mla.plan -> bind -> run` (with `attention_sink`) on CUDA;
-        the torch-op reference on CPU. Both fold the per-head sink exactly once
-        and return a base-2 LSE with `sink_folded=True`. `cache_lengths` is each
-        row's KV length (the `sparse_mla` `cache_lengths` operand); it defaults
-        to the selection width.
+        the torch-op reference on CPU. Both surface the same provenance.
+        `cache_lengths` is each row's KV length (the `sparse_mla` `cache_lengths`
+        operand); it defaults to the selection width.
+
+        World 1 (`fold_sink=True`, `expand=True`): the per-head sink folds per
+        call and the output expands through `W_UV` — the eager path, the
+        simulation's ground truth, unchanged. The CP partial (D2) calls with
+        `fold_sink=False, expand=False`: the sink stays UNBOUND (provenance
+        `sink_folded=False`) and the output stays in the wide latent, because
+        `kv_b_proj` is head-sharded and only this rank's head shard can expand
+        — the partials exchange in latent space and the single post-merge
+        `fold_sink` + `W_UV` finish the shard (`q_b_proj`/`kv_b_proj`
+        replication, the 256-wide partial variant, is the later measured
+        lever). The merge is per (row, head) convex and `W_UV` per head, so
+        expanding before or after the merge is the same map.
         """
         sink = self.weights.sink
         if self.device.type == "cuda":
             output, lse, binding = self._attend_cuda(q_absorbed, latent_table, selected, counts,
-                                                     cache_lengths=cache_lengths)
+                                                     fold_sink=fold_sink, cache_lengths=cache_lengths)
             provenance = SparseMLAProvenance.from_binding(binding)
         else:
-            output, lse = self._attend_reference(q_absorbed, latent_table, selected, counts)
-            provenance = SparseMLAProvenance(sink_folded=sink is not None)
+            output, lse = self._attend_reference(q_absorbed, latent_table, selected, counts,
+                                                 fold_sink=fold_sink)
+            provenance = SparseMLAProvenance(sink_folded=bool(fold_sink and sink is not None))
+        if expand:
+            output = torch.einsum("rhd,hvd->rhv", output, self.expand_wuv.float()).to(q_absorbed.dtype)
         return SparseMLAOutput(output=output, lse=lse if return_lse else None, provenance=provenance)
 
-    def _attend_reference(self, q_absorbed, latent_table, selected, counts):
-        """The eager sparse-MLA contract in torch (sink column + folded LSE)."""
-        rows, heads, width = selected.shape[0], self.heads, selected.shape[1]
+    def fold_sink(self, out, lse):
+        """The ONE post-merge sink fold (D2): `out *= sigmoid(lse - sink); lse = logaddexp(lse, sink)`.
+
+        `PreparedSinkFold` (`b12x.comm.pcie.prepare_sink_fold`) on this rank's
+        head-shard sink and the base-2 merged LSE, run exactly once after
+        `Collectives.lse_reduce`. Folding per shard instead is the double-fold
+        defect the merge's `partials_sink_folded` guard rejects (gate c's
+        sink-per-rank mutant).
+        """
+        from b12x.comm.pcie.api import prepare_sink_fold
+
+        sink = self.weights.sink
+        prepared = prepare_sink_fold(out=out, lse=lse, sink=sink, lse_base="base2")
+        return prepared.run(out, lse, sink)
+
+    def _attend_reference(self, q_absorbed, latent_table, selected, counts, *, fold_sink=True):
+        """The eager sparse-MLA contract in torch (latent-space output)."""
+        rows, heads, width = selected.shape[0], int(q_absorbed.shape[1]), selected.shape[1]
         slots = selected.long().clamp_min(0)
         keys = latent_table[slots]                       # [rows, width, kv_lora + rope]
         valid = (selected >= 0) & (torch.arange(width, device=self.device).reshape(1, width)
                                    < counts.reshape(-1, 1))
         logits = torch.einsum("rhd,rwd->rhw", q_absorbed.float(), keys.float()) * self.scaling
         logits = logits.masked_fill(~valid.reshape(rows, 1, width), float("-inf"))
-        sink = self.weights.sink.float().reshape(1, heads, 1)
-        combined = torch.cat((logits, sink.expand(rows, heads, 1)), dim=-1)
-        probs = torch.softmax(combined, dim=-1)
         values = keys[..., :self.kv_lora]                # the absorbed value is the latent itself
-        out_latent = torch.einsum("rhw,rwd->rhd", probs[..., :-1].float(), values.float())
-        # LSE in base 2, sink folded exactly once (logaddexp of token LSE and sink).
-        lse = torch.logsumexp(combined, dim=-1) * (1.0 / torch.log(torch.tensor(2.0)))
-        expanded = torch.einsum("rhd,hvd->rhv", out_latent, self.expand_wuv.float()).to(q_absorbed.dtype)
-        return expanded, lse.float()
+        ln2 = 1.0 / torch.log(torch.tensor(2.0))
+        if fold_sink:
+            sink = self.weights.sink.float().reshape(1, heads, 1)
+            combined = torch.cat((logits, sink.expand(rows, heads, 1)), dim=-1)
+            probs = torch.softmax(combined, dim=-1)
+            out_latent = torch.einsum("rhw,rwd->rhd", probs[..., :-1].float(), values.float())
+            # LSE in base 2, sink folded exactly once (logaddexp of token LSE and sink).
+            lse = torch.logsumexp(combined, dim=-1) * ln2
+        else:
+            # The CP partial: sink UNBOUND over this rank's own record shard.
+            probs = torch.softmax(logits, dim=-1)
+            out_latent = torch.einsum("rhw,rwd->rhd", probs.float(), values.float())
+            lse = torch.logsumexp(logits, dim=-1) * ln2
+        return out_latent, lse.float()
 
-    def _attend_cuda(self, q_absorbed, latent_table, selected, counts, *, cache_lengths=None):
-        """`sparse_mla.plan -> bind -> run` on CUDA with sink provenance."""
+    def _attend_cuda(self, q_absorbed, latent_table, selected, counts, *, fold_sink=True,
+                     cache_lengths=None):
+        """`sparse_mla.plan -> bind -> run` on CUDA with sink provenance.
+
+        `fold_sink=False` (the CP partial) binds WITHOUT `attention_sink`, so
+        `Binding.sink_folded` is False and the post-merge `PreparedSinkFold`
+        owns the one fold. The kernel emits the latent-space value output
+        (`Caps.v_head_dim == kv_lora_rank`), which `attend` expands.
+        """
         from b12x.attention import sparse_mla
 
         rows = q_absorbed.shape[0]
@@ -343,7 +428,8 @@ class Hy4LayerAttention:
         binding = sparse_mla.bind(self._mla, scratch=self._scratch(), q=q_absorbed.to(torch.bfloat16),
                                   kv_cache=latent_table, selected_indices=selected,
                                   cache_lengths=cache_lengths,
-                                  selected_lengths=counts, attention_sink=self.weights.sink)
+                                  selected_lengths=counts,
+                                  attention_sink=self.weights.sink if fold_sink else None)
         result = sparse_mla.run(binding)
         output, lse = result
         return output, lse, binding
@@ -418,16 +504,21 @@ class SelectionCell:
         target[:, :width].copy_(slots.to(target.dtype))
         counts[:rows].copy_(live.to(counts.dtype))
 
-    def handback(self, merged, *, world_size, rank, prepared=None):
-        """Cross-rank selection hand-back into the owner's buffers.
+    def handback(self, merged, *, world_size, rank, slot_map=None, prepared=None):
+        """Cross-rank selection hand-back into the owner's buffers (D3).
 
         Under context parallelism the merged global top-k lands in GLOBAL
         positions; `IndexCache.handback` (backed by
         `dsa_indexer.selection_handback.PreparedSelectionHandback`) recovers
-        this rank's local selection once per group.
+        this rank's local selection once per group. `slot_map` is the PER-ROW
+        local-index -> physical-slot table (`[rows, local_capacity]`,
+        `Hy4Cache.local_slot_map`) — one shared map would send every query row
+        into row zero's cache (`selection_handback.py` fix-on-the-way).
         """
         if prepared is not None:
-            selected, counts = prepared.run(merged, output=self.cache.selected(self.owner_id),
+            selected, counts = prepared.run(merged, slot_map=slot_map,
+                                            output=self.cache.selected(self.owner_id),
                                             counts=self.cache.counts(self.owner_id))
             return selected, counts
-        return self.cache.handback(self.layer_id, merged, world_size=world_size, rank=rank)
+        return self.cache.handback(self.layer_id, merged, world_size=world_size, rank=rank,
+                                  slot_map=slot_map)

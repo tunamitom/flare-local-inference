@@ -892,7 +892,7 @@ class PreparedVarlenGather:
 @torch.library.custom_op("flare::pcie_lse_reduce_scatter", mutates_args=("output",))
 def _lse_reduce_scatter(partial: torch.Tensor, lse: torch.Tensor, output: torch.Tensor, handle: int) -> None:
     owner = _OWNERS[handle]
-    owner.runtime.lse_reduce_scatter(partial, lse, out=output, plan=owner.plan, is_lse_base_on_e=True)
+    owner.runtime.lse_reduce_scatter(partial, lse, out=output, plan=owner.plan, lse_base=owner.lse_base)
 
 
 @_lse_reduce_scatter.register_fake
@@ -901,24 +901,36 @@ def _fake_lse_reduce_scatter(partial, lse, output, handle):
 
 
 class PreparedLseReduceScatter:
-    """Combine every rank's partial attention by natural-log LSE and keep this rank's heads.
+    """Combine every rank's partial attention by LSE and keep this rank's heads.
 
     Partial outputs are [rows, heads, dim] over all heads with FP32 [rows, heads] LSE;
-    the output holds this rank's contiguous head shard. Operations sharing the
+    the output holds this rank's contiguous head shard. `lse_base` states the
+    partials' log base ("base2" or "natural") and the merged LSE's — the
+    natural-log value is hard-coded no more (Hy4's sparse-MLA partials are
+    base 2 and silently merging them as natural re-weights every rank, the W6
+    wrong-LSE-base mutant); the default stays "natural" for the older callers
+    (`kimi3`/`kimi31` dense-MLA and `glm53`'s `lse_scale="natural"` partials).
+    Operations sharing the
     channel must execute serially on every rank. Over RoCEnante, ranks all-gather
     the shards each peer keeps through `staging` (send [rows, width] and received
     [rows, W * width] BF16, from head_exchange.pack_width) and merge locally;
-    `rank` is this rank as a one-element device tensor.
+    `rank` is this rank as a one-element device tensor. The RoCE merge kernel
+    weights with `exp()` — natural-log LSEs only, so it rejects anything else.
     """
 
     def __init__(self, partial, lse, output, *, runtime, session, coordinator, name, staging=None, rank=None,
-                 threads=None, block_limit=None):
+                 threads=None, block_limit=None, lse_base="natural"):
         import torch.distributed as dist
         from b12x.comm import pcie
 
+        if lse_base not in ("base2", "natural"):
+            raise ValueError(f"lse_base must be 'base2' or 'natural', got {lse_base!r}")
+        self.lse_base = lse_base
         rows = partial.shape[0]
         self.roce = _roce(runtime)
         if self.roce:
+            if lse_base != "natural":
+                raise ValueError("the RoCE head-exchange merge weights with exp() — natural-log LSEs only")
             from .head_exchange import pack_width
 
             heads, dim = partial.shape[1:]
@@ -943,7 +955,7 @@ class PreparedLseReduceScatter:
                 or output.dtype != torch.bfloat16 or not 0 < rows <= runtime.max_batch_size):
             raise ValueError("LSE reduce-scatter requires BF16 partials, FP32 LSE and a head shard of its channel")
         self.runtime, self.output = runtime, output
-        call = {"partial_output": partial, "partial_lse": lse, "out": output, "is_lse_base_on_e": True}
+        call = {"partial_output": partial, "partial_lse": lse, "out": output, "lse_base": self.lse_base}
         geometry = {key: value for key, value in (("threads", threads), ("block_limit", block_limit))
                     if value is not None}
         query = pcie.query_from_runtime(runtime, surface="DcpAllToAll.lse_reduce_scatter", call={**call, **geometry})
