@@ -352,7 +352,7 @@ class Hy4LayerAttention:
         """Attach the rank's `KernelPlanBook` (from `wire_operators`)."""
         self._plan_book = book
 
-    def prepare_plans(self, shapes, *, device=None):
+    def prepare_plans(self, shapes, *, device=None, sink_variants=(True, False)):
         """Bind one `sparse_mla` plan per call shape, plus the sink fold.
 
         The one-row decode plan is NOT the verification-rows plan (consult7
@@ -362,19 +362,46 @@ class Hy4LayerAttention:
         b12x plans; on CPU the book records the bound shape (the torch-op
         reference needs no lower). Once a plan book is bound, `attend` refuses
         a call shape with no prepared plan — there is no JIT at run time.
+
+        Each shape gets a plan per BIND variant: the world-1 variant (the sink
+        bound, folded in kernel) and the CP-partial variant (sink UNBOUND —
+        D2/D6: the merge has no sink input and the one `PreparedSinkFold`
+        folds after it). `sparse_mla.bind` requires `attention_sink` presence
+        to match `Caps.has_attention_sink`, so the variants are distinct
+        plans with distinct scratch. `sink_variants` selects which to prepare
+        (default: both); a CP serve that never runs the world-1 call prepares
+        `(False,)` and adds the bound variant only at its graph-capture shapes
+        — the plan set is a measured memory term and the full two-variant book
+        at 14 call shapes exhausted the card on the first h4 boot.
         """
         from .wiring import KernelPlanBook
 
         self._plan_book = self._plan_book or KernelPlanBook()
+        # One shared plan per (bind variant, call-shape name): `sparse_mla`
+        # plans are MAX-capacity (`_validate_q` admits q rows <= max_total_q),
+        # so a plan built at the group's largest geometry serves every smaller
+        # call — the per-shape plan/scratch duplication is what exhausted the
+        # card at 14 shapes x 64-head partials. Heads follow the variant: the
+        # world-1 call is this rank's shard, the CP partial is total-head.
+        groups = {}
         for shape in shapes:
-            plan = self._make_mla_plan(shape)
-            self._mla_plans[(shape.name, shape.rows, shape.tokens)] = plan
-            self._plan_book.bind(shape, "sparse_mla", plan)
-            if self.device.type == "cuda":
-                # Caller-owned scratch for the prepared plan (`plan.scratch_specs`)
-                # — allocated once per call shape at prepare time, never inside a
-                # step or a graph capture (no JIT at run time).
-                self._mla_scratch[(shape.name, shape.rows, shape.tokens)] = self._allocate_scratch(plan)
+            for bound in sink_variants:
+                groups.setdefault((bool(bound), shape.name), []).append(shape)
+        for (bound, name), group_shapes in groups.items():
+            eff = self.weights.sink is not None and bool(bound)
+            heads = self.heads if bound else int(self.config.text["num_attention_heads"])
+            proto = group_shapes[0]
+            plan = self._make_mla_plan(
+                proto, has_sink=eff, num_q_heads=heads,
+                max_q_rows=max(s.rows * s.tokens for s in group_shapes))
+            scratch = self._allocate_scratch(plan) if self.device.type == "cuda" else None
+            for shape in group_shapes:
+                self._mla_plans[(shape.name, shape.rows, shape.tokens, eff)] = plan
+                if scratch is not None:
+                    self._mla_scratch[(shape.name, shape.rows, shape.tokens, eff)] = scratch
+                if bound == sink_variants[0]:
+                    self._plan_book.bind(shape, "sparse_mla", plan)
+        for shape in shapes:
             if self.weights.sink is not None:
                 # The fold geometry is the call shape's flattened query rows:
                 # [rows*tokens, heads, kv_lora] out + [rows*tokens, heads] LSE
@@ -388,16 +415,23 @@ class Hy4LayerAttention:
                 self._plan_book.bind(shape, "sink_fold", fold)
         return self
 
-    def _make_mla_plan(self, shape):
+    def _make_mla_plan(self, shape, *, has_sink=True, num_q_heads=None, max_q_rows=None):
         if self.device.type != "cuda":
-            return ("reference-sparse-mla", shape.name, shape.rows, shape.tokens, shape.mla_mode)
+            return ("reference-sparse-mla", shape.name, shape.rows, shape.tokens, shape.mla_mode,
+                    has_sink, num_q_heads, max_q_rows)
         from b12x.attention import sparse_mla
 
         caps = sparse_mla.Caps(
-            device=self.device, num_q_heads=self.heads,
+            device=self.device,
+            # The world-1 call runs this rank's head shard; the CP partial (D2)
+            # runs the head all-gather's ALL-HEAD output, so its plan and
+            # scratch are total-head (`num_q_heads`).
+            num_q_heads=self.heads if num_q_heads is None else int(num_q_heads),
             # Queries flatten to rows * tokens (the sink-fold geometry's
-            # `batch`), so the plan's row capacity covers the whole call shape.
-            max_q_rows=shape.rows * shape.tokens, max_width=self.config.text["index_topk"],
+            # `batch`); `max_q_rows` may cover a whole call-shape family —
+            # `sparse_mla.bind` admits any call at or under the planned rows.
+            max_q_rows=shape.rows * shape.tokens if max_q_rows is None else int(max_q_rows),
+            max_width=self.config.text["index_topk"],
             softmax_scale=self.scaling,
             head_dim=self.kv_lora + self.qk_rope, v_head_dim=self.kv_lora,
             # The engine contract is the fused 656-byte FP8 record (uint8 byte
@@ -405,13 +439,17 @@ class Hy4LayerAttention:
             # RoPE) — the record `concat_and_cache_glm_next_mla` writes.
             kv_dtype=torch.uint8, model_type=sparse_mla.ModelType.GLM_NSA,
             cache_record_bytes=self.kv_lora + self.qk_rope + 80,
-            mode=shape.mla_mode, return_lse=True, lse_scale="base2", has_attention_sink=True)
+            mode=shape.mla_mode, return_lse=True, lse_scale="base2",
+            # `sparse_mla.bind` requires the sink's presence at bind time to
+            # match the caps: the world-1 variant folds it in kernel, the CP
+            # partial (D2/D6) binds without it and folds once post-merge.
+            has_attention_sink=bool(has_sink))
         return sparse_mla.plan(caps)
 
-    def _mla_plan_for(self, call_shape):
-        """The prepared plan for `call_shape`; no plan book -> legacy lazy plan."""
+    def _mla_plan_for(self, call_shape, *, sink_bound=True):
+        """The prepared plan for `call_shape` at this sink-binding mode."""
         if call_shape is not None:
-            key = (call_shape.name, call_shape.rows, call_shape.tokens)
+            key = (call_shape.name, call_shape.rows, call_shape.tokens, bool(sink_bound))
             if key in self._mla_plans:
                 return self._mla_plans[key]
         if self._plan_book is not None:
@@ -579,13 +617,14 @@ class Hy4LayerAttention:
         expanding before or after the merge is the same map.
         """
         sink = self.weights.sink
+        sink_bound = sink is not None and fold_sink
         if self.device.type == "cuda":
             output, lse, binding = self._attend_cuda(q_absorbed, latent_table, selected, counts,
                                                      fold_sink=fold_sink, cache_lengths=cache_lengths,
                                                      call_shape=call_shape)
             provenance = SparseMLAProvenance.from_binding(binding)
         else:
-            plan = self._mla_plan_for(call_shape)  # the no-JIT check runs on CPU too
+            plan = self._mla_plan_for(call_shape, sink_bound=sink_bound)  # the no-JIT check runs on CPU too
             output, lse = self._attend_reference(q_absorbed, latent_table, selected, counts,
                                                  fold_sink=fold_sink)
             provenance = SparseMLAProvenance(sink_folded=bool(fold_sink and sink is not None))
@@ -661,6 +700,7 @@ class Hy4LayerAttention:
         """
         from b12x.attention import sparse_mla
 
+        sink_bound = self.weights.sink is not None and fold_sink
         rows = q_absorbed.shape[0]
         record_bytes = self.config.text["kv_lora_rank"] + self.config.text["qk_rope_head_dim"] + 80
         # The kernel reads the FUSED 656-byte FP8 record (`Hy4Cache` with
@@ -673,16 +713,18 @@ class Hy4LayerAttention:
                 f"the CUDA sparse-MLA bind needs the fused {record_bytes}-byte FP8 record "
                 f"cache (uint8) written by concat_and_cache_glm_next_mla — got {got}; "
                 "allocate the cache with fused_records=True")
-        plan = self._mla_plan_for(call_shape)
-        key = (call_shape.name, call_shape.rows, call_shape.tokens) if call_shape is not None else "lazy"
+        plan = self._mla_plan_for(call_shape, sink_bound=sink_bound)
+        key = ((call_shape.name, call_shape.rows, call_shape.tokens, bool(sink_bound))
+               if call_shape is not None else "lazy")
         if plan is None:
             caps = sparse_mla.Caps(
-                device=self.device, num_q_heads=self.heads, max_q_rows=rows,
+                device=self.device, num_q_heads=int(q_absorbed.shape[1]), max_q_rows=rows,
                 max_width=selected.shape[1], softmax_scale=self.scaling,
                 head_dim=self.kv_lora + self.qk_rope, v_head_dim=self.kv_lora,
                 kv_dtype=torch.uint8, model_type=sparse_mla.ModelType.GLM_NSA,
                 cache_record_bytes=record_bytes,
-                mode="decode", return_lse=True, lse_scale="base2", has_attention_sink=True)
+                mode="decode", return_lse=True, lse_scale="base2",
+                has_attention_sink=bool(sink_bound))
             plan = sparse_mla.plan(caps)
             self._mla = plan
             self._mla_scratch["lazy"] = self._allocate_scratch(plan)
@@ -704,7 +746,7 @@ class Hy4LayerAttention:
                                   selected_indices=selected,
                                   cache_lengths=cache_lengths,
                                   selected_lengths=counts,
-                                  attention_sink=self.weights.sink if fold_sink else None)
+                                  attention_sink=self.weights.sink if sink_bound else None)
         result = sparse_mla.run(binding)
         output, lse = result
         return output, lse, binding

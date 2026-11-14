@@ -351,7 +351,7 @@ class Hy4Decoder:
             return DECODE_ONE_ROW if rows == 1 else verify_shape(rows)
         return prefill_shape(rows, width)
 
-    def bind_plan_book(self, book, shapes):
+    def bind_plan_book(self, book, shapes, *, sink_variants=(True, False)):
         """Wire prepared plans (from `wire_operators`) into every layer.
 
         One `sparse_mla` plan per call shape plus the sink folds; from here
@@ -360,7 +360,7 @@ class Hy4Decoder:
         self.plan_book = book
         for layer in self.weights.layers:
             layer.attention.bind_plan_book(book)
-            layer.attention.prepare_plans(shapes)
+            layer.attention.prepare_plans(shapes, sink_variants=sink_variants)
         return self
 
     # --- entry points ------------------------------------------------------
