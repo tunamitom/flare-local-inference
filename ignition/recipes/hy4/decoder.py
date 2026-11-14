@@ -44,7 +44,9 @@ class Hy4Cache:
     `capacity` slots per row; `slot_base[r] = r * capacity`. Layer `i` owns
     `latent[i]` (kv_lora + qk_rope wide — the GLM_NSA record's live payload);
     each `full` indexer layer's prepared keys live in `index[owner]`. The MTP
-    block's records sit at layer `config.layers`.
+    block's records sit at layer `config.layers`. Records are stored at
+    `dtype` (BF16 — the GLM_NSA FP8 record's decoded form — unless a caller
+    overrides it for a full-precision dry run).
     """
 
     config: ModelConfig
@@ -53,18 +55,19 @@ class Hy4Cache:
     device: torch.device
     latent: dict = field(default_factory=dict)
     index: dict = field(default_factory=dict)
+    dtype: torch.dtype = torch.bfloat16
 
     @classmethod
-    def allocate(cls, config, rows, capacity, device, *, draft=False):
+    def allocate(cls, config, rows, capacity, device, *, draft=False, dtype=torch.bfloat16):
         c = config.text
-        cache = cls(config=config, rows=rows, capacity=capacity, device=device)
+        cache = cls(config=config, rows=rows, capacity=capacity, device=device, dtype=dtype)
         layers = config.layers + int(draft)
         width = c["kv_lora_rank"] + c["qk_rope_head_dim"]
         for layer in range(layers):
-            cache.latent[layer] = torch.zeros((rows * capacity, width), dtype=torch.bfloat16, device=device)
+            cache.latent[layer] = torch.zeros((rows * capacity, width), dtype=dtype, device=device)
         for owner in (*config.full_indexer_layers, *( (config.layers,) if draft else () )):
             cache.index[owner] = torch.zeros((rows * capacity, c["index_head_dim"]),
-                                            dtype=torch.bfloat16, device=device)
+                                            dtype=dtype, device=device)
         return cache
 
     @property
@@ -77,11 +80,23 @@ class Hy4Cache:
 
     def write_latent(self, layer, tokens, positions, latent):
         """Store this layer's latent records at the tokens' physical slots."""
-        slots = self.slots_for(tokens) + positions.long()
-        self.latent[layer][slots] = latent.to(self.latent[layer].dtype)
+        self.latent[layer][self._slots(tokens, positions)] = latent.to(self.latent[layer].dtype)
 
     def write_index_keys(self, owner, tokens, positions, keys):
-        self.index[owner][self.slots_for(tokens) + positions.long()] = keys.to(self.index[owner].dtype)
+        self.index[owner][self._slots(tokens, positions)] = keys.to(self.index[owner].dtype)
+
+    def _slots(self, tokens, positions):
+        """Physical slots for `positions`, refusing writes past the row.
+
+        The slot is `row * capacity + position`, so a position >= `capacity`
+        lands in the NEXT row's records — silently, at the default capacity of
+        4,096 (consult3 W4). A row is `capacity` positions long; anything
+        beyond raises instead of aliasing another request's cache.
+        """
+        positions = positions.long()
+        if bool((positions < 0).any()) or bool((positions >= self.capacity).any()):
+            raise IndexError(f"cache position out of range: a row holds {self.capacity} slots")
+        return self.slots_for(tokens) + positions
 
     def latents(self, layer):
         return self.latent[layer]
@@ -125,13 +140,19 @@ class StreamState:
 
 
 class Hy4Decoder:
-    """The rank's decoder body: one layer loop behind prefill and decode."""
+    """The rank's decoder body: one layer loop behind prefill and decode.
 
-    def __init__(self, weights: Hy4ModelWeights, cache: Hy4Cache):
+    `compute_dtype` is the stream/activation precision the loop runs at; it
+    defaults to BF16 (the serve path's stream rows and cache records). A
+    full-precision dry run passes FP32 with a matching `Hy4Cache` dtype.
+    """
+
+    def __init__(self, weights: Hy4ModelWeights, cache: Hy4Cache, *, compute_dtype=None):
         self.weights = weights
         self.cache = cache
         self.config = weights.config
         self.device = weights.device
+        self.compute_dtype = torch.bfloat16 if compute_dtype is None else compute_dtype
         self._row_lengths = {}
 
     # --- entry points ------------------------------------------------------
@@ -165,7 +186,7 @@ class Hy4Decoder:
         positions = self._positions(next_tokens.shape, rows)
         token_rows = self._token_rows(next_tokens.shape, rows)
         visible = positions + 1
-        next_embeds = self.weights.embed[next_tokens.reshape(-1)].to(torch.bfloat16)
+        next_embeds = self.weights.embed[next_tokens.reshape(-1)].to(self.compute_dtype)
         hidden, _ = draft.forward(next_embeds, prev_hidden, positions, cache, visible,
                                   token_rows=token_rows)
         return hidden.float() @ self.weights.head.T
@@ -182,7 +203,7 @@ class Hy4Decoder:
         positions = self._positions(token_ids.shape, rows)
         token_rows = self._token_rows(token_ids.shape, rows)
         visible = positions + 1  # each query's causal cache length
-        embeds = self.weights.embed[token_ids.reshape(-1)].to(torch.bfloat16)
+        embeds = self.weights.embed[token_ids.reshape(-1)].to(self.compute_dtype)
         streams = StreamState.begin(embeds)
         if state is not None:
             state.streams[:streams.streams.shape[0]] = streams.streams
@@ -254,8 +275,23 @@ class Hy4Decoder:
         if not hasattr(self, "_row_lengths"):
             self._row_lengths = {}
         for row in rows:
+            row = int(row)
             self._row_lengths[row] = self._row_lengths.get(row, 0) + count
 
     def complete(self, rows, token_ids):
         """Commit a forward's tokens to the row counters (prefill/decode bookkeeping)."""
         self.append(rows, token_ids.shape[1])
+
+    def release(self, rows):
+        """Release `rows` for reuse: a released row restarts at position 0.
+
+        Without this a reused row silently continues the previous request at
+        its old positions and reads its old KV (consult3 W4). Slot bookkeeping
+        only: the row's stale records are unreachable once the counter resets —
+        reads are causal within the row's new length — and the next request
+        overwrites them as it fills.
+        """
+        if not hasattr(self, "_row_lengths"):
+            self._row_lengths = {}
+        for row in rows:
+            self._row_lengths.pop(int(row), None)

@@ -230,18 +230,32 @@ class _Builder:
         `row_range`/`column_range` are `(first, last)` global partitions (from
         `Hy4Sharding`); omitted axes load whole. The checkpoint dtype is
         preserved (BF16 projections stay BF16 — the do-not-quantize floor).
+        `kept_fp32` tensors upcast AT LOAD whatever the checkpoint stores
+        (`weights.kept_fp32`: the real shards hold `lm_head` as BF16
+        [120832, 6144] and the runtime floor is FP32), so a BF16 source is
+        consumed, not refused.
         """
         self.take(name + ".weight")
         source = self.loader._sources[name + ".weight"]
         if source.ndim != 2 or tuple(source.shape) != tuple(shape):
             raise ValueError(f"{name}.weight: expected {shape}, checkpoint has {tuple(source.shape)}")
-        if kept_fp32(name + ".weight") and source.dtype != torch.float32:
-            raise ValueError(f"{name}.weight must be an FP32 do-not-quantize tensor")
-        weight = self.loader.load_linear(name, rows=row_range, columns=column_range)
+        if kept_fp32(name + ".weight"):
+            weight = self._load_upcast(name, shape, row_range=row_range, column_range=column_range)
+        else:
+            weight = self.loader.load_linear(name, rows=row_range, columns=column_range)
         expected = ((row_range[1] - row_range[0] if row_range else shape[0]),
                     (column_range[1] - column_range[0] if column_range else shape[1]))
         if tuple(weight.shape) != expected:
             raise ValueError(f"{name}.weight: rank slice {tuple(weight.shape)} != {expected}")
+        return weight
+
+    def _load_upcast(self, name, shape, *, row_range=None, column_range=None):
+        """One `kept_fp32` matrix loaded into FP32 destinations straight from storage."""
+        rows = slice(*(row_range if row_range else (0, shape[0])))
+        columns = slice(*(column_range if column_range else (0, shape[1])))
+        weight = self.loader.load_tensor(name + ".weight", dtype=torch.float32, extent=(rows, columns))
+        if weight.dtype != torch.float32:
+            raise ValueError(f"{name}.weight must load FP32 (`kept_fp32` floor)")
         return weight
 
     def matrix(self, name, shape, *, row_range=None, column_range=None):
@@ -249,14 +263,15 @@ class _Builder:
 
         `load_linear` refuses prefixes whose module owns extra tensors (the
         router's `e_score_correction_bias` buffer); this reads the weight
-        directly with the same rank slicing and shape checks.
+        directly with the same rank slicing and shape checks. `kept_fp32`
+        tensors upcast at load, as in `linear`.
         """
         self.take(name + ".weight")
         source = self.loader._sources[name + ".weight"]
         if source.ndim != 2 or tuple(source.shape) != tuple(shape):
             raise ValueError(f"{name}.weight: expected {shape}, checkpoint has {tuple(source.shape)}")
-        if kept_fp32(name + ".weight") and source.dtype != torch.float32:
-            raise ValueError(f"{name}.weight must be an FP32 do-not-quantize tensor")
+        if kept_fp32(name + ".weight"):
+            return self._load_upcast(name, shape, row_range=row_range, column_range=column_range)
         rows = slice(*(row_range if row_range else (0, shape[0])))
         columns = slice(*(column_range if column_range else (0, shape[1])))
         weight = self.loader.load_tensor(name + ".weight", extent=(rows, columns))
@@ -400,9 +415,12 @@ def build_model_state(loader, config, sharding, *, selections, mtp=True):
     embed = builder.linear("model.embed_tokens", (config.vocabulary, hidden),
                            row_range=sharding.vocabulary_range)
     norm = builder.norm("model.norm.weight", hidden)
+    # `kept_fp32` floor: the real shards store `lm_head` as BF16 [120832, 6144]
+    # and it upcasts at load (`weights.kept_fp32`, `stored_parameter_counts`);
+    # the runtime head is always FP32 (`enable_lm_head_fp32`).
     head = builder.linear("lm_head", (config.vocabulary, hidden), row_range=sharding.vocabulary_range)
     if head.dtype != torch.float32:
-        raise ValueError("lm_head.weight must be FP32 (`enable_lm_head_fp32`)")
+        raise ValueError("lm_head.weight must be loaded FP32 (`enable_lm_head_fp32`)")
     head_parts = _load_ihc(builder, "model.hc_head", head=True)
     hc_head = IhcHead(IhcHeadWeights(fn=head_parts["hc_head_fn"], base=head_parts["hc_head_base"],
                                      scale=head_parts["hc_head_scale"]), config, loader.device)

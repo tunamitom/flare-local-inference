@@ -462,6 +462,70 @@ class _CpuWeightSession:
         return {}
 
 
+class _HeadersWeightSession:
+    """Header dry run: account transfers without touching tensor payloads."""
+
+    def __init__(self):
+        self.payload_bytes = 0
+
+    def __call__(self, destination, source):
+        self.payload_bytes += destination.numel() * destination.element_size()
+        return True
+
+    def flush(self):
+        pass
+
+    def stats(self):
+        return {"headers_only": True}
+
+
+# safetensors header dtype names (what `TensorMetadata.dtype` carries).
+_SAFETENSORS_DTYPES = {
+    "U8": "uint8", "I8": "int8", "U16": "uint16", "I16": "int16", "I32": "int32",
+    "I64": "int64", "F16": "float16", "BF16": "bfloat16", "F32": "float32",
+    "F64": "float64", "F8_E4M3": "float8_e4m3fn", "F8_E5M2": "float8_e5m2", "BOOL": "bool",
+}
+
+def headers_dry_run(loader, *, headers=None):
+    """Context manager exposing HEADER geometry as meta tensors.
+
+    The rank-construction dry run against real metadata (consult3 gate c:
+    `construct_rank` had never run on real shard headers). Every name, shape,
+    dtype and rank-slicing check runs end to end and construction completes;
+    tensor payloads are never read and destinations are meta tensors.
+
+    `headers` may supply an explicit `name -> (dtype, shape)` inventory — a
+    repacked header view over a package's per-expert headers — and defaults to
+    the loader's own manifest headers.
+    """
+    import contextlib
+
+    @contextlib.contextmanager
+    def open_sources():
+        import torch
+
+        if loader._stack is not None or loader._session is not None:
+            raise RuntimeError("weight loader context is already open")
+        if headers is None:
+            inventory = {name: (getattr(torch, _SAFETENSORS_DTYPES[meta.dtype]), tuple(meta.shape))
+                         for name, meta in loader.manifest.tensors.items()}
+        else:
+            inventory = dict(headers)
+        sources = {name: torch.empty(shape, dtype=dtype, device="meta")
+                   for name, (dtype, shape) in inventory.items()}
+        loader._sources = sources
+        loader._session = _HeadersWeightSession()
+        loader._stack = ()  # marks the loader open for `_require_open`
+        try:
+            yield loader
+        finally:
+            loader._sources = {}
+            loader._session = None
+            loader._stack = None
+
+    return open_sources()
+
+
 def cpu_dry_run(loader):
     """Context manager populating `loader._sources` from the checkpoint on CPU.
 

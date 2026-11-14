@@ -177,10 +177,15 @@ class Hy4LayerAttention:
         self.v_head = c["v_head_dim"]
         self.rope_theta = c["rope_parameters"]["rope_theta"]
         self.scaling = c["qk_head_dim"] ** -0.5  # rope_type default: no mscale
-        self.absorb_wuk = self.weights.kv_b_proj[:self.heads * self.qk_nope].view(
-            self.heads, self.qk_nope, self.kv_lora)
-        self.expand_wuv = self.weights.kv_b_proj[self.heads * self.qk_nope:].view(
-            self.heads, self.v_head, self.kv_lora)
+        # `kv_b_proj` rows are PER HEAD, `[key qk_nope; value v]` (reference
+        # `expand_kv`, modeling_hy_v4_patched.py:431-434: `kv_b_proj(x).view(B,
+        # S, heads, qk_nope + v)` then a dim=-1 split). The split is therefore
+        # within each head's row block — slicing "all heads' keys then all
+        # heads' values" only ever got head 0 right (consult3 finding B), and
+        # contradicts `shard.kv_b_rows`, which slices whole-head blocks.
+        per_head = self.weights.kv_b_proj.view(self.heads, self.qk_nope + self.v_head, self.kv_lora)
+        self.absorb_wuk = per_head[:, :self.qk_nope]
+        self.expand_wuv = per_head[:, self.qk_nope:]
 
     # --- projection --------------------------------------------------------
 

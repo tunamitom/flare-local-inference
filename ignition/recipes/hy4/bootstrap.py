@@ -200,7 +200,8 @@ class PreparedHy4Rank:
 
 
 def construct_rank(snapshot, config: PreparationConfig, *, rank=0, device=None, pinned=True,
-                   mtp=None, cache_rows=None, cache_capacity=None, index_pages_per_layer=1):
+                   mtp=None, cache_rows=None, cache_capacity=None, index_pages_per_layer=1,
+                   headers_only=False, manifest=None):
     """Construct one Hy4 rank end to end (the CPU-shape/dtype dry run's core).
 
     Shard assignment, name-checked weight loading (the do-not-quantize floor
@@ -209,12 +210,19 @@ def construct_rank(snapshot, config: PreparationConfig, *, rank=0, device=None, 
     `device` defaults to CPU; pass a CUDA device for the real checkpoint
     (`pinned=True`). Every checkpoint tensor is consumed exactly once — an
     unmatched or leftover name raises instead of being dropped.
+
+    `headers_only=True` is the header dry run (consult3 gate c): construction
+    completes from the checkpoint's shard HEADERS — names, shapes, dtypes,
+    rank slicing and the dtype floors all run — over meta tensors, never
+    reading a payload. `manifest` may supply a pre-inspected header inventory
+    (a repacked header view over a package's per-expert headers) and defaults
+    to `inspect_indexed_checkpoint(snapshot)`.
     """
     import torch
 
     from .decoder import Hy4Cache, Hy4Decoder
     from .state import build_model_state
-    from .weights import Hy4WeightLoader, cpu_dry_run
+    from .weights import Hy4WeightLoader, cpu_dry_run, headers_dry_run
 
     snapshot = Path(snapshot).expanduser().resolve()
     model_config = ModelConfig.load(snapshot, pinned=pinned)
@@ -227,12 +235,19 @@ def construct_rank(snapshot, config: PreparationConfig, *, rank=0, device=None, 
     max_q_rows = max(config.prefill_chunk_size, config.request_capacity)
     index_cache, selections = selection_cells(model_config, device, max_q_rows=max_q_rows,
                                              index_pages_per_layer=index_pages_per_layer)
-    from ignition.preparation.checkpoint import inspect_indexed_checkpoint
+    if manifest is None:
+        from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 
-    manifest = inspect_indexed_checkpoint(snapshot)
-    loader = Hy4WeightLoader(manifest, device, shard=shard, mtp=mtp, pinned=pinned,
+        manifest = inspect_indexed_checkpoint(snapshot)
+    loader_device = torch.device("meta") if headers_only else device
+    loader = Hy4WeightLoader(manifest, loader_device, shard=shard, mtp=mtp, pinned=pinned,
                              expert_scale_compression=config.expert_scale_compression)
-    sources = loader if device.type == "cuda" else cpu_dry_run(loader)
+    if headers_only:
+        sources = headers_dry_run(loader)
+    elif device.type == "cuda":
+        sources = loader
+    else:
+        sources = cpu_dry_run(loader)
     with sources:
         weights = build_model_state(loader, model_config, sharding, selections=selections, mtp=mtp)
     rows = config.max_active if cache_rows is None else cache_rows
