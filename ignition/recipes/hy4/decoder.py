@@ -152,7 +152,7 @@ class Hy4Cache:
     def _store(self, table, tokens, positions, values):
         positions = positions.long()
         slots = self._slots(tokens, positions)   # bounds-checked over every position
-        keep = (positions % self.world) == self.rank   # store only owned records (D1)
+        keep = self.owner(positions) == self.rank   # store only owned records (D1)
         table[slots[keep]] = values.to(table.dtype)[keep]
 
     def _slots(self, tokens, positions):
@@ -167,7 +167,16 @@ class Hy4Cache:
         positions = positions.long()
         if bool((positions < 0).any()) or bool((positions >= self.capacity).any()):
             raise IndexError(f"cache position out of range: a row holds {self.capacity} slots")
-        return self.slots_for(tokens) + self.local(positions)
+        tokens = tokens.long()
+        if bool((tokens < 0).any()) or bool((tokens >= self.rows).any()):
+            raise IndexError(f"cache row out of range: {self.rows} request rows")
+        local_index = self.local(positions)
+        if bool((local_index < 0).any()) or bool((local_index >= self.local_capacity).any()):
+            raise IndexError(
+                f"cache local slot out of range: a row holds {self.local_capacity} local "
+                f"slots (capacity {self.capacity}, world {self.world}) — a mapping that "
+                f"lands past the row would alias another request's records")
+        return self.slots_for(tokens) + local_index
 
     def latents(self, layer):
         return self.latent[layer]
