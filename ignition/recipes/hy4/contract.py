@@ -20,9 +20,29 @@ do-not-quantize list is the floor: embeddings, `lm_head`, iHC `fn`, the
 `linear_gate`, the router `gate`, and the indexer `weights_proj`; the shared
 experts and layer 0 also stay BF16 (they see every token).
 
-The packed W4A16 experts need no external quantization step: the loader packs
-the BF16 checkpoint's experts at load (`weights.py`), and the export writes the
-same packing out under this contract.
+Packed expert storage (the export writes exactly these names and shapes; the
+loader consumes exactly them through `load_fp4_experts`, slicing each rank's
+bytes bit-exactly from the checkpoint). For every fused prefix `P` of
+`quantized_source_names` with `e` experts, intermediate width `mi` and hidden
+width `h`:
+
+| tensor | dtype | shape | note |
+|---|---|---|---|
+| `P.gate_up_proj.weight` | uint8 | (e, 2*mi, h//2) | packed NVFP4, rows [gate; up] |
+| `P.gate_up_proj.weight_scale` | float8_e4m3fn | (e, 2*mi, h//16) | block scales, group 16 |
+| `P.gate_up_proj.weight_scale_2` | float32 | (e,) | max-scaling gain, shared gate/up |
+| `P.down_proj.weight` | uint8 | (e, h, mi//2) | packed NVFP4 |
+| `P.down_proj.weight_scale` | float8_e4m3fn | (e, h, mi//16) | block scales, group 16 |
+| `P.down_proj.weight_scale_2` | float32 | (e,) | max-scaling gain |
+
+The row order keeps the BF16 checkpoint's fused semantics (`gate_up.chunk(2)`:
+first block gate, second up), and `weight_scale_2` is a multiplier gain in
+ModelOpt's sense (`amax / (448 * 6)`). There is no `input_scale`: the package
+is A16 everywhere (A4 is a separate speed lever with its own loss measurement).
+
+The packed W4A16 experts need no external quantization step on the BF16
+route: the loader packs the BF16 checkpoint's experts at load (`weights.py`),
+and the export writes the same packing out under this contract.
 """
 
 from ignition.preparation.quantization import expert_format, quantized_layers
@@ -30,6 +50,13 @@ from ignition.preparation.quantization import expert_format, quantized_layers
 # Expert packing the export writes and the loader accepts: maximum-scale
 # ModelOpt NVFP4, activations in 16 bits (`W4A16_NVFP4` -> ("nvfp4", "a16")).
 EXPERT_ALGORITHM = {"quant_algo": "W4A16_NVFP4", "group_size": 16}
+
+# The fused expert projections of one packed prefix, in the export's names.
+PACKED_PROJECTIONS = ("gate_up_proj", "down_proj")
+
+# Suffixes each packed projection carries. `weight_scale_2` is the multiplier
+# gain; there is deliberately no `input_scale` (A16 package).
+PACKED_SUFFIXES = ("weight", "weight_scale", "weight_scale_2")
 
 # Families that must never appear in `quantized_layers` (do-not-quantize floor).
 UNQUANTIZED_FAMILIES = (
@@ -44,6 +71,36 @@ def quantized_source_names(config, *, mtp=True):
     names = tuple(f"model.layers.{layer}.mlp.experts" for layer in range(1, config.layers))
     return names + (tuple(f"model.mtp_layers.{index}.mlp.experts" for index in range(config.draft_layers))
                     if mtp else ())
+
+
+def packed_expert_tensor_names(config, *, mtp=True):
+    """Every packed expert tensor name the export writes for the fused prefixes."""
+    names = set()
+    for prefix in quantized_source_names(config, mtp=mtp):
+        names |= {f"{prefix}.{projection}.{suffix}"
+                  for projection in PACKED_PROJECTIONS for suffix in PACKED_SUFFIXES}
+    return frozenset(names)
+
+
+def packed_expert_geometry(config, prefix):
+    """(dtype, shape) per export tensor name of one fused expert prefix.
+
+    `prefix` must belong to `quantized_source_names`; the geometry is the
+    packed checkpoint storage the loader slices (see the module table).
+    """
+    import torch
+
+    if prefix not in quantized_source_names(config):
+        raise ValueError(f"{prefix}: not a packed fused expert prefix of the export")
+    e, mi, h = config.experts, config.text["moe_intermediate_size"], config.hidden
+    return {
+        f"{prefix}.gate_up_proj.weight": (torch.uint8, (e, 2 * mi, h // 2)),
+        f"{prefix}.gate_up_proj.weight_scale": (torch.float8_e4m3fn, (e, 2 * mi, h // 16)),
+        f"{prefix}.gate_up_proj.weight_scale_2": (torch.float32, (e,)),
+        f"{prefix}.down_proj.weight": (torch.uint8, (e, h, mi // 2)),
+        f"{prefix}.down_proj.weight_scale": (torch.float8_e4m3fn, (e, h, mi // 16)),
+        f"{prefix}.down_proj.weight_scale_2": (torch.float32, (e,)),
+    }
 
 
 def quantization_config(config, *, mtp=True):

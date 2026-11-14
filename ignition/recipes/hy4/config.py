@@ -24,6 +24,12 @@ PAGE_TOKENS = 128
 FULL_INDEXER_LAYERS = (0, 1, *range(5, 78, 4))
 assert len(FULL_INDEXER_LAYERS) == 21 and FULL_INDEXER_LAYERS[-1] == 77
 
+# CSF (`csf_32x2_v1`) resident size as a fraction of the raw block scales,
+# measured on real Hy4 scales (`/home/tom/hy4/consult2-plan.md` section 1c).
+# The MSE-searched scales are the worse case and therefore the planning
+# number; max scales compress slightly better (0.539 / 0.595).
+CSF_RESIDENT_SCALE_RATIOS = {"gate_up_proj": 0.557, "down_proj": 0.600}
+
 # Bytes of one rank-local cache record per token: the FP8 latent record (512
 # no-RoPE + 64 RoPE dims plus the record header) and, on full indexer layers,
 # the FP8 index-key record. 656 x 78 + 132 x 21 = 53,940 B per token.
@@ -245,3 +251,99 @@ class ModelConfig:
         fp32 += (self.layers - 1) * self.experts  # target-layer correction biases
         fp32 += self.layers * self.heads          # target-layer sinks
         return sum(census.values()) - fp32, fp32
+
+    def packed_byte_arithmetic(self):
+        """Exact resident byte arithmetic of the W4A16-packed checkpoint.
+
+        Every figure is documented derivation from `parameter_census`, not a
+        measurement; `tests/recipes/test_hy4_csf.py` reproduces it independently.
+
+        - `packed_resident_bytes`: every tensor once at its **resident** dtype:
+          routed experts packed to W4A16 NVFP4 (4 bits per weight, one FP8
+          block scale per 16 weights, one FP32 gain pair per expert), `lm_head`,
+          the indexer `weights_proj`/`k_norm`, and the MTP block's correction
+          bias and sink upgraded to FP32 by `weights.kept_fp32`.
+        - `replicated_bytes`: resident bytes every tensor-parallel rank carries
+          whole. The partition policy follows the reference vLLM port: the
+          `q_a_proj`/`kv_a_proj_with_mqa` down-projections, the whole indexer,
+          the router `gate` and correction bias, every norm, the learnable
+          sinks, and the iHC streams (`fn`/`base`/`scale`, `hc_head`) replicate;
+          `q_b_proj`, `kv_b_proj`, `o_proj`, `linear_gate`, the experts, the
+          shared experts, the dense layer-0 FFN, `eh_proj`, the embedding and
+          the FP32 head shard. (If the embedding and FP32 head do not shard,
+          every rank pays 4,454,141,952 bytes more.)
+        - `draft_bytes`: the packed MTP block, loaded only for learned drafts.
+        - `expert_scale_bytes`/`csf_scale_bytes`: raw block scales and their
+          CSF-resident form at the measured ratios (worse MSE case).
+        - `scale_scratch_bytes`: one rank's shared CSF expansion scratch at TP8
+          (two scale layouts: an expansion writes one while the next layer's
+          compressed bytes stage in the other), about 0.15 GiB per rank.
+        """
+        import math
+
+        c = self.text
+        h, v = self.hidden, self.vocabulary
+        heads, qk, nope, rope, vd = self.heads, c["qk_head_dim"], c["qk_nope_head_dim"], c["qk_rope_head_dim"], c["v_head_dim"]
+        ql, kv = c["q_lora_rank"], c["kv_lora_rank"]
+        indexers = len(self.full_indexer_layers) + self.draft_layers
+        blocks = self.layers + self.draft_layers
+        moe_blocks = self.layers - 1 + self.draft_layers
+        e, mi = self.experts, c["moe_intermediate_size"]
+        census = self.parameter_census()
+        stored_bf16, stored_fp32 = self.stored_parameter_counts()
+
+        # Resident dtype upgrades over storage: `lm_head`, indexer
+        # `weights_proj`/`k_norm`, and the MTP block's correction bias and sink
+        # load FP32 from BF16 storage.
+        upgrades = (v * h + indexers * 32 * h + indexers * 2 * 128 + e + heads) * 2
+        expert_params = census["mlp.experts"]
+        packed_experts = expert_params * 4 // 8 + expert_params // 16 + moe_blocks * e * 2 * 4
+        packed_resident = (packed_experts + (stored_bf16 - expert_params) * 2
+                           + stored_fp32 * 4 + upgrades)
+
+        replicated = (
+            blocks * ql * h * 2                    # q_a_proj
+            + blocks * (kv + rope) * h * 2         # kv_a_proj_with_mqa
+            + blocks * ql * 2 + blocks * kv * 2    # q_a/kv_a layernorms
+            + blocks * h * 2 * 2                   # input/post_attention layernorms
+            + h * 2                                # model.norm
+            + blocks * heads * 4                   # learnable sinks (FP32)
+            + moe_blocks * e * h * 2               # router gate.weight
+            + moe_blocks * e * 4                   # correction biases (FP32 resident)
+            + indexers * (32 * 128) * ql * 2       # indexer.wq_b
+            + indexers * 128 * h * 2               # indexer.wk
+            + indexers * 32 * h * 4                # indexer.weights_proj (FP32 resident)
+            + indexers * 2 * 128 * 4               # indexer.k_norm (FP32 resident)
+            + self.layers * 2 * (8 * (4 * h) + 8 + 2) * 4  # iHC hc_pre, attn and mlp
+            + (4 * (4 * h) + 4 + 1) * 4            # hc_head
+            + self.draft_layers * 3 * h * 2)       # MTP enorm/hnorm/final_layernorm
+
+        draft_experts = e * (2 * mi * h + h * mi)
+        draft_bytes = (
+            draft_experts * 4 // 8 + draft_experts // 16 + e * 2 * 4  # packed experts
+            + (2 * mi * h + h * mi) * 2            # shared experts
+            + 2 * h * h * 2                        # eh_proj
+            + ql * h * 2 + heads * qk * ql * 2     # q_a_proj, q_b_proj
+            + (kv + rope) * h * 2 + heads * (nope + vd) * kv * 2
+            + h * heads * vd * 2 + heads * vd * h * 2  # o_proj, linear_gate
+            + ((32 * 128) * ql + 128 * h + 32 * h) * 2 + 2 * 128 * 2  # indexer
+            + e * h * 2                            # router gate
+            + (5 * h + ql + kv) * 2                # enorm/hnorm/final/input/post_attention norms
+            + (e + heads) * 2 + (32 * h + 2 * 128 + e + heads) * 2)  # bias/sink and FP32 upgrades
+
+        gate_up_scales = moe_blocks * e * (2 * mi) * (h // 16)
+        down_scales = moe_blocks * e * h * (mi // 16)
+        ratios = CSF_RESIDENT_SCALE_RATIOS
+        csf_scales = (math.ceil(ratios["gate_up_proj"] * gate_up_scales)
+                      + math.ceil(ratios["down_proj"] * down_scales))
+        # Two expansion layouts of one rank's block scales at TP8 (256 experts,
+        # 256 local intermediate channels).
+        scale_scratch = 2 * (e * (2 * mi // 8) * (h // 16) + e * h * ((mi // 8) // 16))
+        return {
+            "packed_resident_bytes": packed_resident,
+            "replicated_bytes": replicated,
+            "draft_bytes": draft_bytes,
+            "expert_scale_bytes": gate_up_scales + down_scales,
+            "csf_scale_bytes": csf_scales,
+            "scale_scratch_bytes": scale_scratch,
+        }

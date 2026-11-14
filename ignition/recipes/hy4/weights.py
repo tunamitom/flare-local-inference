@@ -2,22 +2,33 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Hy4 checkpoint tensor names, FP32 policy, and BF16-to-NVFP4 expert packing.
+"""Hy4 checkpoint tensor names, FP32 policy, and expert loading.
 
-The checkpoint stores fused stacked experts (`experts.gate_up_proj` /
-`experts.down_proj`); the loader consumes the canonical `gate`/`up`/`down`
-stacks, so this module splits the fused tensors into source views before
-`DirectWeightLoader.load_bf16_experts_as_nvfp4` packs them to W4A16 NVFP4 at
-load time — a BF16 checkpoint then serves with no external quantization step.
+Two checkpoint forms load through `Hy4WeightLoader`:
+
+- the raw BF16 checkpoint stores fused stacked experts (`experts.gate_up_proj`
+  / `experts.down_proj`); the loader splits them into source views before
+  `DirectWeightLoader.load_bf16_experts_as_nvfp4` packs them to W4A16 NVFP4 at
+  load time — a BF16 checkpoint then serves with no external quantization step;
+- the W4A16_NVFP4 export stores the same fused prefixes already packed
+  (`contract.py` names the exact tensors); the loader slices each rank's bytes
+  bit-exactly into `DirectWeightLoader.load_fp4_experts`, which records the
+  checkpoint-byte provenance of every served expert tensor.
 
 Tensor coverage is checked strictly: an unmatched checkpoint key is an error,
 not a silent drop (the stock streaming loader drops unmatched keys without
 reporting, which left iHC, sinks and gates uninitialized for other models).
+With `mtp=False` the MTP block is deliberately unselected (drafts load only
+for learned speculation) and may be present or absent from the checkpoint.
 """
 
+import json
 from functools import cached_property
 
 from ignition.components.weights import DirectWeightLoader
+from ignition.preparation.quantization import expert_format, quantized_layers
+
+from . import contract
 
 # Loaded and kept in FP32 at runtime, whatever the checkpoint stores: the iHC
 # `fn`/`base`/`scale` parameters, the learnable sinks, the indexer's
@@ -31,14 +42,22 @@ def kept_fp32(name):
             or name == "lm_head.weight")
 
 
-def checkpoint_names(config, *, mtp=True):
+def checkpoint_names(config, *, mtp=True, packed=False):
     """Every tensor name of the checkpoint, from `ref/idx.json`'s schema.
 
     Verified against the real `model.safetensors.index.json` (2006 tensors) in
-    `tests/recipes/test_hy4_construction.py`.
+    `tests/recipes/test_hy4_construction.py`. `packed` describes the W4A16_NVFP4
+    export instead: the two fused expert tensors of every MoE block become the
+    packed weight/scale/gain triples of `contract.packed_expert_tensor_names`.
     """
     names = {"lm_head.weight", "model.embed_tokens.weight", "model.norm.weight",
              "model.hc_head.hc_head_base", "model.hc_head.hc_head_fn", "model.hc_head.hc_head_scale"}
+
+    def moe_names(prefix):
+        if packed:
+            return set(contract.packed_expert_geometry(config, f"{prefix}.mlp.experts"))
+        return {f"{prefix}.mlp.experts.{proj}" for proj in ("down_proj", "gate_up_proj")}
+
     for layer in range(config.layers):
         prefix = f"model.layers.{layer}"
         names |= {f"{prefix}.hc_attn_layer.hc_pre.{part}" for part in ("hc_base", "hc_fn", "hc_scale")}
@@ -55,7 +74,7 @@ def checkpoint_names(config, *, mtp=True):
         if layer == 0:
             names |= {f"{prefix}.mlp.{proj}.weight" for proj in ("down_proj", "gate_proj", "up_proj")}
         else:
-            names |= {f"{prefix}.mlp.experts.{proj}" for proj in ("down_proj", "gate_up_proj")}
+            names |= moe_names(prefix)
             names |= {f"{prefix}.mlp.gate.{name}" for name in ("e_score_correction_bias", "weight")}
             names |= {f"{prefix}.mlp.shared_experts.{proj}.weight" for proj in ("down_proj", "gate_proj", "up_proj")}
     if mtp:
@@ -71,26 +90,33 @@ def checkpoint_names(config, *, mtp=True):
                 "q_a_layernorm.weight", "q_a_proj.weight", "q_b_proj.weight")}
             names |= {f"{attention}.indexer.{name}" for name in (
                 "k_norm.bias", "k_norm.weight", "weights_proj.weight", "wk.weight", "wq_b.weight")}
-            names |= {f"{prefix}.mlp.experts.{proj}" for proj in ("down_proj", "gate_up_proj")}
+            names |= moe_names(prefix)
             names |= {f"{prefix}.mlp.gate.{name}" for name in ("e_score_correction_bias", "weight")}
             names |= {f"{prefix}.mlp.shared_experts.{proj}.weight" for proj in ("down_proj", "gate_proj", "up_proj")}
     return frozenset(names)
 
 
 class Hy4WeightLoader(DirectWeightLoader):
-    """Direct transfers for a Hy4 checkpoint, packing routed experts on the way.
+    """Direct transfers for a Hy4 checkpoint, packing or slicing routed experts.
 
     `shard` is the tensor-parallel partition of the expert intermediate width
     (256 ranks-wide channels at TP8, 128 at TP16); omit it for a full-width
-    load. `mtp` includes the checkpoint's MTP block in the selection.
+    load. `mtp` includes the checkpoint's MTP block in the selection; with
+    `mtp=False` the block may be present or absent (drafts load only for
+    learned speculation). `expert_scale_compression` optionally stores the
+    routed experts' block scales in the lossless `csf` encoding at load.
     """
 
-    def __init__(self, manifest, device, *, shard=None, progress=None, prefixes=None, mtp=True):
+    def __init__(self, manifest, device, *, shard=None, progress=None, prefixes=None, mtp=True,
+                 expert_scale_compression=None):
         super().__init__(manifest, device, prefixes=prefixes, progress=progress)
         from .config import ModelConfig
 
+        if expert_scale_compression not in (None, "csf"):
+            raise ValueError("Hy4 expert scale compression must be None or 'csf'")
         self.config = ModelConfig.load(manifest.snapshot)
         self.shard, self.mtp = shard, mtp
+        self.expert_scale_compression = expert_scale_compression
 
     @cached_property
     def quantization(self):
@@ -98,22 +124,63 @@ class Hy4WeightLoader(DirectWeightLoader):
 
         The raw BF16 checkpoint has no `quantization_config`; its experts pack
         to W4A16 NVFP4 at load instead of through `linear_format` declarations.
+        A checkpoint that does declare one is parsed strictly: a parser error —
+        including any mentioning `MIXED_PRECISION` — is never swallowed as
+        unquantized, because treating a malformed declaration as plain storage
+        would repack quantized experts as if they were BF16.
         """
-        try:
-            return super().quantization
-        except ValueError as error:
-            if "MIXED_PRECISION" in str(error):
-                return {}
-            raise
+        config = json.loads((self.manifest.metadata_path / "config.json").read_text())
+        if config.get("quantization_config") is None:
+            return {}
+        return quantized_layers(config)
+
+    @cached_property
+    def _packed(self):
+        """The checkpoint is the W4A16_NVFP4 export when any prefix declares it."""
+        return bool(self.quantization)
 
     def _selected_names(self):
-        expected = checkpoint_names(self.config, mtp=self.mtp)
+        packed = self._packed
+        inventory = checkpoint_names(self.config, mtp=True, packed=packed)
+        expected = checkpoint_names(self.config, mtp=self.mtp, packed=packed)
         available = set(self.manifest.tensors)
-        missing, unexpected = sorted(expected - available), sorted(available - expected)
+        missing, unexpected = sorted(expected - available), sorted(available - inventory)
         if missing or unexpected:
             raise ValueError(f"Hy4 checkpoint tensor names disagree with the recipe: "
                              f"missing={missing[:8]}, unexpected={unexpected[:8]}")
         return {name for name in super()._selected_names() if name in expected}
+
+    @cached_property
+    def scale_scratch(self):
+        """The two shared CSF expansion buffers (Step-5's pattern).
+
+        Routed layers run serially and share them; they hold one layer's raw
+        block scales per layout. Sizing reserves two layouts (about 0.15 GiB
+        per rank at TP8): an expansion writes one while the next layer's
+        compressed scales stage in the other.
+        """
+        if self.expert_scale_compression is None:
+            return ()
+        import torch
+
+        c = self.config.text
+        inter = c["moe_intermediate_size"]
+        first, last = ((0, inter) if self.shard is None else self.shard.partition(inter, alignment=32))
+        padded = (last - first + 127) // 128 * 128
+        count, hidden = self.config.experts, self.config.hidden
+        return tuple(torch.empty(shape, dtype=torch.float8_e4m3fn, device=self.device)
+                     for shape in ((count, 2 * padded, hidden // 16),
+                                   (count, hidden, padded // 16)))
+
+    def expert_scale_scratch(self, intermediate):
+        """This call's views of the shared expansion buffers, or None without CSF."""
+        if not self.scale_scratch:
+            return None
+        count, hidden = self.config.experts, self.config.hidden
+        shapes = ((count, 2 * intermediate, hidden // 16),
+                  (count, hidden, (intermediate // 16 + 3) // 4 * 4))
+        return tuple(buffer.flatten()[:count * rows * columns].view(count, rows, columns)
+                     for buffer, (count, rows, columns) in zip(self.scale_scratch, shapes, strict=True))
 
     def expert_stacks(self, prefix):
         """Split the checkpoint's fused experts into the loader's stacked views.
@@ -142,27 +209,105 @@ class Hy4WeightLoader(DirectWeightLoader):
             self._sources[name] = source
         return stacks
 
-    def load_experts(self, prefix, *, intermediate_range=None, swiglu_limit=None, **packing):
-        """Pack one layer's fused BF16 experts to W4A16 NVFP4 at load.
+    def quantized_expert_stacks(self, prefix):
+        """Slice the export's packed fused experts into per-expert loader views.
 
-        Gate and up share one global scale per expert shard, down has its own
-        (`amax / (448 * 6)`), matching ModelOpt's max scaling. Hy4 clamps the
-        routed SwiGLU operands before SiLU (`gate <= limit`, `|up| <= limit`);
-        the shared expert and layer 0 are unclamped and never pass through
-        here. `swiglu_clamp_after_silu` stays False for exactly that reason.
+        Every alias is a zero-copy view of the checkpoint tensor, so the bytes
+        `load_fp4_experts` serves are exactly the checkpoint's at any world
+        size (its provenance records the map). `gate_up_proj` holds [gate; up]
+        along the intermediate rows, matching the BF16 fused semantics, and
+        gate and up share the fused `weight_scale_2` gain.
+        """
+        geometry = contract.packed_expert_geometry(self.config, prefix)
+        sources = {name: self._sources[name] for name in geometry}
+        for name, (dtype, shape) in geometry.items():
+            source = sources[name]
+            if source.dtype != dtype or tuple(source.shape) != shape:
+                raise ValueError(f"{name}: storage disagrees with the packed expert contract {shape}")
+        count, inter = self.config.experts, self.config.text["moe_intermediate_size"]
+        fused, fused_scale, fused_gain = (sources[f"{prefix}.gate_up_proj.{suffix}"]
+                                         for suffix in contract.PACKED_SUFFIXES)
+        down, down_scale, down_gain = (sources[f"{prefix}.down_proj.{suffix}"]
+                                       for suffix in contract.PACKED_SUFFIXES)
+        stacks = {}
+        for index in range(count):
+            target = f"{prefix}.experts.{index}"
+            stacks |= {
+                f"{target}.gate_proj.weight": fused[index, :inter],
+                f"{target}.up_proj.weight": fused[index, inter:],
+                f"{target}.down_proj.weight": down[index],
+                f"{target}.gate_proj.weight_scale": fused_scale[index, :inter],
+                f"{target}.up_proj.weight_scale": fused_scale[index, inter:],
+                f"{target}.down_proj.weight_scale": down_scale[index],
+                f"{target}.gate_proj.weight_scale_2": fused_gain[index:index + 1],
+                f"{target}.up_proj.weight_scale_2": fused_gain[index:index + 1],
+                f"{target}.down_proj.weight_scale_2": down_gain[index:index + 1],
+            }
+        for name, source in stacks.items():
+            self._sources[name] = source
+        return stacks
+
+    def load_quantized_experts(self, prefix, *, intermediate_range=None, swiglu_limit=None, **packing):
+        """Serve one MoE block's experts from the export's packed W4A16 storage.
+
+        The checkpoint bytes are sliced verbatim (bit-exact at any world size)
+        into `load_fp4_experts`, which records their provenance. The clamp
+        policy is the checkpoint's: routed SwiGLU operands clamp before SiLU
+        (`gate <= limit`, `|up| <= limit`), so `swiglu_clamp_after_silu` stays
+        False; the shared expert and layer 0 are unclamped and never pass
+        through here.
+        """
+        if expert_format(self.quantization, prefix) != ("nvfp4", "a16"):
+            raise ValueError(f"{prefix}: expected W4A16 NVFP4 packed experts")
+        if swiglu_limit is None:
+            swiglu_limit = self.config.text["swiglu_limit"]
+        inter = self.config.text["moe_intermediate_size"]
+        local = inter if intermediate_range is None else intermediate_range[1] - intermediate_range[0]
+        stacks = self.quantized_expert_stacks(prefix)
+        try:
+            return self.load_fp4_experts(
+                tuple(f"{prefix}.experts.{index}" for index in range(self.config.experts)),
+                hidden_size=self.config.hidden, intermediate_size=inter,
+                intermediate_range=intermediate_range,
+                format="nvfp4", activation_mode="a16",
+                swiglu_limit=swiglu_limit, swiglu_clamp_after_silu=False,
+                scale_compression=self.expert_scale_compression,
+                scale_scratch=self.expert_scale_scratch((local + 127) // 128 * 128), **packing)
+        finally:
+            for name in stacks:
+                del self._sources[name]
+
+    def load_experts(self, prefix, *, intermediate_range=None, swiglu_limit=None, **packing):
+        """Load one MoE block's routed experts into the W4A16 NVFP4 runtime form.
+
+        A W4A16_NVFP4 checkpoint's packed experts are sliced bit-exactly; a raw
+        BF16 checkpoint's fused experts are packed at load (gate and up share
+        one global scale per expert shard, down has its own, `amax / (448 * 6)`,
+        matching ModelOpt's max scaling). Hy4 clamps the routed SwiGLU operands
+        before SiLU (`gate <= limit`, `|up| <= limit`); the shared expert and
+        layer 0 are unclamped and never pass through here.
         """
         from .config import ModelConfig  # noqa: F401  (documents the config dependency)
 
         if swiglu_limit is None:
             swiglu_limit = self.config.text["swiglu_limit"]
+        if self._packed:
+            if prefix not in self.quantization:
+                raise ValueError(f"{prefix}: the packed checkpoint declares no W4A16_NVFP4 experts here")
+            return self.load_quantized_experts(prefix, intermediate_range=intermediate_range,
+                                               swiglu_limit=swiglu_limit, **packing)
+        inter = self.config.text["moe_intermediate_size"]
+        local = inter if intermediate_range is None else intermediate_range[1] - intermediate_range[0]
         stacks = self.expert_stacks(prefix)
         try:
             return self.load_bf16_experts_as_nvfp4(
                 prefix, num_experts=self.config.experts,
                 hidden_size=self.config.hidden,
-                intermediate_size=self.config.text["moe_intermediate_size"],
+                intermediate_size=inter,
                 intermediate_range=intermediate_range,
-                swiglu_limit=swiglu_limit, swiglu_clamp_after_silu=False, **packing)
+                swiglu_limit=swiglu_limit, swiglu_clamp_after_silu=False,
+                scale_compression=self.expert_scale_compression,
+                scale_scratch=self.expert_scale_scratch((local + 127) // 128 * 128), **packing)
         finally:
             for name in stacks:
                 del self._sources[name]

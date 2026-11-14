@@ -6,8 +6,10 @@
 
 Byte figures are documented arithmetic, not measurements: they follow from the
 checkpoint's published parameter census and the cache record sizes (656-byte
-latent records, 132-byte index-key records). Measured per-rank costs replace
-them once a full-shape export records real allocations.
+latent records, 132-byte index-key records). `ModelConfig.packed_byte_arithmetic`
+reproduces every weight figure below and `tests/recipes/test_hy4_csf.py` checks
+it independently. Measured per-rank costs replace them once a full-shape export
+records real allocations.
 """
 
 from types import MappingProxyType
@@ -28,12 +30,41 @@ from .config import INDEX_RECORD_BYTES, LATENT_RECORD_BYTES, PAGE_TOKENS
 # the repository's `usedStorage`). Routed experts pack to W4A16 NVFP4 at load:
 # 4 bits per weight plus one FP8 block scale per 16 weights and one FP32 gain
 # pair per expert shard (78 MoE blocks, layer 0's dense FFN and the shared
-# experts stay BF16, `lm_head` becomes FP32).
+# experts stay BF16, `lm_head` becomes FP32; the indexer `weights_proj`/
+# `k_norm` and the MTP block's correction bias and sink join the FP32 upgrade).
 STORED_BYTES = 1_560_008_337_568
-DEVICE_BYTES = 477_928_801_524
+# Every tensor once at its resident dtype (packed experts, FP32 upgrades).
+PACKED_RESIDENT_BYTES = 477_937_464_180
+# Resident bytes every tensor-parallel rank carries whole: the `q_a_proj`/
+# `kv_a_proj_with_mqa` down-projections, the whole indexer, the router `gate`
+# and correction bias, every norm, the learnable sinks, the iHC streams and the
+# MTP norms (`config.ModelConfig.packed_byte_arithmetic` derives the exact
+# figure). `device_bytes` counts each replicated tensor once **per rank** at
+# the primary TP8 world: seven extra copies on top of the one-copy sum, of
+# which 7/8 — 2,921,820,934 bytes, "roughly 2.9 GB per rank" — the old TP8
+# estimate was missing. At TP16 the replicated share of this figure is a floor
+# (the world-16 sum would add eight more copies); measured per-rank costs
+# replace the estimate after the first full-shape export. If the embedding and
+# the FP32 head turn out unsharded, add 4,454,141,952 bytes per rank.
+REPLICATED_BYTES = 3_339_223_924
+DEVICE_BYTES = PACKED_RESIDENT_BYTES + 7 * REPLICATED_BYTES
 # The MTP block: one packed 256-expert MoE plus its attention, indexer, iHC-free
 # norms and the `eh_proj` embedding/hidden merge.
 DRAFT_BYTES = 6_216_029_440
+# Loading the optional lossless `csf` expert-scale encoding expands one layer's
+# compressed scales through two shared scratch layouts (Step-5's pattern):
+# about 0.15 GiB per rank at TP8 (150,994,944 B x 8 ranks here). This is the
+# `expansion_bytes` docstring's "block scales expanded from a compressed
+# encoding"; it is reserved in both scale modes.
+EXPANSION_BYTES = 8 * 150_994_944
+# Resident weights with the routed experts' block scales in `csf`
+# (`csf_32x2_v1`, lossless): the raw 47,110,422,528 scale bytes fall to
+# 26,915,754,739 at the measured MSE-scale ratios (0.557 gate/up, 0.600 down;
+# `config.CSF_RESIDENT_SCALE_RATIOS`) — 2.35 GiB per rank at TP8. Max scales
+# compress slightly better (0.539 / 0.595). Loading measures the real encoded
+# allocation and this planning figure is then replaced.
+SCALE_COMPRESSED_DEVICE_BYTES = MappingProxyType(
+    {"csf": PACKED_RESIDENT_BYTES - 20_194_667_789 + 7 * REPLICATED_BYTES})
 
 # One rank's state row: the four iHC streams, the hidden state `hnorm` consumes,
 # and the consumed-token counter — 4 x 6144 BF16 of residual state. Speculative
@@ -83,7 +114,8 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         snapshot_budget_bytes=plan.snapshots * plan.costs.state_row_bytes,
         headroom_bytes=plan.headroom_bytes + plan.reserve_bytes,
         kernel_cache=kernel_cache, compile_decoder=compile_forwards, retain_graphs=retain_graphs,
-        mtp=speculation is not None, stream_overlap=plan.stream_overlap, **drafting)
+        mtp=speculation is not None, stream_overlap=plan.stream_overlap,
+        expert_scale_compression=plan.expert_scale_compression, **drafting)
     return prepare_group(snapshot, config, prepare_rank, progress=progress, core_storage=core_storage,
                          ranks=ranks, checkpoint=plan.checkpoint)
 
@@ -104,8 +136,12 @@ RECIPE = Recipe(
         alias="hy4-preview", repository="tencent/Hy4-preview",
         revision="705d81ee51566a186d645b74c974d642ef2828fe", architecture="HYV4ForCausalLM",
         stored_bytes=STORED_BYTES,
-        # W4A16 packed experts; see the constants above for the derivation.
-        device_bytes=DEVICE_BYTES, draft_bytes=DRAFT_BYTES),),
+        # W4A16 packed experts with replicated tensors counted per rank; see
+        # the constants above for the derivation. `csf` reserves the shared
+        # scale expansion scratch and shrinks the resident scales losslessly.
+        device_bytes=DEVICE_BYTES, draft_bytes=DRAFT_BYTES,
+        expansion_bytes=EXPANSION_BYTES,
+        scale_compressed_device_bytes=SCALE_COMPRESSED_DEVICE_BYTES),),
     context=1048576, page_tokens=PAGE_TOKENS, concurrency=32, max_concurrency=64, prefill_chunk=4096,
     # Official recipe is MTP at three draft tokens (vLLM TP8, MTP@3).
     speculation=Speculation(draft_tokens=3, token_capacity=128), max_draft_tokens=3,

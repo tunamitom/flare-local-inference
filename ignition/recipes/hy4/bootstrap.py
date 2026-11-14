@@ -43,6 +43,8 @@ class PreparationConfig:
     kernel_cache: Path | None = None
     mtp: bool = False
     stream_overlap: bool = True
+    # Store the routed experts' block scales in the lossless `csf` encoding.
+    expert_scale_compression: str | None = None
     # One native MTP predictor with three draft tokens: widths up to four.
     speculative_widths: tuple[int, ...] = (1, 2, 3, 4)
     speculative_fixed_width: int | None = None
@@ -50,6 +52,8 @@ class PreparationConfig:
     mtp_only: bool = False
 
     def __post_init__(self):
+        if self.expert_scale_compression not in (None, "csf"):
+            raise ValueError("Hy4 expert scale compression must be None or 'csf'")
         if self.mtp_only and (not self.mtp
                 or max(self.speculative_widths, default=1) <= 1 or self.speculative_fixed_width == 1):
             raise ValueError("--mtp-only requires enabled learned speculation with positive draft depth")
