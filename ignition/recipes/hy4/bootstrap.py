@@ -295,12 +295,14 @@ def capture_kernel_graphs(constructed, shapes=(("decode", (1, 1)), ("prefill", (
     """Capture the prepared kernel chain at the measurement shapes; return bytes.
 
     The capture covers the CUDA-graph-safe b12x operator chain the decode and
-    prefill steps execute per layer (the sparse-MLA prepared attend + sink
-    fold and the fused-record writer write) — the graph-pool residency that
-    the `Allocate cache` line must subtract. The torch-op terms (MoE routing,
-    indexer scoring) are NOT capture-safe today (host-side value reads inside
-    the layer loop), so this is a LOWER BOUND on the final graph catalog; the
-    report states it as measured-and-bounded, never as a placeholder.
+    prefill steps execute per layer (the sparse-MLA prepared attend with its
+    in-kernel sink fold; the `W_UV` expansion rides the CP body's
+    `expand_output` and is not part of this chain) — the graph-pool residency
+    that the `Allocate cache` line must subtract. The torch-op terms (MoE
+    routing, indexer scoring) are NOT capture-safe today (host-side value
+    reads inside the layer loop), so this is a LOWER BOUND on the final graph
+    catalog; the report states it as measured-and-bounded, never as a
+    placeholder.
 
     Footprint = the device-free delta across warmup + capture + one replay,
     measured with the caching allocator drained (`empty_cache`) so the number
@@ -326,11 +328,13 @@ def capture_kernel_graphs(constructed, shapes=(("decode", (1, 1)), ("prefill", (
         counts = torch.ones((rows * tokens,), dtype=torch.int32, device=device)
         lengths = torch.ones((rows * tokens,), dtype=torch.int32, device=device)
         # eager warmup (JIT/preparation allocations land before capture)
-        attn.attend(q, table, selected, counts, cache_lengths=lengths, call_shape=shape)
+        attn.attend(q, table, selected, counts, cache_lengths=lengths, call_shape=shape,
+                    expand=False, fold_sink=True)
         torch.cuda.synchronize(device)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            attn.attend(q, table, selected, counts, cache_lengths=lengths, call_shape=shape)
+            attn.attend(q, table, selected, counts, cache_lengths=lengths, call_shape=shape,
+                        expand=False, fold_sink=True)
         graph.replay()
         torch.cuda.synchronize(device)
         captured[name] = graph
