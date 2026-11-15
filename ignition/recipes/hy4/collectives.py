@@ -55,6 +55,7 @@ __all__ = [
     "CE_AUDIT_REL_L2",
     "CeExchange",
     "merge_lse_partials",
+    "relay_partner",
     "all_reduce_arm_for",
     "audit_scores_only_selection",
     "check_scores_only_exactness",
@@ -691,16 +692,9 @@ def all_reduce_arm_for(rows, rules):
 # --------------------------------------------------------------------------
 # consult18 stage B1: the prefill DCP exchanges on copy-engine peer copies
 # --------------------------------------------------------------------------
-def merge_lse_partials(partials, lses):
-    """Merge per-source attention partials by their base-2 LSE (B1's local merge).
-
-    `partials` `[sources, heads, rows, width]`, `lses` `[sources, heads, rows]`
-    FP32 base 2. Returns `(out [rows, heads, width] in the partials' dtype,
-    lse [rows, heads] FP32)`: FP32 accumulation, one rounding. A row no source
-    saw (every LSE `-inf`) gets a zero output and `-inf` LSE, as
-    `lse_reduce_scatter_reference` returns. The sink is not involved: it folds
-    once after the merge (D6).
-    """
+def _merge_head_major(partials, lses):
+    """FP32 base-2 LSE merge over the source axis: `(out [heads, rows, width] FP32,
+    lse [heads, rows])`; rows no source saw get zero / `-inf`."""
     lses = lses.float()
     peak = lses.max(dim=0).values
     peak = torch.where(torch.isfinite(peak), peak, torch.zeros_like(peak))
@@ -712,6 +706,22 @@ def merge_lse_partials(partials, lses):
                       torch.zeros_like(acc))
     lse = torch.where(seen, peak + torch.log2(total.clamp_min(1e-30)),
                       torch.full_like(total, float("-inf")))
+    return out, lse
+
+
+def merge_lse_partials(partials, lses):
+    """Merge per-source attention partials by their base-2 LSE (B1's local merge).
+
+    `partials` `[sources, heads, rows, width]`, `lses` `[sources, heads, rows]`
+    FP32 base 2. Returns `(out [rows, heads, width] in the partials' dtype,
+    lse [rows, heads] FP32)`: FP32 accumulation, one rounding. A row no source
+    saw (every LSE `-inf`) gets a zero output and `-inf` LSE, as
+    `lse_reduce_scatter_reference` returns. The sink is not involved: it folds
+    once after the merge (D6). The merge is associative, so B2's two-level
+    form (four sources per switch, then the two switch results) is the same
+    map up to rounding.
+    """
+    out, lse = _merge_head_major(partials, lses)
     return out.to(partials.dtype).permute(1, 0, 2).contiguous(), lse.t().contiguous()
 
 
@@ -724,23 +734,37 @@ class _DeviceBytes:
             "version": 3, "strides": None}
 
 
+def relay_partner(rank, world_size, island_size):
+    """consult18 B2: the rank's cross-switch partner (same position, other island)."""
+    if world_size != 2 * island_size:
+        raise ValueError("the pairwise relay needs exactly two islands")
+    return (rank + island_size) % world_size
+
+
 class CeExchange:
-    """consult18 stage B1: the prefill head gather and LSE reduce-scatter on
+    """consult18 stage B1/B2: the prefill head gather and LSE reduce-scatter on
     copy-engine peer copies instead of SM copy kernels.
 
     One CUDA-IPC slab per rank holds the flags and, per operation, two banks
-    of inbound slots — one slot per source rank. Every rank pushes its blocks
-    straight into the destinations' slots with `cudaMemcpyAsync` (cross-switch
-    copies on one stream, in-switch copies on another so the two overlap),
-    publishes one monotonic flag per (source, destination) after its copy,
-    and the destination waits its flags on the main stream before it reads.
-    The flag and copy primitives are the copy-engine ring's (`DmaAllReduce`,
+    of inbound slots. Every rank pushes blocks straight into the destinations'
+    slots with `cudaMemcpyAsync` (cross-switch and in-switch copies on separate
+    streams), publishes one monotonic flag per (source, destination) after its
+    copies, and the destination waits its flags on the main stream before it
+    reads. Flag and copy primitives are the copy-engine ring's (`DmaAllReduce`,
     whose launchers its prepared plan installed), so this needs the ring.
 
+    Direct (B1): every block crosses straight to its destination — a quarter
+    of each rank's blocks for every cross-switch peer cross the B<->D link.
+    Relay (B2, `relay=True`): only the cross-switch partner pair exchanges
+    over the link. The gather sends each block across once and the partner
+    forwards it inside its switch; the LSE reduce-scatter merges the four
+    partials of a switch first and sends one merged block per destination
+    across (BF16 on the wire, FP32 merges). About a quarter of the link bytes.
+
     Bank reuse needs no end handshake: a rank writes a peer's bank b again two
-    calls later, only after it waited for that peer's data of the call in
-    between — which the peer pushed after its main stream had finished reading
-    bank b (the same argument as `pcie_dma._all_reduce_fp8`).
+    calls later, only after it waited for data the peer sent after its main
+    stream had finished reading bank b (the argument of
+    `pcie_dma._all_reduce_fp8`, which holds per phase here).
     """
 
     FLAG_SLOTS = 256
@@ -751,8 +775,8 @@ class CeExchange:
                  lse_width, gather_width, island_size=4):
         from b12x.comm.pcie.pcie_oneshot import PCIeOneshotAllReduce
 
-        if world_size > 16:
-            raise ValueError("the CE exchange's flag layout holds at most 16 ranks")
+        if world_size > 8:
+            raise ValueError("the CE exchange's counter layout holds at most 8 ranks")
         def align(n):
             return (int(n) + 255) // 256 * 256
         self.ring = ring
@@ -764,7 +788,10 @@ class CeExchange:
         self.lse_slot = self.lse_part + align(self.hpr * self.max_rows * 4)
         self.gather_slot = align(self.max_rows * self.hpr * self.gather_width * 2)
         self.lse_base = self.FLAG_SLOTS * self.FLAG_STRIDE
-        self.gather_base = self.lse_base + 2 * self.world * self.lse_slot
+        # Two halves per LSE bank: [0, world) blocks for this rank's heads by
+        # source (B2: index partner = the partner's merged block), [world, 2w)
+        # B2's blocks for the partner's heads by local source.
+        self.gather_base = self.lse_base + 2 * 2 * self.world * self.lse_slot
         self.nbytes = self.gather_base + 2 * self.world * self.gather_slot
         self._slab = PCIeOneshotAllReduce._allocate_shared_buffer(
             group, self.nbytes, zero_fill=True, ipc=ring._ipc)
@@ -777,51 +804,66 @@ class CeExchange:
         peers = [peer for peer in range(self.world) if peer != self.rank]
         self.cross = [peer for peer in peers if island[peer] != island[self.rank]]
         self.local = [peer for peer in peers if island[peer] == island[self.rank]]
+        self.partner = (relay_partner(self.rank, self.world, island_size)
+                        if self.world == 2 * island_size else None)
         self._cross_stream = torch.cuda.Stream(device=self.device)
         self._local_stream = torch.cuda.Stream(device=self.device)
         self._flag_stream = torch.cuda.Stream(device=self.device)
         self._ready = torch.cuda.Event()
-        self._copied = [torch.cuda.Event() for _ in range(self.world)]
+        self._events = {}
         self.calls = {op: 0 for op in self._OPS}
 
+    # -- flags, counters, events ------------------------------------------
     def _flag_ptr(self, rank, op, source):
         return self.ptrs[rank] + (self._OPS.index(op) * 16 + source) * self.FLAG_STRIDE
 
-    @staticmethod
-    def _counter(counters, op, peer):
-        return counters.data_ptr() + (CeExchange._OPS.index(op) * 16 + peer) * 4
+    def _send_ctr(self, op, dest, source):
+        return self._send.data_ptr() + (32 + self._OPS.index(op) * 64 + dest * 8 + source) * 4
+
+    def _wait_ctr(self, op, source, relay=False):
+        return self._wait.data_ptr() + ((128 if relay else 0) + self._OPS.index(op) * 16 + source) * 4
+
+    def _event(self, key):
+        event = self._events.get(key)
+        if event is None:
+            event = self._events[key] = torch.cuda.Event()
+        return event
 
     def _bank(self, op):
         bank = self.calls[op] % 2
         self.calls[op] += 1
         return bank
 
-    def _push(self, op, blocks):
-        """Push `blocks[d] = [(dst_offset, src_ptr, nbytes), ...]` to every peer
-        d, flag each destination after its copies, then wait for every peer's
-        flag on the main stream."""
+    def _send_block(self, stream, dest, copies, sources, op, key):
+        """`copies` [(dest_offset, src_ptr, nbytes)] on `stream`, then flag `dest`
+        once per source in `sources` (after the copies) on the flag stream."""
         kernels = self.ring._kernels
-        main = torch.cuda.current_stream()
-        self._ready.record(main)
-        for dest in (*self.cross, *self.local):
-            stream = self._cross_stream if dest in self.cross else self._local_stream
-            stream.wait_event(self._ready)
-            with torch.cuda.stream(stream):
-                for offset, source, nbytes in blocks[dest]:
-                    kernels.dma_copy(self.ptrs[dest] + offset, source, nbytes)
-                self._copied[dest].record(stream)
-            with torch.cuda.stream(self._flag_stream):
-                self._flag_stream.wait_event(self._copied[dest])
-                kernels.dma_set_flag(self._flag_ptr(dest, op, self.rank),
-                                     self._counter(self._send, op, dest))
-        for source in (*self.cross, *self.local):
-            kernels.dma_wait_flag(self._flag_ptr(self.rank, op, source),
-                                  self._counter(self._wait, op, source))
+        event = self._event(key)
+        with torch.cuda.stream(stream):
+            for offset, source, nbytes in copies:
+                kernels.dma_copy(self.ptrs[dest] + offset, source, nbytes)
+            event.record(stream)
+        with torch.cuda.stream(self._flag_stream):
+            self._flag_stream.wait_event(event)
+            for origin in sources:
+                kernels.dma_set_flag(self._flag_ptr(dest, op, origin),
+                                     self._send_ctr(op, dest, origin))
+
+    def _await(self, op, source, *, relay=False):
+        """Wait (on the current stream) for `source`'s data of this call."""
+        self.ring._kernels.dma_wait_flag(self._flag_ptr(self.rank, op, source),
+                                         self._wait_ctr(op, source, relay))
 
     def _drain(self):
         main = torch.cuda.current_stream()
         for stream in (self._cross_stream, self._local_stream, self._flag_stream):
             main.wait_stream(stream)
+
+    def _start(self):
+        main = torch.cuda.current_stream()
+        self._ready.record(main)
+        for stream in (self._cross_stream, self._local_stream):
+            stream.wait_event(self._ready)
 
     def accepts_lse(self, partials):
         rows, heads, width = (int(v) for v in partials.shape)
@@ -833,7 +875,21 @@ class CeExchange:
         return (local.dtype == torch.bfloat16 and rows <= self.max_rows
                 and heads == self.hpr and width == self.gather_width)
 
-    def lse_reduce_scatter(self, partials, lses):
+    # -- LSE reduce-scatter -----------------------------------------------
+    def _lse_views(self, bank, half, rows, width):
+        hpr = self.hpr
+        first = self.lse_base + (bank * 2 + half) * self.world * self.lse_slot
+        slots = self._memory[first:first + self.world * self.lse_slot].view(self.world, self.lse_slot)
+        part_bytes, lse_bytes = hpr * rows * width * 2, hpr * rows * 4
+        received = slots[:, :part_bytes].view(torch.bfloat16).view(self.world, hpr, rows, width)
+        received_lse = slots[:, self.lse_part:self.lse_part + lse_bytes] \
+            .view(torch.float32).view(self.world, hpr, rows)
+        return received, received_lse
+
+    def _lse_offset(self, bank, half, source):
+        return self.lse_base + ((bank * 2 + half) * self.world + source) * self.lse_slot
+
+    def lse_reduce_scatter(self, partials, lses, *, relay=False):
         """`[rows, heads, width]` partials + `[rows, heads]` base-2 LSE over
         ALL heads -> this rank's merged head shard `(out, lse)`."""
         rows, heads, width = (int(v) for v in partials.shape)
@@ -841,41 +897,107 @@ class CeExchange:
         if not head_major.is_contiguous():
             head_major = head_major.contiguous()
         lse_major = lses.float().t().contiguous()
-        hpr = self.hpr
+        hpr, me = self.hpr, self.rank
         part_bytes, lse_bytes = hpr * rows * width * 2, hpr * rows * 4
+
+        def block(owner, offset):
+            return ((offset, head_major[owner * hpr].data_ptr(), part_bytes),
+                    (offset + self.lse_part, lse_major[owner * hpr].data_ptr(), lse_bytes))
+
         bank = self._bank("lse")
-        base = self.lse_base + (bank * self.world + self.rank) * self.lse_slot
-        blocks = {dest: ((base, head_major[dest * hpr].data_ptr(), part_bytes),
-                         (base + self.lse_part, lse_major[dest * hpr].data_ptr(), lse_bytes))
-                  for dest in (*self.cross, *self.local)}
-        self._push("lse", blocks)
-        slots = self._memory[self.lse_base + bank * self.world * self.lse_slot:
-                             self.lse_base + (bank + 1) * self.world * self.lse_slot]
-        slots = slots.view(self.world, self.lse_slot)
-        received = slots[:, :part_bytes].view(torch.bfloat16).view(self.world, hpr, rows, width)
-        received_lse = slots[:, self.lse_part:self.lse_part + lse_bytes] \
-            .view(torch.float32).view(self.world, hpr, rows)
-        own = slice(self.rank * hpr, (self.rank + 1) * hpr)
-        received[self.rank].copy_(head_major[own])
-        received_lse[self.rank].copy_(lse_major[own])
-        result = merge_lse_partials(received, received_lse)
+        self._start()
+        own = slice(me * hpr, (me + 1) * hpr)
+        mine, mine_lse = self._lse_views(bank, 0, rows, width)
+        if not relay:
+            for dest in (*self.cross, *self.local):
+                stream = self._cross_stream if dest in self.cross else self._local_stream
+                self._send_block(stream, dest, block(dest, self._lse_offset(bank, 0, me)),
+                                 (me,), "lse", ("lse", dest))
+            mine[me].copy_(head_major[own])
+            mine_lse[me].copy_(lse_major[own])
+            for source in (*self.cross, *self.local):
+                self._await("lse", source)
+            result = merge_lse_partials(mine, mine_lse)
+            self._drain()
+            return result
+        partner = self.partner
+        if partner is None:
+            raise RuntimeError("the LSE relay needs two islands")
+        # Phase 1, inside the switch: each local peer gets its own heads' block
+        # and its partner's heads' block.
+        for dest in self.local:
+            other = relay_partner(dest, self.world, len(self.local) + 1)
+            copies = (*block(dest, self._lse_offset(bank, 0, me)),
+                      *block(other, self._lse_offset(bank, 1, me)))
+            self._send_block(self._local_stream, dest, copies, (me,), "lse", ("lse1", dest))
+        theirs, theirs_lse = self._lse_views(bank, 1, rows, width)
+        mine[me].copy_(head_major[own])
+        mine_lse[me].copy_(lse_major[own])
+        partner_heads = slice(partner * hpr, (partner + 1) * hpr)
+        theirs[me].copy_(head_major[partner_heads])
+        theirs_lse[me].copy_(lse_major[partner_heads])
+        for source in self.local:
+            self._await("lse", source)
+        switch = sorted((me, *self.local))
+        mine4, mine4_lse = _merge_head_major(mine[switch], mine_lse[switch])
+        out4, out4_lse = _merge_head_major(theirs[switch], theirs_lse[switch])
+        out4 = out4.to(torch.bfloat16)
+        # Phase 2, across the link: one merged block per partner pair.
+        main = torch.cuda.current_stream()
+        merged = self._event("lse-merged")
+        merged.record(main)
+        self._cross_stream.wait_event(merged)
+        self._send_block(self._cross_stream, partner,
+                         ((self._lse_offset(bank, 0, me), out4.data_ptr(), part_bytes),
+                          (self._lse_offset(bank, 0, me) + self.lse_part, out4_lse.data_ptr(),
+                           lse_bytes)),
+                         (me,), "lse", ("lse2", partner))
+        self._await("lse", partner)
+        both = torch.stack((mine4, mine[partner].float()))
+        both_lse = torch.stack((mine4_lse, mine_lse[partner]))
+        out, lse = _merge_head_major(both, both_lse)
+        result = out.to(partials.dtype).permute(1, 0, 2).contiguous(), lse.t().contiguous()
         self._drain()
         return result
 
-    def all_gather_heads(self, local):
+    # -- head all-gather --------------------------------------------------
+    def all_gather_heads(self, local, *, relay=False):
         """`[rows, heads // world, width]` -> `[rows, heads, width]` (rank-major)."""
         rows, hpr, width = (int(v) for v in local.shape)
         source = local.contiguous()
         nbytes = rows * hpr * width * 2
+        me = self.rank
         bank = self._bank("gather")
-        base = self.gather_base + (bank * self.world + self.rank) * self.gather_slot
-        self._push("gather", {dest: ((base, source.data_ptr(), nbytes),)
-                              for dest in (*self.cross, *self.local)})
-        slots = self._memory[self.gather_base + bank * self.world * self.gather_slot:
-                             self.gather_base + (bank + 1) * self.world * self.gather_slot]
+
+        def offset(origin):
+            return self.gather_base + (bank * self.world + origin) * self.gather_slot
+
+        self._start()
+        own = ((offset(me), source.data_ptr(), nbytes),)
+        if not relay:
+            for dest in (*self.cross, *self.local):
+                stream = self._cross_stream if dest in self.cross else self._local_stream
+                self._send_block(stream, dest, own, (me,), "gather", ("gather", dest))
+        else:
+            partner = self.partner
+            if partner is None:
+                raise RuntimeError("the gather relay needs two islands")
+            self._send_block(self._cross_stream, partner, own, (me,), "gather", ("g-x", partner))
+            for dest in self.local:
+                self._send_block(self._local_stream, dest, own, (me,), "gather", ("g-own", dest))
+            # Forward the partner's block inside the switch once it has arrived.
+            with torch.cuda.stream(self._local_stream):
+                self._await("gather", partner, relay=True)
+            forward = ((offset(partner), self.ptrs[me] + offset(partner), nbytes),)
+            for dest in self.local:
+                self._send_block(self._local_stream, dest, forward, (partner,), "gather",
+                                 ("g-fwd", dest))
+        slots = self._memory[offset(0):offset(0) + self.world * self.gather_slot]
         received = slots.view(self.world, self.gather_slot)[:, :nbytes] \
             .view(torch.bfloat16).view(self.world, rows, hpr, width)
-        received[self.rank].copy_(source)
+        received[me].copy_(source)
+        for origin in (*self.cross, *self.local):
+            self._await("gather", origin)
         gathered = received.permute(1, 0, 2, 3).reshape(rows, self.world * hpr, width)
         self._drain()
         return gathered
@@ -905,7 +1027,7 @@ class PcieDcpTransport:
     def __init__(self, *, group, device, pools, rank, world_size, total_heads,
                  all_reduce=None, reduce_width=None, all_reduce_arms=None, score_offer=None,
                  dma=None, kernel_rows=None, ce=None, ce_lse_rows=None,
-                 ce_gather_rows=None):
+                 ce_gather_rows=None, ce_lse_relay=False, ce_gather_relay=False):
         self.group = group
         self.device = torch.device(device)
         self.rank = rank
@@ -927,6 +1049,7 @@ class PcieDcpTransport:
         self._ce = ce
         self.ce_lse_rows = None if ce_lse_rows is None else int(ce_lse_rows)
         self.ce_gather_rows = None if ce_gather_rows is None else int(ce_gather_rows)
+        self.ce_lse_relay, self.ce_gather_relay = bool(ce_lse_relay), bool(ce_gather_relay)
         import os as _os
         self.ce_audit = bool(_os.environ.get("HY4_CE_AUDIT"))
         self.ce_audit_calls = {"lse": 0, "gather": 0}
@@ -958,7 +1081,8 @@ class PcieDcpTransport:
                            value_width, max_rows, reduce_width=None, all_reduce_arms=None,
                            score_offer=None, extra_value_widths=(), value_max_rows=None,
                            dma=False, kernel_rows=None, ce_lse_rows=None,
-                           ce_gather_rows=None, ce_lse_width=None, ce_gather_width=None):
+                           ce_gather_rows=None, ce_lse_width=None, ce_gather_width=None,
+                           ce_lse_relay=False, ce_gather_relay=False):
         """One channel pool per wire geometry (the query gather's absorbed and
         unabsorbed widths, and the 512-wide latent partials).
 
@@ -1045,7 +1169,8 @@ class PcieDcpTransport:
                    all_reduce=all_reduce, reduce_width=reduce_width,
                    all_reduce_arms=all_reduce_arms, score_offer=score_offer,
                    dma=ring, kernel_rows=kernel_rows, ce=ce, ce_lse_rows=ce_lse_rows,
-                   ce_gather_rows=ce_gather_rows)
+                   ce_gather_rows=ce_gather_rows, ce_lse_relay=ce_lse_relay,
+                   ce_gather_relay=ce_gather_relay)
 
     def bind(self, rank):
         if rank != self.rank:
@@ -1343,7 +1468,7 @@ class PcieDcpTransport:
         if (out is None and self._ce is not None and self.ce_gather_rows is not None
                 and rows >= self.ce_gather_rows and self._ce.accepts_gather(local_input)):
             _trace(f"all_gather_heads(ce) rows={rows} width={width}")
-            gathered = self._ce.all_gather_heads(local_input)
+            gathered = self._ce.all_gather_heads(local_input, relay=self.ce_gather_relay)
             if self.ce_audit:
                 self._audit_gather(local_input, gathered)
             return gathered
@@ -1371,7 +1496,8 @@ class PcieDcpTransport:
                 and self.ce_lse_rows is not None and rows >= self.ce_lse_rows
                 and self._ce.accepts_lse(partial_output)):
             _trace(f"lse_reduce_scatter(ce) rows={rows} width={width}")
-            merged = self._ce.lse_reduce_scatter(partial_output, partial_lse)
+            merged = self._ce.lse_reduce_scatter(partial_output, partial_lse,
+                                                 relay=self.ce_lse_relay)
             if self.ce_audit:
                 self._audit_lse(partial_output, partial_lse, merged)
             return merged

@@ -43,11 +43,11 @@ class _FakeCe:
     def accepts_gather(self, local):
         return local.shape[2] == 4
 
-    def lse_reduce_scatter(self, partials, lses):
+    def lse_reduce_scatter(self, partials, lses, relay=False):
         self.calls.append("lse")
         return self.merge(partials, lses)
 
-    def all_gather_heads(self, local):
+    def all_gather_heads(self, local, relay=False):
         self.calls.append("gather")
         return self.gather(local)
 
@@ -102,3 +102,48 @@ def test_ce_routing_thresholds_widths_and_audits():
         broken.all_gather_heads(wide)
     with pytest.raises(RuntimeError, match="CE LSE merge differs"):
         broken.lse_reduce_scatter(partials, lses, partials_sink_folded=False, return_lse=True)
+
+
+def test_two_level_merge_equals_the_flat_merge():
+    """B2's LSE relay merges each switch's four partials, then the two switch
+    results; that equals the flat eight-source merge up to rounding, empty
+    sources and rows included."""
+    from ignition.recipes.hy4.collectives import _merge_head_major
+
+    torch.manual_seed(9)
+    sources, heads, rows, width = 8, 2, 6, 16
+    partials = torch.randn(sources, heads, rows, width)
+    lses = torch.randn(sources, heads, rows) * 6
+    lses[0:4, 1, 2] = float("-inf")            # one switch saw nothing for (head 1, row 2)
+    lses[:, 0, 4] = float("-inf")              # nobody saw (head 0, row 4)
+    flat, flat_lse = _merge_head_major(partials, lses)
+    first, first_lse = _merge_head_major(partials[:4], lses[:4])
+    second, second_lse = _merge_head_major(partials[4:], lses[4:])
+    out, lse = _merge_head_major(torch.stack((first, second)), torch.stack((first_lse, second_lse)))
+    torch.testing.assert_close(out, flat, rtol=1e-5, atol=1e-6)
+    assert torch.equal(torch.isfinite(lse), torch.isfinite(flat_lse))
+    finite = torch.isfinite(flat_lse)
+    torch.testing.assert_close(lse[finite], flat_lse[finite], rtol=1e-5, atol=1e-5)
+    assert float(out[0, 4].abs().max()) == 0.0
+
+
+def test_relay_partner_pairs_the_two_switches():
+    from ignition.recipes.hy4.collectives import relay_partner
+
+    assert [relay_partner(rank, 8, 4) for rank in range(8)] == [4, 5, 6, 7, 0, 1, 2, 3]
+    with pytest.raises(ValueError, match="two islands"):
+        relay_partner(0, 8, 2)
+
+
+def test_relay_flags_route_to_the_relay_paths():
+    good = _FakeCe(lambda local: torch.cat([local, local], dim=1),
+                   lambda partials, lses: (partials[:, :2].clone(), lses[:, :2].clone()))
+    seen = {}
+    good.all_gather_heads = lambda local, relay=False: seen.setdefault("gather", relay) or torch.cat([local, local], dim=1)
+    good.lse_reduce_scatter = lambda partials, lses, relay=False: (seen.setdefault("lse", relay), (partials[:, :2].clone(), lses[:, :2].clone()))[1]
+    transport, _ = _transport(good, ce_lse_rows=4, ce_gather_rows=4, ce_lse_relay=True,
+                              ce_gather_relay=False)
+    transport.all_gather_heads(torch.randn(4, 2, 4).to(torch.bfloat16))
+    transport.lse_reduce_scatter(torch.randn(4, 4, 4).to(torch.bfloat16), torch.randn(4, 4),
+                                 partials_sink_folded=False, return_lse=True)
+    assert seen == {"gather": False, "lse": True}
