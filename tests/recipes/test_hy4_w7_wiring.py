@@ -1183,3 +1183,87 @@ def test_transport_keeps_the_arm_rules_it_was_built_with():
     assert all_reduce_arm_for(1024, build("1:oneshot,2-:twoshot").all_reduce_arms)[0] == "twoshot"
     with pytest.raises(ValueError):
         build("2-:nope")
+
+
+# --------------------------------------------------------------------------
+# consult17: the scores-only offer on the DCP gather (lever 2 step 2)
+# --------------------------------------------------------------------------
+def test_score_gather_moves_the_fp32_bits_unchanged_and_falls_back():
+    """The offer travels as raw 16-bit words through an `all_gather_heads`
+    shaped pool and comes back as the same FP32 bits (`-inf`, NaN payloads and
+    signed zeros included); other shapes take the control-group wire."""
+    from ignition.recipes.hy4.collectives import PcieDcpTransport
+
+    world, rows, offer = 4, 3, 8
+    peers = [torch.randn(rows, offer) for _ in range(world)]
+    peers[1][0, :3] = float("-inf")
+    peers[2][1, 0] = float("nan")
+    peers[2].view(torch.int32)[1, 1] = 0x7FC12345          # a NaN with a payload
+    peers[3][2, 0] = -0.0
+    calls = []
+
+    class FakeChannel:
+        def all_gather_heads(self, local_input, out, *, plan):
+            calls.append((tuple(local_input.shape), local_input.dtype, plan))
+            assert local_input.is_contiguous()
+            parts = [p.contiguous().view(torch.bfloat16).reshape(rows, 1, 2 * offer) for p in peers]
+            return torch.cat(parts, dim=1)
+
+    class FakePool:
+        def for_stream(self):
+            return FakeChannel()
+
+    transport = PcieDcpTransport(group=None, device="cpu", pools={(2 * offer, "scores"): FakePool()},
+                                 rank=0, world_size=world, total_heads=64, score_offer=offer)
+    transport._plans[("score_gather", rows, 2 * offer, "")] = "plan"
+    got = transport.exchange_scores(peers[0])
+    assert calls == [((rows, 1, 2 * offer), torch.bfloat16, "plan")]
+    assert len(got) == world
+    for rank in range(world):
+        assert got[rank].dtype == torch.float32 and tuple(got[rank].shape) == (rows, offer)
+        assert torch.equal(got[rank].contiguous().view(torch.int32),
+                           peers[rank].view(torch.int32)), "the FP32 bit pattern must survive"
+    # Not the prepared shape -> the control-group wire (stubbed here).
+    fallback = []
+    transport._gather_all = lambda value: fallback.append(tuple(value.shape)) or ("gloo",)
+    assert transport.exchange_scores(torch.randn(rows, 2 * offer)) == ("gloo",)      # the re-offer
+    assert transport.exchange_scores(torch.randn(rows + 1, offer)) == ("gloo",)     # unprepared rows
+    assert transport.exchange_scores(peers[0].double()) == ("gloo",)
+    assert fallback == [(rows, 2 * offer), (rows + 1, offer), (rows, offer)] and len(calls) == 1
+    plain = PcieDcpTransport(group=None, device="cpu", pools={}, rank=0, world_size=world,
+                             total_heads=64)
+    plain._gather_all = lambda value: ("gloo",)
+    assert plain.exchange_scores(peers[0]) == ("gloo",)
+
+
+def test_score_wire_audit_compares_both_wires_bit_for_bit():
+    from ignition.recipes.hy4.collectives import PcieDcpTransport
+
+    world, rows, offer = 2, 2, 4
+    peers = [torch.randn(rows, offer) for _ in range(world)]
+
+    def build(corrupt):
+        class Channel:
+            def all_gather_heads(self, local_input, out, *, plan):
+                parts = [p.contiguous().view(torch.bfloat16).reshape(rows, 1, 2 * offer).clone()
+                         for p in peers]
+                if corrupt:
+                    parts[1][0, 0, 0] = 1.0     # one 16-bit word changed in rank 1's offer
+                return torch.cat(parts, dim=1)
+
+        class Pool:
+            def for_stream(self):
+                return Channel()
+
+        transport = PcieDcpTransport(group=None, device="cpu", pools={(2 * offer, "scores"): Pool()},
+                                     rank=0, world_size=world, total_heads=64, score_offer=offer)
+        transport._plans[("score_gather", rows, 2 * offer, "")] = "plan"
+        transport._gather_all = lambda value: tuple(peers)
+        transport.score_wire_audit = True
+        return transport
+
+    clean = build(False)
+    clean.exchange_scores(peers[0])
+    assert clean.score_wire_checked == 1
+    with pytest.raises(RuntimeError, match="not a pure copy"):
+        build(True).exchange_scores(peers[0])

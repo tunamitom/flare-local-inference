@@ -693,7 +693,7 @@ class PcieDcpTransport:
     """
 
     def __init__(self, *, group, device, pools, rank, world_size, total_heads,
-                 all_reduce=None, reduce_width=None, all_reduce_arms=None):
+                 all_reduce=None, reduce_width=None, all_reduce_arms=None, score_offer=None):
         self.group = group
         self.device = torch.device(device)
         self.rank = rank
@@ -705,6 +705,14 @@ class PcieDcpTransport:
         self._ar = all_reduce          # consult15 §2 lever 1: b12x PCIe all-reduce
         self.reduce_width = None if reduce_width is None else int(reduce_width)
         self._ar_plans = {}            # rows -> (plan, runtime, arm)
+        # consult17: the scores-only offer width carried on the DCP all-gather
+        # (`None` = the offers ride the control group, as before).
+        self.score_offer = None if score_offer is None else int(score_offer)
+        # HY4_SCORE_WIRE_AUDIT=1 (a gate boot): every GPU offer gather is also
+        # run over the control group and the two must agree bit for bit.
+        import os
+        self.score_wire_audit = bool(os.environ.get("HY4_SCORE_WIRE_AUDIT"))
+        self.score_wire_checked = 0
         # consult17: which arm each row count runs (the A/B flag's rules).
         self.all_reduce_arms = parse_all_reduce_arms(all_reduce_arms or DEFAULT_ALL_REDUCE_ARMS)
 
@@ -712,7 +720,8 @@ class PcieDcpTransport:
 
     @classmethod
     def from_process_group(cls, process_group, device, *, total_heads, query_widths,
-                           value_width, max_rows, reduce_width=None, all_reduce_arms=None):
+                           value_width, max_rows, reduce_width=None, all_reduce_arms=None,
+                           score_offer=None):
         """One channel pool per wire geometry (the query gather's absorbed and
         unabsorbed widths, and the 512-wide latent partials).
 
@@ -742,6 +751,20 @@ class PcieDcpTransport:
             max_batch_size=max_rows, total_heads=total_heads,
             head_dim=value_width, query_head_dim=value_width, single_channel=True)
         _trace(f"PCIeDCPA2APool partials width={value_width} done")
+        if score_offer is not None:
+            # consult17 (lever 2 step 2): one more gather channel for the
+            # scores-only offer. The gather moves 16-bit words, so each rank's
+            # `[rows, offer]` FP32 scores travel as `[rows, 1, 2 * offer]`
+            # BF16 words — one "head" per rank — and are viewed back unchanged.
+            words = 2 * int(score_offer)
+            if words % 8:
+                raise ValueError("the score offer must be a multiple of 4 scores")
+            _trace(f"PCIeDCPA2APool scores words={words}")
+            pools[(words, "scores")] = PCIeDCPA2APool.from_process_group(
+                process_group=process_group, device=device,
+                max_batch_size=max_rows, total_heads=world_size,
+                head_dim=words, query_head_dim=words, single_channel=True)
+            _trace(f"PCIeDCPA2APool scores words={words} done")
         all_reduce = None
         if reduce_width is not None:
             from ignition.preparation.collectives import create_all_reduce_runtime
@@ -754,7 +777,7 @@ class PcieDcpTransport:
         return cls(group=process_group, device=device, pools=pools,
                    rank=rank, world_size=world_size, total_heads=total_heads,
                    all_reduce=all_reduce, reduce_width=reduce_width,
-                   all_reduce_arms=all_reduce_arms)
+                   all_reduce_arms=all_reduce_arms, score_offer=score_offer)
 
     def bind(self, rank):
         if rank != self.rank:
@@ -804,6 +827,39 @@ class PcieDcpTransport:
             runtime, surface="DcpAllToAll.all_gather_heads", call=call)
         plan = preparation.plan(query, runtime=runtime)
         label = name or f"gather-{rows}-{width}"
+        session.prepare(
+            (plan.request(
+                name=label,
+                collective=CollectiveRequirement(key=label, ranks=tuple(range(self.world_size))),
+                prepare_call=lambda state: preparation.prepare_call(state, **call),
+            ),),
+            coordinator=lambda progress: progress.ready_collectives[0].key
+            if progress.ready_collectives else None,
+        )
+        self._plans[key] = plan
+        self._prepared += 1
+        return plan
+
+    def prepare_score_gather(self, session, rows):
+        """Prepare the offer gather for `rows` (consult17: scores off the host)."""
+        from b12x.comm.pcie import _dcp_preparation as preparation
+        from b12x.preparation import CollectiveRequirement
+
+        if self.score_offer is None:
+            raise RuntimeError("no score-gather pool (construct with score_offer)")
+        words = 2 * self.score_offer
+        key = ("score_gather", int(rows), words, "")
+        if key in self._plans:
+            return self._plans[key]
+        runtime = self._pools[(words, "scores")].for_stream()
+        inp = torch.zeros((rows, 1, words), dtype=torch.bfloat16, device=self.device)
+        out = torch.empty((rows, self.world_size, words), dtype=torch.bfloat16,
+                          device=self.device)
+        call = dict(local_input=inp, out=out)
+        query = preparation.query_from_runtime(
+            runtime, surface="DcpAllToAll.all_gather_heads", call=call)
+        plan = preparation.plan(query, runtime=runtime)
+        label = f"scores-{rows}-{words}"
         session.prepare(
             (plan.request(
                 name=label,
@@ -975,7 +1031,35 @@ class PcieDcpTransport:
         return result.to(wire_dtype)
 
     def exchange_scores(self, offers, *, plan=None):
-        return self._gather_all(offers)
+        """Every rank's `[rows, offer]` FP32 scores, in rank order.
+
+        With a prepared score gather for this exact `(rows, offer)` the offer
+        rides the DCP all-gather as raw 16-bit words (no host wire); any other
+        shape — the full-width re-offer after a saturated cut, an unprepared
+        row count — takes the control group, as before. Every rank holds the
+        same plans, so every rank takes the same path.
+        """
+        rows, width = (int(v) for v in offers.shape)
+        key = ("score_gather", rows, 2 * width, "")
+        if (self.score_offer != width or offers.dtype != torch.float32
+                or key not in self._plans):
+            return self._gather_all(offers)
+        words = offers.contiguous().view(torch.bfloat16).reshape(rows, 1, 2 * width)
+        _trace(f"score_gather rows={rows} offer={width}")
+        gathered = self._pools[(2 * width, "scores")].for_stream().all_gather_heads(
+            words, None, plan=self._plans[key])
+        _trace(f"score_gather rows={rows} offer={width} done")
+        scores = gathered.contiguous().view(torch.float32)      # [rows, world, offer]
+        result = tuple(scores[:, rank, :] for rank in range(self.world_size))
+        if self.score_wire_audit:
+            for rank, (got, want) in enumerate(zip(result, self._gather_all(offers))):
+                if not torch.equal(got.contiguous().view(torch.int32),
+                                   want.contiguous().view(torch.int32)):
+                    raise RuntimeError(
+                        f"score gather returned different bits for rank {rank}'s offer "
+                        f"(rows={rows}, offer={width}): the DCP gather is not a pure copy here")
+            self.score_wire_checked += 1
+        return result
 
     def stage_candidates(self, local_indices, local_scores, local_counts=None, *, plan=None):
         scores = self._gather_all(local_scores)
