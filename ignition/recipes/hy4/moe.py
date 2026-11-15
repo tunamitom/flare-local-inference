@@ -28,6 +28,7 @@ from dataclasses import dataclass
 import torch
 
 from .config import ModelConfig
+from .profile import TIMER
 
 
 @dataclass(frozen=True)
@@ -412,29 +413,39 @@ class MoEBlock:
         if packed is not None:
             # One packed weight at load; per-projection GEMMs over its rows —
             # bitwise the same as the loose weights (content gates are exact).
-            logits = (x.float() @ packed.rows("router").float().T)
-            shared_gate = x @ packed.rows("shared_gate").T
-            shared_up = x @ packed.rows("shared_up").T
-            _, topk_weights, topk_indices = self._route_from_logits(logits)
+            with TIMER.phase("moe.route_shared"):
+                logits = (x.float() @ packed.rows("router").float().T)
+                shared_gate = x @ packed.rows("shared_gate").T
+                shared_up = x @ packed.rows("shared_up").T
+                _, topk_weights, topk_indices = self._route_from_logits(logits)
         else:
             shared_gate = shared_up = None
-            _, topk_weights, topk_indices = self.route(x)
+            with TIMER.phase("moe.route_shared"):
+                _, topk_weights, topk_indices = self.route(x)
         overlap = bool(overlap_shared) and self.device.type == "cuda"
         self.overlap_applied = bool(overlap_shared)
         if overlap:
+            # W29: the phase's entry/exit synchronisation serialises the two
+            # streams while profiling (the documented caveat — it hides
+            # overlap); with the timer off this branch is the exact old code.
             side = getattr(self, "_shared_stream", None)
             if side is None:
                 side = torch.cuda.Stream()
                 self._shared_stream = side
             joined = torch.cuda.Event()
-            with torch.cuda.stream(side):
-                shared = self._shared_forward(x, shared_gate, shared_up)
-            joined.record(side)
+            with TIMER.phase("moe.route_shared"):
+                with torch.cuda.stream(side):
+                    shared = self._shared_forward(x, shared_gate, shared_up)
+                joined.record(side)
+            with TIMER.phase("moe.routed"):
+                routed = self._routed_forward(x, topk_indices, topk_weights)
+                torch.cuda.current_stream().wait_event(joined)
+                return routed + shared
+        with TIMER.phase("moe.routed"):
             routed = self._routed_forward(x, topk_indices, topk_weights)
-            torch.cuda.current_stream().wait_event(joined)
-            return routed + shared
-        routed = self._routed_forward(x, topk_indices, topk_weights)
-        return routed + self._shared_forward(x, shared_gate, shared_up)
+        with TIMER.phase("moe.route_shared"):
+            shared = self._shared_forward(x, shared_gate, shared_up)
+        return routed + shared
 
 
 class DenseBlock:
@@ -445,4 +456,5 @@ class DenseBlock:
 
     def forward(self, x, *, overlap_shared=False):
         # No shared/routed split here — the overlap flag is a no-op.
-        return self.weights.forward(x)
+        with TIMER.phase("moe.routed"):
+            return self.weights.forward(x)

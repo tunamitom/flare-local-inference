@@ -40,6 +40,7 @@ import torch
 
 from .attention import SelectionCell, rms_norm
 from .config import ModelConfig
+from .profile import TIMER
 from .state import Hy4ModelWeights
 from .wiring import DECODE_ONE_ROW, SCHEDULE, chunk_plan, prefill_shape, verify_shape
 
@@ -534,15 +535,17 @@ class Hy4Decoder:
                 f"tokens={call_shape.tokens}) does not match the forward's "
                 f"{tuple(token_ids.shape)}")
         self.trace.append(("call_shape", call_shape))
+        TIMER.forward_begin(call_shape.name)   # W29: no-op unless --profile-steps armed
         rows = self._rows(token_ids, request_rows)
         positions = self._positions(token_ids.shape, rows)
         token_rows = self._token_rows(token_ids.shape, rows)
         visible = positions + 1  # each query's causal cache length
         # Vocabulary-sharded embedding (D5): masked lookup over this rank's
         # shard + all-reduce (identity at world 1).
-        embeds = self.collectives.embed_lookup(
-            token_ids.reshape(-1), self.weights.embed,
-            vocabulary_range=self.weights.sharding.vocabulary_range).to(self.compute_dtype)
+        with TIMER.phase("embed"):
+            embeds = self.collectives.embed_lookup(
+                token_ids.reshape(-1), self.weights.embed,
+                vocabulary_range=self.weights.sharding.vocabulary_range).to(self.compute_dtype)
         streams = StreamState.begin(embeds)
         if state is not None:
             state.streams[:streams.streams.shape[0]] = streams.streams
@@ -550,28 +553,35 @@ class Hy4Decoder:
         mlp_out = None
         for index, layer in enumerate(self.weights.layers):
             if index == 0:
-                post, y = layer.attn_ihc.pre(streams.streams)
-                y = rms_norm(y, layer.input_norm, self.config.text["rms_norm_eps"])
+                with TIMER.phase("ihc"):
+                    post, y = layer.attn_ihc.pre(streams.streams)
+                    y = rms_norm(y, layer.input_norm, self.config.text["rms_norm_eps"])
             else:
-                streams.streams, post, y = previous_ffn.post_pre(
-                    mlp_out, streams.streams, post, layer.attn_ihc,
-                    norm_weight=layer.input_norm)
-            attn_out = self.collectives.all_reduce(
-                self._attention(layer, y, positions, token_rows, visible,
-                                call_shape=call_shape))  # D4 (o_proj shard)
-            streams.streams, post, y = layer.attn_ihc.post_pre(
-                attn_out, streams.streams, post, layer.ffn_ihc,
-                norm_weight=layer.post_attention_norm)
+                with TIMER.phase("ihc"):
+                    streams.streams, post, y = previous_ffn.post_pre(
+                        mlp_out, streams.streams, post, layer.attn_ihc,
+                        norm_weight=layer.input_norm)
+            attn_out = self._attention(layer, y, positions, token_rows, visible,
+                                       call_shape=call_shape)
+            with TIMER.phase("comm.all_reduce.attn"):
+                attn_out = self.collectives.all_reduce(attn_out)  # D4 (o_proj shard)
+            with TIMER.phase("ihc"):
+                streams.streams, post, y = layer.attn_ihc.post_pre(
+                    attn_out, streams.streams, post, layer.ffn_ihc,
+                    norm_weight=layer.post_attention_norm)
             # D4: the MoE/dense-FFN outputs are intermediate-sharded partial
             # sums (the layer-0 dense FFN is `mlp.forward` at layer 0). The
             # shared-expert overlap is a per-graph-family decision (consult7 §5
             # / consult8 §6): decode graphs overlap, prefill graphs do not.
-            mlp_out = self.collectives.all_reduce(
-                layer.mlp.forward(y, overlap_shared=call_shape.overlap_shared_expert))
+            # (`moe.route_shared` / `moe.routed` time inside `moe.py`.)
+            mlp_out = layer.mlp.forward(y, overlap_shared=call_shape.overlap_shared_expert)
+            with TIMER.phase("comm.all_reduce.mlp"):
+                mlp_out = self.collectives.all_reduce(mlp_out)
             previous_ffn = layer.ffn_ihc
-        streams.streams = previous_ffn.post(mlp_out, streams.streams, post)
-        hidden = self.weights.hc_head.merge(streams.streams)
-        normed = rms_norm(hidden, self.weights.norm, self.config.text["rms_norm_eps"])
+        with TIMER.phase("ihc"):
+            streams.streams = previous_ffn.post(mlp_out, streams.streams, post)
+            hidden = self.weights.hc_head.merge(streams.streams)
+            normed = rms_norm(hidden, self.weights.norm, self.config.text["rms_norm_eps"])
         # The state rows keep the POST-`model.norm` hidden — the exact tensor
         # the MTP's `hnorm` consumes (finding F; vLLM vllm_hy4_model.py:403,
         # SGLang sgl_hunyuan_v4.py:734, transformers candidate_generator.py:1418
@@ -580,12 +590,15 @@ class Hy4Decoder:
         if state is not None:
             state.hidden[:normed.shape[0]] = normed
             state.count[:normed.shape[0]] += token_ids.shape[1]
-        logits = normed.float() @ self.weights.head.T
+        with TIMER.phase("head"):
+            logits = normed.float() @ self.weights.head.T
         # D5: logits come back per vocabulary shard; all-gather to the sampler
         # (identity at world 1).
-        logits = self.collectives.gather_logits(
-            logits.reshape(token_ids.shape[0], token_ids.shape[1], -1),
-            vocabulary_range=self.weights.sharding.vocabulary_range)
+        with TIMER.phase("comm.logits_gather"):
+            logits = self.collectives.gather_logits(
+                logits.reshape(token_ids.shape[0], token_ids.shape[1], -1),
+                vocabulary_range=self.weights.sharding.vocabulary_range)
+        TIMER.forward_end()
         if return_hidden:
             rows, width = token_ids.shape
             return (logits,
@@ -646,76 +659,91 @@ class Hy4Decoder:
         # absorb (weight reads stay this rank's shard rows); prefill gathers
         # UNABSORBED queries and absorbs + expands locally.
         local_absorb_after_gather = world > 1 and call_shape.query_wiring == "unabsorbed-local-absorb"
-        bundle = attn.project_packed(y, positions, absorb=not local_absorb_after_gather,
-                                     with_index_keys=attn.weights.indexer is not None)
+        with TIMER.phase("attn.project"):
+            bundle = attn.project_packed(y, positions, absorb=not local_absorb_after_gather,
+                                         with_index_keys=attn.weights.indexer is not None)
         q_resid, q_local, latent = bundle.q_resid, bundle.q, bundle.latent
-        self.cache.write_latent(layer.index, token_rows, positions, latent)
-        if attn.weights.indexer is not None:
-            self.cache.write_index_keys(layer.index, token_rows, positions, bundle.index_keys)
+        with TIMER.phase("attn.cache_write"):
+            self.cache.write_latent(layer.index, token_rows, positions, latent)
+            if attn.weights.indexer is not None:
+                self.cache.write_index_keys(layer.index, token_rows, positions, bundle.index_keys)
         owner = attn.selection.owner_id
         slot_base = self.cache.slots_for(token_rows)
         if world == 1:
-            selected, counts = attn.select(y, q_resid, positions, visible,
-                                          self.cache.key_table(owner), slot_base)
-            attended = attn.attend(q_local, self.cache.latents(layer.index), selected, counts,
-                                  call_shape=call_shape)
-            return attn.gate_and_project(attended.output, y)
+            with TIMER.phase("attn.index_score"):
+                selected, counts = attn.select(y, q_resid, positions, visible,
+                                               self.cache.key_table(owner), slot_base)
+            with TIMER.phase("attn.sparse_mla"):
+                attended = attn.attend(q_local, self.cache.latents(layer.index), selected, counts,
+                                       call_shape=call_shape)
+            with TIMER.phase("attn.fold_expand_gate"):
+                return attn.gate_and_project(attended.output, y)
         short = call_shape.short_context_bypass and call_shape.is_decode_graph \
             and int(visible.max()) <= topk
         if short:
             # The short-context bypass: at context <= top-k the global top-k is
             # every visible key — no indexer, no selection exchange.
             self.trace.append(("selection_bypass", family, int(visible.max()), topk))
-            attn.selection.fill_visible(visible, slot_base, world=world, rank=rank)
+            with TIMER.phase("attn.handback"):
+                attn.selection.fill_visible(visible, slot_base, world=world, rank=rank)
         else:
             if attn.selection.kind == "full":
                 self.trace.append(("selection_exchange",
                                    schedule.placement("selection_exchange", family)))
-                scores, candidates = attn.local_candidates(
-                    y, q_resid, positions, visible, self.cache.key_table(owner), slot_base,
-                    world=world, rank=rank)
-                _, merged = self.collectives.merge_topk(
-                    scores, candidates, topk=self.config.text["index_topk"])
-                # `local_slot_map`'s `[rows, local_capacity]` table is pure
-                # arithmetic (slot = row_base + p // world) and the hand-back
-                # only ever reads its `[rows, topk]` picks — materializing the
-                # whole table costs 1.5 GiB of int64 at 1024 prefill rows (the
-                # 2k-cell OOM). Shift each row's global positions by
-                # `world * row_base` (ownership `p % world` is unchanged and
-                # `p // world` becomes the physical slot — the map's exact
-                # gather value) and hand back with no table, preserving the
-                # table's `-1` padding and out-of-range guard by hand.
-                pos = merged
-                base = self.cache.slots_for(token_rows).reshape(-1, 1)
-                local = pos.clamp(min=0) // world
-                bounded = (pos < 0) | (local < self.cache.local_capacity)
-                shifted = torch.where(pos >= 0, pos.to(torch.int64) + world * base,
-                                      pos.to(torch.int64))  # `-1` padding stays -1
-                mapped = torch.where(bounded, shifted,
-                                     torch.full_like(shifted, -1)).to(pos.dtype)
-                attn.selection.handback(mapped, world_size=world, rank=rank,
-                                        slot_map=None)
-        selected, counts = attn.selection.buffers(rows=y.shape[0])
+                with TIMER.phase("attn.index_score"):
+                    scores, candidates = attn.local_candidates(
+                        y, q_resid, positions, visible, self.cache.key_table(owner), slot_base,
+                        world=world, rank=rank)
+                with TIMER.phase("comm.selection"):
+                    _, merged = self.collectives.merge_topk(
+                        scores, candidates, topk=self.config.text["index_topk"])
+                with TIMER.phase("attn.handback"):
+                    # `local_slot_map`'s `[rows, local_capacity]` table is pure
+                    # arithmetic (slot = row_base + p // world) and the hand-back
+                    # only ever reads its `[rows, topk]` picks — materializing the
+                    # whole table costs 1.5 GiB of int64 at 1024 prefill rows (the
+                    # 2k-cell OOM). Shift each row's global positions by
+                    # `world * row_base` (ownership `p % world` is unchanged and
+                    # `p // world` becomes the physical slot — the map's exact
+                    # gather value) and hand back with no table, preserving the
+                    # table's `-1` padding and out-of-range guard by hand.
+                    pos = merged
+                    base = self.cache.slots_for(token_rows).reshape(-1, 1)
+                    local = pos.clamp(min=0) // world
+                    bounded = (pos < 0) | (local < self.cache.local_capacity)
+                    shifted = torch.where(pos >= 0, pos.to(torch.int64) + world * base,
+                                          pos.to(torch.int64))  # `-1` padding stays -1
+                    mapped = torch.where(bounded, shifted,
+                                         torch.full_like(shifted, -1)).to(pos.dtype)
+                    attn.selection.handback(mapped, world_size=world, rank=rank,
+                                            slot_map=None)
+        with TIMER.phase("attn.handback"):
+            selected, counts = attn.selection.buffers(rows=y.shape[0])
         self.trace.append(("query_exchange", schedule.placement("query_exchange", family),
                            call_shape.query_wiring, int(q_local.shape[-1])))
-        q_all = self.collectives.all_gather_heads(q_local)   # all heads per call (D2)
+        with TIMER.phase("comm.head_gather"):
+            q_all = self.collectives.all_gather_heads(q_local)   # all heads per call (D2)
         if local_absorb_after_gather:
             # Prefill wiring: the gathered queries are UNABSORBED; W_UK applies
             # locally over ALL gathered heads (replicated `kv_b_proj`).
-            q_all = attn.absorb_queries(q_all)
-        partial = attn.attend(q_all, self.cache.latents(layer.index), selected, counts,
-                              fold_sink=False, expand=False,  # sink unbound
-                              call_shape=call_shape)
+            with TIMER.phase("attn.absorb"):
+                q_all = attn.absorb_queries(q_all)
+        with TIMER.phase("attn.sparse_mla"):
+            partial = attn.attend(q_all, self.cache.latents(layer.index), selected, counts,
+                                  fold_sink=False, expand=False,  # sink unbound
+                                  call_shape=call_shape)
         # D6: the partials' provenance goes into the merge
         # (`partials_sink_folded=provenance.sink_folded`, `lse_base="base2"`).
-        out, lse = self.collectives.lse_reduce(
-            partial.output, partial.lse, partials_sink_folded=partial.provenance.sink_folded)
-        out, lse = attn.fold_sink(out, lse)   # the ONE sink fold, after the merge
-        # `W_UV` expansion over this rank's head shard (a per (row, head) scale
-        # commutes with the fold; the latent-space partials cannot expand on a
-        # foreign head — `kv_b_proj` is head-sharded for the decode wiring).
-        out = attn.expand_output(out).to(y.dtype)
-        return attn.gate_and_project(out, y)
+        with TIMER.phase("comm.lse_reduce"):
+            out, lse = self.collectives.lse_reduce(
+                partial.output, partial.lse, partials_sink_folded=partial.provenance.sink_folded)
+        with TIMER.phase("attn.fold_expand_gate"):
+            out, lse = attn.fold_sink(out, lse)   # the ONE sink fold, after the merge
+            # `W_UV` expansion over this rank's head shard (a per (row, head) scale
+            # commutes with the fold; the latent-space partials cannot expand on a
+            # foreign head — `kv_b_proj` is head-sharded for the decode wiring).
+            out = attn.expand_output(out).to(y.dtype)
+            return attn.gate_and_project(out, y)
 
     def append(self, rows, count=1):
         """Advance the rows' consumed-token counters after a committed step."""

@@ -729,36 +729,54 @@ class PcieDcpTransport:
     def all_reduce(self, value):
         import torch.distributed as dist
 
+        from .profile import TIMER
+
         _trace(f"all_reduce shape={tuple(value.shape)}")
-        host = value.contiguous().cpu()
-        dist.all_reduce(host, op=dist.ReduceOp.SUM, group=self.group)
+        with TIMER.phase("host.d2h"):
+            host = value.contiguous().cpu()
+        with TIMER.phase("host.gloo"):
+            dist.all_reduce(host, op=dist.ReduceOp.SUM, group=self.group)
+        TIMER.add_host("all_reduce", host.nbytes)
         _trace(f"all_reduce shape={tuple(value.shape)} done")
-        return host.to(value.device)
+        with TIMER.phase("host.h2d"):
+            return host.to(value.device)
 
     def all_gather(self, value):
         import torch.distributed as dist
 
+        from .profile import TIMER
+
         _trace(f"all_gather shape={tuple(value.shape)}")
-        host = value.contiguous().cpu()
-        taken = [torch.empty_like(host) for _ in range(self.world_size)]
-        dist.all_gather(taken, host, group=self.group)
+        with TIMER.phase("host.d2h"):
+            host = value.contiguous().cpu()
+        with TIMER.phase("host.gloo"):
+            taken = [torch.empty_like(host) for _ in range(self.world_size)]
+            dist.all_gather(taken, host, group=self.group)
+        TIMER.add_host("all_gather", host.nbytes, copies=self.world_size)
         _trace(f"all_gather shape={tuple(value.shape)} done")
         # Cat on the host and move ONCE: moving each shard first then catting
         # holds 2x the full-vocab result on GPU (world x shard + the cat) —
         # at 1024 prefill rows that is ~1 GiB of eager transient per chunk.
         # Same bytes, one device transfer instead of world+1.
-        return torch.cat(taken, dim=-1).to(value.device)
+        with TIMER.phase("host.h2d"):
+            return torch.cat(taken, dim=-1).to(value.device)
 
     def _gather_all(self, value):
         """Every rank's copy of `value`, in rank order (the control-group wire)."""
         import torch.distributed as dist
 
+        from .profile import TIMER
+
         _trace(f"gather_all shape={tuple(value.shape)}")
-        host = value.contiguous().cpu()
-        taken = [torch.empty_like(host) for _ in range(self.world_size)]
-        dist.all_gather(taken, host, group=self.group)
+        with TIMER.phase("host.d2h"):
+            host = value.contiguous().cpu()
+        with TIMER.phase("host.gloo"):
+            taken = [torch.empty_like(host) for _ in range(self.world_size)]
+            dist.all_gather(taken, host, group=self.group)
+        TIMER.add_host("gather_all", host.nbytes, copies=self.world_size)
         _trace(f"gather_all shape={tuple(value.shape)} done")
-        return tuple(t.to(value.device) for t in taken)
+        with TIMER.phase("host.h2d"):
+            return tuple(t.to(value.device) for t in taken)
 
     def _lookup(self, surface, rows, width, lse_base):
         key = (surface, int(rows), int(width), lse_base)
