@@ -769,10 +769,10 @@ class CeExchange:
 
     FLAG_SLOTS = 256
     FLAG_STRIDE = 128
-    _OPS = ("lse", "gather")
+    _OPS = ("lse", "gather", "scores")
 
     def __init__(self, *, group, ring, rank, world_size, device, max_rows, heads_per_rank,
-                 lse_width, gather_width, island_size=4):
+                 lse_width, gather_width, island_size=4, score_offer=512):
         from b12x.comm.pcie.pcie_oneshot import PCIeOneshotAllReduce
 
         if world_size > 8:
@@ -787,12 +787,15 @@ class CeExchange:
         self.lse_part = align(self.hpr * self.max_rows * self.lse_width * 2)
         self.lse_slot = self.lse_part + align(self.hpr * self.max_rows * 4)
         self.gather_slot = align(self.max_rows * self.hpr * self.gather_width * 2)
+        self.score_offer = int(score_offer)
+        self.score_slot = align(self.max_rows * self.score_offer * 4)
         self.lse_base = self.FLAG_SLOTS * self.FLAG_STRIDE
         # Two halves per LSE bank: [0, world) blocks for this rank's heads by
         # source (B2: index partner = the partner's merged block), [world, 2w)
         # B2's blocks for the partner's heads by local source.
         self.gather_base = self.lse_base + 2 * 2 * self.world * self.lse_slot
-        self.nbytes = self.gather_base + 2 * self.world * self.gather_slot
+        self.scores_base = self.gather_base + 2 * self.world * self.gather_slot
+        self.nbytes = self.scores_base + 2 * self.world * self.score_slot
         self._slab = PCIeOneshotAllReduce._allocate_shared_buffer(
             group, self.nbytes, zero_fill=True, ipc=ring._ipc)
         self.ptrs = [int(ptr) for ptr in self._slab.peer_ptrs]
@@ -960,6 +963,38 @@ class CeExchange:
         self._drain()
         return result
 
+    # -- scores-only offer gather (consult18 stage D: one channel per lane) --
+    def accepts_scores(self, offers):
+        rows, width = (int(v) for v in offers.shape)
+        return offers.dtype == torch.float32 and rows <= self.max_rows and width == self.score_offer
+
+    def exchange_scores(self, offers):
+        """Every rank's `[rows, offer]` FP32 scores in rank order (byte copies).
+        The returned views live in this lane's bank: consume them before the
+        lane's next-but-one scores call."""
+        rows, width = (int(v) for v in offers.shape)
+        source = offers.contiguous()
+        nbytes = rows * width * 4
+        me = self.rank
+        bank = self._bank("scores")
+
+        def offset(origin):
+            return self.scores_base + (bank * self.world + origin) * self.score_slot
+
+        self._start()
+        own = ((offset(me), source.data_ptr(), nbytes),)
+        for dest in (*self.cross, *self.local):
+            stream = self._cross_stream if dest in self.cross else self._local_stream
+            self._send_block(stream, dest, own, (me,), "scores", ("scores", dest))
+        slots = self._memory[offset(0):offset(0) + self.world * self.score_slot]
+        received = slots.view(self.world, self.score_slot)[:, :nbytes] \
+            .view(torch.float32).view(self.world, rows, width)
+        received[me].copy_(source)
+        for origin in (*self.cross, *self.local):
+            self._await("scores", origin)
+        self._drain()
+        return tuple(received[origin] for origin in range(self.world))
+
     # -- head all-gather --------------------------------------------------
     def all_gather_heads(self, local, *, relay=False):
         """`[rows, heads // world, width]` -> `[rows, heads, width]` (rank-major)."""
@@ -1027,7 +1062,8 @@ class PcieDcpTransport:
     def __init__(self, *, group, device, pools, rank, world_size, total_heads,
                  all_reduce=None, reduce_width=None, all_reduce_arms=None, score_offer=None,
                  dma=None, kernel_rows=None, ce=None, ce_lse_rows=None,
-                 ce_gather_rows=None, ce_lse_relay=False, ce_gather_relay=False):
+                 ce_gather_rows=None, ce_lse_relay=False, ce_gather_relay=False,
+                 lane_rings=(), lane_ces=()):
         self.group = group
         self.device = torch.device(device)
         self.rank = rank
@@ -1050,6 +1086,12 @@ class PcieDcpTransport:
         self.ce_lse_rows = None if ce_lse_rows is None else int(ce_lse_rows)
         self.ce_gather_rows = None if ce_gather_rows is None else int(ce_gather_rows)
         self.ce_lse_relay, self.ce_gather_relay = bool(ce_lse_relay), bool(ce_gather_relay)
+        # consult18 stage D: one copy-engine ring and one CE exchange per
+        # extra lane (index i -> lane i + 1); every channel is single-stream,
+        # so two in-flight halves never share one. Lane plans: (lane, rows).
+        self._lane_rings = tuple(lane_rings)
+        self._lane_ces = tuple(lane_ces)
+        self._lane_ar_plans = {}
         import os as _os
         self.ce_audit = bool(_os.environ.get("HY4_CE_AUDIT"))
         self.ce_audit_calls = {"lse": 0, "gather": 0}
@@ -1082,7 +1124,7 @@ class PcieDcpTransport:
                            score_offer=None, extra_value_widths=(), value_max_rows=None,
                            dma=False, kernel_rows=None, ce_lse_rows=None,
                            ce_gather_rows=None, ce_lse_width=None, ce_gather_width=None,
-                           ce_lse_relay=False, ce_gather_relay=False):
+                           ce_lse_relay=False, ce_gather_relay=False, lanes=1, lane_rows=None):
         """One channel pool per wire geometry (the query gather's absorbed and
         unabsorbed widths, and the 512-wide latent partials).
 
@@ -1162,15 +1204,34 @@ class PcieDcpTransport:
                             device=device, max_rows=max_rows,
                             heads_per_rank=int(total_heads) // world_size,
                             lse_width=int(ce_lse_width or value_width),
-                            gather_width=int(ce_gather_width or min(query_widths)))
+                            gather_width=int(ce_gather_width or min(query_widths)),
+                            score_offer=int(score_offer or 512))
             _trace(f"CeExchange done ({ce.nbytes} B slab)")
+        lane_rings, lane_ces = [], []
+        for extra in range(1, int(lanes)):
+            # consult18 stage D: lane `extra`'s own channels, sized for a half.
+            if ring is None or ce is None:
+                raise ValueError("overlap lanes need the dma ring and the CE exchange")
+            from ignition.preparation.collectives import create_dma_all_reduce_runtime
+
+            rows_l = int(lane_rows or max_rows)
+            _trace(f"lane {extra}: DmaAllReduce + CeExchange rows={rows_l}")
+            lane_ring = create_dma_all_reduce_runtime(
+                process_group, device, max_tokens=rows_l, hidden_size=int(reduce_width))
+            lane_rings.append(lane_ring)
+            lane_ces.append(CeExchange(group=process_group, ring=lane_ring, rank=rank,
+                                       world_size=world_size, device=device, max_rows=rows_l,
+                                       heads_per_rank=int(total_heads) // world_size,
+                                       lse_width=ce.lse_width, gather_width=ce.gather_width,
+                                       score_offer=ce.score_offer))
+            _trace(f"lane {extra} done")
         return cls(group=process_group, device=device, pools=pools,
                    rank=rank, world_size=world_size, total_heads=total_heads,
                    all_reduce=all_reduce, reduce_width=reduce_width,
                    all_reduce_arms=all_reduce_arms, score_offer=score_offer,
                    dma=ring, kernel_rows=kernel_rows, ce=ce, ce_lse_rows=ce_lse_rows,
                    ce_gather_rows=ce_gather_rows, ce_lse_relay=ce_lse_relay,
-                   ce_gather_relay=ce_gather_relay)
+                   ce_gather_relay=ce_gather_relay, lane_rings=lane_rings, lane_ces=lane_ces)
 
     def bind(self, rank):
         if rank != self.rank:
@@ -1358,6 +1419,33 @@ class PcieDcpTransport:
         )
         return plan
 
+    def prepare_lane_all_reduce(self, session, lane_index, rows):
+        """consult18 stage D: the ring plan for `rows` on lane `lane_index`'s ring."""
+        from b12x.comm.pcie import _dma_preparation as dma
+        from b12x.preparation import CollectiveRequirement
+
+        ring = self._lane_rings[lane_index - 1]
+        rows = int(rows)
+        inp = torch.zeros((rows, self.reduce_width), dtype=torch.bfloat16, device=self.device)
+        out = torch.empty_like(inp)
+        label = f"ar-lane{lane_index}-{rows}-{self.reduce_width}"
+        plan = dma.plan(dma.query_from_metadata(ring, shape=tuple(inp.shape), dtype=inp.dtype),
+                        runtime=ring)
+        session.prepare(
+            (plan.request(
+                name=label,
+                collective=CollectiveRequirement(key=label, ranks=tuple(range(self.world_size))),
+                prepare_call=lambda state: dma.prepared_call(state, inp=inp, out=out),
+            ),),
+            coordinator=lambda progress: progress.ready_collectives[0].key
+            if progress.ready_collectives else None,
+        )
+        self._lane_ar_plans[(lane_index, rows)] = (plan, ring, "dma")
+        ring.min_bytes = rows * self.reduce_width * 2
+        ring.prepare_eager_replay(torch.bfloat16, max_elements=rows * self.reduce_width,
+                                  state=plan.prepared.state)
+        return plan
+
     def prepare_dma_replay(self):
         """consult18 A1: capture the ring's eager-replay graphs (call collectively,
         after every ring plan is prepared). One graph launch per call instead
@@ -1463,18 +1551,38 @@ class PcieDcpTransport:
         stages through the production wire and is restored on return)."""
         return tensor.to(torch.bfloat16) if tensor.dtype == torch.float32 else tensor
 
+    def _lane_ce(self):
+        """The current lane's CE exchange (lane 0: the base one)."""
+        from .lanes import lane
+
+        current = lane()
+        if current == 0:
+            return self._ce
+        if current > len(self._lane_ces):
+            raise RuntimeError(f"no CE exchange for lane {current}")
+        return self._lane_ces[current - 1]
+
+    def _lane_check(self, what):
+        from .lanes import lane
+
+        if lane():
+            raise RuntimeError(f"lane {lane()} reached the single-channel {what}: "
+                               "an overlapped half must stay on its lane's channels")
+
     def all_gather_heads(self, local_input, out=None, *, plan=None):
         rows, _, width = (int(v) for v in local_input.shape)
-        if (out is None and self._ce is not None and self.ce_gather_rows is not None
-                and rows >= self.ce_gather_rows and self._ce.accepts_gather(local_input)):
+        ce = self._lane_ce()
+        if (out is None and ce is not None and self.ce_gather_rows is not None
+                and rows >= self.ce_gather_rows and ce.accepts_gather(local_input)):
             _trace(f"all_gather_heads(ce) rows={rows} width={width}")
-            gathered = self._ce.all_gather_heads(local_input, relay=self.ce_gather_relay)
+            gathered = ce.all_gather_heads(local_input, relay=self.ce_gather_relay)
             if self.ce_audit:
                 self._audit_gather(local_input, gathered)
             return gathered
         return self._kernel_gather(local_input, out)
 
     def _kernel_gather(self, local_input, out=None):
+        self._lane_check("DCP gather pool")
         rows, _, width = (int(v) for v in local_input.shape)
         plan = self._lookup("all_gather_heads", rows, width, "")
         pool = self._pools[(width, "gather")]
@@ -1491,13 +1599,14 @@ class PcieDcpTransport:
             raise ValueError(
                 "lse_reduce_scatter requires declared partials_sink_folded "
                 "(the sink never enters the merge; D6)")
+        ce = self._lane_ce()
         if (out is None and return_lse and partials_sink_folded is False
-                and lse_base == LSE_BASE and self._ce is not None
+                and lse_base == LSE_BASE and ce is not None
                 and self.ce_lse_rows is not None and rows >= self.ce_lse_rows
-                and self._ce.accepts_lse(partial_output)):
+                and ce.accepts_lse(partial_output)):
             _trace(f"lse_reduce_scatter(ce) rows={rows} width={width}")
-            merged = self._ce.lse_reduce_scatter(partial_output, partial_lse,
-                                                 relay=self.ce_lse_relay)
+            merged = ce.lse_reduce_scatter(partial_output, partial_lse,
+                                           relay=self.ce_lse_relay)
             if self.ce_audit:
                 self._audit_lse(partial_output, partial_lse, merged)
             return merged
@@ -1507,6 +1616,7 @@ class PcieDcpTransport:
 
     def _kernel_lse(self, partial_output, partial_lse, out=None, *, lse_base,
                     partials_sink_folded, return_lse):
+        self._lane_check("DCP partials pool")
         rows, heads, width = (int(v) for v in partial_output.shape)
         plan = self._lookup("lse_reduce_scatter", rows, width, lse_base)
         pool = self._pools[(width, "partials")]
@@ -1525,6 +1635,13 @@ class PcieDcpTransport:
 
     def _audit_gather(self, local_input, gathered):
         """HY4_CE_AUDIT: the CE gather must be byte-identical to the kernel's."""
+        from .lanes import lane
+
+        if lane():
+            # The kernel path is single-channel (lane 0 only); lane 1 runs the
+            # same CE code on its own instance and is not cross-checked here.
+            self.ce_audit_skipped = getattr(self, "ce_audit_skipped", 0) + 1
+            return
         want = self._kernel_gather(local_input)
         self.ce_audit_calls["gather"] += 1
         if not torch.equal(gathered.view(torch.int16), want.view(torch.int16)):
@@ -1533,6 +1650,13 @@ class PcieDcpTransport:
 
     def _audit_lse(self, partial_output, partial_lse, merged):
         """HY4_CE_AUDIT: the CE merge against the kernel reduce-scatter."""
+        from .lanes import lane
+
+        if lane():
+            # The kernel path is single-channel (lane 0 only); lane 1 runs the
+            # same CE code on its own instance and is not cross-checked here.
+            self.ce_audit_skipped = getattr(self, "ce_audit_skipped", 0) + 1
+            return
         want, want_lse = self._kernel_lse(partial_output, partial_lse, lse_base=LSE_BASE,
                                           partials_sink_folded=False, return_lse=True)
         got, got_lse = merged
@@ -1559,6 +1683,15 @@ class PcieDcpTransport:
         same plans, so every rank takes the same path.
         """
         rows, width = (int(v) for v in offers.shape)
+        from .lanes import lane
+
+        if lane():
+            ce = self._lane_ce()
+            if ce.accepts_scores(offers):
+                return ce.exchange_scores(offers)
+            # Any other shape (the full-width re-offer) takes the host wire,
+            # which is program-ordered on the host and so lane-safe.
+            return self._gather_all(offers)
         key = ("score_gather", rows, 2 * width, "")
         if (self.score_offer != width or offers.dtype != torch.float32
                 or key not in self._plans):
@@ -1596,7 +1729,10 @@ class PcieDcpTransport:
                 raise RuntimeError(
                     f"unprepared all-reduce value {tuple(value.shape)} {value.dtype}; "
                     f"the GPU path reduces [rows, {self.reduce_width}] BF16")
-            entry = self._ar_plans.get(int(value.shape[0]))
+            from .lanes import lane
+
+            entry = (self._ar_plans.get(int(value.shape[0])) if lane() == 0
+                     else self._lane_ar_plans.get((lane(), int(value.shape[0]))))
             if entry is None:
                 raise RuntimeError(
                     f"no prepared all-reduce plan for rows={int(value.shape[0])}; "

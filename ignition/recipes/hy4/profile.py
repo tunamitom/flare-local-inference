@@ -42,6 +42,10 @@ class PhaseTimer:
 
     def __init__(self):
         self.enabled = False          # armed for this request
+        # consult18 stage D: phase timing synchronises the device at every
+        # phase boundary, which serialises the overlapped halves; with
+        # phases off only whole forwards are timed.
+        self.phases = True
         self.budget = 0               # forwards still to time in this request
         self.shape = None
         self.forwards = []            # per-forward wall ms (timed forwards only)
@@ -93,7 +97,7 @@ class PhaseTimer:
     # -- phases -----------------------------------------------------------
     @contextmanager
     def phase(self, name):
-        if not self._active:
+        if not self._active or not self.phases:
             yield
             return
         self._sync()

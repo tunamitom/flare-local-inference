@@ -213,6 +213,7 @@ class Hy4LayerAttention:
     _indexer_plan: object = field(default=None, repr=False)
     _mla_plans: dict = field(default_factory=dict, repr=False)
     _mla_scratch: dict = field(default_factory=dict, repr=False)
+    _mla_scratch_lanes: dict = field(default_factory=dict, repr=False)   # consult18 D
     _plan_book: object = field(default=None, repr=False)
     _sink_folds: dict = field(default_factory=dict, repr=False)
 
@@ -370,7 +371,7 @@ class Hy4LayerAttention:
         self._plan_book = book
 
     def prepare_plans(self, shapes, *, device=None, sink_variants=(True, False),
-                      scratch_pool=None, expanded_partials=False):
+                      scratch_pool=None, expanded_partials=False, lane_pools=()):
         """Bind one `sparse_mla` plan per call shape, plus the sink fold.
 
         The one-row decode plan is NOT the verification-rows plan (consult7
@@ -422,10 +423,27 @@ class Hy4LayerAttention:
                 scratch = scratch_pool.get(pool_key)
                 if scratch is None:
                     scratch = scratch_pool[pool_key] = self._allocate_scratch(plan)
+            # consult18 stage D: every extra lane gets its own scratch (from
+            # its own shared pool): sparse-MLA outputs alias their scratch, so
+            # two in-flight halves must never share one.
+            lane_scratch = []
+            for index, pool in enumerate(lane_pools, start=1):
+                if self.device.type != "cuda":
+                    lane_scratch.append((index, None))
+                    continue
+                spec, = plan.scratch_specs()
+                pool_key = (bool(bound), name, heads, tuple(spec.shape), spec.dtype)
+                if pool_key not in pool:
+                    pool[pool_key] = self._allocate_scratch(plan)
+                lane_scratch.append((index, pool[pool_key]))
             for shape in group_shapes:
                 self._mla_plans[(shape.name, shape.rows, shape.tokens, eff)] = plan
                 if scratch is not None:
                     self._mla_scratch[(shape.name, shape.rows, shape.tokens, eff)] = scratch
+                for index, extra in lane_scratch:
+                    if extra is not None:
+                        self._mla_scratch_lanes.setdefault(index, {})[
+                            (shape.name, shape.rows, shape.tokens, eff)] = extra
                 if bound == sink_variants[0]:
                     self._plan_book.bind(shape, "sparse_mla", plan)
         for shape in shapes:
@@ -792,7 +810,15 @@ class Hy4LayerAttention:
             plan = sparse_mla.plan(caps)
             self._mla = plan
             self._mla_scratch["lazy"] = self._allocate_scratch(plan)
-        scratch = self._mla_scratch.get(key)
+        from .lanes import lane
+
+        current = lane()
+        if current:
+            if current not in self._mla_scratch_lanes or key not in self._mla_scratch_lanes[current]:
+                raise RuntimeError(f"no sparse-MLA scratch for lane {current} at {key}")
+            scratch = self._mla_scratch_lanes[current][key]
+        else:
+            scratch = self._mla_scratch.get(key)
         if scratch is None and plan is self._mla:
             scratch = self._mla_scratch.get("lazy")
         if scratch is None:
@@ -879,10 +905,24 @@ class SelectionCell:
     kind: str
     owner_id: int
     cache: object  # b12x.attention.dsa_indexer.index_cache.IndexCache
+    # consult18 stage D: one more IndexCache per extra execution lane, so a
+    # half's selection (kept live through its shared layers) is never
+    # overwritten by the other half's.
+    lane_caches: tuple = ()
+
+    def _cache(self):
+        from .lanes import lane
+
+        current = lane()
+        if current == 0:
+            return self.cache
+        if current > len(self.lane_caches):
+            raise RuntimeError(f"selection cell {self.layer_id} has no buffers for lane {current}")
+        return self.lane_caches[current - 1]
 
     def buffers(self, rows=None):
         """The owner's `(selected, counts)`; with `rows`, the live row views."""
-        selected, counts = self.cache.selected(self.layer_id), self.cache.counts(self.layer_id)
+        selected, counts = self._cache().selected(self.layer_id), self._cache().counts(self.layer_id)
         if rows is None:
             return selected, counts
         return selected[:rows], counts[:rows]
@@ -896,7 +936,7 @@ class SelectionCell:
         shorter). Masked tie-fill picks past the query's causal bound are
         dropped — the reference package's defect 16 (causal-only selections).
         """
-        selected, counts = self.cache.selected(self.layer_id), self.cache.counts(self.layer_id)
+        selected, counts = self._cache().selected(self.layer_id), self._cache().counts(self.layer_id)
         rows, width = indices.shape
         ranks = torch.arange(width, device=indices.device).reshape(1, width)
         live = torch.minimum(visible, torch.full_like(visible, width))
@@ -921,7 +961,7 @@ class SelectionCell:
         ownership rule) — a slot past the row's visible prefix would alias a
         not-yet-written record.
         """
-        selected, counts = self.cache.selected(self.layer_id), self.cache.counts(self.layer_id)
+        selected, counts = self._cache().selected(self.layer_id), self._cache().counts(self.layer_id)
         rows = int(visible.shape[0])
         width = int(selected.shape[1])
         target = selected[:rows]
@@ -949,10 +989,11 @@ class SelectionCell:
         `Hy4Cache.local_slot_map`) — one shared map would send every query row
         into row zero's cache (`selection_handback.py` fix-on-the-way).
         """
+        cache = self._cache()
         if prepared is not None:
             selected, counts = prepared.run(merged, slot_map=slot_map,
-                                            output=self.cache.selected(self.owner_id),
-                                            counts=self.cache.counts(self.owner_id))
+                                            output=cache.selected(self.owner_id),
+                                            counts=cache.counts(self.owner_id))
             return selected, counts
-        return self.cache.handback(self.layer_id, merged, world_size=world_size, rank=rank,
-                                  slot_map=slot_map)
+        return cache.handback(self.layer_id, merged, world_size=world_size, rank=rank,
+                              slot_map=slot_map)

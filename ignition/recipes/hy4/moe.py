@@ -255,6 +255,7 @@ class FusedRoutedExperts:
         self.op = None                  # `PreparedRoutedExperts` after `wire`
         self._workspace = None          # persistent byte scratch (serial layers)
         self._storage = None            # persistent scale storage views
+        self._lane_scratch = {}         # consult18 D: lane -> (workspace, storage)
         self.calls = 0
 
     @property
@@ -339,8 +340,13 @@ class FusedRoutedExperts:
         ids = topk_indices.to(torch.int32).contiguous()
         weights = topk_weights.float().contiguous()
         output = torch.zeros((rows, self.hidden), dtype=x.dtype, device=x.device)
-        prepared_moe_out(x, weights, ids, output, self._workspace, self.op.scale_inputs,
-                         self._storage, self.op.plan.handle, True, None, None, None,
+        from .lanes import lane
+
+        current = lane()
+        workspace, storage = ((self._workspace, self._storage) if current == 0
+                              else self._lane_scratch[current])
+        prepared_moe_out(x, weights, ids, output, workspace, self.op.scale_inputs,
+                         storage, self.op.plan.handle, True, None, None, None,
                          None, None, False, self.op.precision.get("a4_prefill"))
         self.calls += 1
         return output

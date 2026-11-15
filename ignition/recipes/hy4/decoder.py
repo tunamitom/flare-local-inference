@@ -97,7 +97,7 @@ class Hy4Cache:
     # One forward's validated (tokens, positions) -> owned rows and slots
     # (`begin_forward`): every layer writes the same rows, so the bounds check
     # and the ownership mask are computed once, not per layer per table.
-    _forward_memo: object = field(default=None, repr=False, compare=False)
+    _forward_memo: dict = field(default_factory=dict, repr=False, compare=False)
 
     def __post_init__(self):
         if type(self.world) is not int or self.world < 1:
@@ -228,12 +228,13 @@ class Hy4Cache:
         memo answers only for these exact objects, so any other write (the MTP
         block, a test) still takes the full bounds check.
         """
-        self._forward_memo = None
+        self._forward_memo.pop(id(tokens), None)
         kept, slots = self._owned_slots(tokens, positions)
-        self._forward_memo = (tokens, positions, kept, slots)
+        # consult18 stage D: one entry per in-flight forward (two halves).
+        self._forward_memo[id(tokens)] = (tokens, positions, kept, slots)
 
     def end_forward(self):
-        self._forward_memo = None
+        self._forward_memo.clear()
 
     def _owned_slots(self, tokens, positions):
         """`(kept, slots)`: the row indices this rank owns and their physical slots.
@@ -241,7 +242,7 @@ class Hy4Cache:
         Bounds-checked over EVERY position (owned or not) before the ownership
         filter — the check that refuses a write past the row.
         """
-        memo = self._forward_memo
+        memo = self._forward_memo.get(id(tokens))
         if memo is not None and memo[0] is tokens and memo[1] is positions:
             return memo[2], memo[3]
         positions = positions.long()
@@ -387,7 +388,7 @@ class Hy4Decoder:
         return prefill_shape(rows, width)
 
     def bind_plan_book(self, book, shapes, *, sink_variants=(True, False),
-                       share_scratch=False):
+                       share_scratch=False, lanes=1):
         """Wire prepared plans (from `wire_operators`) into every layer.
 
         One `sparse_mla` plan per call shape plus the sink folds; from here
@@ -397,11 +398,17 @@ class Hy4Decoder:
         """
         self.plan_book = book
         scratch_pool = self._mla_scratch_pool if share_scratch else None
+        # consult18 stage D: one shared scratch pool per extra lane.
+        if not hasattr(self, "_lane_scratch_pools"):
+            self._lane_scratch_pools = []
+        while len(self._lane_scratch_pools) < lanes - 1:
+            self._lane_scratch_pools.append({})
         for layer in self.weights.layers:
             layer.attention.bind_plan_book(book)
             layer.attention.prepare_plans(shapes, sink_variants=sink_variants,
                                           scratch_pool=scratch_pool,
-                                          expanded_partials=self.partial_wire == "expanded")
+                                          expanded_partials=self.partial_wire == "expanded",
+                                          lane_pools=self._lane_scratch_pools[:lanes - 1])
         return self
 
     # --- entry points ------------------------------------------------------
@@ -677,6 +684,156 @@ class Hy4Decoder:
         return logits
 
     # --- internals ---------------------------------------------------------
+
+    # --- consult18 stage D: the two-half overlapped prefill -----------------
+    def enable_lanes(self, *, max_q_rows):
+        """Give lane 1 its own selection buffers and fused-MoE workspace.
+
+        The sparse-MLA scratch for lane 1 comes from `bind_plan_book(lanes=2)`;
+        the collectives' lane channels from the transport (`lanes=2`).
+        """
+        from .bootstrap import selection_cells
+        from .moe import FusedRoutedExperts
+
+        lane_cache, _ = selection_cells(self.config, self.device, max_q_rows=max_q_rows)
+        seen = set()
+        for layer in self.weights.layers:
+            cell = layer.attention.selection
+            if cell is not None and id(cell) not in seen:
+                seen.add(id(cell))
+                cell.lane_caches = (lane_cache,)
+        workspace = storage = None
+        for layer in self.weights.layers:
+            fused = getattr(layer.mlp, "routed", None)
+            if isinstance(fused, FusedRoutedExperts) and fused.op is not None:
+                if workspace is None:
+                    workspace = torch.empty(fused.op.workspace_nbytes, dtype=torch.uint8,
+                                            device=self.device)
+                    storage = [torch.empty_strided(shape, stride, dtype=dtype, device=self.device)
+                               for shape, stride, dtype in fused.op.scale_layouts]
+                elif workspace.numel() != fused.op.workspace_nbytes:
+                    raise ValueError("the fused MoE layers disagree on their workspace size")
+                fused._lane_scratch[1] = (workspace, storage)
+        self.lanes = 2
+        return self
+
+    def _half_steps(self, token_ids, positions, token_rows, call_shape):
+        """One half of an overlapped chunk: the body loop, yielding after each
+        layer; returns the half's post-norm hidden."""
+        visible = positions + 1
+        self.cache.begin_forward(token_rows, positions)
+        with TIMER.phase("embed"):
+            embeds = self.collectives.embed_lookup(
+                token_ids.reshape(-1), self.weights.embed,
+                vocabulary_range=self.weights.sharding.vocabulary_range).to(self.compute_dtype)
+        streams = StreamState.begin(embeds)
+        post = y = None
+        mlp_out = None
+        previous_ffn = None
+        for index, layer in enumerate(self.weights.layers):
+            with TIMER.phase("ihc"):
+                if index == 0:
+                    post, y = layer.attn_ihc.pre(streams.streams)
+                    y = rms_norm(y, layer.input_norm, self.config.text["rms_norm_eps"])
+                else:
+                    streams.streams, post, y = previous_ffn.post_pre(
+                        mlp_out, streams.streams, post, layer.attn_ihc,
+                        norm_weight=layer.input_norm)
+            attn_out = self._attention(layer, y, positions, token_rows, visible,
+                                       call_shape=call_shape, visible_max=None)
+            with TIMER.phase("comm.all_reduce.attn"):
+                attn_out = self.collectives.all_reduce(attn_out)
+            with TIMER.phase("ihc"):
+                streams.streams, post, y = layer.attn_ihc.post_pre(
+                    attn_out, streams.streams, post, layer.ffn_ihc,
+                    norm_weight=layer.post_attention_norm)
+            mlp_out = layer.mlp.forward(y, overlap_shared=call_shape.overlap_shared_expert)
+            with TIMER.phase("comm.all_reduce.mlp"):
+                mlp_out = self.collectives.all_reduce(mlp_out)
+            previous_ffn = layer.ffn_ihc
+            yield index
+        with TIMER.phase("ihc"):
+            streams.streams = previous_ffn.post(mlp_out, streams.streams, post)
+            hidden = self.weights.hc_head.merge(streams.streams)
+            normed = rms_norm(hidden, self.weights.norm, self.config.text["rms_norm_eps"])
+        return normed
+
+    def forward_overlapped(self, token_ids, *, half_shape, logits_rows="none"):
+        """consult18 stage D: one prefill chunk as two halves on two lanes.
+
+        Half A (the first `half_shape.tokens` positions) runs on lane 0's
+        stream, half B on lane 1's; layer l of B waits for layer l of A (B's
+        queries read A's records and index keys), nothing of A waits for B.
+        So B's layer l runs beside A's layer l+1 and one half's collectives
+        overlap the other half's compute. Each lane uses only its own
+        channels, selection buffers and scratch (`lanes.py`). Same results as
+        two sequential half-width forwards; `logits_rows` as in `forward`.
+        """
+        from contextlib import nullcontext
+
+        from .lanes import use_lane
+
+        if getattr(self, "lanes", 1) < 2:
+            raise RuntimeError("forward_overlapped needs enable_lanes() first")
+        half = int(half_shape.tokens)
+        if token_ids.ndim != 2 or token_ids.shape[0] != 1 or token_ids.shape[1] != 2 * half \
+                or half_shape.rows != 1:
+            raise ValueError("forward_overlapped takes one row of exactly two halves")
+        if logits_rows not in ("all", "last", "none") and (
+                type(logits_rows) is not int or not 0 <= logits_rows < 2 * half):
+            raise ValueError(
+                "logits_rows must be 'all', 'last', 'none' or a token index inside the forward")
+        self.trace.append(("call_shape_overlapped", half_shape))
+        TIMER.forward_begin(half_shape.name)
+        rows = self._rows(token_ids, None)
+        positions = self._positions(token_ids.shape, rows)
+        token_rows = self._token_rows(token_ids.shape, rows)
+        halves = ((token_ids[:, :half], positions[:half], token_rows[:half]),
+                  (token_ids[:, half:], positions[half:], token_rows[half:]))
+        cuda = self.device.type == "cuda"
+        streams = (None, None)
+        if cuda:
+            main = torch.cuda.current_stream()
+            if getattr(self, "_lane_streams", None) is None:
+                self._lane_streams = (torch.cuda.Stream(device=self.device),
+                                      torch.cuda.Stream(device=self.device))
+            streams = self._lane_streams
+            for stream in streams:
+                stream.wait_stream(main)
+        steps = [self._half_steps(*halves[index], half_shape) for index in (0, 1)]
+        results = [None, None]
+        layers = len(self.weights.layers)
+        done = [torch.cuda.Event() for _ in range(layers + 1)] if cuda else None
+        for step in range(layers + 1):
+            for index in (0, 1):
+                with use_lane(index), (torch.cuda.stream(streams[index]) if cuda else nullcontext()):
+                    if cuda and index == 1:
+                        streams[1].wait_event(done[step])
+                    try:
+                        next(steps[index])
+                    except StopIteration as finished:
+                        results[index] = finished.value
+                    if cuda and index == 0:
+                        done[step].record(streams[0])
+        if cuda:
+            for stream in streams:
+                main.wait_stream(stream)
+        normed = torch.cat(results, dim=0)
+        self.cache.end_forward()
+        if logits_rows == "none":
+            logits = None
+        else:
+            with TIMER.phase("head"):
+                logits = normed.float() @ self.weights.head.T
+                logits = logits.reshape(1, 2 * half, -1)
+                if logits_rows != "all":
+                    token = 2 * half - 1 if logits_rows == "last" else logits_rows
+                    logits = logits[:, token:token + 1, :].contiguous()
+            with TIMER.phase("comm.logits_gather"):
+                logits = self.collectives.gather_logits(
+                    logits, vocabulary_range=self.weights.sharding.vocabulary_range)
+        TIMER.forward_end()
+        return logits
 
     def _rows(self, token_ids, request_rows):
         rows = token_ids.shape[0]
