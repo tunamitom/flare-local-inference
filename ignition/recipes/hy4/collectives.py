@@ -721,7 +721,7 @@ class PcieDcpTransport:
     @classmethod
     def from_process_group(cls, process_group, device, *, total_heads, query_widths,
                            value_width, max_rows, reduce_width=None, all_reduce_arms=None,
-                           score_offer=None):
+                           score_offer=None, extra_value_widths=(), value_max_rows=None):
         """One channel pool per wire geometry (the query gather's absorbed and
         unabsorbed widths, and the 512-wide latent partials).
 
@@ -745,12 +745,18 @@ class PcieDcpTransport:
                 max_batch_size=max_rows, total_heads=total_heads,
                 head_dim=width, query_head_dim=width, single_channel=True)
             _trace(f"PCIeDCPA2APool gather width={width} done")
-        _trace(f"PCIeDCPA2APool partials width={value_width}")
-        pools[(value_width, "partials")] = PCIeDCPA2APool.from_process_group(
-            process_group=process_group, device=device,
-            max_batch_size=max_rows, total_heads=total_heads,
-            head_dim=value_width, query_head_dim=value_width, single_channel=True)
-        _trace(f"PCIeDCPA2APool partials width={value_width} done")
+        # consult17 (lever 9): `extra_value_widths` adds partial pools at other
+        # widths (the 256-wide expanded prefill partials); `value_max_rows`
+        # caps the rows of the `value_width` pool when only decode still uses
+        # it (pools are sized by their row capacity).
+        for width, capacity in ((value_width, value_max_rows or max_rows),
+                                *((extra, max_rows) for extra in extra_value_widths)):
+            _trace(f"PCIeDCPA2APool partials width={width} rows={capacity}")
+            pools[(width, "partials")] = PCIeDCPA2APool.from_process_group(
+                process_group=process_group, device=device,
+                max_batch_size=capacity, total_heads=total_heads,
+                head_dim=width, query_head_dim=width, single_channel=True)
+            _trace(f"PCIeDCPA2APool partials width={width} done")
         if score_offer is not None:
             # consult17 (lever 2 step 2): one more gather channel for the
             # scores-only offer. The gather moves 16-bit words, so each rank's

@@ -347,13 +347,30 @@ class Hy4LayerAttention:
         # while the CPU reference partials are fp32.
         return torch.einsum("rhd,hvd->rhv", out.float(), wuv.float()).to(out.dtype)
 
+    def expand_partials(self, out):
+        """`W_UV` over EVERY head, before the exchange (consult17, lever 9).
+
+        The merge is a per (row, head) convex combination and the sink fold a
+        per (row, head) scale, so expanding the all-head partial here and
+        merging the expanded values is the same map as merging latents and
+        expanding the shard afterwards — but the wire then carries `v_head_dim`
+        values per head instead of `kv_lora_rank` (256 instead of 512). Needs
+        the whole `kv_b_proj` on every rank (the prefill wiring has it). BF16
+        partials expand in BF16 (FP32 accumulate inside the GEMM, rounded once
+        to the wire dtype); the FP32 twin expands in FP32.
+        """
+        wuv = self.expand_wuv
+        if out.dtype == torch.bfloat16 and wuv.dtype == torch.bfloat16:
+            return torch.einsum("rhd,hvd->rhv", out, wuv)
+        return torch.einsum("rhd,hvd->rhv", out.float(), wuv.float()).to(out.dtype)
+
     # --- prepared plans (no JIT at run time) -------------------------------
     def bind_plan_book(self, book):
         """Attach the rank's `KernelPlanBook` (from `wire_operators`)."""
         self._plan_book = book
 
     def prepare_plans(self, shapes, *, device=None, sink_variants=(True, False),
-                      scratch_pool=None):
+                      scratch_pool=None, expanded_partials=False):
         """Bind one `sparse_mla` plan per call shape, plus the sink fold.
 
         The one-row decode plan is NOT the verification-rows plan (consult7
@@ -416,9 +433,13 @@ class Hy4LayerAttention:
                 # The fold geometry is the call shape's flattened query rows:
                 # [rows*tokens, heads, kv_lora] out + [rows*tokens, heads] LSE
                 # (placeholder operands pin the plan).
+                # With expanded partials (consult17) a prefill graph folds
+                # the merged EXPANDED values: `v_head_dim` wide, not latent.
                 batch = shape.rows * shape.tokens
+                width = (int(self.expand_wuv.shape[1])
+                         if expanded_partials and shape.is_prefill_graph else self.kv_lora)
                 out = self.weights.sink.new_zeros(
-                    (batch, self.heads, self.kv_lora), dtype=self.weights.q_b_proj.dtype)
+                    (batch, self.heads, width), dtype=self.weights.q_b_proj.dtype)
                 lse = self.weights.sink.new_zeros((batch, self.heads))
                 fold = self._make_sink_fold(out, lse)
                 self._sink_folds[(shape.name, shape.rows, shape.tokens)] = fold

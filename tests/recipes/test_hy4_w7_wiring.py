@@ -1267,3 +1267,73 @@ def test_score_wire_audit_compares_both_wires_bit_for_bit():
     assert clean.score_wire_checked == 1
     with pytest.raises(RuntimeError, match="not a pure copy"):
         build(True).exchange_scores(peers[0])
+
+
+# --------------------------------------------------------------------------
+# consult17 (lever 9): expanded partials on the wire
+# --------------------------------------------------------------------------
+def _scenario_partial_wire(mode, widths):
+    def body(decoder):
+        decoder.partial_wire = mode
+        original = decoder.collectives.lse_reduce
+
+        def lse_reduce(values, lse, **kwargs):
+            widths.append(int(values.shape[-1]))
+            return original(values, lse, **kwargs)
+
+        decoder.collectives.lse_reduce = lse_reduce
+        return scenario_prompt_and_step(decoder)
+    return body
+
+
+@pytest.mark.parametrize("world", (2, 8))
+def test_expanded_partials_match_the_latent_wire(worlds, world):
+    """Expanding every head before the exchange is the same map as merging
+    latents and expanding the shard afterwards; prefill graphs then carry
+    `v_head_dim`-wide partials and decode graphs keep the latent width."""
+    from ignition.recipes.hy4.collectives import SimulatedGroup
+
+    attn = worlds[world][0].weights.layers[0].attention
+    latent_width, value_width = int(attn.expand_wuv.shape[2]), int(attn.expand_wuv.shape[1])
+    seen = {}
+    runs = {}
+    for mode in ("latent", "expanded"):
+        seen[mode] = []
+        runs[mode] = run_wired(worlds[world], _scenario_partial_wire(mode, seen[mode]),
+                               group=SimulatedGroup(world))
+    assert set(seen["latent"]) == {latent_width}
+    assert set(seen["expanded"]) == {latent_width, value_width}, "decode keeps the latent wire"
+    # One prefill forward and one decode step: half the calls on each wire.
+    assert seen["expanded"].count(value_width) == seen["expanded"].count(latent_width)
+    for latent_rank, expanded_rank in zip(runs["latent"], runs["expanded"]):
+        for want, got in zip(latent_rank, expanded_rank):
+            assert rel_error(got, want) <= 2e-5, (
+                f"expanded partials drifted (world {world}): {rel_error(got, want)}")
+            assert torch.equal(got.argmax(-1), want.argmax(-1))
+
+
+def test_expanded_partials_pin_the_prefill_fold_at_the_value_width(worlds):
+    attn = worlds[2][0].weights.layers[0].attention
+    saved = (attn._plan_book, dict(attn._mla_plans), dict(attn._sink_folds))
+    try:
+        shapes = (DECODE_ONE_ROW, prefill_shape(1, 4))
+        attn.bind_plan_book(wiring.KernelPlanBook())
+        attn.prepare_plans(shapes, sink_variants=(False,), expanded_partials=True)
+        value_width, latent_width = int(attn.expand_wuv.shape[1]), int(attn.expand_wuv.shape[2])
+        assert int(attn._sink_folds[("prefill", 1, 4)].head_dim) == value_width
+        assert int(attn._sink_folds[("decode", 1, 1)].head_dim) == latent_width
+        attn.prepare_plans(shapes, sink_variants=(False,))
+        assert int(attn._sink_folds[("prefill", 1, 4)].head_dim) == latent_width
+    finally:
+        attn._plan_book, attn._mla_plans, attn._sink_folds = saved
+
+
+def test_unknown_partial_wire_is_refused(worlds):
+    from ignition.recipes.hy4.collectives import SimulatedGroup
+
+    def body(decoder):
+        decoder.partial_wire = "wide"
+        return decoder.forward(torch.tensor([[1, 2, 3, 4]], dtype=torch.long))
+
+    with pytest.raises(Exception, match="partial wire"):
+        run_wired(worlds[2], body, group=SimulatedGroup(2))

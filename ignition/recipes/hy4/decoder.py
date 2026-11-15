@@ -351,6 +351,11 @@ class Hy4Decoder:
         self.device = weights.device
         self.compute_dtype = torch.bfloat16 if compute_dtype is None else compute_dtype
         self.prefill_chunk_size = prefill_chunk_size
+        # consult17 (lever 9): "latent" exchanges the kernel's 512-wide latent
+        # partials and expands this rank's shard after the merge; "expanded"
+        # expands every head first on PREFILL graphs and exchanges 256-wide
+        # values (decode graphs keep the latent wire: one row, owner-side reads).
+        self.partial_wire = "latent"
         if collectives is None:
             if cache.world != 1:
                 raise ValueError(
@@ -395,7 +400,8 @@ class Hy4Decoder:
         for layer in self.weights.layers:
             layer.attention.bind_plan_book(book)
             layer.attention.prepare_plans(shapes, sink_variants=sink_variants,
-                                          scratch_pool=scratch_pool)
+                                          scratch_pool=scratch_pool,
+                                          expanded_partials=self.partial_wire == "expanded")
         return self
 
     # --- entry points ------------------------------------------------------
@@ -815,16 +821,26 @@ class Hy4Decoder:
                                                 torch.zeros((), device=partial.lse.device)))
         # D6: the partials' provenance goes into the merge
         # (`partials_sink_folded=provenance.sink_folded`, `lse_base="base2"`).
+        if self.partial_wire not in ("latent", "expanded"):
+            raise ValueError(f"unknown partial wire {self.partial_wire!r}")
+        expanded = self.partial_wire == "expanded" and call_shape.is_prefill_graph
+        values = partial.output
+        if expanded:
+            # consult17: expand every head before the exchange — the wire
+            # carries v_head_dim values per head instead of the latent width.
+            with TIMER.phase("attn.expand_wire"):
+                values = attn.expand_partials(values)
         with TIMER.phase("comm.lse_reduce"):
             out, lse = self.collectives.lse_reduce(
-                partial.output, partial.lse, partials_sink_folded=partial.provenance.sink_folded)
+                values, partial.lse, partials_sink_folded=partial.provenance.sink_folded)
         WATCH.check("comm.lse_reduce", layer.index, merged=out, merged_lse=lse)
         with TIMER.phase("attn.fold_expand_gate"):
             out, lse = attn.fold_sink(out, lse)   # the ONE sink fold, after the merge
             # `W_UV` expansion over this rank's head shard (a per (row, head) scale
             # commutes with the fold; the latent-space partials cannot expand on a
             # foreign head — `kv_b_proj` is head-sharded for the decode wiring).
-            out = attn.expand_output(out).to(y.dtype)
+            # Already expanded on the wire when `expanded`.
+            out = (out if expanded else attn.expand_output(out)).to(y.dtype)
             return attn.gate_and_project(out, y)
 
     def append(self, rows, count=1):
