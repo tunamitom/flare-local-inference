@@ -1096,12 +1096,15 @@ class PcieDcpTransport:
         self.ce_audit = bool(_os.environ.get("HY4_CE_AUDIT"))
         self.ce_audit_calls = {"lse": 0, "gather": 0}
         self.ce_audit_max = 0.0
-        # consult18 D: HY4_LANE_AUDIT=1 (a gate boot) checks lane 1's own
-        # channels against the host control group, which is program-ordered on
-        # the host and so safe inside the overlapped loop (the kernel pools the
-        # lane-0 audits use are single-channel). Gathers and score offers every
-        # call (byte-equal); merges and ring sums every HY4_LANE_AUDIT_EVERY-th
-        # call (their reference moves every rank's full partials over gloo).
+        # consult18 D: HY4_LANE_AUDIT=1 (a gate boot) checks the overlapped
+        # halves' channels against the host control group. Gathers and score
+        # offers every call (byte-equal); merges and ring sums every
+        # HY4_LANE_AUDIT_EVERY-th call (their reference moves every rank's
+        # full partials over gloo). WARNING: the 626151a9 audit boot deadlocked
+        # across ranks inside this audit (switch-B ranks in the gloo gather,
+        # switch-D ranks unable to drain their lane-0 stream): a host barrier
+        # inside the overlapped loop is NOT safe, so this audit must become
+        # post-hoc (snapshot in the loop, compare after it) before it is used.
         self.lane_audit = bool(_os.environ.get("HY4_LANE_AUDIT"))
         self.lane_audit_every = max(1, int(_os.environ.get("HY4_LANE_AUDIT_EVERY") or "8"))
         self.lane_audit_calls = {"gather": 0, "scores": 0, "lse": 0, "all_reduce": 0}
@@ -1775,8 +1778,11 @@ class PcieDcpTransport:
                 if self.lane_audit:
                     self._lane_audit_scores(offers, got)
                 return got
-            # Any other shape (the full-width re-offer) takes the host wire,
-            # which is program-ordered on the host and so lane-safe.
+            # Any other shape (an offer narrower than score_offer, the
+            # full-width re-offer) takes the host wire. KNOWN HAZARD (consult18
+            # D): a host barrier inside the overlapped loop has deadlocked the
+            # ranks (the audit boot, 2026-11-15); --overlap stays off until the
+            # loop is free of host barriers and device-wide synchronizes.
             return self._gather_all(offers)
         key = ("score_gather", rows, 2 * width, "")
         if (self.score_offer != width or offers.dtype != torch.float32
