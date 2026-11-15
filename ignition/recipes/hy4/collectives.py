@@ -51,6 +51,7 @@ __all__ = [
     "scores_only_offer_saturated",
     "scores_only_merge",
     "parse_all_reduce_arms",
+    "AR_AUDIT_REL_L2",
     "all_reduce_arm_for",
     "audit_scores_only_selection",
     "check_scores_only_exactness",
@@ -619,7 +620,15 @@ ALL_REDUCE_ARMS = {
     "rsag": "remote_push_rsag",
     "pull": "pull",
     "twoshot": None,
+    # consult18 stage A1: b12x's copy-engine ring (`DmaAllReduce`,
+    # comm/pcie/pcie_dma.py) — reduce-scatter + all-gather ring whose data
+    # plane is cudaMemcpyAsync peer copies; SMs only flag and add.
+    "dma": None,
 }
+# Relative L2 error allowed between the ring and the incumbent kernel arm on
+# the same input (HY4_AR_AUDIT=1). The ring rounds to BF16 at each of its 7
+# reduce hops; the kernel arms round once. Expected ~2-5e-3; refuse above.
+AR_AUDIT_REL_L2 = 1.5e-2
 DEFAULT_ALL_REDUCE_ARMS = "1:oneshot,2-:rsag"
 
 
@@ -650,6 +659,8 @@ def parse_all_reduce_arms(spec):
                 raise ValueError(f"all-reduce launch {launch!r}: threads in 32s, blocks >= 1")
         if arm not in ALL_REDUCE_ARMS:
             raise ValueError(f"unknown all-reduce arm {arm!r}; one of {sorted(ALL_REDUCE_ARMS)}")
+        if arm == "dma" and at:
+            raise ValueError("the dma ring has no thread/block launch to pin")
         lo, dash, hi = rows.partition("-")
         if not lo.isdigit() or (dash and hi and not hi.isdigit()):
             raise ValueError(f"all-reduce row range {rows!r} is not N, LO-HI or LO-")
@@ -693,7 +704,8 @@ class PcieDcpTransport:
     """
 
     def __init__(self, *, group, device, pools, rank, world_size, total_heads,
-                 all_reduce=None, reduce_width=None, all_reduce_arms=None, score_offer=None):
+                 all_reduce=None, reduce_width=None, all_reduce_arms=None, score_offer=None,
+                 dma=None, kernel_rows=None):
         self.group = group
         self.device = torch.device(device)
         self.rank = rank
@@ -705,6 +717,18 @@ class PcieDcpTransport:
         self._ar = all_reduce          # consult15 §2 lever 1: b12x PCIe all-reduce
         self.reduce_width = None if reduce_width is None else int(reduce_width)
         self._ar_plans = {}            # rows -> (plan, runtime, arm)
+        # consult18 stage A1: the copy-engine ring (None = not built) and the
+        # largest row count the kernel pool was sized for (None = unbounded).
+        self._dma = dma
+        self.kernel_rows = None if kernel_rows is None else int(kernel_rows)
+        # HY4_AR_AUDIT=1 (a gate boot): every ring call also runs the rsag
+        # kernel arm on the same input and the two must agree within
+        # AR_AUDIT_REL_L2. The kernel pool must then cover the ring's rows.
+        import os
+        self.ar_audit = bool(os.environ.get("HY4_AR_AUDIT"))
+        self._ar_audit_plans = {}      # rows -> (plan, runtime) of the incumbent arm
+        self.ar_audit_calls = 0
+        self.ar_audit_max = 0.0
         # consult17: the scores-only offer width carried on the DCP all-gather
         # (`None` = the offers ride the control group, as before).
         self.score_offer = None if score_offer is None else int(score_offer)
@@ -721,7 +745,8 @@ class PcieDcpTransport:
     @classmethod
     def from_process_group(cls, process_group, device, *, total_heads, query_widths,
                            value_width, max_rows, reduce_width=None, all_reduce_arms=None,
-                           score_offer=None, extra_value_widths=(), value_max_rows=None):
+                           score_offer=None, extra_value_widths=(), value_max_rows=None,
+                           dma=False, kernel_rows=None):
         """One channel pool per wire geometry (the query gather's absorbed and
         unabsorbed widths, and the 512-wide latent partials).
 
@@ -772,18 +797,30 @@ class PcieDcpTransport:
                 head_dim=words, query_head_dim=words, single_channel=True)
             _trace(f"PCIeDCPA2APool scores words={words} done")
         all_reduce = None
+        ring = None
         if reduce_width is not None:
-            from ignition.preparation.collectives import create_all_reduce_runtime
+            from ignition.preparation.collectives import (
+                create_all_reduce_runtime, create_dma_all_reduce_runtime,
+            )
 
-            _trace(f"PCIeAllReduce width={reduce_width} rows={max_rows}")
+            # consult18 A1: with the ring carrying the wide rows, the kernel
+            # pool only needs `kernel_rows` rows (its IPC storage scales with them).
+            kernel_capacity = max_rows if kernel_rows is None else int(kernel_rows)
+            _trace(f"PCIeAllReduce width={reduce_width} rows={kernel_capacity}")
             all_reduce = create_all_reduce_runtime(
-                process_group, device, max_tokens=max_rows, hidden_size=int(reduce_width))
+                process_group, device, max_tokens=kernel_capacity, hidden_size=int(reduce_width))
             all_reduce.prepare_channels(("h4:allreduce",))
-            _trace(f"PCIeAllReduce width={reduce_width} rows={max_rows} done")
+            _trace(f"PCIeAllReduce width={reduce_width} rows={kernel_capacity} done")
+            if dma:
+                _trace(f"DmaAllReduce width={reduce_width} rows={max_rows}")
+                ring = create_dma_all_reduce_runtime(
+                    process_group, device, max_tokens=max_rows, hidden_size=int(reduce_width))
+                _trace(f"DmaAllReduce width={reduce_width} rows={max_rows} done")
         return cls(group=process_group, device=device, pools=pools,
                    rank=rank, world_size=world_size, total_heads=total_heads,
                    all_reduce=all_reduce, reduce_width=reduce_width,
-                   all_reduce_arms=all_reduce_arms, score_offer=score_offer)
+                   all_reduce_arms=all_reduce_arms, score_offer=score_offer,
+                   dma=ring, kernel_rows=kernel_rows)
 
     def bind(self, rank):
         if rank != self.rank:
@@ -922,20 +959,80 @@ class PcieDcpTransport:
         The arm comes from `self.all_reduce_arms` (consult17; the default is
         consult15's lever 1: `oneshot` at 1 row, `rsag` above, 256 x 16).
         `oneshot` / `rsag` / `pull` are transports of the one-shot pool;
-        `twoshot` is the BF16 two-shot runtime the manager builds beside it.
-        Each is prepared exactly as the c1 cells' bench prepares it
-        (`benchmark_pcie_allreduce_transports.prepare`, minus graph replay).
+        `twoshot` is the BF16 two-shot runtime the manager builds beside it;
+        `dma` (consult18 A1) is the copy-engine ring. Each is prepared exactly
+        as the c1 cells' bench or FLARE's `PreparedAllReduce` prepares it.
         """
-        from dataclasses import replace
-
-        from b12x.preparation import CollectiveRequirement, FrozenMapping
-
         if self._ar is None:
             raise RuntimeError("no all-reduce runtime (construct with reduce_width)")
         rows = int(rows)
         if rows in self._ar_plans:
             return self._ar_plans[rows][0]
         arm, threads, blocks = all_reduce_arm_for(rows, self.all_reduce_arms)
+        label = name or f"ar-{arm}-{rows}-{self.reduce_width}"
+        if arm == "dma":
+            plan = self._prepare_ring(session, rows, label)
+            self._ar_plans[rows] = (plan, self._dma, "dma")
+            if self.ar_audit:
+                self._ar_audit_plans[rows] = self._prepare_kernel_arm(
+                    session, rows, "rsag", None, None, label + "-audit")
+        else:
+            plan, target = self._prepare_kernel_arm(session, rows, arm, threads, blocks, label)
+            self._ar_plans[rows] = (plan, target, arm)
+        self._prepared += 1
+        return plan
+
+    def _prepare_ring(self, session, rows, label):
+        """consult18 A1: declare and prime the copy-engine ring for `rows`."""
+        from b12x.comm.pcie import _dma_preparation as dma
+        from b12x.preparation import CollectiveRequirement
+
+        if self._dma is None:
+            raise RuntimeError("the dma all-reduce arm needs the ring (construct with dma=True)")
+        inp = torch.zeros((rows, self.reduce_width), dtype=torch.bfloat16, device=self.device)
+        out = torch.empty_like(inp)
+        if not self._dma.should_allreduce(inp):
+            raise RuntimeError(
+                f"the dma ring refuses rows={rows} at width {self.reduce_width} "
+                "(capacity or 8-element shard alignment)")
+        plan = dma.plan(dma.query_from_metadata(self._dma, shape=tuple(inp.shape), dtype=inp.dtype),
+                        runtime=self._dma)
+        session.prepare(
+            (plan.request(
+                name=label,
+                collective=CollectiveRequirement(key=label, ranks=tuple(range(self.world_size))),
+                prepare_call=lambda state: dma.prepared_call(state, inp=inp, out=out),
+            ),),
+            coordinator=lambda progress: progress.ready_collectives[0].key
+            if progress.ready_collectives else None,
+        )
+        return plan
+
+    def prepare_dma_replay(self):
+        """consult18 A1: capture the ring's eager-replay graphs (call collectively,
+        after every ring plan is prepared). One graph launch per call instead
+        of ~110 host launches; only capacities from the narrowest ring row
+        count up are captured."""
+        if self._dma is None:
+            return 0
+        ring_rows = [rows for rows, entry in self._ar_plans.items() if entry[2] == "dma"]
+        if not ring_rows:
+            return 0
+        self._dma.min_bytes = min(ring_rows) * self.reduce_width * 2
+        self._dma.prepare_eager_replay(torch.bfloat16,
+                                       max_elements=max(ring_rows) * self.reduce_width)
+        return len(self._dma._eager_replays.get(torch.bfloat16, ()))
+
+    def _prepare_kernel_arm(self, session, rows, arm, threads, blocks, label):
+        """One of the one-shot pool's / two-shot runtime's arms; `(plan, runtime)`."""
+        from dataclasses import replace
+
+        from b12x.preparation import CollectiveRequirement, FrozenMapping
+
+        if self.kernel_rows is not None and rows > self.kernel_rows:
+            raise RuntimeError(
+                f"rows={rows} runs the {arm} kernel arm but the kernel pool holds "
+                f"{self.kernel_rows} rows; route these rows to dma or raise the pool")
         inp = torch.zeros((rows, self.reduce_width), dtype=torch.bfloat16, device=self.device)
         out = torch.empty_like(inp)
         if arm == "twoshot":
@@ -979,7 +1076,6 @@ class PcieDcpTransport:
             def prime(state):
                 return oneshot._prepare_plain_call(state, inp=inp, out=out)
 
-        label = name or f"ar-{arm}-{rows}-{self.reduce_width}"
         session.prepare(
             (plan.request(
                 name=label,
@@ -989,9 +1085,20 @@ class PcieDcpTransport:
             coordinator=lambda progress: progress.ready_collectives[0].key
             if progress.ready_collectives else None,
         )
-        self._ar_plans[rows] = (plan, target, arm)
-        self._prepared += 1
-        return plan
+        return plan, target
+
+    def _audit_ring(self, inp, result):
+        """HY4_AR_AUDIT: the ring's sum against the rsag kernel arm's, same input."""
+        plan, target = self._ar_audit_plans[int(inp.shape[0])]
+        reference = target.all_reduce(inp, plan=plan, out=torch.empty_like(inp))
+        want = reference.float()
+        error = float((result.float() - want).norm() / want.norm().clamp_min(1e-30))
+        self.ar_audit_calls += 1
+        self.ar_audit_max = max(self.ar_audit_max, error)
+        if not error <= AR_AUDIT_REL_L2:
+            raise RuntimeError(
+                f"dma ring all-reduce differs from the rsag arm by rel-L2 {error:.3e} "
+                f"(rows={int(inp.shape[0])}; band {AR_AUDIT_REL_L2:.1e})")
 
     def _total_heads_local(self):
         return self.total_heads // self.world_size
@@ -1101,6 +1208,8 @@ class PcieDcpTransport:
                                            block_limit=prepared["block_limit"])
             else:
                 result = target.all_reduce(inp, plan=plan, out=out)
+            if arm == "dma" and self.ar_audit:
+                self._audit_ring(inp, result)
             _trace(f"all_reduce(gpu) rows={int(value.shape[0])} done")
             return result
         import torch.distributed as dist
