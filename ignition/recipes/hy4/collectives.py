@@ -39,6 +39,8 @@ every rank (W6 gate c's wrong-LSE-base mutant).
 
 import threading
 
+from contextlib import contextmanager
+
 import torch
 
 __all__ = [
@@ -1148,6 +1150,9 @@ class PcieDcpTransport:
         # the rare full-width widen in offer-width chunks): no host wire and no
         # kernel-pool (full-residency, peer-waiting) grid between two lanes.
         self.overlap_ce_scores = (_os.environ.get("HY4_OVERLAP_CE_SCORES", "1") or "1") != "0"
+        # consult18 D (fix C): serialize collectives across lanes (see _comm_token).
+        self.overlap_comm_token = (_os.environ.get("HY4_OVERLAP_COMM_TOKEN", "1") or "1") != "0"
+        self._comm_last = None
         self.lane_audit_calls = {"gather": 0, "scores": 0, "lse": 0, "all_reduce": 0}
         self.lane_audit_seen = {"lse": 0, "all_reduce": 0}
         self.lane_audit_max = {"lse": 0.0, "all_reduce": 0.0}
@@ -1624,7 +1629,7 @@ class PcieDcpTransport:
             raise RuntimeError(f"lane {lane()} reached the single-channel {what}: "
                                "an overlapped half must stay on its lane's channels")
 
-    def all_gather_heads(self, local_input, out=None, *, plan=None):
+    def _all_gather_heads_impl(self, local_input, out=None, *, plan=None):
         rows, _, width = (int(v) for v in local_input.shape)
         ce = self._lane_ce()
         if (out is None and ce is not None and self.ce_gather_rows is not None
@@ -1649,8 +1654,8 @@ class PcieDcpTransport:
         _trace(f"all_gather_heads rows={rows} width={width} done")
         return result.to(local_input.dtype) if out is None else out
 
-    def lse_reduce_scatter(self, partial_output, partial_lse, out=None, *, plan=None,
-                           lse_base=LSE_BASE, partials_sink_folded=None, return_lse=False):
+    def _lse_reduce_scatter_impl(self, partial_output, partial_lse, out=None, *, plan=None,
+                                 lse_base=LSE_BASE, partials_sink_folded=None, return_lse=False):
         rows, heads, width = (int(v) for v in partial_output.shape)
         if partials_sink_folded is None:
             raise ValueError(
@@ -1890,7 +1895,7 @@ class PcieDcpTransport:
                 f"CE LSE merge differs from the kernel: rel-L2 {error:.3e}, LSE gap "
                 f"{lse_gap:.3e} (rows={int(partial_output.shape[0])})")
 
-    def exchange_scores(self, offers, *, plan=None):
+    def _exchange_scores_impl(self, offers, *, plan=None):
         """Every rank's `[rows, offer]` FP32 scores, in rank order.
 
         With a prepared score gather for this exact `(rows, offer)` the offer
@@ -1945,6 +1950,50 @@ class PcieDcpTransport:
             self.score_wire_checked += 1
         return result
 
+    # -- consult18 D (fix C): one collective in flight per rank -----------
+    # b12x's PCIe runtimes are single ordered channels ("callers must not
+    # overlap collective streams"). Inside the overlap each collective waits
+    # on a device event the previous collective of EITHER lane recorded when
+    # it finished (after its side streams drained into the lane stream), so
+    # collectives execute one at a time in host program order — identical on
+    # every rank, the single-lane (B2) regime — while the other lane's
+    # COMPUTE, which never waits on a peer, runs beside them.
+    @contextmanager
+    def _comm_token(self):
+        from .lanes import overlapped
+
+        if not (self.overlap_comm_token and overlapped() and self.device.type == "cuda"):
+            yield
+            return
+        stream = torch.cuda.current_stream()
+        if self._comm_last is not None:
+            stream.wait_event(self._comm_last)
+        try:
+            yield
+        finally:
+            done = torch.cuda.Event()
+            done.record(torch.cuda.current_stream())
+            self._comm_last = done
+
+    def all_gather_heads(self, local_input, out=None, *, plan=None):
+        with self._comm_token():
+            return self._all_gather_heads_impl(local_input, out, plan=plan)
+
+    def lse_reduce_scatter(self, partial_output, partial_lse, out=None, *, plan=None,
+                           lse_base=LSE_BASE, partials_sink_folded=None, return_lse=False):
+        with self._comm_token():
+            return self._lse_reduce_scatter_impl(
+                partial_output, partial_lse, out, plan=plan, lse_base=lse_base,
+                partials_sink_folded=partials_sink_folded, return_lse=return_lse)
+
+    def exchange_scores(self, offers, *, plan=None):
+        with self._comm_token():
+            return self._exchange_scores_impl(offers, plan=plan)
+
+    def all_reduce(self, value):
+        with self._comm_token():
+            return self._all_reduce_impl(value)
+
     def _ce_scores(self, ce, offers):
         """consult18 D (F1/F2): every rank's `[rows, width]` FP32 offer over this
         lane's CE exchange, whatever the width: padded with -inf to whole
@@ -1977,7 +2026,7 @@ class PcieDcpTransport:
         indices = self._gather_all(local_indices)
         return tuple(zip(scores, indices))
 
-    def all_reduce(self, value):
+    def _all_reduce_impl(self, value):
         from .profile import TIMER
 
         if self._ar is not None:
