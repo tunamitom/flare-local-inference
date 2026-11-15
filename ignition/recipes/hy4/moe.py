@@ -281,6 +281,17 @@ class FusedRoutedExperts:
             preparation = PreparationSession(device=self.device, autotune=False,
                                              compile_workers=0)
             self._session = preparation
+        # consult18 (determinism): the prefill forward's run-to-run divergence
+        # starts at the routed MoE (decoder.PROBE: identical input, different
+        # output bits, first sparse layer, every rank). HY4_MOE_DETERMINISTIC=1
+        # declares b12x's deterministic route reduction (RoutingSpec
+        # deterministic_output) so the same input gives the same bits.
+        import os as _os
+
+        from b12x.moe import fused_moe as _fused_moe
+
+        routing = ({"routing": _fused_moe.RoutingSpec(deterministic_output=True)}
+                   if (_os.environ.get("HY4_MOE_DETERMINISTIC") or "") not in ("", "0") else {})
         if scratch is not None:
             if ((scratch.max_tokens, scratch.hidden, scratch.top_k)
                     != (self.max_tokens, self.hidden, self.top_k)
@@ -288,7 +299,7 @@ class FusedRoutedExperts:
                 raise ValueError(f"{self.name}: shared wire scratch geometry differs from this op")
             self.op = PreparedRoutedExperts(
                 scratch.source, self.experts, scratch.ids, scratch.weights, scratch.output,
-                session=preparation, name=self.name, workspace=scratch.arena)
+                session=preparation, name=self.name, workspace=scratch.arena, **routing)
             self.op.functional(session=preparation)
             self._workspace, self._storage = scratch.adopt(self.op)
             return self
@@ -300,7 +311,7 @@ class FusedRoutedExperts:
                              dtype=torch.float32, device=self.device)
         output = torch.zeros_like(source)
         self.op = PreparedRoutedExperts(source, self.experts, ids, weights, output,
-                                        session=preparation, name=self.name)
+                                        session=preparation, name=self.name, **routing)
         self.op.functional(session=preparation)
         self._workspace = torch.empty(self.op.workspace_nbytes, dtype=torch.uint8,
                                       device=self.device)
