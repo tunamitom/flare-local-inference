@@ -544,9 +544,25 @@ class Hy4LayerAttention:
         """
         if self.weights.indexer is None:
             raise ValueError("full layer lacks indexer weights")
+        topk = self.config.text["index_topk"]
+        # Bound the [rows, width] logits and the top-k's sort copies (about
+        # 20 B per query row per owned key): above the budget, score the rows
+        # in blocks. Each block is this same method on a row slice.
+        count = int(visible.shape[0])
+        owned = torch.div((visible.long() - rank).clamp_min(0) + world - 1, world,
+                          rounding_mode="floor")
+        widest = max(int(owned.max()) if count else 0, topk)
+        block = max(1, self.INDEX_CANDIDATE_BLOCK_BYTES // (widest * 20))
+        if count > block:
+            parts = [self.local_candidates(
+                x[start:start + block], q_resid[start:start + block],
+                positions[start:start + block], visible[start:start + block], key_table,
+                slot_base[start:start + block], world=world, rank=rank)
+                for start in range(0, count, block)]
+            return (torch.cat([values for values, _ in parts]),
+                    torch.cat([picked for _, picked in parts]))
         scores = self.index_scores(x, q_resid, positions, visible, key_table, slot_base,
                                   world=world, rank=rank)
-        topk = self.config.text["index_topk"]
         rows, width = scores.shape
         if width < topk:
             scores = torch.cat((scores, scores.new_full((rows, topk - width), float("-inf"))), dim=-1)
@@ -557,6 +573,12 @@ class Hy4LayerAttention:
         picked = torch.where(torch.isfinite(values), columns[indices],
                              torch.full_like(indices, -1, dtype=torch.int64))
         return values.to(torch.float32), picked.to(torch.int32)
+
+    # Byte budgets of the torch indexer scoring (consult14): one score block
+    # `[block_rows, heads, live]` FP32, and one candidate block's logits plus
+    # top-k copies. They bound the request-time transient at any context.
+    INDEX_SCORE_BLOCK_BYTES = 256 << 20
+    INDEX_CANDIDATE_BLOCK_BYTES = 256 << 20
 
     def index_scores(self, x, q_resid, positions, visible, key_table, slot_base, *, world=1, rank=0):
         """Dense causal indexer logits [rows, width] over the key cache.
@@ -587,14 +609,25 @@ class Hy4LayerAttention:
                           rounding_mode="floor")
         width = int(owned.max()) if owned.numel() else 0
         rows = int(q.shape[0])
-        keys = key_table.new_zeros((rows, width, key_table.shape[-1]))
-        for row in range(rows):
-            live = int(owned[row])
-            if live:
-                keys[row, :live] = key_table[int(slot_base[row]):int(slot_base[row]) + live]
-        scores = torch.relu(torch.einsum("rhd,rwd->rhw", q.float(), keys.float()))
+        q = q.float()
         weights = (x.float() @ iw.weights_proj.float().T) * (n_heads ** -0.5) * (head_dim ** -0.5)
-        logits = torch.einsum("rh,rhw->rw", weights, scores)
+        # No `[rows, width, key_dim]` key copy: the tokens of one request row
+        # share one `[live, key_dim]` key segment, scored in row blocks of at
+        # most `INDEX_SCORE_BLOCK_BYTES` (the copy was 1 KiB per query row per
+        # owned key — 4.0 GiB at a 32k context, the consult14 request OOM).
+        # Columns past a token's own live keys are masked below, as before.
+        logits = q.new_zeros((rows, width))
+        for base in torch.unique(slot_base).tolist() if width else ():
+            members = (slot_base == base).nonzero(as_tuple=True)[0]
+            live = int(owned[members].max())
+            if not live:
+                continue
+            keys = key_table[base:base + live].float()
+            block = max(1, self.INDEX_SCORE_BLOCK_BYTES // (n_heads * live * 4))
+            for start in range(0, int(members.numel()), block):
+                part = members[start:start + block]
+                scores = torch.relu_(q[part].reshape(-1, head_dim) @ keys.T).view(-1, n_heads, live)
+                logits[part, :live] = torch.einsum("rh,rhw->rw", weights[part], scores)
         # Causal masking over the token's owned live keys (world 1: `owned` is
         # exactly the visible cache length).
         causal = torch.arange(width, device=self.device).reshape(1, width) < owned.reshape(-1, 1)
