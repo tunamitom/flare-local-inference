@@ -168,6 +168,55 @@ class ReferenceRoutedExperts:
         return final.to(x.dtype)
 
 
+class FusedWireScratch:
+    """Wire-time scratch shared by every fused op of one rank.
+
+    The layer loop is serial per rank, so one set of call tensors, one byte
+    workspace and one scale storage serve every sparse layer in turn. The
+    arena is also the priming owner b12x retains per plan
+    (`prime_owners` -> `(arena,)`), so 77 plans retain ONE buffer.
+    """
+
+    def __init__(self, *, device, max_tokens, hidden, top_k):
+        import torch
+        from ignition.preparation.scratch import ScratchArena
+
+        self.device, self.max_tokens = device, max_tokens
+        self.hidden, self.top_k = hidden, top_k
+        self.source = torch.zeros((max_tokens, hidden), dtype=torch.bfloat16, device=device)
+        self.ids = torch.zeros((max_tokens, top_k), dtype=torch.int32, device=device)
+        self.weights = torch.full((max_tokens, top_k), 1.0 / top_k, dtype=torch.float32,
+                                  device=device)
+        self.output = torch.zeros_like(self.source)
+        self.arena = ScratchArena(device, overlap=False)
+        self.nbytes = None
+        self.layouts = None
+        self.storage = None
+        self._pointer = None
+
+    def adopt(self, op):
+        """Return (workspace, storage) for a wired op; the first op sizes them."""
+        import torch
+        nbytes, layouts = op.workspace_nbytes, tuple(op.scale_layouts)
+        if self.nbytes is None:
+            if self.arena.nbytes < nbytes:
+                raise RuntimeError("fused wire arena was not sized by the first plan")
+            self.nbytes, self.layouts = nbytes, layouts
+            self._pointer = self.arena.tensor.data_ptr()
+            self.storage = [torch.empty_strided(shape, stride, dtype=dtype, device=self.device)
+                            for shape, stride, dtype in layouts]
+        elif (nbytes != self.nbytes or layouts != self.layouts
+              or self.arena.tensor.data_ptr() != self._pointer):
+            raise ValueError("shared fused wire scratch was sized for a different plan")
+        return self.arena.tensor.narrow(0, 0, self.nbytes), self.storage
+
+    def seal(self):
+        """Forbid growth once every layer is wired."""
+        if self.nbytes is None:
+            raise RuntimeError("no fused op adopted the shared wire scratch")
+        self.arena.freeze()
+
+
 class FusedRoutedExperts:
     """The fused GPU routed-experts execution (`MoEBlock._prepared` seam).
 
@@ -211,7 +260,7 @@ class FusedRoutedExperts:
     def wired(self):
         return self.op is not None
 
-    def wire(self, *, session, max_tokens):
+    def wire(self, *, session, max_tokens, scratch=None):
         """Build the prepared operator and its persistent scratch (idempotent)."""
         if self.op is not None:
             return self
@@ -230,6 +279,17 @@ class FusedRoutedExperts:
             preparation = PreparationSession(device=self.device, autotune=False,
                                              compile_workers=0)
             self._session = preparation
+        if scratch is not None:
+            if ((scratch.max_tokens, scratch.hidden, scratch.top_k)
+                    != (self.max_tokens, self.hidden, self.top_k)
+                    or torch.device(scratch.device) != torch.device(self.device)):
+                raise ValueError(f"{self.name}: shared wire scratch geometry differs from this op")
+            self.op = PreparedRoutedExperts(
+                scratch.source, self.experts, scratch.ids, scratch.weights, scratch.output,
+                session=preparation, name=self.name, workspace=scratch.arena)
+            self.op.functional(session=preparation)
+            self._workspace, self._storage = scratch.adopt(self.op)
+            return self
         source = torch.zeros((self.max_tokens, self.hidden), dtype=torch.bfloat16,
                              device=self.device)
         ids = torch.zeros((self.max_tokens, self.top_k), dtype=torch.int32,

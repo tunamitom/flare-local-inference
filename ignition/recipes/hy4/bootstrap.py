@@ -161,6 +161,8 @@ class PreparedHy4Rank:
     index_cache: object
     selections: dict
     memory_report: dict
+    fused_session: object = None
+    fused_scratch: object = None
 
     def wire_operators(self, *, session=None):
         """Bind the b12x operator plans this rank's forwards execute.
@@ -233,15 +235,27 @@ class PreparedHy4Rank:
         # are `prefill_chunk_size` wide; decode/verify feed rows x 1 tokens).
         # `warm` runs the extremes so no plan preparation lands inside a step
         # or a graph capture (KernelPlanBook's no-JIT-at-run-time contract).
-        from .moe import FusedRoutedExperts
+        from .moe import FusedRoutedExperts, FusedWireScratch
 
         capacity = max(self.settings.prefill_chunk_size, self.settings.request_capacity)
-        for layer in self.weights.layers:
-            fused = getattr(layer.mlp, "routed", None)
-            if isinstance(fused, FusedRoutedExperts):
-                fused.wire(session=session, max_tokens=capacity)
+        fused_layers = [layer for layer in self.weights.layers
+                        if isinstance(getattr(layer.mlp, "routed", None), FusedRoutedExperts)]
+        if fused_layers:
+            from b12x.preparation import PreparationSession
+
+            # ONE session and ONE scratch per rank: the layer loop is serial.
+            preparation = session if isinstance(session, PreparationSession) else \
+                PreparationSession(device=self.device, autotune=False, compile_workers=0)
+            first = fused_layers[0].mlp.routed
+            scratch = FusedWireScratch(device=self.device, max_tokens=capacity,
+                                       hidden=first.hidden, top_k=first.top_k)
+            for layer in fused_layers:
+                fused = layer.mlp.routed
+                fused.wire(session=preparation, max_tokens=capacity, scratch=scratch)
                 fused.warm()
                 layer.mlp._prepared = fused
+            scratch.seal()
+            self.fused_session, self.fused_scratch = preparation, scratch
         return self
 
 

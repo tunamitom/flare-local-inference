@@ -20,7 +20,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from ignition.recipes.hy4 import contract
-from ignition.recipes.hy4.moe import FusedRoutedExperts, MoEBlock
+from ignition.recipes.hy4.moe import FusedRoutedExperts, FusedWireScratch, MoEBlock
 from ignition.recipes.hy4.weights import Hy4WeightLoader
 
 from tests.recipes.test_hy4_expert_loading import (COUNT, HIDDEN, INTER, PREFIX,
@@ -38,7 +38,8 @@ class FakePreparationSession:
 class FakeOp:
     """Stand-in for `ignition.components.moe.PreparedRoutedExperts`."""
 
-    def __init__(self, source, experts, ids, weights, output, *, session, name):
+    def __init__(self, source, experts, ids, weights, output, *, session, name,
+                 workspace=None):
         self.source, self.experts = source, experts
         self.ids, self.weights, self.output = ids, weights, output
         self.name = name
@@ -47,6 +48,11 @@ class FakeOp:
         self.scale_inputs = ("scale-inputs",)
         self.plan = SimpleNamespace(handle="plan-handle")
         self.precision = {"a4_prefill": False}
+        if workspace is not None:
+            # The real op's eager binding finalizer sizes a `ScratchArena`
+            # through `planned_scratch` -> `views` -> `reserve` before the
+            # wrapper adopts it; mirror that one effect.
+            workspace.reserve(self.workspace_nbytes)
 
     def functional(self, *, session):
         self.functional_session = session
@@ -121,6 +127,44 @@ def test_wire_builds_one_prepared_op_and_warms_the_extremes(fake_boundary):
     before = op.op
     op.wire(session="prepared", max_tokens=64)
     assert op.op is before and op.max_tokens == 16
+
+
+# --- the shared fused wire scratch (consult 13 patch A) ----------------------
+
+def test_shared_wire_scratch_gives_every_op_one_workspace(fake_boundary):
+    scratch = FusedWireScratch(device=torch.device("cpu"), max_tokens=16,
+                               hidden=HIDDEN, top_k=2)
+    first, second = fused(), fused()
+    first.name = "layer1.experts.fused"
+    second.name = "layer2.experts.fused"
+    first.wire(session="prepared", max_tokens=16, scratch=scratch)
+    second.wire(session="prepared", max_tokens=16, scratch=scratch)
+    # both ops ride ONE arena buffer and ONE scale-storage list
+    assert first._workspace.data_ptr() == second._workspace.data_ptr()
+    assert first._workspace.data_ptr() == scratch.arena.tensor.data_ptr()
+    assert first._storage[0] is second._storage[0]
+    assert scratch.nbytes == first.op.workspace_nbytes
+    scratch.seal()                       # every layer wired: growth forbidden
+    assert scratch.arena.frozen
+
+
+def test_shared_wire_scratch_refuses_a_different_plan(fake_boundary, monkeypatch):
+    import ignition.components.moe as components_moe
+
+    scratch = FusedWireScratch(device=torch.device("cpu"), max_tokens=16,
+                               hidden=HIDDEN, top_k=2)
+    first = fused()
+    first.wire(session="prepared", max_tokens=16, scratch=scratch)
+
+    class BiggerOp(FakeOp):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.workspace_nbytes = 8192
+
+    monkeypatch.setattr(components_moe, "PreparedRoutedExperts", BiggerOp)
+    second = fused()
+    with pytest.raises(ValueError, match="sized for a different plan"):
+        second.wire(session="prepared", max_tokens=16, scratch=scratch)
 
 
 def test_forward_shapes_and_route_contract(fake_boundary):
