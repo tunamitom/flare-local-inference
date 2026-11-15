@@ -804,17 +804,23 @@ class Hy4Decoder:
         results = [None, None]
         layers = len(self.weights.layers)
         done = [torch.cuda.Event() for _ in range(layers + 1)] if cuda else None
-        for step in range(layers + 1):
-            for index in (0, 1):
-                with use_lane(index), (torch.cuda.stream(streams[index]) if cuda else nullcontext()):
-                    if cuda and index == 1:
-                        streams[1].wait_event(done[step])
-                    try:
-                        next(steps[index])
-                    except StopIteration as finished:
-                        results[index] = finished.value
-                    if cuda and index == 0:
-                        done[step].record(streams[0])
+        from .hangdump import lazy_preparation_trap
+
+        # No b12x first-use preparation (a device-wide synchronize) between
+        # two lanes' exchanges: the plain forward at this shape prepares first.
+        with lazy_preparation_trap("forward_overlapped") if cuda else nullcontext():
+            for step in range(layers + 1):
+                for index in (0, 1):
+                    with use_lane(index, overlap=True), \
+                            (torch.cuda.stream(streams[index]) if cuda else nullcontext()):
+                        if cuda and index == 1:
+                            streams[1].wait_event(done[step])
+                        try:
+                            next(steps[index])
+                        except StopIteration as finished:
+                            results[index] = finished.value
+                        if cuda and index == 0:
+                            done[step].record(streams[0])
         if cuda:
             for stream in streams:
                 main.wait_stream(stream)

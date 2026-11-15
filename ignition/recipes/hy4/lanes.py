@@ -14,9 +14,10 @@ when the overlap is enabled.
 import contextvars
 from contextlib import contextmanager
 
-__all__ = ["lane", "use_lane"]
+__all__ = ["lane", "overlapped", "use_lane"]
 
 _LANE = contextvars.ContextVar("hy4_lane", default=0)
+_OVERLAPPED = contextvars.ContextVar("hy4_overlapped", default=False)
 
 
 def lane():
@@ -24,10 +25,17 @@ def lane():
     return _LANE.get()
 
 
+def overlapped():
+    """True inside an overlapped prefill's half (either lane)."""
+    return _OVERLAPPED.get()
+
+
 @contextmanager
-def use_lane(index):
+def use_lane(index, *, overlap=False):
     token = _LANE.set(int(index))
+    marker = _OVERLAPPED.set(bool(overlap))
     try:
         yield
     finally:
+        _OVERLAPPED.reset(marker)
         _LANE.reset(token)

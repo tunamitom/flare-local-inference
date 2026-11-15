@@ -1096,6 +1096,17 @@ class PcieDcpTransport:
         self.ce_audit = bool(_os.environ.get("HY4_CE_AUDIT"))
         self.ce_audit_calls = {"lse": 0, "gather": 0}
         self.ce_audit_max = 0.0
+        # consult18 D: HY4_LANE_AUDIT=1 (a gate boot) checks lane 1's own
+        # channels against the host control group, which is program-ordered on
+        # the host and so safe inside the overlapped loop (the kernel pools the
+        # lane-0 audits use are single-channel). Gathers and score offers every
+        # call (byte-equal); merges and ring sums every HY4_LANE_AUDIT_EVERY-th
+        # call (their reference moves every rank's full partials over gloo).
+        self.lane_audit = bool(_os.environ.get("HY4_LANE_AUDIT"))
+        self.lane_audit_every = max(1, int(_os.environ.get("HY4_LANE_AUDIT_EVERY", "8")))
+        self.lane_audit_calls = {"gather": 0, "scores": 0, "lse": 0, "all_reduce": 0}
+        self.lane_audit_seen = {"lse": 0, "all_reduce": 0}
+        self.lane_audit_max = {"lse": 0.0, "all_reduce": 0.0}
         self.kernel_rows = None if kernel_rows is None else int(kernel_rows)
         # HY4_AR_AUDIT=1 (a gate boot): every ring call also runs the rsag
         # kernel arm on the same input and the two must agree within
@@ -1576,8 +1587,10 @@ class PcieDcpTransport:
                 and rows >= self.ce_gather_rows and ce.accepts_gather(local_input)):
             _trace(f"all_gather_heads(ce) rows={rows} width={width}")
             gathered = ce.all_gather_heads(local_input, relay=self.ce_gather_relay)
-            if self.ce_audit:
+            if self.ce_audit and not self._in_lane():
                 self._audit_gather(local_input, gathered)
+            if self.lane_audit and self._in_lane():
+                self._lane_audit_gather(local_input, gathered)
             return gathered
         return self._kernel_gather(local_input, out)
 
@@ -1607,8 +1620,10 @@ class PcieDcpTransport:
             _trace(f"lse_reduce_scatter(ce) rows={rows} width={width}")
             merged = ce.lse_reduce_scatter(partial_output, partial_lse,
                                            relay=self.ce_lse_relay)
-            if self.ce_audit:
+            if self.ce_audit and not self._in_lane():
                 self._audit_lse(partial_output, partial_lse, merged)
+            if self.lane_audit and self._in_lane():
+                self._lane_audit_lse(partial_output, partial_lse, merged)
             return merged
         return self._kernel_lse(partial_output, partial_lse, out, lse_base=lse_base,
                                 partials_sink_folded=partials_sink_folded,
@@ -1632,6 +1647,74 @@ class PcieDcpTransport:
             merged, merged_lse = result
             return merged.to(wire_dtype), merged_lse
         return result.to(wire_dtype)
+
+    @staticmethod
+    def _in_lane():
+        """Inside an overlapped half (either lane): the lane audit's scope."""
+        from .lanes import lane, overlapped
+
+        return overlapped() or lane() != 0
+
+    def _lane_audit_gather(self, local_input, gathered):
+        """HY4_LANE_AUDIT: an overlapped half's CE gather == every rank's block over gloo."""
+        parts = self._gather_all(local_input.contiguous())
+        want = torch.cat(parts, dim=1)
+        self.lane_audit_calls["gather"] += 1
+        if not torch.equal(gathered.contiguous().view(torch.int16), want.view(torch.int16)):
+            raise RuntimeError(
+                f"lane CE head gather differs from the control-group gather "
+                f"(rows={int(local_input.shape[0])})")
+
+    def _lane_audit_lse(self, partial_output, partial_lse, merged):
+        """HY4_LANE_AUDIT: an overlapped half's CE merge vs an FP32 merge of every rank's
+        partials gathered over gloo (sampled: the partials are the big wire)."""
+        self.lane_audit_seen["lse"] += 1
+        if (self.lane_audit_seen["lse"] - 1) % self.lane_audit_every:
+            return
+        outs = self._gather_all(partial_output.contiguous())
+        lses = self._gather_all(partial_lse.float().contiguous())
+        hpr = int(partial_output.shape[1]) // self.world_size
+        mine = slice(self.rank * hpr, (self.rank + 1) * hpr)
+        stacked = torch.stack([o[:, mine].permute(1, 0, 2) for o in outs])      # [src, h, rows, w]
+        stacked_lse = torch.stack([l[:, mine].t() for l in lses])                # [src, h, rows]
+        want, want_lse = merge_lse_partials(stacked, stacked_lse)
+        got, got_lse = merged
+        error = float((got.float() - want.float()).norm() / want.float().norm().clamp_min(1e-30))
+        finite = torch.isfinite(want_lse)
+        lse_gap = (float((got_lse[finite] - want_lse[finite]).abs().max())
+                   if bool(finite.any()) else 0.0)
+        if not torch.equal(torch.isfinite(got_lse), finite):
+            lse_gap = float("inf")
+        self.lane_audit_calls["lse"] += 1
+        self.lane_audit_max["lse"] = max(self.lane_audit_max["lse"], error)
+        if not (error <= CE_AUDIT_REL_L2 and lse_gap <= 1e-2):
+            raise RuntimeError(
+                f"lane CE LSE merge differs from the gloo reference: rel-L2 {error:.3e}, "
+                f"LSE gap {lse_gap:.3e} (rows={int(partial_output.shape[0])})")
+
+    def _lane_audit_scores(self, offers, got):
+        """HY4_LANE_AUDIT: an overlapped half's CE score offers == the gloo offers, bit for bit."""
+        want = self._gather_all(offers.contiguous())
+        self.lane_audit_calls["scores"] += 1
+        for rank, (a, b) in enumerate(zip(got, want)):
+            if not torch.equal(a.contiguous().view(torch.int32), b.contiguous().view(torch.int32)):
+                raise RuntimeError(
+                    f"lane CE score offers differ from the gloo offers for rank {rank} "
+                    f"(rows={int(offers.shape[0])})")
+
+    def _lane_audit_all_reduce(self, inp, result):
+        """HY4_LANE_AUDIT: an overlapped half's ring sum vs an FP32 sum over gloo (sampled)."""
+        self.lane_audit_seen["all_reduce"] += 1
+        if (self.lane_audit_seen["all_reduce"] - 1) % self.lane_audit_every:
+            return
+        want = sum(part.float() for part in self._gather_all(inp.contiguous()))
+        error = float((result.float() - want).norm() / want.norm().clamp_min(1e-30))
+        self.lane_audit_calls["all_reduce"] += 1
+        self.lane_audit_max["all_reduce"] = max(self.lane_audit_max["all_reduce"], error)
+        if not error <= AR_AUDIT_REL_L2:
+            raise RuntimeError(
+                f"lane ring all-reduce differs from the gloo FP32 sum by rel-L2 {error:.3e} "
+                f"(rows={int(inp.shape[0])}; band {AR_AUDIT_REL_L2:.1e})")
 
     def _audit_gather(self, local_input, gathered):
         """HY4_CE_AUDIT: the CE gather must be byte-identical to the kernel's."""
@@ -1688,7 +1771,10 @@ class PcieDcpTransport:
         if lane():
             ce = self._lane_ce()
             if ce.accepts_scores(offers):
-                return ce.exchange_scores(offers)
+                got = ce.exchange_scores(offers)
+                if self.lane_audit:
+                    self._lane_audit_scores(offers, got)
+                return got
             # Any other shape (the full-width re-offer) takes the host wire,
             # which is program-ordered on the host and so lane-safe.
             return self._gather_all(offers)
@@ -1750,8 +1836,10 @@ class PcieDcpTransport:
                                            block_limit=prepared["block_limit"])
             else:
                 result = target.all_reduce(inp, plan=plan, out=out)
-            if arm == "dma" and self.ar_audit:
+            if arm == "dma" and self.ar_audit and not self._in_lane():
                 self._audit_ring(inp, result)
+            if arm == "dma" and self.lane_audit and self._in_lane():
+                self._lane_audit_all_reduce(inp, result)
             _trace(f"all_reduce(gpu) rows={int(value.shape[0])} done")
             return result
         import torch.distributed as dist
