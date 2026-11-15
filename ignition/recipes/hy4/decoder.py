@@ -981,9 +981,10 @@ class Hy4Decoder:
                          f"{first_diff} of {len(same)}; previous: "
                          f"{run_a[first_diff - 1][0] if first_diff else '-'} layer "
                          f"{run_a[first_diff - 1][1] if first_diff else '-'})")
+                firsts = [f"{run_a[i][0]}@{run_a[i][1]}" for i, ok in enumerate(same) if not ok][:6]
                 print(f"[h4 r{getattr(self.collectives, 'rank', 0)}] DETERMINISM first difference "
                       f"between two single-lane runs: {where}; differing records "
-                      f"{same.count(False)} of {len(same)}", flush=True)
+                      f"{same.count(False)} of {len(same)}; first differing {firsts}", flush=True)
                 self._probe_reported = getattr(self, "_probe_reported", 0) + 1
 
             def rel(a, b):

@@ -427,6 +427,8 @@ class MoEBlock:
         when present.
         """
         packed = self.packed_input
+        from .decoder import PROBE
+
         if packed is not None:
             # One packed weight at load; per-projection GEMMs over its rows —
             # bitwise the same as the loose weights (content gates are exact).
@@ -438,7 +440,11 @@ class MoEBlock:
         else:
             shared_gate = shared_up = None
             with TIMER.phase("moe.route_shared"):
-                _, topk_weights, topk_indices = self.route(x)
+                logits, topk_weights, topk_indices = self.route(x)
+        PROBE.add("moe.logits", -2, logits)
+        PROBE.add("moe.topk_ids", -2, topk_indices)
+        PROBE.add("moe.topk_ids_sorted", -2, topk_indices.sort(dim=-1).values)
+        PROBE.add("moe.topk_weights", -2, topk_weights)
         overlap = bool(overlap_shared) and self.device.type == "cuda"
         self.overlap_applied = bool(overlap_shared)
         if overlap:
@@ -471,8 +477,10 @@ class MoEBlock:
                 return routed + shared
         with TIMER.phase("moe.routed"):
             routed = self._routed_forward(x, topk_indices, topk_weights)
+        PROBE.add("moe.routed", -2, routed)
         with TIMER.phase("moe.route_shared"):
             shared = self._shared_forward(x, shared_gate, shared_up)
+        PROBE.add("moe.shared", -2, shared)
         return routed + shared
 
 
