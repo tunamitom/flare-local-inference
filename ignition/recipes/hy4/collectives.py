@@ -428,7 +428,7 @@ def check_scores_only_exactness(thresholds, local_offer, candidate_scores):
 
 
 def select_own_candidates(offers, candidate_scores, candidate_positions, *, topk, world, rank,
-                          local_offer, thresholds=None, aboves=None):
+                          local_offer, thresholds=None, aboves=None, sync_free=False):
     """This rank's own keys in the global top-k, from the k-th score alone.
 
     Keys with score strictly above the threshold are all in; the threshold
@@ -457,7 +457,10 @@ def select_own_candidates(offers, candidate_scores, candidate_positions, *, topk
     finite = torch.isfinite(values)
     selected = finite & (values > limit)
     plateau = finite & (values == limit)
-    if bool(plateau.any()):
+    # `sync_free` (the overlapped loop): run the plateau fill unconditionally
+    # instead of reading the device first — with no plateau the mask is all
+    # False and the OR below adds nothing, so the selection is identical.
+    if sync_free or bool(plateau.any()):
         above = (torch.zeros(rows, dtype=torch.int64, device=device) if aboves is None
                  else torch.as_tensor(aboves, dtype=torch.int64, device=device).reshape(-1))
         # Earlier ranks' plateau keys fill first (a `-inf` threshold has no plateau).
@@ -567,7 +570,7 @@ def scores_only_merge(exchange, candidate_scores, candidate_positions, *, topk, 
             deferred.append(scores_only_flags(offers, thresholds, offer, candidate_scores))
         return select_own_candidates(
             offers, candidate_scores, candidate_positions, topk=topk, world=world, rank=rank,
-            local_offer=local_offer, thresholds=thresholds, aboves=aboves)
+            local_offer=local_offer, thresholds=thresholds, aboves=aboves, sync_free=True)
     if offer < width and scores_only_offer_saturated(offers, thresholds):
         offers = exchange(candidate_scores.contiguous())
         thresholds, aboves = scores_only_threshold(offers, topk)
@@ -843,6 +846,10 @@ class CeExchange:
         self._ready = torch.cuda.Event()
         self._events = {}
         self.calls = {op: 0 for op in self._OPS}
+        # The LSE relay's in-switch source slots (device index, built once and
+        # outside any overlapped loop — see lse_reduce_scatter).
+        self._switch_index = torch.tensor(sorted((self.rank, *self.local)), dtype=torch.long,
+                                          device=self.device)
 
     # -- flags, counters, events ------------------------------------------
     def _flag_ptr(self, rank, op, source):
@@ -980,9 +987,17 @@ class CeExchange:
         theirs_lse[me].copy_(lse_major[partner_heads])
         for source in self.local:
             self._await("lse", source)
-        switch = sorted((me, *self.local))
-        mine4, mine4_lse = _merge_head_major(mine[switch], mine_lse[switch])
-        out4, out4_lse = _merge_head_major(theirs[switch], theirs_lse[switch])
+        # The switch's source slots as a cached DEVICE index: indexing with a
+        # Python list uploads it on every call (a host transfer the overlapped
+        # loop must not make); index_select gathers the same rows.
+        switch = self._switch_index
+        if switch is None:
+            switch = self._switch_index = torch.tensor(sorted((me, *self.local)),
+                                                       dtype=torch.long, device=self.device)
+        mine4, mine4_lse = _merge_head_major(mine.index_select(0, switch),
+                                             mine_lse.index_select(0, switch))
+        out4, out4_lse = _merge_head_major(theirs.index_select(0, switch),
+                                           theirs_lse.index_select(0, switch))
         out4 = out4.to(torch.bfloat16)
         # Phase 2, across the link: one merged block per partner pair.
         main = torch.cuda.current_stream()

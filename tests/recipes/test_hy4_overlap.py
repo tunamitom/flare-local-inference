@@ -261,3 +261,23 @@ def test_scores_only_flags_match_the_host_checks(seed):
             refused = True
         got = bool(C.scores_only_flags(offers, thresholds, offer, scores[rank]))
         assert got == (want or refused)
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_sync_free_selection_is_identical(seed):
+    """consult18 D: the overlapped loop's selection runs the plateau fill
+    without reading the device first; the result is bit-identical."""
+    from ignition.recipes.hy4 import collectives as C
+
+    torch.manual_seed(seed)
+    world, rows, width, topk = 4, 5, 10, 6
+    scores = [torch.randn(rows, width).round(decimals=0).sort(dim=1, descending=True).values
+              for _ in range(world)]          # rounded: plateaus at the cut are common
+    positions = [torch.arange(width).repeat(rows, 1) * world + r for r in range(world)]
+    offers = [s[:, :4].contiguous() for s in scores]
+    for rank in range(world):
+        a = C.select_own_candidates(offers, scores[rank], positions[rank], topk=topk, world=world,
+                                    rank=rank, local_offer=4)
+        b = C.select_own_candidates(offers, scores[rank], positions[rank], topk=topk, world=world,
+                                    rank=rank, local_offer=4, sync_free=True)
+        assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1])
