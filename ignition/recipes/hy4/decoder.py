@@ -874,15 +874,16 @@ class Hy4Decoder:
                 # Lane 1's layer l reads lane 0's layer-l records and index keys,
                 # nothing else of lane 0: it starts layer l only after lane 0's
                 # `kv_ready[l]` exists on the host, and its stream waits on it.
-                # The gate: lane 1 starts layer l once lane 0 has FINISHED layer
-                # l ("layer", default) — the two lanes never run the same layer's
-                # prepared operators at once (per-layer plan state is single-copy;
-                # the d4 gate boot measured rel-L2 0.15 against the single-lane
-                # pair with the "kv" gate, which opens at lane 0's layer-l cache
-                # writes). Collectives still interleave one at a time.
+                # The gate. "layer" (the code default): lane 1 starts layer l once
+                # lane 0 has FINISHED layer l. "kv" (HY4_OVERLAP_GATE=kv, the
+                # production launcher since consult18 S2): at lane 0's layer-l
+                # cache writes, so both lanes can be inside one layer. Every
+                # mutable per-layer state the forward uses is per lane (selection
+                # buffers, sparse-MLA scratch, MoE workspace, comm channels, the
+                # packed-gate stash); exact verify 23 pairs x 8 ranks at 0 and 158
+                # production pairs clean. Its old hang (layer 33) was the
+                # cooperative-admission cycle, not shared plan state.
                 gate_on = "kv" if (_os.environ.get("HY4_OVERLAP_GATE") or "layer") == "kv" else "layer_end"
-                # Cooperative kernels (the W4A16 routed experts) run in the comm
-                # token's section: never beside another lane's peer-waiting comm.
                 # consult18 S1 — the cooperative W4A16 grid and the other lane's
                 # peer waits: either the grid leaves room for every resident
                 # peer wait (the reserve contract, default) or it runs in the
