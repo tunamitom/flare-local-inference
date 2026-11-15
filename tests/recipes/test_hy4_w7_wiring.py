@@ -408,6 +408,130 @@ def test_scores_only_exchange_is_the_2048_selection_equality(worlds):
         check_scores_only_exactness(thresholds, None, per_rank[0][0])
 
 
+def _owned_candidates(scores, world, rank, topk):
+    """One rank's `[rows, topk]` candidates over its owned positions (`p % world`)."""
+    rows, n = scores.shape
+    owned = torch.arange(rank, n, world)
+    values = torch.full((rows, topk), float("-inf"))
+    positions = torch.full((rows, topk), -1, dtype=torch.int64)
+    k = min(topk, int(owned.numel()))
+    if k:
+        best, index = scores[:, owned].topk(k, dim=1)
+        values[:, :k] = best
+        positions[:, :k] = owned[index]
+    return values, positions
+
+
+@pytest.mark.parametrize("world", (2, 8))
+def test_scores_only_merge_narrow_offer_is_exact_and_widens_in_lockstep(world):
+    """consult16 lever 2: a narrow first offer selects the exact global top-k
+    (tie-aware: the selected SCORE multiset is the global top-k's), and when
+    one rank's offer is saturated every rank re-offers its full width on the
+    same call — the decision reads only the shared offers."""
+    from ignition.recipes.hy4.collectives import scores_only_merge
+
+    torch.manual_seed(11)
+    topk, offer = 64, 16
+    rows = 4
+    spread = torch.randn(rows, 1000)                       # no rank near its offer
+    periodic = torch.randn(rows, 1000)
+    periodic[:, 0::world] += 100.0                          # rank 0 owns the whole top-k
+    tied = torch.randint(0, 40, (rows, 1000)).float()       # the cut lands inside a plateau
+    short = torch.randn(rows, 9)                            # fewer keys than topk
+    expected_widen = {"spread": world == 2, "periodic": True, "tied": True, "short": False}
+    for name, scores in (("spread", spread), ("periodic", periodic), ("tied", tied),
+                         ("short", short)):
+        per_rank = [_owned_candidates(scores, world, rank, topk) for rank in range(world)]
+        calls = [[] for _ in range(world)]
+        got_scores = [[] for _ in range(rows)]
+        got_positions = [[] for _ in range(rows)]
+        for rank in range(world):
+            values, positions = per_rank[rank]
+
+            def exchange(mine, rank=rank):
+                calls[rank].append(int(mine.shape[1]))
+                return [other[:, :mine.shape[1]].contiguous() for other, _ in per_rank]
+
+            out_values, out_positions = scores_only_merge(
+                exchange, values, positions, topk=topk, world=world, rank=rank, local_offer=offer)
+            assert tuple(out_values.shape) == tuple(out_positions.shape) == (rows, topk)
+            for row in range(rows):
+                keep = out_positions[row] >= 0
+                got_positions[row] += out_positions[row][keep].tolist()
+                got_scores[row] += out_values[row][keep].tolist()
+                assert torch.equal(scores[row, out_positions[row][keep].long()],
+                                   out_values[row][keep]), "a key must carry its own score"
+        assert all(c == calls[0] for c in calls), f"{name}: ranks widened apart: {calls}"
+        assert (len(calls[0]) == 2) == expected_widen[name], (name, calls[0])
+        if len(calls[0]) == 2:
+            assert calls[0] == [offer, topk]
+        want = scores.topk(min(topk, scores.shape[1]), dim=1).values.sort(dim=1).values
+        for row in range(rows):
+            assert len(got_positions[row]) == len(set(got_positions[row])) == want.shape[1]
+            assert torch.equal(torch.tensor(sorted(got_scores[row])), want[row]), (
+                f"{name}: the selection is not a global top-{topk} (row {row})")
+
+
+def test_scores_only_guard_ignores_padding_past_the_live_keys():
+    """A rank with fewer live keys than its offer has `-inf` padding where the
+    first un-offered candidate would be: nothing was truncated, so the guard
+    must stay quiet (it used to raise on every short context)."""
+    from ignition.recipes.hy4.collectives import (
+        check_scores_only_exactness, scores_only_offer_saturated, scores_only_threshold,
+    )
+
+    inf = float("-inf")
+    candidates = [torch.tensor([[5.0, 4.0, inf, inf]]), torch.tensor([[3.0, inf, inf, inf]])]
+    offers = [values[:, :3] for values in candidates]
+    thresholds, aboves = scores_only_threshold(offers, 8)
+    assert thresholds[0] == inf and int(aboves[0]) == 3
+    assert not scores_only_offer_saturated(offers, thresholds)
+    check_scores_only_exactness(thresholds, 3, candidates[0])
+    # A finite un-offered key under a `-inf` threshold IS a truncation.
+    live = torch.tensor([[5.0, 4.0, 3.5, 3.2]])
+    assert scores_only_offer_saturated([live[:, :3], offers[1]], thresholds)
+    with pytest.raises(ValueError, match="truncated"):
+        check_scores_only_exactness(thresholds, 3, live)
+
+
+def test_selection_audit_passes_ties_at_the_cut_and_refuses_anything_else():
+    """The tie-aware gate: a scores-only result may differ from the exact
+    merge only by keys whose score equals the k-th score."""
+    from ignition.recipes.hy4.collectives import (
+        audit_scores_only_selection, merge_candidate_topk, scores_only_merge,
+    )
+
+    torch.manual_seed(5)
+    world, topk, rows = 8, 64, 6
+    for name, scores in (("smooth", torch.randn(rows, 900)),
+                         ("tied", torch.randint(0, 30, (rows, 900)).float())):
+        per_rank = [_owned_candidates(scores, world, rank, topk) for rank in range(world)]
+        exact_values, exact_positions = merge_candidate_topk(per_rank, topk)
+        swaps = 0
+        for rank in range(world):
+            values, positions = per_rank[rank]
+            own_values, own_positions = scores_only_merge(
+                lambda mine: [other[:, :mine.shape[1]] for other, _ in per_rank],
+                values, positions, topk=topk, world=world, rank=rank, local_offer=16)
+            swaps += audit_scores_only_selection(
+                own_values, own_positions, exact_values, exact_positions, world=world, rank=rank)
+            if rank == 0:
+                # Swap one selected key for an unselected, lower-scored key of this rank.
+                broken = own_positions.clone()
+                row = 0
+                chosen = set(broken[row][broken[row] >= 0].tolist())
+                spare = [p for p in range(rank, scores.shape[1], world) if p not in chosen
+                         and scores[row, p] < exact_values[row].min()]
+                victim = int((own_values[row] > exact_values[row].min()).nonzero()[0])
+                broken[row, victim] = spare[0]
+                broken_values = own_values.clone()
+                broken_values[row, victim] = scores[row, spare[0]]
+                with pytest.raises(ValueError, match="not a tie at the cut"):
+                    audit_scores_only_selection(broken_values, broken, exact_values,
+                                                exact_positions, world=world, rank=rank)
+        assert swaps == 0 or name == "tied", "a smooth score row has no tie to swap"
+
+
 def test_local_512_offer_exactness_guard_raises_on_truncation():
     """The guard: an offer whose cut sits at/above the global k-th score cannot
     be exact — it must raise rather than return a wrong selection."""

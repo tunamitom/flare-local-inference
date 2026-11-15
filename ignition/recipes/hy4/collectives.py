@@ -48,6 +48,9 @@ __all__ = [
     "SimulatedCollectives",
     "merge_candidate_topk",
     "scores_only_threshold",
+    "scores_only_offer_saturated",
+    "scores_only_merge",
+    "audit_scores_only_selection",
     "check_scores_only_exactness",
     "select_own_candidates",
     "SimulatedDcpTransport",
@@ -311,9 +314,9 @@ class SimulatedCollectives:
         each rank selects its own keys above the global k-th score.
         """
         if self.exchange_mode == "scores-only":
-            offers = exchange_scores(self.group, self.rank, candidate_scores, self.local_offer)
-            return scores_only_selection(
-                offers, candidate_scores, candidate_positions,
+            return scores_only_merge(
+                lambda scores: self.group._exchange(self.rank, scores),
+                candidate_scores, candidate_positions,
                 topk=topk, world=self.world_size, rank=self.rank, local_offer=self.local_offer)
         if self.exchange_mode != "candidates":
             raise ValueError(f"unknown selection exchange mode {self.exchange_mode!r}")
@@ -348,22 +351,43 @@ def scores_only_threshold(offers, topk):
     `offers` is the per-rank `[rows, offer]` score offers in rank order. The
     threshold is the topk-th largest offered score; `above` is how many
     offered scores are strictly greater (so `topk - above` slots remain for
-    the threshold plateau). Padding `-inf` never counts.
+    the threshold plateau). Padding `-inf` never counts. Returns two `[rows]`
+    tensors (FP32, int64) — one batched top-k, no per-row host reads.
     """
-    stacked = torch.stack([offer.float() for offer in offers], dim=0)  # [world, rows, offer]
-    thresholds, aboves = [], []
-    for row in range(stacked.shape[1]):
-        values = stacked[:, row].flatten()
-        values = values[torch.isfinite(values)].sort(descending=True).values
-        total = int(values.numel())
-        if total <= topk:
-            thresholds.append(float("-inf"))
-            aboves.append(total)
-            continue
-        thresholds.append(float(values[topk - 1]))
-        above = int((values > values[topk - 1]).sum())
-        aboves.append(above)
+    stacked = torch.cat([offer.float() for offer in offers], dim=1)   # [rows, world * offer]
+    total = torch.isfinite(stacked).sum(dim=1)
+    k = min(int(topk), int(stacked.shape[1]))
+    if k == 0:
+        thresholds = stacked.new_full((stacked.shape[0],), float("-inf"))
+    else:
+        kth = stacked.topk(k, dim=1).values[:, k - 1]
+        # At most `topk` finite offers: every offered key is in (threshold -inf).
+        thresholds = torch.where(total > topk, kth, torch.full_like(kth, float("-inf")))
+    aboves = (stacked > thresholds.unsqueeze(1)).sum(dim=1)
     return thresholds, aboves
+
+
+def _threshold_tensor(thresholds, like):
+    return torch.as_tensor(thresholds, dtype=torch.float32, device=like.device).reshape(-1)
+
+
+def scores_only_offer_saturated(offers, thresholds):
+    """True when some rank's offer may hide keys at or above the cut.
+
+    A rank's offer is sorted descending, so its LAST offered score bounds every
+    score it did not offer. If that last score is finite and reaches the row's
+    threshold, un-offered keys could clear the cut. The test reads the shared
+    offers only, so every rank computes the same answer and widens together
+    (one host read per exchange).
+    """
+    limit = _threshold_tensor(thresholds, offers[0])
+    for offer in offers:
+        if not offer.shape[1]:
+            continue
+        last = offer[:, -1].float()
+        if bool((torch.isfinite(last) & (last >= limit)).any()):
+            return True
+    return False
 
 
 def check_scores_only_exactness(thresholds, local_offer, candidate_scores):
@@ -374,21 +398,24 @@ def check_scores_only_exactness(thresholds, local_offer, candidate_scores):
     k-th score, un-offered keys might clear the threshold and the selection
     would not equal the global top-k (the W6 gate-b 2,048-selection equality).
     Raise instead of returning an inexact selection — the fix is a wider offer
-    (`local_offer` up to the full width).
+    (`local_offer` up to the full width). `-inf` padding past a rank's live
+    keys is not a candidate and never trips the guard.
     """
     if local_offer is None:
         return  # full-width offer: nothing is ever truncated
     rows, width = candidate_scores.shape
     if width <= int(local_offer):
         return  # everything this rank has was offered
-    for row in range(rows):
-        first_unoffered = float(candidate_scores[row, int(local_offer)])
-        if first_unoffered >= thresholds[row]:
-            raise ValueError(
-                f"scores-only offer truncated the selection at row {row}: the first "
-                f"un-offered score {first_unoffered} reaches the global k-th score "
-                f"{thresholds[row]}; widen local_offer (up to the full width) — "
-                "the selection must equal the global top-k exactly (W6 gate b)")
+    first_unoffered = candidate_scores[:, int(local_offer)].float()
+    limit = _threshold_tensor(thresholds, candidate_scores)
+    truncated = torch.isfinite(first_unoffered) & (first_unoffered >= limit)
+    if bool(truncated.any()):
+        row = int(truncated.nonzero()[0])
+        raise ValueError(
+            f"scores-only offer truncated the selection at row {row}: the first "
+            f"un-offered score {float(first_unoffered[row])} reaches the global k-th score "
+            f"{float(limit[row])}; widen local_offer (up to the full width) — "
+            "the selection must equal the global top-k exactly (W6 gate b)")
 
 
 def select_own_candidates(offers, candidate_scores, candidate_positions, *, topk, world, rank,
@@ -407,41 +434,77 @@ def select_own_candidates(offers, candidate_scores, candidate_positions, *, topk
     the W-rank set may therefore differ from the world-1 `torch.topk` pick —
     a tie-order artifact of an exactly tied cut, not a selection error; the
     content gates verify such swaps as exact score ties.
+
+    Batched over the rows (consult16 lever 2): the per-row Python loop cost a
+    dozen host reads per query row per full layer.
     """
     if thresholds is None:
         thresholds, aboves = scores_only_threshold(offers, topk)
     rows, width = candidate_scores.shape
-    out_values = candidate_scores.new_full((rows, topk), float("-inf"), dtype=torch.float32)
-    out_positions = torch.full((rows, topk), -1, dtype=torch.int64, device=candidate_scores.device)
-    for row in range(rows):
-        threshold = thresholds[row]
-        values = candidate_scores[row].float()
-        positions = candidate_positions[row].long()
-        plateau = torch.isfinite(values) & (values == threshold)
-        # Global plateau fill order: (rank, ascending global position). This
-        # rank's plateau keys in ascending position; earlier ranks fill first.
-        plateau_positions = positions[plateau]
-        plateau_values = values[plateau]
-        order = plateau_positions.argsort()
-        plateau_positions, plateau_values = plateau_positions[order], plateau_values[order]
-        earlier = 0
+    device = candidate_scores.device
+    limit = _threshold_tensor(thresholds, candidate_scores).unsqueeze(1)
+    values = candidate_scores.float()
+    positions = candidate_positions.long()
+    finite = torch.isfinite(values)
+    selected = finite & (values > limit)
+    plateau = finite & (values == limit)
+    if bool(plateau.any()):
+        above = (torch.zeros(rows, dtype=torch.int64, device=device) if aboves is None
+                 else torch.as_tensor(aboves, dtype=torch.int64, device=device).reshape(-1))
+        # Earlier ranks' plateau keys fill first (a `-inf` threshold has no plateau).
+        earlier = torch.zeros(rows, dtype=torch.int64, device=device)
+        live = torch.isfinite(limit)
         for other in range(rank):
-            other_plateau = int((offers[other][row] == threshold).sum()) \
-                if float("-inf") != threshold else 0
-            earlier += other_plateau
-        budget = topk - (aboves[row] if aboves is not None else 0)
-        mine = max(0, min(int(plateau_positions.numel()), budget - earlier))
-        keep = torch.isfinite(values) & (values > threshold)
-        kept_values = values[keep]
-        kept_positions = positions[keep]
-        fill_values = torch.cat((kept_values, plateau_values[:mine]))
-        fill_positions = torch.cat((kept_positions, plateau_positions[:mine]))
-        count = min(topk, int(fill_values.numel()))
-        if count:
-            sort = fill_values[:count].sort(descending=True).indices
-            out_values[row, :count] = fill_values[:count][sort].to(out_values.dtype)
-            out_positions[row, :count] = fill_positions[:count][sort]
-    return out_values, out_positions.to(torch.int32)
+            earlier += ((offers[other].float() == limit) & live).sum(dim=1)
+        mine = (topk - above - earlier).clamp_min(0)
+        # This rank's plateau keys in ascending global position: keep the first `mine`.
+        key = torch.where(plateau, positions, torch.full_like(positions, torch.iinfo(torch.int64).max))
+        order = key.argsort(dim=1, stable=True).argsort(dim=1, stable=True)
+        selected = selected | (plateau & (order < mine.unsqueeze(1)))
+    # Selected keys first, by score descending (stable: ties keep candidate order).
+    masked = torch.where(selected, values, torch.full_like(values, float("-inf")))
+    ranked, index = masked.sort(dim=1, descending=True, stable=True)
+    picked = torch.where(torch.isfinite(ranked), positions.gather(1, index),
+                         torch.full_like(positions, -1))
+    if width < topk:
+        ranked = torch.cat((ranked, ranked.new_full((rows, topk - width), float("-inf"))), dim=1)
+        picked = torch.cat((picked, picked.new_full((rows, topk - width), -1)), dim=1)
+    return ranked[:, :topk].to(torch.float32), picked[:, :topk].to(torch.int32)
+
+
+def audit_scores_only_selection(own_values, own_positions, exact_values, exact_positions, *,
+                                world, rank):
+    """The tie-aware exactness gate, in the run's own scores (consult16 lever 2).
+
+    `own_*` is this rank's scores-only result, `exact_*` the full-candidate
+    global merge of the same call. This rank's keys must be exactly the exact
+    merge's keys it owns (`position % world == rank`), except for keys whose
+    score EQUALS the row's k-th score: a tied cut may keep either key. Any
+    other difference raises. Returns the number of rows with such a tie swap.
+    """
+    big = torch.iinfo(torch.int64).max
+    own = own_positions.long()
+    exact = exact_positions.long()
+    exact_mine = torch.where((exact >= 0) & (exact % world == rank), exact, torch.full_like(exact, -1))
+    left = torch.where(own >= 0, own, torch.full_like(own, big)).sort(dim=1).values
+    right = torch.where(exact_mine >= 0, exact_mine, torch.full_like(exact_mine, big)).sort(dim=1).values
+    differing = (left != right).any(dim=1).nonzero(as_tuple=True)[0].tolist()
+    swaps = 0
+    for row in differing:
+        finite = torch.isfinite(exact_values[row])
+        full = int(finite.sum()) == int(exact_values.shape[1])
+        cut = float(exact_values[row][finite].min()) if full else None
+        mine = {int(p): float(v) for p, v in zip(own[row].tolist(), own_values[row].tolist()) if p >= 0}
+        theirs = {int(p): float(v) for p, v in zip(exact[row].tolist(), exact_values[row].tolist())
+                  if p >= 0 and p % world == rank}
+        for position in set(mine) ^ set(theirs):
+            score = mine.get(position, theirs.get(position))
+            if cut is None or score != cut:
+                raise ValueError(
+                    f"scores-only selection differs from the exact merge at row {row}, position "
+                    f"{position} (score {score}, k-th score {cut}): not a tie at the cut")
+        swaps += 1
+    return swaps
 
 
 def scores_only_selection(offers, candidate_scores, candidate_positions, *, topk, world, rank,
@@ -449,6 +512,32 @@ def scores_only_selection(offers, candidate_scores, candidate_positions, *, topk
     """The full scores-only merge for one rank: threshold, guard, own keys."""
     thresholds, aboves = scores_only_threshold(offers, topk)
     check_scores_only_exactness(thresholds, local_offer, candidate_scores)
+    return select_own_candidates(
+        offers, candidate_scores, candidate_positions, topk=topk, world=world, rank=rank,
+        local_offer=local_offer, thresholds=thresholds, aboves=aboves)
+
+
+def scores_only_merge(exchange, candidate_scores, candidate_positions, *, topk, world, rank,
+                      local_offer):
+    """The scores-only exchange with a narrow first offer and an exact fallback.
+
+    `exchange(scores)` gathers every rank's `[rows, offer]` slice in rank
+    order. Each rank first offers its top `local_offer` scores; when any
+    rank's offer is saturated at the cut (`scores_only_offer_saturated`) every
+    rank re-offers its FULL candidate width — the decision reads only the
+    shared offers, so the ranks stay in lockstep — and the selection is the
+    exact global top-k either way. `local_offer=None` offers the full width
+    at once (the W6 gate-b form).
+    """
+    width = int(candidate_scores.shape[1])
+    offer = width if local_offer is None else min(int(local_offer), width)
+    offers = exchange(candidate_scores[:, :offer].contiguous())
+    thresholds, aboves = scores_only_threshold(offers, topk)
+    if offer < width and scores_only_offer_saturated(offers, thresholds):
+        offers = exchange(candidate_scores.contiguous())
+        thresholds, aboves = scores_only_threshold(offers, topk)
+        offer = width
+    check_scores_only_exactness(thresholds, None if offer == width else offer, candidate_scores)
     return select_own_candidates(
         offers, candidate_scores, candidate_positions, topk=topk, world=world, rank=rank,
         local_offer=local_offer, thresholds=thresholds, aboves=aboves)
@@ -919,6 +1008,12 @@ class PcieDcpCollectives:
         self.exchange_mode = exchange_mode
         self.local_offer = local_offer
         self.lse_base = LSE_BASE
+        # HY4_SELECTION_AUDIT=1: also run the exact full-candidate merge and
+        # check the scores-only result against it, tie-aware (a gate boot only:
+        # it doubles the selection wire). Counters are read by the serve.
+        import os
+        self.audit = bool(os.environ.get("HY4_SELECTION_AUDIT"))
+        self.audit_rows = self.audit_swaps = 0
 
     def _plan(self, kernel, shape, *tensors):
         """The prepared plan for (kernel, call shape); `shape=None` shares one plan."""
@@ -964,13 +1059,22 @@ class PcieDcpCollectives:
 
     def merge_topk(self, candidate_scores, candidate_positions, *, topk):
         if self.exchange_mode == "scores-only":
-            offers = self.transport.exchange_scores(
-                candidate_scores[:, :self.local_offer].contiguous() if self.local_offer
-                else candidate_scores.contiguous(),
-                plan=self._plan("selection_exchange", None))
-            return scores_only_selection(
-                offers, candidate_scores, candidate_positions,
-                topk=topk, world=self.world_size, rank=self.rank, local_offer=self.local_offer)
+            plan = self._plan("selection_exchange", None)
+            values, positions = scores_only_merge(
+                lambda scores: self.transport.exchange_scores(scores, plan=plan),
+                candidate_scores, candidate_positions,
+                topk=topk, world=self.world_size, rank=self.rank,
+                local_offer=self.local_offer or None)
+            if self.audit:
+                exact_values, exact_positions = merge_candidate_topk(
+                    self.transport.stage_candidates(
+                        candidate_positions.contiguous(), candidate_scores.contiguous(), None,
+                        plan=plan), topk)
+                self.audit_swaps += audit_scores_only_selection(
+                    values, positions, exact_values, exact_positions,
+                    world=self.world_size, rank=self.rank)
+                self.audit_rows += int(values.shape[0])
+            return values, positions
         if self.exchange_mode != "candidates":
             raise ValueError(f"unknown selection exchange mode {self.exchange_mode!r}")
         candidates = self.transport.stage_candidates(
