@@ -924,10 +924,11 @@ class Hy4Decoder:
         flags = list(deferred) if deferred else []
         if deferred is not None:
             deferred.clear()
-        if flags and bool(torch.stack(flags).any()):
-            self.overlap_reruns = getattr(self, "overlap_reruns", 0) + 1
+
+        def single_lane():
+            """The pair on the single-lane path (same positions, same slots)."""
             self.cache.end_forward()
-            results = []
+            out = []
             for index in (0, 1):
                 self.cache.begin_forward(halves[index][2], halves[index][1])
                 single = self._half_steps(*halves[index], half_shape, prevalidated=True)
@@ -935,7 +936,27 @@ class Hy4Decoder:
                     while True:
                         next(single)
                 except StopIteration as finished:
-                    results.append(finished.value)
+                    out.append(finished.value)
+            return out
+
+        if flags and bool(torch.stack(flags).any()):
+            self.overlap_reruns = getattr(self, "overlap_reruns", 0) + 1
+            results = single_lane()
+        elif (_os.environ.get("HY4_OVERLAP_VERIFY") or "") not in ("", "0"):
+            # A gate boot: recompute the pair on the single-lane path and compare
+            # the post-norm hidden — a cross-lane ordering error (lane 1 reading
+            # lane 0's records early) shows as a large difference. Serves the
+            # single-lane result.
+            overlapped_hidden = torch.cat(results, dim=0).float()
+            results = single_lane()
+            sequential = torch.cat(results, dim=0).float()
+            error = float((overlapped_hidden - sequential).norm()
+                          / sequential.norm().clamp_min(1e-30))
+            self.overlap_verified = getattr(self, "overlap_verified", 0) + 1
+            self.overlap_verify_max = max(getattr(self, "overlap_verify_max", 0.0), error)
+            if not error <= 1.5e-2:
+                raise RuntimeError(f"overlapped pair differs from the single-lane pair by "
+                                   f"rel-L2 {error:.3e}")
         self.overlap_pairs = getattr(self, "overlap_pairs", 0) + 1
         normed = torch.cat(results, dim=0)
         self.cache.end_forward()
