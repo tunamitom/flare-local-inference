@@ -1038,3 +1038,51 @@ def test_forward_past_the_row_capacity_still_raises(worlds):
     batch = torch.zeros((1, CAPACITY + 1), dtype=torch.long)
     with pytest.raises(IndexError, match="out of range"):
         decoder.forward(batch)
+
+
+# --------------------------------------------------------------------------
+# consult16 lever 6: a padded last forward
+# --------------------------------------------------------------------------
+def _scenario_remainder(padded):
+    """13 prompt tokens then two decode steps; `padded` runs them as one
+    16-wide forward whose last three rows are throw-away copies."""
+    def body(decoder):
+        _, tokens = golden_tokens()
+        real = tokens[:13]
+        if padded:
+            batch = torch.tensor([real + [real[-1]] * 3], dtype=torch.long)
+            last = decoder.forward(batch, logits_rows=len(real) - 1)
+            decoder.append([0], len(real))          # commit the real tokens only
+        else:
+            batch = torch.tensor([real], dtype=torch.long)
+            last = decoder.forward(batch, logits_rows="last")
+            decoder.complete([0], batch)
+        steps = []
+        for token in (7, 9):
+            t = torch.tensor([[token]], dtype=torch.long)
+            steps.append(decoder.decode_step(t, request_rows=[0]))
+            decoder.complete([0], t)
+        return [last] + steps
+    return body
+
+
+@pytest.mark.parametrize("world", (1, 2, 8))
+def test_padded_last_forward_matches_the_exact_forward(worlds, world):
+    """The serve's remainder plan pads a prompt's last forward to a prepared
+    width. The padded rows sit past the prompt, are never committed and are
+    overwritten before anything can read them: the last real token's logits
+    and the following decode steps match the exact-width run."""
+    from ignition.recipes.hy4.collectives import SimulatedGroup
+
+    def run(padded):
+        if world == 1:
+            return [_scenario_remainder(padded)(d) for d in fresh_decoders(worlds[1])]
+        return run_wired(worlds[world], _scenario_remainder(padded), group=SimulatedGroup(world))
+
+    for exact, padded in zip(run(False), run(True)):
+        for index, (want, got) in enumerate(zip(exact, padded)):
+            assert tuple(got.shape) == tuple(want.shape)
+            # Not bit-identical: a 16-row and a 13-row batch round differently in BLAS.
+            assert rel_error(got, want) <= 2e-5, (
+                f"padded run drifted at output {index} (world {world}): {rel_error(got, want)}")
+            assert torch.equal(got.argmax(-1), want.argmax(-1))
