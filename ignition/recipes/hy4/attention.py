@@ -220,7 +220,7 @@ class Hy4LayerAttention:
     def __post_init__(self):
         c = self.config.text
         self._active_call_shape = None
-        self._packed_gate = None
+        self._packed_gates = {}
         self.hidden = self.config.hidden
         self.heads = self.weights.heads
         self.qk_nope = c["qk_nope_head_dim"]
@@ -293,7 +293,7 @@ class Hy4LayerAttention:
             q_resid, q, latent = self.project(x, positions, absorb=absorb)
             index_keys = self.prepare_index_keys(x, positions) if with_index_keys else None
             gate_raw = x @ w.gate_proj.T.to(x.dtype)
-            self._packed_gate = (x.data_ptr(), gate_raw)
+            self._stash_gate(x, gate_raw)
             return LayerProjections(q_resid, q, latent, index_keys, gate_raw)
         q_a_raw = x @ packed.rows("q_a_proj").T
         kv_raw = x @ packed.rows("kv_a_proj").T
@@ -311,7 +311,7 @@ class Hy4LayerAttention:
             # Through `prepare_index_keys` — the single key-prep entry point
             # (a wrong-rotation mutant wraps this method and must stay live).
             index_keys = self.prepare_index_keys(x, positions)
-        self._packed_gate = (x.data_ptr(), gate_raw)
+        self._stash_gate(x, gate_raw)
         return LayerProjections(q_resid, q_out, latent, index_keys, gate_raw)
 
     def absorb_queries(self, q_unabsorbed):
@@ -874,6 +874,15 @@ class Hy4LayerAttention:
         spec = specs[0]
         return torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
 
+    def _stash_gate(self, x, gate_raw):
+        """The packed gate for this lane's `gate_and_project` (consult18 S2: one
+        stash PER LANE — under the kv gate both lanes are inside one layer)."""
+        from .lanes import lane
+
+        if getattr(self, "_packed_gates", None) is None:
+            self._packed_gates = {}
+        self._packed_gates[lane()] = (x.data_ptr(), gate_raw)
+
     def gate_and_project(self, attn_output, x):
         """Elementwise per-head gate (`gated_mla`, `gating_type=elementwise`) then `o_proj`.
 
@@ -883,11 +892,14 @@ class Hy4LayerAttention:
         gate-after-o_proj mutant replaces this method), so the packed result
         travels out of band.
         """
+        from .lanes import lane
+
         gate_raw = None
-        stashed = getattr(self, "_packed_gate", None)
+        stashes = getattr(self, "_packed_gates", None) or {}
+        stashed = stashes.get(lane())
         if stashed is not None and stashed[0] == x.data_ptr():
             gate_raw = stashed[1]
-            self._packed_gate = None
+            stashes[lane()] = None
         if gate_raw is None:
             gate_raw = x @ self.weights.gate_proj.T.to(x.dtype)
         gate = torch.sigmoid(gate_raw)
