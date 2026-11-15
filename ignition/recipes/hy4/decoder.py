@@ -745,10 +745,11 @@ class Hy4Decoder:
                     streams.streams, post, y = previous_ffn.post_pre(
                         mlp_out, streams.streams, post, layer.attn_ihc,
                         norm_weight=layer.input_norm)
-            attn_out = self._attention(layer, y, positions, token_rows, visible,
-                                       call_shape=call_shape, visible_max=None)
+            attn_out = yield from self._attention_gen(layer, y, positions, token_rows, visible,
+                                                      call_shape=call_shape, visible_max=None)
             with TIMER.phase("comm.all_reduce.attn"):
                 attn_out = self.collectives.all_reduce(attn_out)
+            yield ("comm", "ar_attn")
             with TIMER.phase("ihc"):
                 streams.streams, post, y = layer.attn_ihc.post_pre(
                     attn_out, streams.streams, post, layer.ffn_ihc,
@@ -757,7 +758,7 @@ class Hy4Decoder:
             with TIMER.phase("comm.all_reduce.mlp"):
                 mlp_out = self.collectives.all_reduce(mlp_out)
             previous_ffn = layer.ffn_ihc
-            yield index
+            yield ("layer_end", index)
         with TIMER.phase("ihc"):
             streams.streams = previous_ffn.post(mlp_out, streams.streams, post)
             hidden = self.weights.hc_head.merge(streams.streams)
@@ -838,7 +839,6 @@ class Hy4Decoder:
                  for index in (0, 1)]
         results = [None, None]
         layers = len(self.weights.layers)
-        done = [torch.cuda.Event() for _ in range(layers + 1)] if cuda else None
         from .hangdump import lazy_preparation_trap
 
         import os as _os
@@ -859,18 +859,51 @@ class Hy4Decoder:
                     _sync_site_reporter.install(getattr(self.collectives, "rank", 0))
                 torch.cuda.set_sync_debug_mode(guard_mode)
             try:
-                for step in range(layers + 1):
-                    for index in (0, 1):
-                        with use_lane(index, overlap=True, geometry=geometries[index]), \
-                                (torch.cuda.stream(streams[index]) if cuda else nullcontext()):
-                            if cuda and index == 1:
-                                streams[1].wait_event(done[step])
+                # Fine-grained two-lane schedule: the lanes advance one step at a
+                # time, alternately (a step ends at this layer's cache writes or
+                # after one collective), so their collectives interleave one at a
+                # time in host order (the comm token keeps that order on the
+                # device) and each lane's compute runs beside the other's comm.
+                # Lane 1's layer l reads lane 0's layer-l records and index keys,
+                # nothing else of lane 0: it starts layer l only after lane 0's
+                # `kv_ready[l]` exists on the host, and its stream waits on it.
+                kv_ready = {}
+                finished = [False, False]
+                lane1_layer, lane1_at_start = 0, True
+                while not (finished[0] and finished[1]):
+                    if not finished[0]:
+                        with use_lane(0, overlap=True, geometry=geometries[0]), \
+                                (torch.cuda.stream(streams[0]) if cuda else nullcontext()):
                             try:
-                                next(steps[index])
-                            except StopIteration as finished:
-                                results[index] = finished.value
-                            if cuda and index == 0:
-                                done[step].record(streams[0])
+                                label = next(steps[0])
+                            except StopIteration as done:
+                                results[0], finished[0], label = done.value, True, None
+                            if label is not None and label[0] == "kv":
+                                if cuda:
+                                    event = torch.cuda.Event()
+                                    event.record(streams[0])
+                                    kv_ready[label[1]] = event
+                                else:
+                                    kv_ready[label[1]] = True
+                    if finished[1]:
+                        continue
+                    gated = lane1_at_start and lane1_layer < layers
+                    if gated and lane1_layer not in kv_ready:
+                        if finished[0]:
+                            raise RuntimeError(f"lane 0 finished without layer {lane1_layer}'s records")
+                        continue
+                    with use_lane(1, overlap=True, geometry=geometries[1]), \
+                            (torch.cuda.stream(streams[1]) if cuda else nullcontext()):
+                        if cuda and gated:
+                            streams[1].wait_event(kv_ready[lane1_layer])
+                        try:
+                            label = next(steps[1])
+                        except StopIteration as done:
+                            results[1], finished[1], label = done.value, True, None
+                    if label is not None and label[0] == "layer_end":
+                        lane1_layer, lane1_at_start = label[1] + 1, True
+                    elif label is not None:
+                        lane1_at_start = False
             finally:
                 if guard:
                     torch.cuda.set_sync_debug_mode(previous_mode)
@@ -944,7 +977,24 @@ class Hy4Decoder:
 
     def _attention(self, layer, y, positions, token_rows, visible, *, call_shape,
                    visible_max=None):
+        """One layer's attention (`_attention_gen` run to completion)."""
+        steps = self._attention_gen(layer, y, positions, token_rows, visible,
+                                    call_shape=call_shape, visible_max=visible_max)
+        try:
+            while True:
+                next(steps)
+        except StopIteration as finished:
+            return finished.value
+
+    def _attention_gen(self, layer, y, positions, token_rows, visible, *, call_shape,
+                       visible_max=None):
         """One layer's attention: world 1 today's path, world > 1 the CP shape (D2/D3).
+
+        A generator (consult18 D, fine-grained overlap): it yields ("kv", layer)
+        right after this forward's cache writes and ("comm", name) after each
+        collective, and returns the attention output. The plain path runs it
+        to completion (`_attention`); an overlapped half yields between steps so
+        the two lanes' collectives interleave one at a time.
 
         CP (amendment 1): full layers offer local top-k candidates over their
         OWN key table, the selection exchange merges the W ranks' candidates
@@ -983,6 +1033,7 @@ class Hy4Decoder:
             self.cache.write_latent(layer.index, token_rows, positions, latent)
             if attn.weights.indexer is not None:
                 self.cache.write_index_keys(layer.index, token_rows, positions, bundle.index_keys)
+        yield ("kv", layer.index)       # this layer's records + index keys are written
         owner = attn.selection.owner_id
         slot_base = self.cache.slots_for(token_rows)
         if world == 1:
@@ -1016,6 +1067,7 @@ class Hy4Decoder:
                 with TIMER.phase("comm.selection"):
                     _, merged = self.collectives.merge_topk(
                         scores, candidates, topk=self.config.text["index_topk"])
+                yield ("comm", "scores")
                 with TIMER.phase("attn.handback"):
                     # `local_slot_map`'s `[rows, local_capacity]` table is pure
                     # arithmetic (slot = row_base + p // world) and the hand-back
@@ -1042,6 +1094,7 @@ class Hy4Decoder:
                            call_shape.query_wiring, int(q_local.shape[-1])))
         with TIMER.phase("comm.head_gather"):
             q_all = self.collectives.all_gather_heads(q_local)   # all heads per call (D2)
+        yield ("comm", "gather")
         if local_absorb_after_gather:
             # Prefill wiring: the gathered queries are UNABSORBED; W_UK applies
             # locally over ALL gathered heads (replicated `kv_b_proj`).
@@ -1076,6 +1129,7 @@ class Hy4Decoder:
         with TIMER.phase("comm.lse_reduce"):
             out, lse = self.collectives.lse_reduce(
                 values, partial.lse, partials_sink_folded=partial.provenance.sink_folded)
+        yield ("comm", "lse")
         WATCH.check("comm.lse_reduce", layer.index, merged=out, merged_lse=lse)
         with TIMER.phase("attn.fold_expand_gate"):
             out, lse = attn.fold_sink(out, lse)   # the ONE sink fold, after the merge
