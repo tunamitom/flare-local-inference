@@ -433,13 +433,24 @@ class MoEBlock:
                 side = torch.cuda.Stream()
                 self._shared_stream = side
             joined = torch.cuda.Event()
+            main = torch.cuda.current_stream()
             with TIMER.phase("moe.route_shared"):
+                # consult18 stage 0: the side stream must not start before the
+                # main stream has produced `x` and the packed shared gate/up
+                # (and finished the previous layer's `routed + shared` add,
+                # whose side-allocated operand the allocator may hand back to
+                # this stream). Without this wait the side stream reads
+                # half-written inputs — the decode-only token-0 collapse,
+                # which every synchronising instrument (finite watch, W29
+                # timer) hid. The bracketing (wait here, join below) also
+                # orders every cross-stream reuse, so no record_stream is needed.
+                side.wait_stream(main)
                 with torch.cuda.stream(side):
                     shared = self._shared_forward(x, shared_gate, shared_up)
                 joined.record(side)
             with TIMER.phase("moe.routed"):
                 routed = self._routed_forward(x, topk_indices, topk_weights)
-                torch.cuda.current_stream().wait_event(joined)
+                main.wait_event(joined)
                 return routed + shared
         with TIMER.phase("moe.routed"):
             routed = self._routed_forward(x, topk_indices, topk_weights)
