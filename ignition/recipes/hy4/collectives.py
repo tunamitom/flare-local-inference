@@ -1103,7 +1103,7 @@ class PcieDcpTransport:
         # call (byte-equal); merges and ring sums every HY4_LANE_AUDIT_EVERY-th
         # call (their reference moves every rank's full partials over gloo).
         self.lane_audit = bool(_os.environ.get("HY4_LANE_AUDIT"))
-        self.lane_audit_every = max(1, int(_os.environ.get("HY4_LANE_AUDIT_EVERY", "8")))
+        self.lane_audit_every = max(1, int(_os.environ.get("HY4_LANE_AUDIT_EVERY") or "8"))
         self.lane_audit_calls = {"gather": 0, "scores": 0, "lse": 0, "all_reduce": 0}
         self.lane_audit_seen = {"lse": 0, "all_reduce": 0}
         self.lane_audit_max = {"lse": 0.0, "all_reduce": 0.0}
