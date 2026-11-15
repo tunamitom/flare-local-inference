@@ -73,15 +73,20 @@ def test_kernel_pool_size_guard_and_ring_replay_capacities():
         min_bytes = 0
         _eager_replays = {}
 
-        def prepare_eager_replay(self, dtype, *, max_elements):
-            self.seen = (dtype, max_elements, self.min_bytes)
+        def prepare_eager_replay(self, dtype, *, max_elements, state):
+            self.seen = (dtype, max_elements, self.min_bytes, state)
             self._eager_replays = {dtype: ("g1", "g2")}
 
     ring = FakeRing()
     transport = _ring_transport(dma=ring)
     assert transport.prepare_dma_replay() == 0                     # no ring plans yet
     transport._ar_plans[1] = ("p", None, "oneshot")
-    transport._ar_plans[512] = ("p", ring, "dma")
-    transport._ar_plans[1024] = ("p", ring, "dma")
+    import types
+
+    def plan(name):
+        return types.SimpleNamespace(prepared=types.SimpleNamespace(state=name))
+
+    transport._ar_plans[512] = (plan("s512"), ring, "dma")
+    transport._ar_plans[1024] = (plan("s1024"), ring, "dma")
     assert transport.prepare_dma_replay() == 2
-    assert ring.seen == (torch.bfloat16, 1024 * 8, 512 * 8 * 2)
+    assert ring.seen == (torch.bfloat16, 1024 * 8, 512 * 8 * 2, "s1024")

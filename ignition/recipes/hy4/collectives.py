@@ -1019,8 +1019,10 @@ class PcieDcpTransport:
         if not ring_rows:
             return 0
         self._dma.min_bytes = min(ring_rows) * self.reduce_width * 2
+        state = self._ar_plans[max(ring_rows)][0].prepared.state
         self._dma.prepare_eager_replay(torch.bfloat16,
-                                       max_elements=max(ring_rows) * self.reduce_width)
+                                       max_elements=max(ring_rows) * self.reduce_width,
+                                       state=state)
         return len(self._dma._eager_replays.get(torch.bfloat16, ()))
 
     def _prepare_kernel_arm(self, session, rows, arm, threads, blocks, label):
