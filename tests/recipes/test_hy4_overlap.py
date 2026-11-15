@@ -236,3 +236,28 @@ def test_ce_scores_pads_and_trims_bit_exact(width):
     for mine, want in zip(got, offers):
         assert mine.shape == want.shape
         assert torch.equal(mine.contiguous().view(torch.int32), want.view(torch.int32))
+
+
+@pytest.mark.parametrize("seed", range(6))
+def test_scores_only_flags_match_the_host_checks(seed):
+    """consult18 D: the overlapped loop's device flag is set exactly when the
+    single-lane path would widen (some offer saturated at the cut) or its
+    exactness guard would refuse the narrow offer."""
+    from ignition.recipes.hy4 import collectives as C
+
+    torch.manual_seed(seed)
+    world, rows, width, offer, topk = 4, 6, 12, 3, 5
+    scores = [torch.randn(rows, width).sort(dim=1, descending=True).values for _ in range(world)]
+    if seed % 2:   # make one rank dominate the top so its narrow offer saturates
+        scores[1] = scores[1] + 4.0
+    offers = [s[:, :offer].contiguous() for s in scores]
+    thresholds, _ = C.scores_only_threshold(offers, topk)
+    want = C.scores_only_offer_saturated(offers, thresholds)
+    for rank in range(world):
+        try:
+            C.check_scores_only_exactness(thresholds, offer, scores[rank])
+            refused = False
+        except ValueError:
+            refused = True
+        got = bool(C.scores_only_flags(offers, thresholds, offer, scores[rank]))
+        assert got == (want or refused)

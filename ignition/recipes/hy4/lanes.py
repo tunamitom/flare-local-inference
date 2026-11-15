@@ -14,10 +14,13 @@ when the overlap is enabled.
 import contextvars
 from contextlib import contextmanager
 
-__all__ = ["lane", "overlapped", "use_lane"]
+__all__ = ["geometry", "lane", "overlapped", "use_lane"]
 
 _LANE = contextvars.ContextVar("hy4_lane", default=0)
 _OVERLAPPED = contextvars.ContextVar("hy4_overlapped", default=False)
+# Host-known geometry of the running half (one request row, a contiguous
+# position range): lets the indexer size its work without reading the device.
+_GEOMETRY = contextvars.ContextVar("hy4_geometry", default=None)
 
 
 def lane():
@@ -30,12 +33,19 @@ def overlapped():
     return _OVERLAPPED.get()
 
 
+def geometry():
+    """The running half's host-known geometry dict, or None."""
+    return _GEOMETRY.get()
+
+
 @contextmanager
-def use_lane(index, *, overlap=False):
+def use_lane(index, *, overlap=False, geometry=None):
     token = _LANE.set(int(index))
     marker = _OVERLAPPED.set(bool(overlap))
+    shape = _GEOMETRY.set(geometry)
     try:
         yield
     finally:
+        _GEOMETRY.reset(shape)
         _OVERLAPPED.reset(marker)
         _LANE.reset(token)

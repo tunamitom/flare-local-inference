@@ -590,7 +590,11 @@ class Hy4LayerAttention:
         count = int(visible.shape[0])
         owned = torch.div((visible.long() - rank).clamp_min(0) + world - 1, world,
                           rounding_mode="floor")
-        widest = max(int(owned.max()) if count else 0, topk)
+        from .lanes import geometry
+
+        known = geometry()      # an overlapped half: sized on the host, no device read
+        widest = max((known["owned_max"] if known is not None
+                      else int(owned.max())) if count else 0, topk)
         block = max(1, self.INDEX_CANDIDATE_BLOCK_BYTES // (widest * 20))
         if count > block:
             parts = [self.local_candidates(
@@ -646,7 +650,13 @@ class Hy4LayerAttention:
         # Owned live keys per query token (world 1: every position is owned).
         owned = torch.div((visible.long() - rank).clamp_min(0) + world - 1, world,
                           rounding_mode="floor")
-        width = int(owned.max()) if owned.numel() else 0
+        from .lanes import geometry
+
+        known = geometry()      # an overlapped half: one row, sized on the host
+        if known is not None:
+            width = int(known["owned_max"]) if owned.numel() else 0
+        else:
+            width = int(owned.max()) if owned.numel() else 0
         rows = int(q.shape[0])
         q = q.float()
         weights = (x.float() @ iw.weights_proj.float().T) * (n_heads ** -0.5) * (head_dim ** -0.5)
@@ -656,15 +666,24 @@ class Hy4LayerAttention:
         # owned key — 4.0 GiB at a 32k context, the consult14 request OOM).
         # Columns past a token's own live keys are masked below, as before.
         logits = q.new_zeros((rows, width))
-        for base in torch.unique(slot_base).tolist() if width else ():
-            members = (slot_base == base).nonzero(as_tuple=True)[0]
-            live = int(owned[members].max())
+        if known is not None:
+            # One request row: every query token shares the row's base slot and
+            # the widest token owns `width` live keys (all host-known).
+            groups = ((int(known["base"]), None, width),) if width else ()
+        else:
+            groups = []
+            for base in torch.unique(slot_base).tolist() if width else ():
+                members = (slot_base == base).nonzero(as_tuple=True)[0]
+                groups.append((base, members, int(owned[members].max())))
+        for base, members, live in groups:
             if not live:
                 continue
             keys = key_table[base:base + live].float()
             block = max(1, self.INDEX_SCORE_BLOCK_BYTES // (n_heads * live * 4))
-            for start in range(0, int(members.numel()), block):
-                part = members[start:start + block]
+            span = rows if members is None else int(members.numel())
+            for start in range(0, span, block):
+                part = (slice(start, min(start + block, rows)) if members is None
+                        else members[start:start + block])
                 scores = torch.relu_(q[part].reshape(-1, head_dim) @ keys.T).view(-1, n_heads, live)
                 logits[part, :live] = torch.einsum("rh,rhw->rw", weights[part], scores)
         # Causal masking over the token's owned live keys (world 1: `owned` is

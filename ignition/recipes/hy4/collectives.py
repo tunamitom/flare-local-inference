@@ -526,8 +526,25 @@ def scores_only_selection(offers, candidate_scores, candidate_positions, *, topk
         local_offer=local_offer, thresholds=thresholds, aboves=aboves)
 
 
+def scores_only_flags(offers, thresholds, local_offer, candidate_scores):
+    """Device-side twin of the widen + exactness host reads: one bool tensor,
+    True when some rank's offer is saturated at the cut or this rank's first
+    un-offered key reaches it (the narrow selection might then be inexact).
+    No host read — the overlapped loop checks it after the loop."""
+    limit = _threshold_tensor(thresholds, offers[0])
+    flag = torch.zeros((), dtype=torch.bool, device=limit.device)
+    for offer in offers:
+        if offer.shape[1]:
+            last = offer[:, -1].float()
+            flag = flag | (torch.isfinite(last) & (last >= limit)).any()
+    if local_offer is not None and candidate_scores.shape[1] > int(local_offer):
+        first = candidate_scores[:, int(local_offer)].float()
+        flag = flag | (torch.isfinite(first) & (first >= limit)).any()
+    return flag
+
+
 def scores_only_merge(exchange, candidate_scores, candidate_positions, *, topk, world, rank,
-                      local_offer):
+                      local_offer, deferred=None):
     """The scores-only exchange with a narrow first offer and an exact fallback.
 
     `exchange(scores)` gathers every rank's `[rows, offer]` slice in rank
@@ -542,6 +559,15 @@ def scores_only_merge(exchange, candidate_scores, candidate_positions, *, topk, 
     offer = width if local_offer is None else min(int(local_offer), width)
     offers = exchange(candidate_scores[:, :offer].contiguous())
     thresholds, aboves = scores_only_threshold(offers, topk)
+    if deferred is not None:
+        # consult18 D: inside the overlapped loop no host read — the widen and
+        # exactness tests become a device flag the caller checks after the loop
+        # (a set flag reruns the pair on the single-lane path).
+        if offer < width:
+            deferred.append(scores_only_flags(offers, thresholds, offer, candidate_scores))
+        return select_own_candidates(
+            offers, candidate_scores, candidate_positions, topk=topk, world=world, rank=rank,
+            local_offer=local_offer, thresholds=thresholds, aboves=aboves)
     if offer < width and scores_only_offer_saturated(offers, thresholds):
         offers = exchange(candidate_scores.contiguous())
         thresholds, aboves = scores_only_threshold(offers, topk)
@@ -2167,6 +2193,9 @@ class PcieDcpCollectives:
         import os
         self.audit = bool(os.environ.get("HY4_SELECTION_AUDIT"))
         self.audit_rows = self.audit_swaps = 0
+        # consult18 D: device flags of the overlapped loop's narrow selections
+        # (scores_only_flags); Decoder.forward_overlapped reads them after the loop.
+        self.deferred_checks = []
 
     def _plan(self, kernel, shape, *tensors):
         """The prepared plan for (kernel, call shape); `shape=None` shares one plan."""
@@ -2198,6 +2227,15 @@ class PcieDcpCollectives:
     def embed_lookup(self, token_ids, embed, *, vocabulary_range):
         first, last = vocabulary_range
         inside = (token_ids >= first) & (token_ids < last)
+        from .lanes import overlapped
+
+        if overlapped():
+            # consult18 D: no host read inside the overlapped loop (the masked
+            # assignment below syncs through nonzero); same values.
+            rows = (token_ids - first).clamp(0, int(embed.shape[0]) - 1)
+            out = torch.where(inside.reshape(-1, 1), embed[rows.reshape(-1)],
+                              embed.new_zeros(()))
+            return self.all_reduce(out)
         out = embed.new_zeros((int(token_ids.numel()), int(embed.shape[1])))
         if bool(inside.any()):
             out[inside] = embed[token_ids[inside] - first]
@@ -2216,12 +2254,15 @@ class PcieDcpCollectives:
     def merge_topk(self, candidate_scores, candidate_positions, *, topk):
         if self.exchange_mode == "scores-only":
             plan = self._plan("selection_exchange", None)
+            from .lanes import overlapped
+
             values, positions = scores_only_merge(
                 lambda scores: self.transport.exchange_scores(scores, plan=plan),
                 candidate_scores, candidate_positions,
                 topk=topk, world=self.world_size, rank=self.rank,
-                local_offer=self.local_offer or None)
-            if self.audit:
+                local_offer=self.local_offer or None,
+                deferred=self.deferred_checks if overlapped() else None)
+            if self.audit and not overlapped():
                 exact_values, exact_positions = merge_candidate_topk(
                     self.transport.stage_candidates(
                         candidate_positions.contiguous(), candidate_scores.contiguous(), None,

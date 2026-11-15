@@ -717,11 +717,14 @@ class Hy4Decoder:
         self.lanes = 2
         return self
 
-    def _half_steps(self, token_ids, positions, token_rows, call_shape):
+    def _half_steps(self, token_ids, positions, token_rows, call_shape, *, prevalidated=False):
         """One half of an overlapped chunk: the body loop, yielding after each
-        layer; returns the half's post-norm hidden."""
+        layer; returns the half's post-norm hidden. `prevalidated`: the caller
+        ran `cache.begin_forward` for these exact tensors before the loop (its
+        bounds checks read the device)."""
         visible = positions + 1
-        self.cache.begin_forward(token_rows, positions)
+        if not prevalidated:
+            self.cache.begin_forward(token_rows, positions)
         with TIMER.phase("embed"):
             embeds = self.collectives.embed_lookup(
                 token_ids.reshape(-1), self.weights.embed,
@@ -807,27 +810,63 @@ class Hy4Decoder:
                 tracer.name_stream(streams[1], "lane1")
             for stream in streams:
                 stream.wait_stream(main)
-        steps = [self._half_steps(*halves[index], half_shape) for index in (0, 1)]
+        # consult18 D — the loop below must never move data between host and
+        # device (the d3 repro: a staged host transfer queued behind one lane's
+        # peer wait held the copy path that the peers' relay forwards and the
+        # other lane's ring needed; the ranks deadlocked). Everything the
+        # bookkeeping would read from the device is known on the host here:
+        # one request row, a contiguous position range per half.
+        row = 0
+        start = int(self._row_lengths.get(row, 0))
+        world = int(getattr(self.collectives, "world_size", 1))
+        rank = int(getattr(self.collectives, "rank", 0))
+        base = row * int(getattr(self.cache, "local_capacity", 0))
+        geometries = []
+        for index in (0, 1):
+            end = start + (index + 1) * half              # the half's widest visible length
+            geometries.append({"owned_max": (max(end - rank, 0) + world - 1) // world,
+                               "base": base})
+        for index in (0, 1):
+            self.cache.begin_forward(halves[index][2], halves[index][1])
+        deferred = getattr(self.collectives, "deferred_checks", None)
+        if deferred is not None:
+            deferred.clear()
+        steps = [self._half_steps(*halves[index], half_shape, prevalidated=True)
+                 for index in (0, 1)]
         results = [None, None]
         layers = len(self.weights.layers)
         done = [torch.cuda.Event() for _ in range(layers + 1)] if cuda else None
         from .hangdump import lazy_preparation_trap
 
+        import os as _os
+
+        guard = (cuda and not getattr(TIMER, "phases", False)
+                 and (_os.environ.get("HY4_OVERLAP_SYNC_GUARD", "1") or "1") != "0"
+                 and not getattr(getattr(self.collectives, "transport", None),
+                                 "lane_audit_inloop", False))
+        previous_mode = torch.cuda.get_sync_debug_mode() if guard else None
         # No b12x first-use preparation (a device-wide synchronize) between
         # two lanes' exchanges: the plain forward at this shape prepares first.
+        # And no synchronizing transfer at all: the sync guard raises on one.
         with lazy_preparation_trap("forward_overlapped") if cuda else nullcontext():
-            for step in range(layers + 1):
-                for index in (0, 1):
-                    with use_lane(index, overlap=True), \
-                            (torch.cuda.stream(streams[index]) if cuda else nullcontext()):
-                        if cuda and index == 1:
-                            streams[1].wait_event(done[step])
-                        try:
-                            next(steps[index])
-                        except StopIteration as finished:
-                            results[index] = finished.value
-                        if cuda and index == 0:
-                            done[step].record(streams[0])
+            if guard:
+                torch.cuda.set_sync_debug_mode("error")
+            try:
+                for step in range(layers + 1):
+                    for index in (0, 1):
+                        with use_lane(index, overlap=True, geometry=geometries[index]), \
+                                (torch.cuda.stream(streams[index]) if cuda else nullcontext()):
+                            if cuda and index == 1:
+                                streams[1].wait_event(done[step])
+                            try:
+                                next(steps[index])
+                            except StopIteration as finished:
+                                results[index] = finished.value
+                            if cuda and index == 0:
+                                done[step].record(streams[0])
+            finally:
+                if guard:
+                    torch.cuda.set_sync_debug_mode(previous_mode)
         if cuda:
             for stream in streams:
                 main.wait_stream(stream)
@@ -836,6 +875,26 @@ class Hy4Decoder:
         flush = getattr(getattr(self.collectives, "transport", None), "flush_lane_audit", None)
         if flush is not None:
             flush()
+        # The narrow selections' widen/exactness flags, read once, here. A set
+        # flag means some layer's scores-only cut may have needed the full
+        # re-offer: recompute the pair on the single-lane path (it widens with
+        # its host read, outside any overlap) — same positions, same slots.
+        flags = list(deferred) if deferred else []
+        if deferred is not None:
+            deferred.clear()
+        if flags and bool(torch.stack(flags).any()):
+            self.overlap_reruns = getattr(self, "overlap_reruns", 0) + 1
+            self.cache.end_forward()
+            results = []
+            for index in (0, 1):
+                self.cache.begin_forward(halves[index][2], halves[index][1])
+                single = self._half_steps(*halves[index], half_shape, prevalidated=True)
+                try:
+                    while True:
+                        next(single)
+                except StopIteration as finished:
+                    results.append(finished.value)
+        self.overlap_pairs = getattr(self, "overlap_pairs", 0) + 1
         normed = torch.cat(results, dim=0)
         self.cache.end_forward()
         if logits_rows == "none":
