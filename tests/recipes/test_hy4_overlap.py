@@ -115,6 +115,8 @@ def _audit_transport(rank, world):
     t.lane_audit_calls = {"gather": 0, "scores": 0, "lse": 0, "all_reduce": 0}
     t.lane_audit_seen = {"lse": 0, "all_reduce": 0}
     t.lane_audit_max = {"lse": 0.0, "all_reduce": 0.0}
+    t.lane_audit_inloop = True
+    t._posthoc, t._digest_weights, t._projection = [], None, None
     return t
 
 
@@ -157,3 +159,80 @@ def test_lane_audit_references(rank):
         t._lane_audit_gather(blocks[rank], torch.cat(blocks[::-1], dim=1))
     # (a refused call is counted before it raises)
     assert t.lane_audit_calls == {"gather": 2, "scores": 0, "lse": 2, "all_reduce": 1}
+
+
+def test_posthoc_lane_audit_flushes_after_the_loop():
+    """consult18 D (F3): in the loop the audit only records device digests /
+    snapshots; flush_lane_audit compares them afterwards — the right bytes
+    pass, a tampered gather segment or score offer is refused."""
+    world, rows, hpr, width = 8, 4, 2, 6
+    rank = 3
+    torch.manual_seed(7)
+    blocks = [torch.randn(rows, hpr, width).bfloat16() for _ in range(world)]
+    offers = [torch.randn(rows, 5) for _ in range(world)]
+    t = _audit_transport(rank, world)
+    t.lane_audit_inloop = False
+    digests = {}
+
+    def gather_all(value):
+        # the flush exchanges the digests this rank recorded for its own data
+        if value.dtype == torch.int64 and value.shape[-1] == 2:
+            key = "gather" if "gather" not in digests else "scores"
+            digests[key] = True
+            src = blocks if key == "gather" else offers
+            return tuple(torch.stack([t._digest(src[k])]) for k in range(world))
+        raise AssertionError(value.shape)
+
+    t._gather_all = gather_all
+    t._lane_audit_gather(blocks[rank], torch.cat(blocks, dim=1))
+    t._lane_audit_scores(offers[rank], tuple(offers))
+    assert t.lane_audit_calls["gather"] == 0       # nothing compared inside the loop
+    t.flush_lane_audit()
+    assert t.lane_audit_calls["gather"] == 1 and t.lane_audit_calls["scores"] == 1
+    bad = list(blocks)
+    bad[5] = bad[5].clone()
+    bad[5][0, 0, 0] += 1
+    digests.clear()
+    t._lane_audit_gather(blocks[rank], torch.cat(bad, dim=1))
+    t._lane_audit_scores(offers[rank], tuple(offers))
+    with pytest.raises(RuntimeError, match="gather call 0 received different bytes from rank 5"):
+        t.flush_lane_audit()
+
+
+class _FakeScoresCe:
+    """A CE exchange stand-in: every rank's offer, unit-wide calls only."""
+
+    def __init__(self, offers_by_rank, unit=4):
+        self.score_offer, self.max_rows = unit, 64
+        self.offers_by_rank, self.calls, self.unit = offers_by_rank, 0, unit
+
+    def exchange_scores(self, part):
+        assert part.shape[1] == self.unit and part.is_contiguous()
+        index = self.calls
+        self.calls += 1
+        out = []
+        for full in self.offers_by_rank:
+            rows, width = full.shape
+            units = -(-width // self.unit)
+            padded = full.new_full((rows, units * self.unit), float("-inf"))
+            padded[:, :width] = full
+            out.append(padded[:, index * self.unit:(index + 1) * self.unit].clone())
+        return tuple(out)
+
+
+@pytest.mark.parametrize("width", [3, 4, 9])
+def test_ce_scores_pads_and_trims_bit_exact(width):
+    """consult18 D (F1): offers of any width ride whole CE units padded with
+    -inf and come back trimmed — bit-identical to the host wire's result."""
+    from ignition.recipes.hy4 import collectives as C
+
+    world = 8
+    torch.manual_seed(width)
+    offers = [torch.randn(3, width).sort(dim=1, descending=True).values for _ in range(world)]
+    t = C.PcieDcpTransport.__new__(C.PcieDcpTransport)
+    t.world_size, t.rank = world, 2
+    got = t._ce_scores(_FakeScoresCe(offers), offers[2])
+    assert len(got) == world
+    for mine, want in zip(got, offers):
+        assert mine.shape == want.shape
+        assert torch.equal(mine.contiguous().view(torch.int32), want.view(torch.int32))

@@ -1131,8 +1131,23 @@ class PcieDcpTransport:
         # switch-D ranks unable to drain their lane-0 stream): a host barrier
         # inside the overlapped loop is NOT safe, so this audit must become
         # post-hoc (snapshot in the loop, compare after it) before it is used.
-        self.lane_audit = bool(_os.environ.get("HY4_LANE_AUDIT"))
+        # HY4_LANE_AUDIT=1 records in the loop and compares after it
+        # (flush_lane_audit, on the main stream once both lanes have joined):
+        # nothing host-blocking runs between two lanes' exchanges. "inloop" is
+        # the old form that compared inside the loop and deadlocked the ranks
+        # (kept only to reproduce that hang under HY4_TRACE).
+        mode = (_os.environ.get("HY4_LANE_AUDIT") or "").strip()
+        self.lane_audit = bool(mode)
+        self.lane_audit_inloop = mode == "inloop"
+        self._posthoc = []
+        self._digest_weights = None
+        self._projection = None
         self.lane_audit_every = max(1, int(_os.environ.get("HY4_LANE_AUDIT_EVERY") or "8"))
+        # consult18 D (F1/F2): inside the overlapped loop every score offer rides
+        # the lane's own CE exchange, padded to the offer width with -inf (and
+        # the rare full-width widen in offer-width chunks): no host wire and no
+        # kernel-pool (full-residency, peer-waiting) grid between two lanes.
+        self.overlap_ce_scores = (_os.environ.get("HY4_OVERLAP_CE_SCORES", "1") or "1") != "0"
         self.lane_audit_calls = {"gather": 0, "scores": 0, "lse": 0, "all_reduce": 0}
         self.lane_audit_seen = {"lse": 0, "all_reduce": 0}
         self.lane_audit_max = {"lse": 0.0, "all_reduce": 0.0}
@@ -1684,8 +1699,78 @@ class PcieDcpTransport:
 
         return overlapped() or lane() != 0
 
+    # -- post-hoc lane audit (records in the loop, compares after it) ------
+    def _digest(self, tensor):
+        """Two position-weighted int64 sums of `tensor`'s raw 16/32-bit words
+        (an exact-equality fingerprint; computed on the current stream)."""
+        words = tensor.contiguous().view(-1)
+        words = words.view(torch.int16 if words.element_size() == 2 else torch.int32).to(torch.int64)
+        n = int(words.numel())
+        if self._digest_weights is None or int(self._digest_weights.shape[1]) < n:
+            index = torch.arange(n, device=words.device, dtype=torch.int64)
+            self._digest_weights = torch.stack((index % 65521 + 1, (index * 40503) % 65519 + 1))
+        return (self._digest_weights[:, :n] * words).sum(dim=1)
+
+    def _project(self, value):
+        """Four random projections of a [rows, width] sum (linear: sum of the
+        inputs' projections == the output's, up to the output's rounding)."""
+        if self._projection is None:
+            generator = torch.Generator(device="cpu").manual_seed(18_04)
+            self._projection = torch.randn(int(value.shape[1]), 4, generator=generator).to(value.device)
+        return (value.float() @ self._projection).sum(dim=0)
+
+    def _record(self, kind, *items):
+        self._posthoc.append((kind, *items))
+
+    def flush_lane_audit(self):
+        """Compare everything the overlapped halves recorded (call on every
+        rank, after the loop: gloo + host reads are safe here)."""
+        records, self._posthoc = self._posthoc, []
+        if not records:
+            return
+        world = self.world_size
+
+        def stacked(kind, index):
+            return [r[index] for r in records if r[0] == kind]
+
+        for kind in ("gather", "scores"):
+            mine = stacked(kind, 1)
+            if not mine:
+                continue
+            segments = torch.stack(stacked(kind, 2))               # [n, world, 2]
+            everyone = self._gather_all(torch.stack(mine))          # world x [n, 2]
+            for origin in range(world):
+                bad = (segments[:, origin] != everyone[origin]).any(dim=1)
+                if bool(bad.any()):
+                    call = int(bad.nonzero()[0])
+                    raise RuntimeError(
+                        f"lane audit: {kind} call {call} received different bytes from rank "
+                        f"{origin} than it sent (digest mismatch)")
+            self.lane_audit_calls[kind] += len(mine)
+        projected_in = stacked("ar", 1)
+        if projected_in:
+            outs = torch.stack(stacked("ar", 2))
+            want = sum(part.double() for part in self._gather_all(torch.stack(projected_in)))
+            rel = ((outs.double() - want).norm(dim=1) / want.norm(dim=1).clamp_min(1e-30))
+            worst = float(rel.max())
+            self.lane_audit_max["ar_projection"] = max(self.lane_audit_max.get("ar_projection", 0.0), worst)
+            self.lane_audit_calls["ar_projection"] = self.lane_audit_calls.get("ar_projection", 0) + len(projected_in)
+            if not worst <= AR_AUDIT_REL_L2:
+                raise RuntimeError(f"lane audit: a ring sum's projections differ by {worst:.3e}")
+        for record in records:
+            if record[0] == "arfull":
+                self._lane_audit_all_reduce_now(record[1], record[2])
+            elif record[0] == "lse":
+                self._lane_audit_lse_now(record[1], record[2], (record[3], record[4]))
+
     def _lane_audit_gather(self, local_input, gathered):
-        """HY4_LANE_AUDIT: an overlapped half's CE gather == every rank's block over gloo."""
+        """HY4_LANE_AUDIT: an overlapped half's CE gather == every rank's block."""
+        if not self.lane_audit_inloop:
+            hpr = int(local_input.shape[1])
+            segments = torch.stack([self._digest(gathered[:, origin * hpr:(origin + 1) * hpr])
+                                    for origin in range(self.world_size)])
+            self._record("gather", self._digest(local_input), segments)
+            return
         parts = self._gather_all(local_input.contiguous())
         want = torch.cat(parts, dim=1)
         self.lane_audit_calls["gather"] += 1
@@ -1700,6 +1785,14 @@ class PcieDcpTransport:
         self.lane_audit_seen["lse"] += 1
         if (self.lane_audit_seen["lse"] - 1) % self.lane_audit_every:
             return
+        if not self.lane_audit_inloop:
+            got, got_lse = merged
+            self._record("lse", partial_output.clone(), partial_lse.float().clone(),
+                         got.clone(), got_lse.clone())
+            return
+        self._lane_audit_lse_now(partial_output, partial_lse, merged)
+
+    def _lane_audit_lse_now(self, partial_output, partial_lse, merged):
         outs = self._gather_all(partial_output.contiguous())
         lses = self._gather_all(partial_lse.float().contiguous())
         hpr = int(partial_output.shape[1]) // self.world_size
@@ -1723,6 +1816,10 @@ class PcieDcpTransport:
 
     def _lane_audit_scores(self, offers, got):
         """HY4_LANE_AUDIT: an overlapped half's CE score offers == the gloo offers, bit for bit."""
+        if not self.lane_audit_inloop:
+            self._record("scores", self._digest(offers),
+                         torch.stack([self._digest(part) for part in got]))
+            return
         want = self._gather_all(offers.contiguous())
         self.lane_audit_calls["scores"] += 1
         for rank, (a, b) in enumerate(zip(got, want)):
@@ -1734,8 +1831,16 @@ class PcieDcpTransport:
     def _lane_audit_all_reduce(self, inp, result):
         """HY4_LANE_AUDIT: an overlapped half's ring sum vs an FP32 sum over gloo (sampled)."""
         self.lane_audit_seen["all_reduce"] += 1
+        if not self.lane_audit_inloop:
+            self._record("ar", self._project(inp), self._project(result))
+            if not (self.lane_audit_seen["all_reduce"] - 1) % (4 * self.lane_audit_every):
+                self._record("arfull", inp.clone(), result.clone())
+            return
         if (self.lane_audit_seen["all_reduce"] - 1) % self.lane_audit_every:
             return
+        self._lane_audit_all_reduce_now(inp, result)
+
+    def _lane_audit_all_reduce_now(self, inp, result):
         want = sum(part.float() for part in self._gather_all(inp.contiguous()))
         error = float((result.float() - want).norm() / want.norm().clamp_min(1e-30))
         self.lane_audit_calls["all_reduce"] += 1
@@ -1795,8 +1900,13 @@ class PcieDcpTransport:
         same plans, so every rank takes the same path.
         """
         rows, width = (int(v) for v in offers.shape)
-        from .lanes import lane
+        from .lanes import lane, overlapped
 
+        if self.overlap_ce_scores and (lane() or overlapped()):
+            got = self._ce_scores(self._lane_ce(), offers)
+            if self.lane_audit:
+                self._lane_audit_scores(offers, got)
+            return got
         if lane():
             ce = self._lane_ce()
             if ce.accepts_scores(offers):
@@ -1834,6 +1944,33 @@ class PcieDcpTransport:
                         f"(rows={rows}, offer={width}): the DCP gather is not a pure copy here")
             self.score_wire_checked += 1
         return result
+
+    def _ce_scores(self, ce, offers):
+        """consult18 D (F1/F2): every rank's `[rows, width]` FP32 offer over this
+        lane's CE exchange, whatever the width: padded with -inf to whole
+        offer-width units (one CE call each) and trimmed back, so the result is
+        bit-identical to the host wire's. -inf padding is not a candidate
+        (`scores_only_threshold` counts finite scores only)."""
+        rows, width = (int(v) for v in offers.shape)
+        unit = int(ce.score_offer)
+        if offers.dtype != torch.float32 or rows > ce.max_rows:
+            raise RuntimeError(f"the lane CE cannot carry a {tuple(offers.shape)} {offers.dtype} offer")
+        units = max(1, -(-width // unit))
+        if units * unit == width:
+            padded = offers.contiguous()
+        else:
+            padded = offers.new_full((rows, units * unit), float("-inf"))
+            padded[:, :width] = offers
+        if units == 1:
+            got = ce.exchange_scores(padded)
+            return tuple(part[:, :width] for part in got)
+        # A bank is rewritten two calls later: copy each unit out first.
+        pieces = [[] for _ in range(self.world_size)]
+        for index in range(units):
+            got = ce.exchange_scores(padded[:, index * unit:(index + 1) * unit].contiguous())
+            for origin, part in enumerate(got):
+                pieces[origin].append(part.clone())
+        return tuple(torch.cat(parts, dim=1)[:, :width] for parts in pieces)
 
     def stage_candidates(self, local_indices, local_scores, local_counts=None, *, plan=None):
         scores = self._gather_all(local_scores)

@@ -831,6 +831,11 @@ class Hy4Decoder:
         if cuda:
             for stream in streams:
                 main.wait_stream(stream)
+        # Post-hoc lane audit (HY4_LANE_AUDIT): compared here, after both lanes
+        # joined the main stream — never between two lanes' exchanges.
+        flush = getattr(getattr(self.collectives, "transport", None), "flush_lane_audit", None)
+        if flush is not None:
+            flush()
         normed = torch.cat(results, dim=0)
         self.cache.end_forward()
         if logits_rows == "none":
