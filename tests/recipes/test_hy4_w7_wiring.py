@@ -983,3 +983,58 @@ def test_logits_rows_refuses_an_index_outside_the_forward(worlds):
     for bad in (3, -1, "first", 1.0):
         with pytest.raises(ValueError, match="logits_rows"):
             decoder.forward(batch, logits_rows=bad)
+
+
+# --------------------------------------------------------------------------
+# consult16 lever 4: one bounds check per forward
+# --------------------------------------------------------------------------
+def test_forward_bounds_check_runs_once_and_still_refuses_bad_rows(worlds):
+    """`Hy4Cache.begin_forward` validates the forward's rows once: the layers'
+    writes reuse it (no per-layer `_slots` call), the stored records are the
+    ones the per-write check stored, and anything outside the forward's own
+    tensors — or out of range — still takes the full check and raises."""
+    from ignition.recipes.hy4.decoder import Hy4Cache
+
+    rank = worlds[8][3]
+    cfg = rank.model_config
+    width = cfg.text["kv_lora_rank"] + cfg.text["qk_rope_head_dim"]
+
+    def fresh():
+        return Hy4Cache.allocate(cfg, rows=2, capacity=CAPACITY, device=torch.device("cpu"),
+                                 draft=False, dtype=torch.float32, world=8, rank=3)
+
+    tokens = torch.tensor([0, 0, 0, 1, 1], dtype=torch.long)
+    positions = torch.tensor([3, 11, 12, 3, 19], dtype=torch.long)
+    values = torch.randn(5, width)
+    plain, memo = fresh(), fresh()
+    plain.write_latent(0, tokens, positions, values)
+    calls = []
+    original = memo._slots
+    memo._slots = lambda *args: calls.append(1) or original(*args)
+    memo.begin_forward(tokens, positions)
+    assert len(calls) == 1
+    for layer in (0, 1):
+        memo.write_latent(layer, tokens, positions, values)
+    assert len(calls) == 1, "a layer write inside the forward must not re-check"
+    assert torch.equal(memo.latents(0), plain.latents(0))
+    # Other tensors (same values) are not the forward's rows: full check again.
+    memo.write_latent(0, tokens.clone(), positions.clone(), values)
+    assert len(calls) == 2
+    with pytest.raises(IndexError):
+        memo.write_latent(0, tokens, torch.tensor([3, 11, 12, 3, CAPACITY]), values)
+    memo.end_forward()
+    memo.write_latent(0, tokens, positions, values)
+    assert len(calls) == 4
+    with pytest.raises(IndexError):
+        fresh().begin_forward(tokens, torch.tensor([3, 11, 12, 3, CAPACITY]))
+    with pytest.raises(IndexError):
+        fresh().begin_forward(torch.tensor([0, 0, 0, 1, 2]), positions)
+
+
+def test_forward_past_the_row_capacity_still_raises(worlds):
+    """The once-per-forward check keeps consult3 W4: a forward that would write
+    past the row raises before any layer runs."""
+    decoder = fresh_decoders(worlds[1])[0]
+    batch = torch.zeros((1, CAPACITY + 1), dtype=torch.long)
+    with pytest.raises(IndexError, match="out of range"):
+        decoder.forward(batch)

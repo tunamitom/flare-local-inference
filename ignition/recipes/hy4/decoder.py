@@ -94,6 +94,10 @@ class Hy4Cache:
     records: dict = field(default_factory=dict)   # layer -> fused uint8 records
     writer_plan: object = None                    # the prepared `plan_cache_writer`
     page_size: int = 64                           # fused-record page geometry
+    # One forward's validated (tokens, positions) -> owned rows and slots
+    # (`begin_forward`): every layer writes the same rows, so the bounds check
+    # and the ownership mask are computed once, not per layer per table.
+    _forward_memo: object = field(default=None, repr=False, compare=False)
 
     def __post_init__(self):
         if type(self.world) is not int or self.world < 1:
@@ -183,11 +187,9 @@ class Hy4Cache:
         readers consume (`_GLM_NSA_RECORD_BYTES` per record).
         """
         if layer in self.records:
-            positions = positions.long()
-            slots = self._slots(tokens, positions)   # bounds-checked over every position
-            keep = self.owner(positions) == self.rank
-            if bool(keep.any()):
-                self._write_records(layer, latent[keep], slots[keep])
+            kept, slots = self._owned_slots(tokens, positions)
+            if int(kept.numel()):
+                self._write_records(layer, latent.index_select(0, kept), slots)
             return
         self._store(self.latent[layer], tokens, positions, latent)
 
@@ -216,10 +218,36 @@ class Hy4Cache:
         self._store(self.index[owner], tokens, positions, keys)
 
     def _store(self, table, tokens, positions, values):
+        kept, slots = self._owned_slots(tokens, positions)   # store only owned records (D1)
+        table[slots] = values.to(table.dtype).index_select(0, kept)
+
+    def begin_forward(self, tokens, positions):
+        """Validate one forward's rows ONCE; its layers then write without host reads.
+
+        `tokens` / `positions` are the forward's own per-token tensors: the
+        memo answers only for these exact objects, so any other write (the MTP
+        block, a test) still takes the full bounds check.
+        """
+        self._forward_memo = None
+        kept, slots = self._owned_slots(tokens, positions)
+        self._forward_memo = (tokens, positions, kept, slots)
+
+    def end_forward(self):
+        self._forward_memo = None
+
+    def _owned_slots(self, tokens, positions):
+        """`(kept, slots)`: the row indices this rank owns and their physical slots.
+
+        Bounds-checked over EVERY position (owned or not) before the ownership
+        filter — the check that refuses a write past the row.
+        """
+        memo = self._forward_memo
+        if memo is not None and memo[0] is tokens and memo[1] is positions:
+            return memo[2], memo[3]
         positions = positions.long()
-        slots = self._slots(tokens, positions)   # bounds-checked over every position
-        keep = self.owner(positions) == self.rank   # store only owned records (D1)
-        table[slots[keep]] = values.to(table.dtype)[keep]
+        slots = self._slots(tokens, positions)
+        kept = (self.owner(positions) == self.rank).nonzero(as_tuple=True)[0]
+        return kept, slots.index_select(0, kept)
 
     def _slots(self, tokens, positions):
         """Physical slots for `positions`, refusing writes past the row.
@@ -552,6 +580,13 @@ class Hy4Decoder:
         positions = self._positions(token_ids.shape, rows)
         token_rows = self._token_rows(token_ids.shape, rows)
         visible = positions + 1  # each query's causal cache length
+        # One bounds check and ownership mask for the whole forward (lever 4).
+        self.cache.begin_forward(token_rows, positions)
+        # The short-context bypass test reads the device once per forward, not
+        # once per layer (decode graphs under context parallelism only).
+        visible_max = (int(visible.max())
+                       if self.collectives.world_size > 1 and call_shape.short_context_bypass
+                       and call_shape.is_decode_graph else None)
         # Vocabulary-sharded embedding (D5): masked lookup over this rank's
         # shard + all-reduce (identity at world 1).
         with TIMER.phase("embed"):
@@ -574,7 +609,7 @@ class Hy4Decoder:
                         mlp_out, streams.streams, post, layer.attn_ihc,
                         norm_weight=layer.input_norm)
             attn_out = self._attention(layer, y, positions, token_rows, visible,
-                                       call_shape=call_shape)
+                                       call_shape=call_shape, visible_max=visible_max)
             with TIMER.phase("comm.all_reduce.attn"):
                 attn_out = self.collectives.all_reduce(attn_out)  # D4 (o_proj shard)
             with TIMER.phase("ihc"):
@@ -602,6 +637,7 @@ class Hy4Decoder:
         if state is not None:
             state.hidden[:normed.shape[0]] = normed
             state.count[:normed.shape[0]] += token_ids.shape[1]
+        self.cache.end_forward()
         if logits_rows == "none":
             logits = None
         else:
@@ -647,7 +683,8 @@ class Hy4Decoder:
     def _token_rows(self, shape, rows):
         return rows.reshape(-1, 1).expand(shape[0], shape[1]).reshape(-1)
 
-    def _attention(self, layer, y, positions, token_rows, visible, *, call_shape):
+    def _attention(self, layer, y, positions, token_rows, visible, *, call_shape,
+                   visible_max=None):
         """One layer's attention: world 1 today's path, world > 1 the CP shape (D2/D3).
 
         CP (amendment 1): full layers offer local top-k candidates over their
@@ -696,12 +733,15 @@ class Hy4Decoder:
                                        call_shape=call_shape)
             with TIMER.phase("attn.fold_expand_gate"):
                 return attn.gate_and_project(attended.output, y)
-        short = call_shape.short_context_bypass and call_shape.is_decode_graph \
-            and int(visible.max()) <= topk
+        short = call_shape.short_context_bypass and call_shape.is_decode_graph
+        if short:
+            if visible_max is None:   # a direct call: read the device here
+                visible_max = int(visible.max())
+            short = visible_max <= topk
         if short:
             # The short-context bypass: at context <= top-k the global top-k is
             # every visible key — no indexer, no selection exchange.
-            self.trace.append(("selection_bypass", family, int(visible.max()), topk))
+            self.trace.append(("selection_bypass", family, visible_max, topk))
             with TIMER.phase("attn.handback"):
                 attn.selection.fill_visible(visible, slot_base, world=world, rank=rank)
         else:
