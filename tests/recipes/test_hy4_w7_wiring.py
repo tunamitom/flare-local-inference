@@ -930,3 +930,56 @@ def test_prefill_graph_catalogue_declared_with_content_gates(worlds):
             assert max(float(errors[row]) for row in tie_rows) <= SELECTION_TIE_BAND, (
                 f"catalogue {size} rows: boundary-tie rows moved more than "
                 f"{SELECTION_TIE_BAND}: {sorted(tie_rows)}")
+
+
+# --------------------------------------------------------------------------
+# consult16 lever 3: last-row logits
+# --------------------------------------------------------------------------
+def _scenario_logits_rows(mode):
+    def body(decoder):
+        _, tokens = golden_tokens()
+        batch = torch.tensor([tokens], dtype=torch.long)
+        first = decoder.forward(batch[:, :16], logits_rows="all" if mode == "all" else "none")
+        decoder.complete([0], batch[:, :16])
+        if mode == "all":
+            last = decoder.forward(batch[:, 16:])
+        else:
+            last = decoder.forward(batch[:, 16:], logits_rows=mode)
+        decoder.complete([0], batch[:, 16:])
+        step = decoder.decode_step(torch.tensor([[7]], dtype=torch.long), request_rows=[0])
+        return [first, last, step]
+    return body
+
+
+@pytest.mark.parametrize("world", (1, 2, 8))
+def test_last_row_logits_are_bit_identical_to_the_all_rows_form(worlds, world):
+    """`logits_rows="last"` (or the same token index) returns exactly the
+    all-rows form's final row, `"none"` returns nothing, and neither changes
+    what the forward writes: the next decode step is bit-identical."""
+    from ignition.recipes.hy4.collectives import SimulatedGroup
+
+    def run(mode):
+        if world == 1:
+            return [_scenario_logits_rows(mode)(decoder) for decoder in fresh_decoders(worlds[1])]
+        return run_wired(worlds[world], _scenario_logits_rows(mode), group=SimulatedGroup(world))
+
+    full = run("all")
+    width = full[0][1].shape[1]
+    for mode in ("last", width - 1):
+        narrow = run(mode)
+        for (all_first, all_last, all_step), (first, last, step) in zip(full, narrow):
+            assert first is None and all_first is not None
+            assert tuple(last.shape) == (1, 1, all_last.shape[-1])
+            assert torch.equal(last, all_last[:, -1:, :]), "the final row must match exactly"
+            assert torch.equal(step, all_step), "skipping the head must not change the state"
+    middle = run(2)
+    for (_, all_last, _), (_, picked, _) in zip(full, middle):
+        assert torch.equal(picked, all_last[:, 2:3, :])
+
+
+def test_logits_rows_refuses_an_index_outside_the_forward(worlds):
+    decoder = fresh_decoders(worlds[1])[0]
+    batch = torch.tensor([[1, 2, 3]], dtype=torch.long)
+    for bad in (3, -1, "first", 1.0):
+        with pytest.raises(ValueError, match="logits_rows"):
+            decoder.forward(batch, logits_rows=bad)

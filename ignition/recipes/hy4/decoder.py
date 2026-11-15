@@ -512,7 +512,7 @@ class Hy4Decoder:
         return hidden, attended, selected
 
     def forward(self, token_ids, *, request_rows=None, state=None, return_hidden=False,
-                call_shape=None):
+                call_shape=None, logits_rows="all"):
         """The real body loop: iHC streams -> 78 gated sparse-MLA layers -> head.
 
         Returns FP32 logits over this rank's vocabulary shard. `request_rows`
@@ -524,9 +524,21 @@ class Hy4Decoder:
         `call_shape` is the forward's fixed shape and graph-family wiring
         (`wiring.CallShape`); it defaults to `default_call_shape` and is
         recorded in `self.trace` for the wiring gates.
+
+        `logits_rows` narrows the head's output (consult16 lever 3): `"all"`
+        (default) returns `[rows, tokens, V]`; `"last"` or a token index
+        returns that one token's logits `[rows, 1, V]` — sliced from the SAME
+        local head product, so the values are bit-identical to the all-rows
+        form and only that row is gathered across the vocabulary shards;
+        `"none"` skips the head and the gather and returns `None` (a prefill
+        chunk that is not the prompt's last).
         """
         if token_ids.ndim != 2:
             raise ValueError("token_ids must be [rows, tokens]")
+        if logits_rows not in ("all", "last", "none"):
+            if type(logits_rows) is not int or not 0 <= logits_rows < token_ids.shape[1]:
+                raise ValueError(
+                    "logits_rows must be 'all', 'last', 'none' or a token index inside the forward")
         if call_shape is None:
             call_shape = self.default_call_shape(token_ids.shape)
         if (call_shape.rows, call_shape.tokens) != tuple(token_ids.shape):
@@ -590,14 +602,20 @@ class Hy4Decoder:
         if state is not None:
             state.hidden[:normed.shape[0]] = normed
             state.count[:normed.shape[0]] += token_ids.shape[1]
-        with TIMER.phase("head"):
-            logits = normed.float() @ self.weights.head.T
-        # D5: logits come back per vocabulary shard; all-gather to the sampler
-        # (identity at world 1).
-        with TIMER.phase("comm.logits_gather"):
-            logits = self.collectives.gather_logits(
-                logits.reshape(token_ids.shape[0], token_ids.shape[1], -1),
-                vocabulary_range=self.weights.sharding.vocabulary_range)
+        if logits_rows == "none":
+            logits = None
+        else:
+            with TIMER.phase("head"):
+                logits = normed.float() @ self.weights.head.T
+                logits = logits.reshape(token_ids.shape[0], token_ids.shape[1], -1)
+                if logits_rows != "all":
+                    token = token_ids.shape[1] - 1 if logits_rows == "last" else logits_rows
+                    logits = logits[:, token:token + 1, :].contiguous()
+            # D5: logits come back per vocabulary shard; all-gather to the
+            # sampler (identity at world 1).
+            with TIMER.phase("comm.logits_gather"):
+                logits = self.collectives.gather_logits(
+                    logits, vocabulary_range=self.weights.sharding.vocabulary_range)
         TIMER.forward_end()
         if return_hidden:
             rows, width = token_ids.shape
