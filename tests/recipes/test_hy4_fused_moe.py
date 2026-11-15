@@ -264,21 +264,17 @@ def test_load_resident_experts_rejects_wrong_slice_geometry():
                                      swiglu_limit=SWIGLU_LIMIT)
 
 
-# --- the session's hand-back: staged sources complete with a local copy ------
+# --- the session's hand-back: fatal, with the offender named -----------------
 
-class HandBackSession:
-    """`DirectWeightSession`'s contract toward staged sources: only registered
-    checkpoint (meta) views are accepted; anything else is refused with its
-    bytes counted as `torch_copy_bytes` — the caller-completed hand-back."""
+class RefusingSession:
+    """`DirectWeightSession`'s worst case: every transfer handed back False
+    (the pre-flight and the fatal error must name the offender)."""
 
     def __init__(self):
         self.transfers = []
         self.torch_copy_bytes = 0
 
     def __call__(self, destination, source):
-        if source.device.type == "meta":
-            self.transfers.append((destination, source))
-            return True
         self.torch_copy_bytes += destination.nbytes
         return False
 
@@ -289,85 +285,93 @@ class HandBackSession:
         return {}
 
 
-class RefusingSession(HandBackSession):
-    """Refuses every transfer (the fail-closed probe)."""
+class B12xShapedRefusingSession(RefusingSession):
+    """Carries the `DirectWeightSession` surface the pre-flight keys on
+    (`sources` registry + `device`) while refusing every transfer."""
 
-    def __call__(self, destination, source):
-        self.torch_copy_bytes += destination.nbytes
-        return False
-
-
-def test_copy_completes_the_session_hand_back_for_staged_sources():
-    loader = make_loader({})
-    session = HandBackSession()
-    loader._session = session
-    staged = torch.arange(24, dtype=torch.uint8).reshape(4, 6)
-    destination = torch.empty_like(staged)
-    loader._copy(destination, staged)          # refused -> local copy, no raise
-    assert torch.equal(destination, staged)
-    assert session.transfers == []
-    assert session.torch_copy_bytes == destination.nbytes
+    device = 0
+    sources = {}
 
 
-def test_copy_stays_fail_closed_for_refused_checkpoint_transfers():
+def test_copy_is_fail_closed_and_names_the_refused_transfer():
     loader = make_loader({})
     loader._session = RefusingSession()
-    checkpoint_view = torch.empty((4, 6), dtype=torch.uint8, device="meta")
-    with pytest.raises(RuntimeError, match="b12x rejected the direct weight transfer"):
-        loader._copy(torch.empty((4, 6), dtype=torch.uint8), checkpoint_view)
-    # a shape-mismatched staged source is a routing bug, not a hand-back
-    with pytest.raises(RuntimeError, match="b12x rejected the direct weight transfer"):
-        loader._copy(torch.empty((4, 6), dtype=torch.uint8),
-                     torch.zeros((2, 3), dtype=torch.uint8))
+    staged = torch.zeros((4, 6), dtype=torch.uint8)
+    destination = torch.empty_like(staged)
+    with pytest.raises(RuntimeError, match="b12x rejected the direct weight transfer") as raised:
+        loader._copy(destination, staged, name="model.layers.1.mlp.experts.0.gate_proj.weight")
+    # the diagnostic names the tensor and both sides
+    message = str(raised.value)
+    assert "model.layers.1.mlp.experts.0.gate_proj.weight" in message
+    assert "source device=cpu" in message and "contiguous=True" in message
 
 
-def test_load_resident_experts_stages_planes_across_the_hand_back(monkeypatch):
-    """The production `_copy` staging seam under the real session semantics:
-    the resident rank slices are already-materialized tensors (the serve's
-    `load_tensor(extent=)` CUDA views), so the session refuses them and the
-    loader must complete the fused planes with local copies."""
-    record = {}
-
-    def load_fp4_experts(self, prefixes, *, hidden_size, intermediate_size, **kwargs):
-        record["planes"] = planes = {}
-        for index, prefix in enumerate(prefixes):
-            w13 = torch.empty((2 * intermediate_size, hidden_size // 2), dtype=torch.uint8)
-            w2 = torch.empty((hidden_size, intermediate_size // 2), dtype=torch.uint8)
-            s13 = torch.empty((2 * intermediate_size, hidden_size // 16), dtype=torch.float8_e4m3fn)
-            s2 = torch.empty((hidden_size, intermediate_size // 16), dtype=torch.float8_e4m3fn)
-            for projection, values, blocks in (
-                    ("up_proj", w13[:intermediate_size], s13[:intermediate_size]),
-                    ("gate_proj", w13[intermediate_size:], s13[intermediate_size:]),
-                    ("down_proj", w2, s2)):
-                source = self._sources[f"{prefix}.{projection}.weight"]
-                scale = self._sources[f"{prefix}.{projection}.weight_scale"]
-                self._copy(values, source)
-                self._copy(blocks, scale)
-            planes[prefix] = (w13, w2, s13, s2)
-        return "prepared-experts"
-
-    monkeypatch.setattr(Hy4WeightLoader, "load_fp4_experts", load_fp4_experts)
+def test_copy_pre_flight_names_the_offender_before_the_session():
     loader = make_loader({})
-    session = HandBackSession()
+    session = B12xShapedRefusingSession()
     loader._session = session
-    resident = resident_sources()
-    out = loader.load_resident_experts(PREFIX, resident,
+    # a non-contiguous staged source violates the host-copy conditions
+    with pytest.raises(RuntimeError, match="b12x would refuse this transfer") as raised:
+        loader._copy(torch.empty((4, 6), dtype=torch.uint8),
+                     torch.zeros((4, 12), dtype=torch.uint8)[:, ::2],
+                     name="sliced", extent=(slice(None), slice(0, 12, 2)))
+    assert "not contiguous" in str(raised.value) and "sliced" in str(raised.value)
+    # a meta checkpoint view with a shape mismatch is refused with name + extent
+    with pytest.raises(RuntimeError, match="b12x would refuse this transfer") as raised:
+        loader._copy(torch.empty((4, 6), dtype=torch.uint8),
+                     torch.empty((2, 3), dtype=torch.uint8, device="meta"),
+                     name="model.layers.1.mlp.experts.0.down_proj.weight",
+                     extent=(slice(None), slice(0, 128)))
+    assert "A5" in str(raised.value) and "down_proj.weight" in str(raised.value)
+    assert session.torch_copy_bytes == 0          # nothing reached the session
+
+
+def test_load_resident_experts_aliases_meta_checkpoint_views(captured_fp4):
+    """Consult 12's direct form: the fused sources are the checkpoint's own
+    meta views; each expert is aliased as a FULL-WIDTH view and
+    `load_fp4_experts` gets the FULL intermediate plus the real rank range, so
+    its own `source[first:last]` slicing fills each plane by one direct
+    transfer (`torch_copy_bytes` stays 0)."""
+    record = captured_fp4
+    loader = make_loader({})
+    packed = packed_checkpoint()
+    meta = {name: torch.empty(tuple(tensor.shape), dtype=tensor.dtype, device="meta")
+            for name, tensor in packed.items() if name != f"{PREFIX}.gate_up_proj.weight_scale_2"
+            and name != f"{PREFIX}.down_proj.weight_scale_2"}
+    # gains stay value-loaded CPU tensors
+    meta[f"{PREFIX}.gate_up_proj.weight_scale_2"] = packed[f"{PREFIX}.gate_up_proj.weight_scale_2"]
+    meta[f"{PREFIX}.down_proj.weight_scale_2"] = packed[f"{PREFIX}.down_proj.weight_scale_2"]
+    out = loader.load_resident_experts(PREFIX, meta,
                                        intermediate_range=(0, LOCAL),
                                        swiglu_limit=SWIGLU_LIMIT)
     assert out == "prepared-experts"
-    assert session.transfers == []        # nothing rode the checkpoint path
+    kwargs = record["kwargs"]
+    assert kwargs["intermediate_size"] == INTER          # FULL intermediate
+    assert kwargs["intermediate_range"] == (0, LOCAL)    # the rank's real range
+    sources = record["sources"]
+    assert len(sources) == COUNT * 9
     for index in range(COUNT):
-        w13, w2, s13, s2 = record["planes"][f"{PREFIX}.experts.{index}"]
-        fused_rows = resident[f"{PREFIX}.gate_up_proj.weight"][index]
-        assert torch.equal(w13[:LOCAL], fused_rows[LOCAL:])       # up half
-        assert torch.equal(w13[LOCAL:], fused_rows[:LOCAL])       # gate half
-        assert torch.equal(w2, resident[f"{PREFIX}.down_proj.weight"][index])
-        assert torch.equal(s13[:LOCAL].view(torch.uint8),
-                           resident[f"{PREFIX}.gate_up_proj.weight_scale"][index, LOCAL:].view(torch.uint8))
-        assert torch.equal(s13[LOCAL:].view(torch.uint8),
-                           resident[f"{PREFIX}.gate_up_proj.weight_scale"][index, :LOCAL].view(torch.uint8))
-        assert torch.equal(s2.view(torch.uint8),
-                           resident[f"{PREFIX}.down_proj.weight_scale"][index].view(torch.uint8))
+        target = f"{PREFIX}.experts.{index}"
+        gate = sources[f"{target}.gate_proj.weight"]
+        up = sources[f"{target}.up_proj.weight"]
+        assert gate.is_meta and up.is_meta
+        # full-width aliases of the checkpoint's fused [gate; up] rows
+        assert gate.shape == (INTER, HIDDEN // 2) and up.shape == (INTER, HIDDEN // 2)
+        fused_storage = meta[f"{PREFIX}.gate_up_proj.weight"].untyped_storage()._cdata
+        assert gate.untyped_storage()._cdata == fused_storage
+        assert up.untyped_storage()._cdata == fused_storage
+        assert gate.storage_offset() == index * 2 * INTER * (HIDDEN // 2)
+        assert up.storage_offset() == (index * 2 + 1) * INTER * (HIDDEN // 2)
+        down = sources[f"{target}.down_proj.weight"]
+        assert down.shape == (HIDDEN, INTER // 2)
+        assert down.untyped_storage()._cdata == \
+            meta[f"{PREFIX}.down_proj.weight"].untyped_storage()._cdata
+        assert down.storage_offset() == index * HIDDEN * (INTER // 2)
+        gain = sources[f"{target}.gate_proj.weight_scale_2"]
+        assert gain.shape == (1,) and not gain.is_meta
+        assert float(gain[0]) == float(meta[f"{PREFIX}.gate_up_proj.weight_scale_2"][index])
+    # the alias views leave no synthetic names behind in the loader session
+    assert not [name for name in loader._sources if name.startswith(f"{PREFIX}.experts.")]
 
 
 # --- allocated_bytes must survive the fused graph's object cycles -----------

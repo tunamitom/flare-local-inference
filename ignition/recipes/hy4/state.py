@@ -409,56 +409,60 @@ def _moe_state(builder, prefix, *, dense=False):
     if loader._packed:
         # Materialize through the loader session when the raw `_sources` entry
         # is a declared (meta) placeholder on GPU (see `weights.expert_stacks`).
-        # The fused tensors hold EVERY routed expert's intermediate width; only
-        # this rank's `sharding.expert_range` channels are resident (the same
-        # slicing the BF16 branch applies below) — materializing whole fused
-        # tensors overruns the card at full shape (w13: the 8-rank construction
-        # OOMed at 91.7 GiB mid-experts loading 3 GiB all-expert tensors).
-        # `load_tensor(extent=)` keeps the transfer over the checkpoint's byte
-        # ranges; the fused [gate; up] row axis splits into the rank's two
-        # half-ranges and re-fuses to [E, 2 * local, hidden // 2].
         first, last = sharding.expert_range
         inter = c["moe_intermediate_size"]
-        half = (slice(None), slice(first, last), slice(None))
-        half_up = (slice(None), slice(inter + first, inter + last), slice(None))
-        down_extent = (slice(None), slice(None), slice(first // 2, last // 2))
-        down_scale_extent = (slice(None), slice(None), slice(first // 16, last // 16))
-
-        def load_sliced(name, extent):
-            source = loader._sources[name]
-            return loader.load_tensor(name, extent=extent) \
-                if getattr(source, "is_meta", False) else source[extent]
-
-        import torch as _torch
-        packed_sources = {}
-        for projection in ("gate_up_proj", "down_proj"):
-            for suffix in ("weight", "weight_scale", "weight_scale_2"):
-                name = f"{expert_prefix}.{projection}.{suffix}"
-                if projection == "gate_up_proj" and suffix != "weight_scale_2":
-                    packed_sources[name] = _torch.cat(
-                        (load_sliced(name, half), load_sliced(name, half_up)), dim=1)
-                elif projection == "down_proj" and suffix == "weight":
-                    packed_sources[name] = load_sliced(name, down_extent)
-                elif projection == "down_proj" and suffix == "weight_scale":
-                    packed_sources[name] = load_sliced(name, down_scale_extent)
-                else:  # per-expert gains: whole first axis
-                    packed_sources[name] = load_sliced(name, (slice(None),))
-        builder.used.update(packed_sources)
         if loader.device.type == "cuda":
             # M2 lever: the fused GPU routed-experts path. The rank keeps ONLY
             # the fused b12x planes (holding the reference's packed bytes as
             # well would double the weights); the torch reference loop stays
             # the CPU dry-run / gate contract (`ReferenceRoutedExperts`).
+            # Consult 12's direct aliases: hand `load_resident_experts` the
+            # fused CHECKPOINT (meta) views, not staged rank slices —
+            # `load_fp4_experts` slices its own rank extents on meta views and
+            # each plane fills by ONE direct transfer. Staging the slices with
+            # `load_tensor(extent=)` made them permanent on top of the planes
+            # (+48.7 GiB per rank, the restart's OOM) and handed the session
+            # non-checkpoint sources it refuses. Gains are value-loaded already.
             from .moe import FusedRoutedExperts
 
+            resident = {f"{expert_prefix}.{projection}.{suffix}":
+                        loader._sources[f"{expert_prefix}.{projection}.{suffix}"]
+                        for projection in ("gate_up_proj", "down_proj")
+                        for suffix in ("weight", "weight_scale", "weight_scale_2")}
+            builder.used.update(resident)
             experts = loader.load_resident_experts(
-                expert_prefix, packed_sources,
+                expert_prefix, resident,
                 intermediate_range=sharding.expert_range,
                 swiglu_limit=c["swiglu_limit"])
             routed = FusedRoutedExperts(
                 experts, hidden=hidden, top_k=c["num_experts_per_tok"],
                 device=loader.device, name=f"{expert_prefix}.fused")
         else:
+            half = (slice(None), slice(first, last), slice(None))
+            half_up = (slice(None), slice(inter + first, inter + last), slice(None))
+            down_extent = (slice(None), slice(None), slice(first // 2, last // 2))
+            down_scale_extent = (slice(None), slice(None), slice(first // 16, last // 16))
+
+            def load_sliced(name, extent):
+                source = loader._sources[name]
+                return loader.load_tensor(name, extent=extent) \
+                    if getattr(source, "is_meta", False) else source[extent]
+
+            import torch as _torch
+            packed_sources = {}
+            for projection in ("gate_up_proj", "down_proj"):
+                for suffix in ("weight", "weight_scale", "weight_scale_2"):
+                    name = f"{expert_prefix}.{projection}.{suffix}"
+                    if projection == "gate_up_proj" and suffix != "weight_scale_2":
+                        packed_sources[name] = _torch.cat(
+                            (load_sliced(name, half), load_sliced(name, half_up)), dim=1)
+                    elif projection == "down_proj" and suffix == "weight":
+                        packed_sources[name] = load_sliced(name, down_extent)
+                    elif projection == "down_proj" and suffix == "weight_scale":
+                        packed_sources[name] = load_sliced(name, down_scale_extent)
+                    else:  # per-expert gains: whole first axis
+                        packed_sources[name] = load_sliced(name, (slice(None),))
+            builder.used.update(packed_sources)
             routed = ReferenceRoutedExperts.from_packed(
                 packed_sources, expert_prefix, swiglu_limit=c["swiglu_limit"])
     else:

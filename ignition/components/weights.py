@@ -995,26 +995,88 @@ class DirectWeightLoader:
         if self._session is None:
             raise RuntimeError(f"weight loading requires an open {type(self).__name__} context")
 
-    def _copy(self, destination, source, *, numeric=True):
+    def _copy(self, destination, source, *, numeric=True, name=None, extent=None):
         from ignition.preparation.tensor_metadata import record_numeric_tensor
 
+        self._pre_flight(destination, source, name=name, extent=extent)
         if not self._session(destination, source):
-            # `DirectWeightSession.__call__` returns False only for sources that
-            # are not registered checkpoint views (its meta path raises on any
-            # malformed transfer and never refuses): it counts their bytes as
-            # `torch_copy_bytes` and hands them back to the caller to complete
-            # with an ordinary tensor copy. That hand-back is the resident-slice
-            # path — `load_resident_experts` re-stages already-materialized rank
-            # slices (CUDA views from `load_tensor(extent=)`) into the fused
-            # planes — so complete it locally. Checkpoint (meta) transfers stay
-            # fail-closed: b12x's acceptance rules are not bypassed for them.
-            if source.device.type == "meta" or source.shape != destination.shape:
-                raise RuntimeError("b12x rejected the direct weight transfer")
-            destination.copy_(source)
+            # Consult 12: a hand-back is fatal. Every weight goes checkpoint ->
+            # final plane in one direct transfer (`torch_copy_bytes == 0` is the
+            # suite's invariant across the recipes); a refusal names the offender.
+            raise RuntimeError("b12x rejected the direct weight transfer: "
+                               + self._transfer_diagnostic(destination, source, name=name, extent=extent))
         if numeric:
             record_numeric_tensor(destination)
         if self._display is not None:
             self._display.update(self._session.payload_bytes)
+
+    @staticmethod
+    def _transfer_diagnostic(destination, source, *, name=None, extent=None):
+        where = f"{name or '<unnamed>'}" + (f"[{extent}]" if extent is not None else "")
+        return (f"{where}: source device={source.device} dtype={source.dtype} "
+                f"shape={tuple(source.shape)} stride={tuple(source.stride())} "
+                f"contiguous={source.is_contiguous()} -> destination device={destination.device} "
+                f"dtype={destination.dtype} shape={tuple(destination.shape)} "
+                f"stride={tuple(destination.stride())} contiguous={destination.is_contiguous()}")
+
+    def _pre_flight(self, destination, source, *, name=None, extent=None):
+        """Refuse what b12x would refuse, naming the tensor and extent.
+
+        Checkpoint (meta) views: the direct path's A2/A5/A6/A7/A9 acceptance
+        checks in Python (version, shape, stride sign, byte span, dtype rule).
+        Staged sources: every path-B (host-copy) condition. The session stays
+        the authority — this only turns its silent refusal into a named error.
+        """
+        import torch
+
+        problems = []
+        if source.device.type == "meta":
+            if source._version != 0:
+                problems.append(f"source was edited in place (version {source._version}, A2)")
+            if source.shape != destination.shape:
+                problems.append(f"shape {tuple(source.shape)} != {tuple(destination.shape)}, A5")
+            if any(step < 0 for step in (*source.stride(), *destination.stride())):
+                problems.append(f"negative stride source={tuple(source.stride())} "
+                                f"destination={tuple(destination.stride())}, A6")
+            registrations = getattr(self._session, "sources", None)
+            item = registrations.get(source.untyped_storage()._cdata) if registrations is not None else None
+            if item is not None:
+                _, checkpoint = item
+                offset = source.storage_offset() * source.element_size()
+                span = ((1 + sum((size - 1) * stride for size, stride in
+                                 zip(source.shape, source.stride(), strict=False)))
+                        * source.element_size() if source.numel() else 0)
+                if span and offset + span > checkpoint.nbytes:
+                    problems.append(f"byte span {offset + span} exceeds checkpoint range "
+                                    f"{checkpoint.nbytes}, A7")
+            if (source.dtype != destination.dtype
+                    and not (source.dtype == torch.bfloat16 and destination.dtype == torch.float32)
+                    and not {source.dtype, destination.dtype} <= {torch.int8, torch.uint8}
+                    and not (source.is_contiguous() and destination.is_contiguous())):
+                problems.append(f"dtype conversion {source.dtype} -> {destination.dtype} "
+                                f"needs both sides contiguous, A9")
+        else:
+            if not (hasattr(self._session, "sources") and hasattr(self._session, "device")):
+                return  # the session owns its contract (CPU/header dry runs, test stubs)
+            if source.device.type != "cpu":
+                problems.append(f"source is not a checkpoint view and not on CPU (device {source.device})")
+            if not source.is_contiguous():
+                problems.append("source is not contiguous")
+            if not destination.is_contiguous():
+                problems.append("destination is not contiguous")
+            if source.shape != destination.shape and not (source.numel() == destination.numel() == 1):
+                problems.append(f"shape {tuple(source.shape)} != {tuple(destination.shape)}")
+            if source.dtype != destination.dtype:
+                problems.append(f"dtype {source.dtype} != {destination.dtype}")
+            device = getattr(self._session, "device", None)
+            if device is not None:
+                expected = torch.device("cuda", device) if type(device) is int else torch.device(device)
+                if destination.device != expected:
+                    problems.append(f"destination device {destination.device} != session device {expected}")
+        if problems:
+            raise RuntimeError("b12x would refuse this transfer ("
+                               + "; ".join(problems) + "): "
+                               + self._transfer_diagnostic(destination, source, name=name, extent=extent))
 
     def load_tensor(self, name: str, *, dtype: torch.dtype | None = None, extent=None, temporary=False) -> torch.Tensor:
         """Transfer a selected resident weight or declared scalar to the GPU."""
@@ -1043,7 +1105,8 @@ class DirectWeightLoader:
         target = zeros((last - first, *source.shape[1:]), dtype=source.dtype, device=self.device)
         count = max(0, min(last, source.shape[0]) - first)
         if count:
-            self._copy(target[:count], source[first:first + count])
+            self._copy(target[:count], source[first:first + count], name=name,
+                       extent=(slice(first, first + count),))
         self._session.flush()
         return target
 
@@ -1056,7 +1119,7 @@ class DirectWeightLoader:
             source = source[extent]
         empty = torch.empty if temporary else persistent_empty
         target = empty(source.shape, dtype=source.dtype if dtype is None else dtype, device=self.device)
-        self._copy(target, source)
+        self._copy(target, source, name=name, extent=extent)
         from ignition.preparation import provenance
 
         provenance.record(
@@ -1115,11 +1178,11 @@ class DirectWeightLoader:
             offset = 0
             for index, source in enumerate(sources):
                 stop = offset + source.shape[0]
-                self._copy(values[offset:stop], source)
+                self._copy(values[offset:stop], source, name=f"{prefixes[index]}.weight")
                 if scales is not None:
                     scale = scale_sources[index]
                     destination = scales[offset // 128:stop // 128]
-                    self._copy(destination.view(scale.shape), scale)
+                    self._copy(destination.view(scale.shape), scale, name=f"{prefixes[index]}.{scale_name}")
                 offset = stop
             self._session.flush()
             from ignition.preparation import provenance
@@ -1435,14 +1498,19 @@ class DirectWeightLoader:
                     # The reader stages the whole projection; its rows are contiguous in the checkpoint.
                     if shared.reader(index) == shared.rank:
                         offset = index // shared.world * slot_bytes
-                        self._copy(shared.view(shared.rank, offset, source.shape, torch.uint8), source, numeric=False)
+                        self._copy(shared.view(shared.rank, offset, source.shape, torch.uint8), source,
+                                   numeric=False, name=f"{prefix}.{projection}.{weight_name}")
                         self._copy(shared.view(shared.rank, offset + down_bytes, scale.shape, scale_dtype), scale,
-                                   numeric=False)
+                                   numeric=False, name=f"{prefix}.{projection}.{scale_name}")
                 else:
-                    self._copy(values, source[:, first // 2:last // 2] if projection == down_name
-                               else source[first:last])
-                    self._copy(blocks, scale[:, first // group:last // group] if projection == down_name
-                               else scale[first:last])
+                    value_slice = ((slice(None), slice(first // 2, last // 2)) if projection == down_name
+                                   else (slice(first, last),))
+                    scale_slice = ((slice(None), slice(first // group, last // group)) if projection == down_name
+                                   else (slice(first, last),))
+                    self._copy(values, source[value_slice],
+                               name=f"{prefix}.{projection}.{weight_name}", extent=value_slice)
+                    self._copy(blocks, scale[scale_slice],
+                               name=f"{prefix}.{projection}.{scale_name}", extent=scale_slice)
                 if format == "mxfp4":
                     continue
                 value = self._sources[f"{prefix}.{projection}.{global_scale_name}"]
