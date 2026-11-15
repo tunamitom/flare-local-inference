@@ -999,7 +999,18 @@ class DirectWeightLoader:
         from ignition.preparation.tensor_metadata import record_numeric_tensor
 
         if not self._session(destination, source):
-            raise RuntimeError("b12x rejected the direct weight transfer")
+            # `DirectWeightSession.__call__` returns False only for sources that
+            # are not registered checkpoint views (its meta path raises on any
+            # malformed transfer and never refuses): it counts their bytes as
+            # `torch_copy_bytes` and hands them back to the caller to complete
+            # with an ordinary tensor copy. That hand-back is the resident-slice
+            # path — `load_resident_experts` re-stages already-materialized rank
+            # slices (CUDA views from `load_tensor(extent=)`) into the fused
+            # planes — so complete it locally. Checkpoint (meta) transfers stay
+            # fail-closed: b12x's acceptance rules are not bypassed for them.
+            if source.device.type == "meta" or source.shape != destination.shape:
+                raise RuntimeError("b12x rejected the direct weight transfer")
+            destination.copy_(source)
         if numeric:
             record_numeric_tensor(destination)
         if self._display is not None:

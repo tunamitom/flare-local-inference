@@ -262,3 +262,109 @@ def test_load_resident_experts_rejects_wrong_slice_geometry():
         loader.load_resident_experts(PREFIX, resident,
                                      intermediate_range=(0, INTER),   # lies about the range
                                      swiglu_limit=SWIGLU_LIMIT)
+
+
+# --- the session's hand-back: staged sources complete with a local copy ------
+
+class HandBackSession:
+    """`DirectWeightSession`'s contract toward staged sources: only registered
+    checkpoint (meta) views are accepted; anything else is refused with its
+    bytes counted as `torch_copy_bytes` — the caller-completed hand-back."""
+
+    def __init__(self):
+        self.transfers = []
+        self.torch_copy_bytes = 0
+
+    def __call__(self, destination, source):
+        if source.device.type == "meta":
+            self.transfers.append((destination, source))
+            return True
+        self.torch_copy_bytes += destination.nbytes
+        return False
+
+    def flush(self):
+        pass
+
+    def stats(self):
+        return {}
+
+
+class RefusingSession(HandBackSession):
+    """Refuses every transfer (the fail-closed probe)."""
+
+    def __call__(self, destination, source):
+        self.torch_copy_bytes += destination.nbytes
+        return False
+
+
+def test_copy_completes_the_session_hand_back_for_staged_sources():
+    loader = make_loader({})
+    session = HandBackSession()
+    loader._session = session
+    staged = torch.arange(24, dtype=torch.uint8).reshape(4, 6)
+    destination = torch.empty_like(staged)
+    loader._copy(destination, staged)          # refused -> local copy, no raise
+    assert torch.equal(destination, staged)
+    assert session.transfers == []
+    assert session.torch_copy_bytes == destination.nbytes
+
+
+def test_copy_stays_fail_closed_for_refused_checkpoint_transfers():
+    loader = make_loader({})
+    loader._session = RefusingSession()
+    checkpoint_view = torch.empty((4, 6), dtype=torch.uint8, device="meta")
+    with pytest.raises(RuntimeError, match="b12x rejected the direct weight transfer"):
+        loader._copy(torch.empty((4, 6), dtype=torch.uint8), checkpoint_view)
+    # a shape-mismatched staged source is a routing bug, not a hand-back
+    with pytest.raises(RuntimeError, match="b12x rejected the direct weight transfer"):
+        loader._copy(torch.empty((4, 6), dtype=torch.uint8),
+                     torch.zeros((2, 3), dtype=torch.uint8))
+
+
+def test_load_resident_experts_stages_planes_across_the_hand_back(monkeypatch):
+    """The production `_copy` staging seam under the real session semantics:
+    the resident rank slices are already-materialized tensors (the serve's
+    `load_tensor(extent=)` CUDA views), so the session refuses them and the
+    loader must complete the fused planes with local copies."""
+    record = {}
+
+    def load_fp4_experts(self, prefixes, *, hidden_size, intermediate_size, **kwargs):
+        record["planes"] = planes = {}
+        for index, prefix in enumerate(prefixes):
+            w13 = torch.empty((2 * intermediate_size, hidden_size // 2), dtype=torch.uint8)
+            w2 = torch.empty((hidden_size, intermediate_size // 2), dtype=torch.uint8)
+            s13 = torch.empty((2 * intermediate_size, hidden_size // 16), dtype=torch.float8_e4m3fn)
+            s2 = torch.empty((hidden_size, intermediate_size // 16), dtype=torch.float8_e4m3fn)
+            for projection, values, blocks in (
+                    ("up_proj", w13[:intermediate_size], s13[:intermediate_size]),
+                    ("gate_proj", w13[intermediate_size:], s13[intermediate_size:]),
+                    ("down_proj", w2, s2)):
+                source = self._sources[f"{prefix}.{projection}.weight"]
+                scale = self._sources[f"{prefix}.{projection}.weight_scale"]
+                self._copy(values, source)
+                self._copy(blocks, scale)
+            planes[prefix] = (w13, w2, s13, s2)
+        return "prepared-experts"
+
+    monkeypatch.setattr(Hy4WeightLoader, "load_fp4_experts", load_fp4_experts)
+    loader = make_loader({})
+    session = HandBackSession()
+    loader._session = session
+    resident = resident_sources()
+    out = loader.load_resident_experts(PREFIX, resident,
+                                       intermediate_range=(0, LOCAL),
+                                       swiglu_limit=SWIGLU_LIMIT)
+    assert out == "prepared-experts"
+    assert session.transfers == []        # nothing rode the checkpoint path
+    for index in range(COUNT):
+        w13, w2, s13, s2 = record["planes"][f"{PREFIX}.experts.{index}"]
+        fused_rows = resident[f"{PREFIX}.gate_up_proj.weight"][index]
+        assert torch.equal(w13[:LOCAL], fused_rows[LOCAL:])       # up half
+        assert torch.equal(w13[LOCAL:], fused_rows[:LOCAL])       # gate half
+        assert torch.equal(w2, resident[f"{PREFIX}.down_proj.weight"][index])
+        assert torch.equal(s13[:LOCAL].view(torch.uint8),
+                           resident[f"{PREFIX}.gate_up_proj.weight_scale"][index, LOCAL:].view(torch.uint8))
+        assert torch.equal(s13[LOCAL:].view(torch.uint8),
+                           resident[f"{PREFIX}.gate_up_proj.weight_scale"][index, :LOCAL].view(torch.uint8))
+        assert torch.equal(s2.view(torch.uint8),
+                           resident[f"{PREFIX}.down_proj.weight_scale"][index].view(torch.uint8))
