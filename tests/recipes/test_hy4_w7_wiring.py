@@ -1145,3 +1145,41 @@ def test_finite_watch_names_the_first_bad_phase_and_layer(worlds, world, monkeyp
     assert finding["call_shape"] == "prefill" and finding["first_position"] == 0
     monkeypatch.setattr(WATCH, "enabled", False)
     WATCH.reset()
+
+
+# --------------------------------------------------------------------------
+# consult17: the all-reduce arm rules
+# --------------------------------------------------------------------------
+def test_all_reduce_arm_rules_parse_and_select():
+    from ignition.recipes.hy4.collectives import (
+        DEFAULT_ALL_REDUCE_ARMS, all_reduce_arm_for, parse_all_reduce_arms,
+    )
+
+    default = parse_all_reduce_arms(DEFAULT_ALL_REDUCE_ARMS)
+    assert all_reduce_arm_for(1, default) == ("oneshot", None, None)
+    for rows in (2, 3, 1024, 4096):
+        assert all_reduce_arm_for(rows, default) == ("rsag", None, None)   # lever 1's choice
+    rules = parse_all_reduce_arms("1:oneshot, 2-64:rsag@256x32, 65-1024:twoshot, 1025-:pull")
+    assert all_reduce_arm_for(1, rules) == ("oneshot", None, None)
+    assert all_reduce_arm_for(64, rules) == ("rsag", 256, 32)
+    assert all_reduce_arm_for(65, rules) == ("twoshot", None, None)
+    assert all_reduce_arm_for(1024, rules) == ("twoshot", None, None)
+    assert all_reduce_arm_for(2048, rules) == ("pull", None, None)
+    with pytest.raises(ValueError, match="no all-reduce arm rule"):
+        all_reduce_arm_for(2, parse_all_reduce_arms("1:oneshot"))
+    for bad in ("", "rsag", "2-:fast", "0:rsag", "8-2:rsag", "2-:rsag@100x4", "2-:rsag@256", "x:rsag"):
+        with pytest.raises(ValueError):
+            parse_all_reduce_arms(bad)
+
+
+def test_transport_keeps_the_arm_rules_it_was_built_with():
+    from ignition.recipes.hy4.collectives import PcieDcpTransport, all_reduce_arm_for
+
+    def build(arms=None):
+        return PcieDcpTransport(group=None, device="cpu", pools={}, rank=0, world_size=8,
+                                total_heads=64, all_reduce_arms=arms)
+
+    assert all_reduce_arm_for(1024, build().all_reduce_arms)[0] == "rsag"
+    assert all_reduce_arm_for(1024, build("1:oneshot,2-:twoshot").all_reduce_arms)[0] == "twoshot"
+    with pytest.raises(ValueError):
+        build("2-:nope")

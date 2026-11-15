@@ -50,6 +50,8 @@ __all__ = [
     "scores_only_threshold",
     "scores_only_offer_saturated",
     "scores_only_merge",
+    "parse_all_reduce_arms",
+    "all_reduce_arm_for",
     "audit_scores_only_selection",
     "check_scores_only_exactness",
     "select_own_candidates",
@@ -610,6 +612,65 @@ class SimulatedDcpTransport:
 # ------------------------------------------------------------------------
 # the W7 GPU transport: the real b12x PCIe DCP surfaces
 # ------------------------------------------------------------------------
+# The b12x PCIe all-reduce arms (the c1 cells' names): the one-shot pool's
+# transports, and the BF16 two-shot runtime the manager builds beside it.
+ALL_REDUCE_ARMS = {
+    "oneshot": "remote_push_full",
+    "rsag": "remote_push_rsag",
+    "pull": "pull",
+    "twoshot": None,
+}
+DEFAULT_ALL_REDUCE_ARMS = "1:oneshot,2-:rsag"
+
+
+def parse_all_reduce_arms(spec):
+    """`"1:oneshot,2-1024:twoshot,1025-:rsag@256x32"` -> row-range rules.
+
+    Each rule is `ROWS:ARM` or `ROWS:ARM@THREADSxBLOCKS`; `ROWS` is `N`,
+    `LO-HI` or `LO-` (open). Rules are tried in order; every row count the
+    serve prepares must match one. Returns `((lo, hi, arm, threads, blocks), ...)`
+    with `hi=None` open and `threads=blocks=None` meaning the arm's default
+    launch (256 x 16 for the one-shot arms — the c1 cells' — and the prepared
+    default for two-shot and pull).
+    """
+    rules = []
+    for item in str(spec).split(","):
+        item = item.strip()
+        rows, sep, arm = item.partition(":")
+        if not sep:
+            raise ValueError(f"all-reduce arm rule {item!r} is not ROWS:ARM")
+        threads = blocks = None
+        arm, at, launch = arm.partition("@")
+        if at:
+            left, x, right = launch.partition("x")
+            if not x or not left.isdigit() or not right.isdigit():
+                raise ValueError(f"all-reduce launch {launch!r} is not THREADSxBLOCKS")
+            threads, blocks = int(left), int(right)
+            if threads < 32 or threads % 32 or blocks < 1:
+                raise ValueError(f"all-reduce launch {launch!r}: threads in 32s, blocks >= 1")
+        if arm not in ALL_REDUCE_ARMS:
+            raise ValueError(f"unknown all-reduce arm {arm!r}; one of {sorted(ALL_REDUCE_ARMS)}")
+        lo, dash, hi = rows.partition("-")
+        if not lo.isdigit() or (dash and hi and not hi.isdigit()):
+            raise ValueError(f"all-reduce row range {rows!r} is not N, LO-HI or LO-")
+        lo = int(lo)
+        hi = lo if not dash else (int(hi) if hi else None)
+        if lo < 1 or (hi is not None and hi < lo):
+            raise ValueError(f"all-reduce row range {rows!r} is empty")
+        rules.append((lo, hi, arm, threads, blocks))
+    if not rules:
+        raise ValueError("the all-reduce arm spec is empty")
+    return tuple(rules)
+
+
+def all_reduce_arm_for(rows, rules):
+    """The first rule covering `rows`: `(arm, threads, blocks)`."""
+    for lo, hi, arm, threads, blocks in rules:
+        if rows >= lo and (hi is None or rows <= hi):
+            return arm, threads, blocks
+    raise ValueError(f"no all-reduce arm rule covers rows={rows}")
+
+
 class PcieDcpTransport:
     """GPU transport over the real b12x PCIe DCP kernels (W7 gate c / P5).
 
@@ -632,7 +693,7 @@ class PcieDcpTransport:
     """
 
     def __init__(self, *, group, device, pools, rank, world_size, total_heads,
-                 all_reduce=None, reduce_width=None):
+                 all_reduce=None, reduce_width=None, all_reduce_arms=None):
         self.group = group
         self.device = torch.device(device)
         self.rank = rank
@@ -643,13 +704,15 @@ class PcieDcpTransport:
         self._prepared = 0
         self._ar = all_reduce          # consult15 §2 lever 1: b12x PCIe all-reduce
         self.reduce_width = None if reduce_width is None else int(reduce_width)
-        self._ar_plans = {}            # rows -> (plan, channel)
+        self._ar_plans = {}            # rows -> (plan, runtime, arm)
+        # consult17: which arm each row count runs (the A/B flag's rules).
+        self.all_reduce_arms = parse_all_reduce_arms(all_reduce_arms or DEFAULT_ALL_REDUCE_ARMS)
 
     # -- construction ------------------------------------------------------
 
     @classmethod
     def from_process_group(cls, process_group, device, *, total_heads, query_widths,
-                           value_width, max_rows, reduce_width=None):
+                           value_width, max_rows, reduce_width=None, all_reduce_arms=None):
         """One channel pool per wire geometry (the query gather's absorbed and
         unabsorbed widths, and the 512-wide latent partials).
 
@@ -690,7 +753,8 @@ class PcieDcpTransport:
             _trace(f"PCIeAllReduce width={reduce_width} rows={max_rows} done")
         return cls(group=process_group, device=device, pools=pools,
                    rank=rank, world_size=world_size, total_heads=total_heads,
-                   all_reduce=all_reduce, reduce_width=reduce_width)
+                   all_reduce=all_reduce, reduce_width=reduce_width,
+                   all_reduce_arms=all_reduce_arms)
 
     def bind(self, rank):
         if rank != self.rank:
@@ -793,16 +857,15 @@ class PcieDcpTransport:
     def prepare_all_reduce(self, session, rows, *, name=None):
         """Prepare the b12x PCIe all-reduce plan for `rows` at the reduce width.
 
-        consult15 §2 lever 1 — the c1 cells' arms (c1-unit-costs.md §1, the
-        w8/w4prod allreduce cells): `oneshot` (remote_push_full) at 1 row,
-        `rsag` (remote_push_rsag) above, threads 256 / blocks 16. Prepared
-        through the same session + CollectiveRequirement form as the DCP
-        gather/lse plans (the bench's `benchmark_pcie_allreduce_transports`
-        prepare path, minus graph replay).
+        The arm comes from `self.all_reduce_arms` (consult17; the default is
+        consult15's lever 1: `oneshot` at 1 row, `rsag` above, 256 x 16).
+        `oneshot` / `rsag` / `pull` are transports of the one-shot pool;
+        `twoshot` is the BF16 two-shot runtime the manager builds beside it.
+        Each is prepared exactly as the c1 cells' bench prepares it
+        (`benchmark_pcie_allreduce_transports.prepare`, minus graph replay).
         """
         from dataclasses import replace
 
-        from b12x.comm.pcie import _oneshot_preparation as oneshot
         from b12x.preparation import CollectiveRequirement, FrozenMapping
 
         if self._ar is None:
@@ -810,24 +873,51 @@ class PcieDcpTransport:
         rows = int(rows)
         if rows in self._ar_plans:
             return self._ar_plans[rows][0]
+        arm, threads, blocks = all_reduce_arm_for(rows, self.all_reduce_arms)
         inp = torch.zeros((rows, self.reduce_width), dtype=torch.bfloat16, device=self.device)
         out = torch.empty_like(inp)
-        target = self._ar._prepared_channel_for_stream(None, None)
-        query = oneshot.query_from_runtime(
-            target, surface="OneshotAllReduce.all_reduce", call={"inp": inp, "out": out})
-        transport = "remote_push_full" if rows <= 1 else "remote_push_rsag"
-        if not query.call["payload_ready_region_packs"]:
-            raise RuntimeError(
-                "the b12x all-reduce pool has no payload-ready region for "
-                f"rows={rows} (remote_push arms unavailable at this setup)")
-        call = {**query.call, "transport": transport, "threads": 256, "blocks": 16}
-        query = replace(query, call=FrozenMapping(call))
-        plan = oneshot.plan(query, runtime=target)
+        if arm == "twoshot":
+            from b12x.comm.pcie import _twoshot_preparation as twoshot
 
-        def prime(state):
-            return oneshot._prepare_plain_call(state, inp=inp, out=out)
+            target = getattr(self._ar, "_bf16_twoshot", None)
+            if target is None or not target.accepts(inp):
+                raise RuntimeError(
+                    f"the two-shot all-reduce is unavailable for rows={rows} "
+                    "(no BF16 two-shot runtime, or the shape is not whole 16-byte packs)")
+            call = {"inp": inp, "out": out}
+            if threads is not None:
+                call.update(threads=threads, block_limit=blocks)
+            query = twoshot.query_from_runtime(
+                target, surface="PCIeTwoShotBF16.all_reduce", call=call)
+            plan = twoshot.plan(query, runtime=target)
 
-        label = name or f"ar-{rows}-{self.reduce_width}"
+            def prime(state):
+                return twoshot.prepared_call(state, payload=inp, out=out)
+        else:
+            from b12x.comm.pcie import _oneshot_preparation as oneshot
+
+            target = self._ar._prepared_channel_for_stream(None, None)
+            query = oneshot.query_from_runtime(
+                target, surface="OneshotAllReduce.all_reduce", call={"inp": inp, "out": out})
+            if arm != "pull" and not query.call["payload_ready_region_packs"]:
+                raise RuntimeError(
+                    "the b12x all-reduce pool has no payload-ready region for "
+                    f"rows={rows} (remote_push arms unavailable at this setup)")
+            call = {**query.call, "transport": ALL_REDUCE_ARMS[arm]}
+            if threads is not None:
+                call.update(threads=threads, blocks=blocks)
+            elif arm == "pull":
+                call.update(threads=query.call["eager_threads"],
+                            blocks=query.call["eager_blocks"])
+            else:
+                call.update(threads=256, blocks=16)
+            query = replace(query, call=FrozenMapping(call))
+            plan = oneshot.plan(query, runtime=target)
+
+            def prime(state):
+                return oneshot._prepare_plain_call(state, inp=inp, out=out)
+
+        label = name or f"ar-{arm}-{rows}-{self.reduce_width}"
         session.prepare(
             (plan.request(
                 name=label,
@@ -837,7 +927,7 @@ class PcieDcpTransport:
             coordinator=lambda progress: progress.ready_collectives[0].key
             if progress.ready_collectives else None,
         )
-        self._ar_plans[rows] = (plan, target)
+        self._ar_plans[rows] = (plan, target, arm)
         self._prepared += 1
         return plan
 
@@ -908,11 +998,19 @@ class PcieDcpTransport:
                 raise RuntimeError(
                     f"no prepared all-reduce plan for rows={int(value.shape[0])}; "
                     "plans bind before the run — there is no JIT at run time")
-            plan, target = entry
+            plan, target, arm = entry
             inp = value.contiguous()
             out = torch.empty_like(inp)
-            _trace(f"all_reduce(gpu) rows={int(value.shape[0])}")
-            result = target.all_reduce(inp, plan=plan, out=out)
+            _trace(f"all_reduce(gpu) rows={int(value.shape[0])} arm={arm}")
+            if arm == "twoshot":
+                if not target.accepts(inp):
+                    inp = inp.clone()      # two-shot wants 16-byte-aligned packs
+                prepared = plan.prepared.state.query.call
+                result = target.all_reduce(inp, plan=plan, out=out,
+                                           threads=prepared["threads"],
+                                           block_limit=prepared["block_limit"])
+            else:
+                result = target.all_reduce(inp, plan=plan, out=out)
             _trace(f"all_reduce(gpu) rows={int(value.shape[0])} done")
             return result
         import torch.distributed as dist
