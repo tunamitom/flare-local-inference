@@ -831,6 +831,9 @@ class Hy4Decoder:
         deferred = getattr(self.collectives, "deferred_checks", None)
         if deferred is not None:
             deferred.clear()
+        prepare = getattr(getattr(self.collectives, "transport", None), "prepare_lane_audit", None)
+        if prepare is not None:
+            prepare()
         steps = [self._half_steps(*halves[index], half_shape, prevalidated=True)
                  for index in (0, 1)]
         results = [None, None]
@@ -840,17 +843,21 @@ class Hy4Decoder:
 
         import os as _os
 
-        guard = (cuda and not getattr(TIMER, "phases", False)
-                 and (_os.environ.get("HY4_OVERLAP_SYNC_GUARD", "1") or "1") != "0"
+        setting = (_os.environ.get("HY4_OVERLAP_SYNC_GUARD", "1") or "1").strip()
+        guard = (cuda and not getattr(TIMER, "phases", False) and setting != "0"
                  and not getattr(getattr(self.collectives, "transport", None),
                                  "lane_audit_inloop", False))
+        guard_mode = "warn" if setting == "warn" else "error"
         previous_mode = torch.cuda.get_sync_debug_mode() if guard else None
         # No b12x first-use preparation (a device-wide synchronize) between
         # two lanes' exchanges: the plain forward at this shape prepares first.
-        # And no synchronizing transfer at all: the sync guard raises on one.
+        # And no synchronizing transfer at all: the sync guard raises on one
+        # ("warn" — a diagnosis boot — prints every distinct site with its stack).
         with lazy_preparation_trap("forward_overlapped") if cuda else nullcontext():
             if guard:
-                torch.cuda.set_sync_debug_mode("error")
+                if guard_mode == "warn":
+                    _sync_site_reporter.install(getattr(self.collectives, "rank", 0))
+                torch.cuda.set_sync_debug_mode(guard_mode)
             try:
                 for step in range(layers + 1):
                     for index in (0, 1):
@@ -867,6 +874,8 @@ class Hy4Decoder:
             finally:
                 if guard:
                     torch.cuda.set_sync_debug_mode(previous_mode)
+                    if guard_mode == "warn":
+                        _sync_site_reporter.uninstall()
         if cuda:
             for stream in streams:
                 main.wait_stream(stream)
@@ -1105,3 +1114,51 @@ class Hy4Decoder:
         for row in rows:
             self._row_lengths.pop(int(row), None)
             self._draft_positions.pop(int(row), None)
+
+
+
+class _SyncSiteReporter:
+    """HY4_OVERLAP_SYNC_GUARD=warn: print each distinct synchronizing call site
+    inside the overlapped loop once, with its Python stack (diagnosis boots)."""
+
+    def __init__(self):
+        self.seen = set()
+        self._previous = None
+        self.rank = 0
+
+    def install(self, rank):
+        import warnings
+
+        self.rank = rank
+        self._previous = warnings.showwarning
+        warnings.simplefilter("always", UserWarning)
+        reporter = self
+
+        def show(message, category, filename, lineno, file=None, line=None):
+            text = str(message)
+            if "synchronizing" not in text:
+                return reporter._previous(message, category, filename, lineno, file, line)
+            import traceback
+
+            stack = traceback.extract_stack()[:-1]
+            frames = [f for f in stack if "hy4" in f.filename or "b12x" in f.filename][-6:]
+            key = tuple((f.filename, f.lineno) for f in frames)
+            if key in reporter.seen:
+                return None
+            reporter.seen.add(key)
+            where = " <- ".join(f"{f.filename.rsplit('/', 1)[-1]}:{f.lineno} {f.name}"
+                                for f in reversed(frames))
+            print(f"[h4 r{reporter.rank}] SYNC-SITE {text[:60]} at {where}", flush=True)
+            return None
+
+        warnings.showwarning = show
+
+    def uninstall(self):
+        import warnings
+
+        if self._previous is not None:
+            warnings.showwarning = self._previous
+            self._previous = None
+
+
+_sync_site_reporter = _SyncSiteReporter()

@@ -1742,12 +1742,31 @@ class PcieDcpTransport:
             self._digest_weights = torch.stack((index % 65521 + 1, (index * 40503) % 65519 + 1))
         return (self._digest_weights[:, :n] * words).sum(dim=1)
 
+    def prepare_lane_audit(self):
+        """Build the post-hoc audit's constants BEFORE the overlapped loop (an
+        upload inside it is exactly the transfer the loop must never make):
+        the ring-sum projection (seeded device generator: same on every rank)
+        and the digest weights at the widest audited tensor."""
+        if not self.lane_audit or self.lane_audit_inloop:
+            return
+        if self._projection is None:
+            generator = torch.Generator(device=self.device).manual_seed(18_04)
+            self._projection = torch.randn(int(self.reduce_width), 4, generator=generator,
+                                           device=self.device)
+        if self._digest_weights is None:
+            widest = 0
+            for channel in (self._ce, *self._lane_ces):
+                if channel is not None:
+                    widest = max(widest, channel.max_rows * channel.hpr * channel.gather_width,
+                                 channel.max_rows * channel.score_offer * 4)
+            index = torch.arange(max(widest, 1), device=self.device, dtype=torch.int64)
+            self._digest_weights = torch.stack((index % 65521 + 1, (index * 40503) % 65519 + 1))
+
     def _project(self, value):
         """Four random projections of a [rows, width] sum (linear: sum of the
         inputs' projections == the output's, up to the output's rounding)."""
         if self._projection is None:
-            generator = torch.Generator(device="cpu").manual_seed(18_04)
-            self._projection = torch.randn(int(value.shape[1]), 4, generator=generator).to(value.device)
+            raise RuntimeError("prepare_lane_audit() must run before the overlapped loop")
         return (value.float() @ self._projection).sum(dim=0)
 
     def _record(self, kind, *items):
