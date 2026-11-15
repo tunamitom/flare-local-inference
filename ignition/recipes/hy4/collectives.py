@@ -1664,11 +1664,12 @@ class PcieDcpTransport:
         return self._lane_ces[current - 1]
 
     def _lane_check(self, what):
-        from .lanes import lane
+        from .lanes import lane, overlapped
 
-        if lane():
+        if lane() or overlapped():
             raise RuntimeError(f"lane {lane()} reached the single-channel {what}: "
-                               "an overlapped half must stay on its lane's channels")
+                               "an overlapped half must stay on its lane's channels "
+                               "(CE exchange or dma ring: single-CTA peer waits only)")
 
     def _all_gather_heads_impl(self, local_input, out=None, *, plan=None):
         rows, _, width = (int(v) for v in local_input.shape)
@@ -1985,6 +1986,8 @@ class PcieDcpTransport:
             # ranks (the audit boot, 2026-11-15); --overlap stays off until the
             # loop is free of host barriers and device-wide synchronizes.
             return self._gather_all(offers)
+        if overlapped():
+            self._lane_check("score pool / control group")
         key = ("score_gather", rows, 2 * width, "")
         if (self.score_offer != width or offers.dtype != torch.float32
                 or key not in self._plans):
@@ -2009,6 +2012,34 @@ class PcieDcpTransport:
                         f"(rows={rows}, offer={width}): the DCP gather is not a pure copy here")
             self.score_wire_checked += 1
         return result
+
+    # -- consult18 S1: cooperative admission contract ---------------------
+    # A pending cooperative grid (the W4A16 routed experts) is admitted only
+    # whole, and until then the device dispatches no later kernel from any
+    # stream. Beside a resident kernel that waits on a PEER, that is a
+    # cross-rank cycle (harness/coop_block.py). Inside the overlap the peer
+    # waits are bounded instead: the comm token keeps one collective in flight
+    # per rank; its peer waits are single-CTA b12x flag waits on at most
+    # PEER_WAIT_STREAMS streams (CE: the lane stream + the gather relay's
+    # local stream; the dma ring: the lane stream, its reduce-phase waits
+    # split out of the multi-CTA wait_add by B12X_PCIE_DMA_SINGLE_CTA_WAITS);
+    # every other collective path raises inside the overlap. The fused grid
+    # leaves B12X_W4A16_COOP_RESERVE_SMS >= PEER_WAIT_STREAMS SMs free, so it
+    # always fits beside them: once ordinary kernels drain it is admitted.
+    PEER_WAIT_STREAMS = 2
+
+    def admission_contract(self):
+        """The overlap's cooperative-admission regime, or raise if none holds."""
+        from b12x._lib.env import env_flag
+        from b12x.moe._shared.kernels.w4a16.kernel.fused_launch import (
+            cooperative_reserve_sms)
+
+        sms = torch.cuda.get_device_properties(self.device).multi_processor_count
+        reserve = cooperative_reserve_sms(sms)
+        single = env_flag("PCIE_DMA_SINGLE_CTA_WAITS")
+        if reserve >= self.PEER_WAIT_STREAMS and single:
+            return f"reserve {reserve} of {sms} SMs >= {self.PEER_WAIT_STREAMS} single-CTA peer waits"
+        return None
 
     # -- consult18 D (fix C): one collective in flight per rank -----------
     # b12x's PCIe runtimes are single ordered channels ("callers must not
@@ -2106,6 +2137,13 @@ class PcieDcpTransport:
                     f"no prepared all-reduce plan for rows={int(value.shape[0])}; "
                     "plans bind before the run — there is no JIT at run time")
             plan, target, arm = entry
+            if arm != "dma":
+                from .lanes import overlapped
+
+                if overlapped():
+                    raise RuntimeError(
+                        f"all-reduce arm {arm!r} (rows={int(value.shape[0])}) inside the "
+                        "overlapped loop: only the dma ring has single-CTA peer waits")
             inp = value.contiguous()
             out = torch.empty_like(inp)
             _trace(f"all_reduce(gpu) rows={int(value.shape[0])} arm={arm}")

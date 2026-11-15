@@ -881,12 +881,34 @@ class Hy4Decoder:
                 # pair with the "kv" gate, which opens at lane 0's layer-l cache
                 # writes). Collectives still interleave one at a time.
                 gate_on = "kv" if (_os.environ.get("HY4_OVERLAP_GATE") or "layer") == "kv" else "layer_end"
+                # Cooperative kernels (the W4A16 routed experts) run in the comm
+                # token's section: never beside another lane's peer-waiting comm.
+                # consult18 S1 — the cooperative W4A16 grid and the other lane's
+                # peer waits: either the grid leaves room for every resident
+                # peer wait (the reserve contract, default) or it runs in the
+                # comm token's section (HY4_OVERLAP_EXCLUSIVE_MOE=1). Neither:
+                # refuse the overlap rather than risk the cross-rank cycle.
+                transport = getattr(self.collectives, "transport", None)
+                exclusive_moe = (_os.environ.get("HY4_OVERLAP_EXCLUSIVE_MOE") or "0") != "0"
+                section = getattr(transport, "_comm_token", None) if exclusive_moe else None
+                contract = getattr(transport, "admission_contract", None)
+                unsafe = (_os.environ.get("HY4_OVERLAP_ADMISSION_UNSAFE") or "0") != "0"
+                if cuda and section is None and contract is not None and contract() is None \
+                        and not unsafe:
+                    raise RuntimeError(
+                        "forward_overlapped: no cooperative-admission regime — set "
+                        "B12X_W4A16_COOP_RESERVE_SMS>=2 with B12X_PCIE_DMA_SINGLE_CTA_WAITS=1, "
+                        "or HY4_OVERLAP_EXCLUSIVE_MOE=1")
+                self.overlap_regime = ("exclusive MoE section" if section is not None
+                                       else (contract() if contract is not None else "cpu")
+                                       or "UNSAFE (diagnosis boot: no admission regime)")
                 kv_ready = {}
                 finished = [False, False]
                 lane1_layer, lane1_at_start = 0, True
                 while not (finished[0] and finished[1]):
                     if not finished[0]:
-                        with use_lane(0, overlap=True, geometry=geometries[0]), \
+                        with use_lane(0, overlap=True, geometry=geometries[0],
+                                      exclusive=section), \
                                 (torch.cuda.stream(streams[0]) if cuda else nullcontext()):
                             try:
                                 label = next(steps[0])
@@ -906,7 +928,8 @@ class Hy4Decoder:
                         if finished[0]:
                             raise RuntimeError(f"lane 0 finished without layer {lane1_layer}'s records")
                         continue
-                    with use_lane(1, overlap=True, geometry=geometries[1]), \
+                    with use_lane(1, overlap=True, geometry=geometries[1],
+                                  exclusive=section), \
                             (torch.cuda.stream(streams[1]) if cuda else nullcontext()):
                         if cuda and gated:
                             streams[1].wait_event(kv_ready[lane1_layer])

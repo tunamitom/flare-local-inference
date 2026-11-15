@@ -281,3 +281,37 @@ def test_sync_free_selection_is_identical(seed):
         b = C.select_own_candidates(offers, scores[rank], positions[rank], topk=topk, world=world,
                                     rank=rank, local_offer=4, sync_free=True)
         assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1])
+
+
+def test_exclusive_section_wraps_cooperative_launch():
+    """consult18 S1: inside an overlapped half a cooperative launch must run in
+    the comm token's section; outside the overlap the section is a no-op."""
+    from contextlib import contextmanager
+
+    import pytest
+
+    from ignition.recipes.hy4 import lanes
+
+    entered = []
+
+    @contextmanager
+    def token():
+        entered.append("in")
+        yield
+        entered.append("out")
+
+    lanes.require_exclusive("plain")                 # no overlap: allowed
+    with lanes.exclusive():                          # no overlap: no-op
+        pass
+    assert entered == []
+    before = lanes.SECTIONS[0]
+    with lanes.use_lane(1, overlap=True, exclusive=token):
+        with pytest.raises(RuntimeError, match="exclusive section"):
+            lanes.require_exclusive("W4A16 routed experts")
+        with lanes.exclusive():
+            lanes.require_exclusive("W4A16 routed experts")
+        with pytest.raises(RuntimeError):
+            lanes.require_exclusive("after the section")
+    assert entered == ["in", "out"]
+    assert lanes.SECTIONS[0] == before + 1
+    lanes.require_exclusive("after the lane")        # section factory reset

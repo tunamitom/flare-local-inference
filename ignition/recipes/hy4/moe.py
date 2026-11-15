@@ -410,6 +410,9 @@ class MoEBlock:
 
     def _routed_forward(self, x, topk_indices, topk_weights):
         if self.device.type == "cuda" and self._prepared is not None:
+            from .lanes import require_exclusive
+
+            require_exclusive("W4A16 routed experts")
             return self._prepared(x, ids=topk_indices, weights=topk_weights)
         return self.routed.forward(x, topk_indices, topk_weights)
 
@@ -475,8 +478,28 @@ class MoEBlock:
                 routed = self._routed_forward(x, topk_indices, topk_weights)
                 main.wait_event(joined)
                 return routed + shared
+        from .lanes import exclusive
+
         with TIMER.phase("moe.routed"):
-            routed = self._routed_forward(x, topk_indices, topk_weights)
+            # consult18 S1: the W4A16 routed experts are ONE cooperative grid
+            # (whole-grid admission, software all-CTA barriers). A PENDING
+            # cooperative grid holds back every later kernel on the card, any
+            # stream (coop_block.py: a 1-thread peer wait resident -> the grid
+            # cannot be admitted -> a flag-set on a third stream never runs).
+            # Beside the other lane's peer-waiting comm that is a cross-rank
+            # cycle: each rank's wait needs a peer's send, held back by that
+            # peer's pending grid, itself waiting for that peer's resident wait.
+            # The comm token's section makes the grid exclusive with every
+            # collective on this rank, in the same host order on every rank.
+            from .hangdump import active_tracer
+
+            tracer = active_tracer()
+            with exclusive():
+                if tracer is not None:
+                    tracer.mark(f"moe.routed begin rows={int(x.shape[0])}")
+                routed = self._routed_forward(x, topk_indices, topk_weights)
+                if tracer is not None:
+                    tracer.mark("moe.routed end")
         PROBE.add("moe.routed", -2, routed)
         with TIMER.phase("moe.route_shared"):
             shared = self._shared_forward(x, shared_gate, shared_up)

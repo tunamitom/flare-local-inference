@@ -24,7 +24,14 @@ import threading
 
 import torch
 
-__all__ = ["HangWatch", "Tracer", "comm_state_lines", "lazy_preparation_trap"]
+__all__ = ["HangWatch", "Tracer", "active_tracer", "comm_state_lines", "lazy_preparation_trap"]
+
+# The rank's HY4_TRACE tracer once the transport built one (compute-side marks).
+_ACTIVE = [None]
+
+
+def active_tracer():
+    return _ACTIVE[0]
 
 
 class _Bytes:
@@ -115,6 +122,7 @@ class Tracer:
         self._submitted = [0] * self.SLOTS
         self._logs = [deque(maxlen=keep) for _ in range(self.SLOTS)]
         self._deque = deque
+        _ACTIVE[0] = self
 
     def name_stream(self, stream, name):
         self._names[int(stream.cuda_stream)] = name
