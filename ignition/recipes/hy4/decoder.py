@@ -729,6 +729,7 @@ class Hy4Decoder:
             embeds = self.collectives.embed_lookup(
                 token_ids.reshape(-1), self.weights.embed,
                 vocabulary_range=self.weights.sharding.vocabulary_range).to(self.compute_dtype)
+        PROBE.add("embed", -1, embeds)
         streams = StreamState.begin(embeds)
         post = y = None
         mlp_out = None
@@ -745,18 +746,24 @@ class Hy4Decoder:
                     streams.streams, post, y = previous_ffn.post_pre(
                         mlp_out, streams.streams, post, layer.attn_ihc,
                         norm_weight=layer.input_norm)
+            PROBE.add("y_attn_in", index, y)
             attn_out = yield from self._attention_gen(layer, y, positions, token_rows, visible,
                                                       call_shape=call_shape, visible_max=None)
+            PROBE.add("attn_out", index, attn_out)
             with TIMER.phase("comm.all_reduce.attn"):
                 attn_out = self.collectives.all_reduce(attn_out)
+            PROBE.add("ar_attn", index, attn_out)
             yield ("comm", "ar_attn")
             with TIMER.phase("ihc"):
                 streams.streams, post, y = layer.attn_ihc.post_pre(
                     attn_out, streams.streams, post, layer.ffn_ihc,
                     norm_weight=layer.post_attention_norm)
+            PROBE.add("y_ffn_in", index, y)
             mlp_out = layer.mlp.forward(y, overlap_shared=call_shape.overlap_shared_expert)
+            PROBE.add("moe", index, mlp_out)
             with TIMER.phase("comm.all_reduce.mlp"):
                 mlp_out = self.collectives.all_reduce(mlp_out)
+            PROBE.add("ar_mlp", index, mlp_out)
             previous_ffn = layer.ffn_ihc
             yield ("layer_end", index)
         with TIMER.phase("ihc"):
@@ -958,9 +965,26 @@ class Hy4Decoder:
             # own run-to-run noise floor (the prefill is not deterministic), the
             # yardstick the overlapped difference is judged against.
             overlapped_hidden = torch.cat(results, dim=0).float()
+            PROBE.start()
             first = torch.cat(single_lane(), dim=0).float()
+            run_a = PROBE.stop()
+            PROBE.start()
             results = single_lane()
+            run_b = PROBE.stop()
             second = torch.cat(results, dim=0).float()
+            if run_a and len(run_a) == len(run_b) and not getattr(self, "_probe_reported", False):
+                # The first intermediate where two identical single-lane runs differ.
+                same = [bool(torch.equal(a[2], b[2])) for a, b in zip(run_a, run_b)]
+                first_diff = next((i for i, ok in enumerate(same) if not ok), None)
+                where = ("none" if first_diff is None else
+                         f"{run_a[first_diff][0]} layer {run_a[first_diff][1]} (record "
+                         f"{first_diff} of {len(same)}; previous: "
+                         f"{run_a[first_diff - 1][0] if first_diff else '-'} layer "
+                         f"{run_a[first_diff - 1][1] if first_diff else '-'})")
+                print(f"[h4 r{getattr(self.collectives, 'rank', 0)}] DETERMINISM first difference "
+                      f"between two single-lane runs: {where}; differing records "
+                      f"{same.count(False)} of {len(same)}", flush=True)
+                self._probe_reported = True
 
             def rel(a, b):
                 return float((a - b).norm() / b.norm().clamp_min(1e-30))
@@ -1067,6 +1091,8 @@ class Hy4Decoder:
             bundle = attn.project_packed(y, positions, absorb=not local_absorb_after_gather,
                                          with_index_keys=attn.weights.indexer is not None)
         q_resid, q_local, latent = bundle.q_resid, bundle.q, bundle.latent
+        PROBE.add("project", layer.index, q_local, latent,
+                  bundle.index_keys if attn.weights.indexer is not None else None)
         WATCH.check("attn.project", layer.index, q_local=q_local, latent=latent,
                     index_keys=bundle.index_keys if attn.weights.indexer is not None else None)
         with TIMER.phase("attn.cache_write"):
@@ -1104,9 +1130,11 @@ class Hy4Decoder:
                     scores, candidates = attn.local_candidates(
                         y, q_resid, positions, visible, self.cache.key_table(owner), slot_base,
                         world=world, rank=rank)
+                PROBE.add("candidates", layer.index, scores, candidates)
                 with TIMER.phase("comm.selection"):
                     _, merged = self.collectives.merge_topk(
                         scores, candidates, topk=self.config.text["index_topk"])
+                PROBE.add("merged", layer.index, merged)
                 yield ("comm", "scores")
                 with TIMER.phase("attn.handback"):
                     # `local_slot_map`'s `[rows, local_capacity]` table is pure
@@ -1130,10 +1158,12 @@ class Hy4Decoder:
                                             slot_map=None)
         with TIMER.phase("attn.handback"):
             selected, counts = attn.selection.buffers(rows=y.shape[0])
+        PROBE.add("selected", layer.index, selected, counts)
         self.trace.append(("query_exchange", schedule.placement("query_exchange", family),
                            call_shape.query_wiring, int(q_local.shape[-1])))
         with TIMER.phase("comm.head_gather"):
             q_all = self.collectives.all_gather_heads(q_local)   # all heads per call (D2)
+        PROBE.add("gather", layer.index, q_all)
         yield ("comm", "gather")
         if local_absorb_after_gather:
             # Prefill wiring: the gathered queries are UNABSORBED; W_UK applies
@@ -1169,6 +1199,8 @@ class Hy4Decoder:
         with TIMER.phase("comm.lse_reduce"):
             out, lse = self.collectives.lse_reduce(
                 values, partial.lse, partials_sink_folded=partial.provenance.sink_folded)
+        PROBE.add("partial", layer.index, partial.output, partial.lse)
+        PROBE.add("lse", layer.index, out, lse)
         yield ("comm", "lse")
         WATCH.check("comm.lse_reduce", layer.index, merged=out, merged_lse=lse)
         with TIMER.phase("attn.fold_expand_gate"):
@@ -1256,3 +1288,40 @@ class _SyncSiteReporter:
 
 
 _sync_site_reporter = _SyncSiteReporter()
+
+
+
+class _DeterminismProbe:
+    """consult18 D: where do two identical single-lane runs of a pair first
+    differ? Device fingerprints (two position-weighted int64 sums over the raw
+    words) of every intermediate, recorded only while `start()`ed — the
+    verify path's single-lane runs; compared on the host after them."""
+
+    def __init__(self):
+        self.records = None
+
+    def start(self):
+        self.records = []
+
+    def stop(self):
+        records, self.records = self.records, None
+        return records
+
+    def add(self, name, layer, *tensors):
+        if self.records is None:
+            return
+        digests = [self._digest(t) for t in tensors if t is not None]
+        if digests:
+            self.records.append((name, layer, torch.stack(digests)))
+
+    @staticmethod
+    def _digest(tensor):
+        flat = tensor.detach().contiguous().view(-1)
+        nbytes = flat.numel() * flat.element_size()
+        words = (flat.view(torch.int32) if nbytes % 4 == 0 else flat.view(torch.uint8)).to(torch.int64)
+        index = torch.arange(words.numel(), device=words.device, dtype=torch.int64)
+        return torch.stack(((words * (index % 65521 + 1)).sum(),
+                            (words * ((index * 40503) % 65519 + 1)).sum()))
+
+
+PROBE = _DeterminismProbe()
