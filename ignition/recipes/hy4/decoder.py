@@ -40,7 +40,7 @@ import torch
 
 from .attention import SelectionCell, rms_norm
 from .config import ModelConfig
-from .profile import TIMER
+from .profile import TIMER, WATCH
 from .state import Hy4ModelWeights
 from .wiring import DECODE_ONE_ROW, SCHEDULE, chunk_plan, prefill_shape, verify_shape
 
@@ -589,10 +589,12 @@ class Hy4Decoder:
                        and call_shape.is_decode_graph else None)
         # Vocabulary-sharded embedding (D5): masked lookup over this rank's
         # shard + all-reduce (identity at world 1).
+        WATCH.begin_forward(call_shape.name, positions)   # consult17: no-op unless armed
         with TIMER.phase("embed"):
             embeds = self.collectives.embed_lookup(
                 token_ids.reshape(-1), self.weights.embed,
                 vocabulary_range=self.weights.sharding.vocabulary_range).to(self.compute_dtype)
+        WATCH.check("embed", -1, embeds=embeds)
         streams = StreamState.begin(embeds)
         if state is not None:
             state.streams[:streams.streams.shape[0]] = streams.streams
@@ -608,10 +610,13 @@ class Hy4Decoder:
                     streams.streams, post, y = previous_ffn.post_pre(
                         mlp_out, streams.streams, post, layer.attn_ihc,
                         norm_weight=layer.input_norm)
+            WATCH.check("ihc", index, y=y, streams=streams.streams)
             attn_out = self._attention(layer, y, positions, token_rows, visible,
                                        call_shape=call_shape, visible_max=visible_max)
+            WATCH.check("attn.fold_expand_gate", index, attn_out=attn_out)
             with TIMER.phase("comm.all_reduce.attn"):
                 attn_out = self.collectives.all_reduce(attn_out)  # D4 (o_proj shard)
+            WATCH.check("comm.all_reduce.attn", index, attn_out=attn_out)
             with TIMER.phase("ihc"):
                 streams.streams, post, y = layer.attn_ihc.post_pre(
                     attn_out, streams.streams, post, layer.ffn_ihc,
@@ -621,9 +626,12 @@ class Hy4Decoder:
             # shared-expert overlap is a per-graph-family decision (consult7 §5
             # / consult8 §6): decode graphs overlap, prefill graphs do not.
             # (`moe.route_shared` / `moe.routed` time inside `moe.py`.)
+            WATCH.check("ihc.post_attention", index, y=y, streams=streams.streams)
             mlp_out = layer.mlp.forward(y, overlap_shared=call_shape.overlap_shared_expert)
+            WATCH.check("moe", index, mlp_out=mlp_out)
             with TIMER.phase("comm.all_reduce.mlp"):
                 mlp_out = self.collectives.all_reduce(mlp_out)
+            WATCH.check("comm.all_reduce.mlp", index, mlp_out=mlp_out)
             previous_ffn = layer.ffn_ihc
         with TIMER.phase("ihc"):
             streams.streams = previous_ffn.post(mlp_out, streams.streams, post)
@@ -633,6 +641,7 @@ class Hy4Decoder:
         # the MTP's `hnorm` consumes (finding F; vLLM vllm_hy4_model.py:403,
         # SGLang sgl_hunyuan_v4.py:734, transformers candidate_generator.py:1418
         # all feed `model_outputs.hidden_states[-1]` == `norm(hc_head(...))`).
+        WATCH.check("final", len(self.weights.layers), zero=True, normed=normed)
         streams.hidden = normed
         if state is not None:
             state.hidden[:normed.shape[0]] = normed
@@ -652,6 +661,7 @@ class Hy4Decoder:
             with TIMER.phase("comm.logits_gather"):
                 logits = self.collectives.gather_logits(
                     logits, vocabulary_range=self.weights.sharding.vocabulary_range)
+            WATCH.check("comm.logits_gather", len(self.weights.layers), zero=True, logits=logits)
         TIMER.forward_end()
         if return_hidden:
             rows, width = token_ids.shape
@@ -718,6 +728,8 @@ class Hy4Decoder:
             bundle = attn.project_packed(y, positions, absorb=not local_absorb_after_gather,
                                          with_index_keys=attn.weights.indexer is not None)
         q_resid, q_local, latent = bundle.q_resid, bundle.q, bundle.latent
+        WATCH.check("attn.project", layer.index, q_local=q_local, latent=latent,
+                    index_keys=bundle.index_keys if attn.weights.indexer is not None else None)
         with TIMER.phase("attn.cache_write"):
             self.cache.write_latent(layer.index, token_rows, positions, latent)
             if attn.weights.indexer is not None:
@@ -786,15 +798,27 @@ class Hy4Decoder:
             # locally over ALL gathered heads (replicated `kv_b_proj`).
             with TIMER.phase("attn.absorb"):
                 q_all = attn.absorb_queries(q_all)
+        WATCH.check("comm.head_gather", layer.index, q_all=q_all)
         with TIMER.phase("attn.sparse_mla"):
             partial = attn.attend(q_all, self.cache.latents(layer.index), selected, counts,
                                   fold_sink=False, expand=False,  # sink unbound
                                   call_shape=call_shape)
+        if WATCH.enabled:
+            # A rank that owns none of a row's selected keys reports LSE -inf
+            # and an undefined value there: legitimate, and weightless in the
+            # merge. Everything else must be finite.
+            owned = torch.isfinite(partial.lse) | torch.isnan(partial.lse)
+            WATCH.check("attn.sparse_mla", layer.index,
+                        partial=torch.where(owned.unsqueeze(-1), partial.output.float(),
+                                            torch.zeros((), device=partial.output.device)),
+                        partial_lse=torch.where(owned, partial.lse.float(),
+                                                torch.zeros((), device=partial.lse.device)))
         # D6: the partials' provenance goes into the merge
         # (`partials_sink_folded=provenance.sink_folded`, `lse_base="base2"`).
         with TIMER.phase("comm.lse_reduce"):
             out, lse = self.collectives.lse_reduce(
                 partial.output, partial.lse, partials_sink_folded=partial.provenance.sink_folded)
+        WATCH.check("comm.lse_reduce", layer.index, merged=out, merged_lse=lse)
         with TIMER.phase("attn.fold_expand_gate"):
             out, lse = attn.fold_sink(out, lse)   # the ONE sink fold, after the merge
             # `W_UV` expansion over this rank's head shard (a per (row, head) scale

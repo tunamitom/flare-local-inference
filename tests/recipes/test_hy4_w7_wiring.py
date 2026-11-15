@@ -1086,3 +1086,62 @@ def test_padded_last_forward_matches_the_exact_forward(worlds, world):
             assert rel_error(got, want) <= 2e-5, (
                 f"padded run drifted at output {index} (world {world}): {rel_error(got, want)}")
             assert torch.equal(got.argmax(-1), want.argmax(-1))
+
+
+# --------------------------------------------------------------------------
+# consult17: the finite watch (diagnosis instrument)
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize("world", (1, 8))
+def test_finite_watch_names_the_first_bad_phase_and_layer(worlds, world, monkeypatch):
+    """Armed, the watch reports the first non-finite tensor with its phase,
+    layer and row; disarmed it is silent and the outputs are unchanged."""
+    from ignition.recipes.hy4.collectives import SimulatedGroup
+    from ignition.recipes.hy4.profile import WATCH
+
+    _, tokens = golden_tokens()
+    batch = torch.tensor([tokens[:8]], dtype=torch.long)
+
+    def body(poison_call):
+        def run(decoder):
+            calls = []
+            original = decoder.collectives.all_reduce
+
+            def all_reduce(value):
+                calls.append(1)
+                out = original(value)
+                if len(calls) == poison_call:
+                    out = out.clone()
+                    out[3, 0] = float("nan")
+                return out
+
+            decoder.collectives.all_reduce = all_reduce
+            return decoder.forward(batch)
+        return run
+
+    def run(poison_call):
+        if world == 1:
+            return [body(poison_call)(fresh_decoders(worlds[1])[0])]
+        return run_wired(worlds[world], body(poison_call), group=SimulatedGroup(world))
+
+    monkeypatch.setattr(WATCH, "enabled", False)
+    WATCH.reset()
+    clean = run(0)
+    assert WATCH.take() is None
+    monkeypatch.setattr(WATCH, "enabled", True)
+    WATCH.reset()
+    watched = run(0)
+    assert WATCH.take() is None, "a clean forward must not trip the watch"
+    for got, want in zip(watched, clean):
+        assert torch.equal(got, want), "the watch must not change the outputs"
+    # Call 1 is the embedding reduce (identity at world 1 uses no reduce there),
+    # so count from the layer loop: poison the MLP reduce of layer 1.
+    embed_reduces = 0 if world == 1 else 1
+    WATCH.reset()
+    run(embed_reduces + 4)                 # layer 0: attn, mlp; layer 1: attn, mlp
+    finding = WATCH.take()
+    assert finding is not None and finding["kind"] == "non-finite"
+    assert (finding["phase"], finding["layer"]) == ("comm.all_reduce.mlp", 1), finding
+    assert finding["first_bad_row"] == 3 and finding["bad_rows"] == 1
+    assert finding["call_shape"] == "prefill" and finding["first_position"] == 0
+    monkeypatch.setattr(WATCH, "enabled", False)
+    WATCH.reset()

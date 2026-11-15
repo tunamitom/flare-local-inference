@@ -27,7 +27,7 @@ not.
 import time
 from contextlib import contextmanager
 
-__all__ = ["PhaseTimer", "TIMER", "render_tables"]
+__all__ = ["PhaseTimer", "TIMER", "FiniteWatch", "WATCH", "render_tables"]
 
 
 class PhaseTimer:
@@ -186,3 +186,68 @@ def render_tables(report):
             lines.append(f"host wire {surface}: {counter['calls']} calls, "
                          f"{counter['bytes'] / (1 << 20):.1f} MiB through host")
     return "\n".join(lines)
+
+
+class FiniteWatch:
+    """consult17 diagnosis: name the first tensor that goes non-finite.
+
+    `HY4_FINITE_WATCH=1` arms it (a diagnosis boot: every check is a device
+    read). `check(phase, layer, **tensors)` records the FIRST non-finite (or,
+    with `zero=True`, all-zero) tensor of the request with its phase, layer,
+    forward ordinal, call shape, the forward's first position and the first
+    bad row; later checks are no-ops until `take()` hands the finding out.
+    Disabled it does nothing — the serving body is unchanged.
+    """
+
+    def __init__(self):
+        import os
+
+        self.enabled = bool(os.environ.get("HY4_FINITE_WATCH"))
+        self.reset()
+
+    def reset(self):
+        self.finding = None
+        self.forwards = 0
+        self.shape = None
+        self.first_position = None
+
+    def begin_forward(self, shape_name, positions):
+        if not self.enabled:
+            return
+        self.forwards += 1
+        self.shape = shape_name
+        self.first_position = int(positions.reshape(-1)[0]) if positions.numel() else None
+
+    def check(self, phase, layer, *, zero=False, **tensors):
+        if not self.enabled or self.finding is not None:
+            return
+        import torch
+
+        for name, tensor in tensors.items():
+            if tensor is None or not torch.is_floating_point(tensor) or not tensor.numel():
+                continue
+            values = tensor.detach().float()
+            bad = ~torch.isfinite(values)
+            kind = "non-finite"
+            if not bool(bad.any()):
+                if not (zero and not bool(values.any())):
+                    continue
+                bad = torch.ones_like(bad)
+                kind = "all-zero"
+            rows = bad.reshape(bad.shape[0], -1).any(dim=1).nonzero(as_tuple=True)[0]
+            self.finding = {
+                "kind": kind, "phase": phase, "layer": layer, "tensor": name,
+                "shape": list(tensor.shape), "bad_elements": int(bad.sum()),
+                "first_bad_row": int(rows[0]), "bad_rows": int(rows.numel()),
+                "forward": self.forwards, "call_shape": self.shape,
+                "first_position": self.first_position,
+            }
+            return
+
+    def take(self):
+        finding, self.finding = self.finding, None
+        self.forwards = 0
+        return finding
+
+
+WATCH = FiniteWatch()
