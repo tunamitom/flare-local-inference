@@ -181,6 +181,7 @@ class Hy4ModelWeights:
     def allocated_bytes(self):
         total = 0
         seen = set()
+        visited = {}
 
         def visit(item):
             nonlocal total
@@ -190,7 +191,16 @@ class Hy4ModelWeights:
                     if id(storage) not in seen:
                         seen.add(id(storage))
                         total += storage.nbytes()
-            elif isinstance(item, (list, tuple)):
+                return
+            # Object graphs legitimately cycle (Enum members reach their class's
+            # member maps; prepared ops hold parent references), so dedupe by
+            # identity before descending. The reference is kept so ids cannot be
+            # reused while the walk runs.
+            marker = id(item)
+            if marker in visited:
+                return
+            visited[marker] = item
+            if isinstance(item, (list, tuple)):
                 for sub in item:
                     visit(sub)
             elif isinstance(item, dict):

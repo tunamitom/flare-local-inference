@@ -368,3 +368,31 @@ def test_load_resident_experts_stages_planes_across_the_hand_back(monkeypatch):
                            resident[f"{PREFIX}.gate_up_proj.weight_scale"][index, :LOCAL].view(torch.uint8))
         assert torch.equal(s2.view(torch.uint8),
                            resident[f"{PREFIX}.down_proj.weight_scale"][index].view(torch.uint8))
+
+
+# --- allocated_bytes must survive the fused graph's object cycles -----------
+
+def test_allocated_bytes_is_cycle_safe_over_fused_plan_graphs():
+    """The prepared fused plan holds Enum members (`PackedSourceFormat`,
+    `AutotuneEffort`); every Enum member reaches its class's member maps and
+    back (`vars(member)['__objclass__']`), so a `vars()`-walking graph visitor
+    without identity dedupe recurses forever — the serve's `allocated_bytes`
+    RecursionError during construct_rank."""
+    from enum import Enum
+
+    from ignition.recipes.hy4.state import Hy4ModelWeights
+
+    class Packing(Enum):
+        MODEL = "modelopt_nvfp4"
+
+    plan = SimpleNamespace(format=Packing.MODEL, packing=Packing.MODEL)
+    routed = SimpleNamespace(plan=plan, source=SimpleNamespace(format=Packing.MODEL))
+    layer = SimpleNamespace(mlp=SimpleNamespace(routed=routed))
+    embed = torch.zeros(2, 2)
+    weights = Hy4ModelWeights(config=None, sharding=None, device=torch.device("cpu"),
+                              embed=embed, norm=torch.zeros(2), head=torch.zeros(2, 2),
+                              hc_head=SimpleNamespace(weight=embed[:1]),   # same storage
+                              layers=(layer,), draft=None)
+    # terminates through the Enum cycle; one storage counts once
+    assert weights.allocated_bytes == embed.untyped_storage().nbytes() \
+        + weights.norm.untyped_storage().nbytes() + weights.head.untyped_storage().nbytes()
