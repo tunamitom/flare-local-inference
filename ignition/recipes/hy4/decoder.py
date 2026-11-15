@@ -972,7 +972,7 @@ class Hy4Decoder:
             results = single_lane()
             run_b = PROBE.stop()
             second = torch.cat(results, dim=0).float()
-            if run_a and len(run_a) == len(run_b) and not getattr(self, "_probe_reported", False):
+            if run_a and len(run_a) == len(run_b) and getattr(self, "_probe_reported", 0) < 8:
                 # The first intermediate where two identical single-lane runs differ.
                 same = [bool(torch.equal(a[2], b[2])) for a, b in zip(run_a, run_b)]
                 first_diff = next((i for i, ok in enumerate(same) if not ok), None)
@@ -984,7 +984,7 @@ class Hy4Decoder:
                 print(f"[h4 r{getattr(self.collectives, 'rank', 0)}] DETERMINISM first difference "
                       f"between two single-lane runs: {where}; differing records "
                       f"{same.count(False)} of {len(same)}", flush=True)
-                self._probe_reported = True
+                self._probe_reported = getattr(self, "_probe_reported", 0) + 1
 
             def rel(a, b):
                 return float((a - b).norm() / b.norm().clamp_min(1e-30))
