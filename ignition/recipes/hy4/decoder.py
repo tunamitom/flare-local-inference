@@ -337,6 +337,7 @@ class Hy4Decoder:
         self._draft_positions = {}
         self.trace = []          # the wiring trace the W7 gates read
         self.plan_book = None    # the `KernelPlanBook` (bound by wire_operators)
+        self._mla_scratch_pool = {}  # Patch C: shared sparse-MLA scratch per rank
 
     # --- W7 wiring ---------------------------------------------------------
     def default_call_shape(self, shape):
@@ -351,16 +352,21 @@ class Hy4Decoder:
             return DECODE_ONE_ROW if rows == 1 else verify_shape(rows)
         return prefill_shape(rows, width)
 
-    def bind_plan_book(self, book, shapes, *, sink_variants=(True, False)):
+    def bind_plan_book(self, book, shapes, *, sink_variants=(True, False),
+                       share_scratch=False):
         """Wire prepared plans (from `wire_operators`) into every layer.
 
         One `sparse_mla` plan per call shape plus the sink folds; from here
         the body refuses unprepared call shapes (no JIT at run time).
+        `share_scratch=True` shares one sparse-MLA scratch across every layer
+        (Patch C: the layer loop is serial per rank).
         """
         self.plan_book = book
+        scratch_pool = self._mla_scratch_pool if share_scratch else None
         for layer in self.weights.layers:
             layer.attention.bind_plan_book(book)
-            layer.attention.prepare_plans(shapes, sink_variants=sink_variants)
+            layer.attention.prepare_plans(shapes, sink_variants=sink_variants,
+                                          scratch_pool=scratch_pool)
         return self
 
     # --- entry points ------------------------------------------------------

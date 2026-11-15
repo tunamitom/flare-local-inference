@@ -352,7 +352,8 @@ class Hy4LayerAttention:
         """Attach the rank's `KernelPlanBook` (from `wire_operators`)."""
         self._plan_book = book
 
-    def prepare_plans(self, shapes, *, device=None, sink_variants=(True, False)):
+    def prepare_plans(self, shapes, *, device=None, sink_variants=(True, False),
+                      scratch_pool=None):
         """Bind one `sparse_mla` plan per call shape, plus the sink fold.
 
         The one-row decode plan is NOT the verification-rows plan (consult7
@@ -394,7 +395,16 @@ class Hy4LayerAttention:
             plan = self._make_mla_plan(
                 proto, has_sink=eff, num_q_heads=heads,
                 max_q_rows=max(s.rows * s.tokens for s in group_shapes))
-            scratch = self._allocate_scratch(plan) if self.device.type == "cuda" else None
+            if self.device.type != "cuda":
+                scratch = None
+            elif scratch_pool is None:
+                scratch = self._allocate_scratch(plan)
+            else:
+                spec, = plan.scratch_specs()
+                pool_key = (bool(bound), name, heads, tuple(spec.shape), spec.dtype)
+                scratch = scratch_pool.get(pool_key)
+                if scratch is None:
+                    scratch = scratch_pool[pool_key] = self._allocate_scratch(plan)
             for shape in group_shapes:
                 self._mla_plans[(shape.name, shape.rows, shape.tokens, eff)] = plan
                 if scratch is not None:
