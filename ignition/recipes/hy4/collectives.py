@@ -837,25 +837,36 @@ class CeExchange:
         self.calls[op] += 1
         return bank
 
+    def _mark(self, label, stream=None):
+        """HY4_TRACE breadcrumb on `stream` (default: the current stream)."""
+        tracer = getattr(self, "tracer", None)
+        if tracer is not None:
+            tracer.mark(f"{getattr(self, 'tag', 'ce')} {label}", stream)
+
     def _send_block(self, stream, dest, copies, sources, op, key):
         """`copies` [(dest_offset, src_ptr, nbytes)] on `stream`, then flag `dest`
         once per source in `sources` (after the copies) on the flag stream."""
         kernels = self.ring._kernels
         event = self._event(key)
+        call = self.calls[op]
         with torch.cuda.stream(stream):
             for offset, source, nbytes in copies:
                 kernels.dma_copy(self.ptrs[dest] + offset, source, nbytes)
+            self._mark(f"copied {key[0]}->{dest} {op}#{call}", stream)
             event.record(stream)
         with torch.cuda.stream(self._flag_stream):
             self._flag_stream.wait_event(event)
             for origin in sources:
                 kernels.dma_set_flag(self._flag_ptr(dest, op, origin),
                                      self._send_ctr(op, dest, origin))
+            self._mark(f"flagged {key[0]}->{dest} src{tuple(sources)} {op}#{call}",
+                       self._flag_stream)
 
     def _await(self, op, source, *, relay=False):
         """Wait (on the current stream) for `source`'s data of this call."""
         self.ring._kernels.dma_wait_flag(self._flag_ptr(self.rank, op, source),
                                          self._wait_ctr(op, source, relay))
+        self._mark(f"got {op} src{source}{' relay' if relay else ''} #{self.calls[op]}")
 
     def _drain(self):
         main = torch.cuda.current_stream()
@@ -1092,6 +1103,21 @@ class PcieDcpTransport:
         self._lane_rings = tuple(lane_rings)
         self._lane_ces = tuple(lane_ces)
         self._lane_ar_plans = {}
+        # consult18 D: HY4_TRACE=1 — host-mapped per-stream breadcrumbs (hangdump.Tracer).
+        self.tracer = None
+        import os as _os_t
+        if _os_t.environ.get("HY4_TRACE") and dma is not None:
+            from .hangdump import Tracer
+
+            self.tracer = Tracer(dma._kernels)
+            self.tracer.name_stream(torch.cuda.current_stream(self.device), "main")
+            for index, channel in enumerate((ce, *self._lane_ces)):
+                if channel is None:
+                    continue
+                channel.tracer, channel.tag = self.tracer, f"ce{index}"
+                self.tracer.name_stream(channel._cross_stream, f"ce{index}.cross")
+                self.tracer.name_stream(channel._local_stream, f"ce{index}.local")
+                self.tracer.name_stream(channel._flag_stream, f"ce{index}.flag")
         import os as _os
         self.ce_audit = bool(_os.environ.get("HY4_CE_AUDIT"))
         self.ce_audit_calls = {"lse": 0, "gather": 0}
@@ -1790,8 +1816,12 @@ class PcieDcpTransport:
             return self._gather_all(offers)
         words = offers.contiguous().view(torch.bfloat16).reshape(rows, 1, 2 * width)
         _trace(f"score_gather rows={rows} offer={width}")
+        if self.tracer is not None:
+            self.tracer.mark(f"pool scores rows={rows}")
         gathered = self._pools[(2 * width, "scores")].for_stream().all_gather_heads(
             words, None, plan=self._plans[key])
+        if self.tracer is not None:
+            self.tracer.mark("pool scores done")
         _trace(f"score_gather rows={rows} offer={width} done")
         scores = gathered.contiguous().view(torch.float32)      # [rows, world, offer]
         result = tuple(scores[:, rank, :] for rank in range(self.world_size))
@@ -1833,6 +1863,8 @@ class PcieDcpTransport:
             inp = value.contiguous()
             out = torch.empty_like(inp)
             _trace(f"all_reduce(gpu) rows={int(value.shape[0])} arm={arm}")
+            if self.tracer is not None:
+                self.tracer.mark(f"ar {arm} rows={int(value.shape[0])} lane{lane()}")
             if arm == "twoshot":
                 if not target.accepts(inp):
                     inp = inp.clone()      # two-shot wants 16-byte-aligned packs
@@ -1842,6 +1874,8 @@ class PcieDcpTransport:
                                            block_limit=prepared["block_limit"])
             else:
                 result = target.all_reduce(inp, plan=plan, out=out)
+            if self.tracer is not None:
+                self.tracer.mark(f"ar {arm} done lane{lane()}")
             if arm == "dma" and self.ar_audit and not self._in_lane():
                 self._audit_ring(inp, result)
             if arm == "dma" and self.lane_audit and self._in_lane():

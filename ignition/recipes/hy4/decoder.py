@@ -730,7 +730,10 @@ class Hy4Decoder:
         post = y = None
         mlp_out = None
         previous_ffn = None
+        tracer = getattr(getattr(self.collectives, "transport", None), "tracer", None)
         for index, layer in enumerate(self.weights.layers):
+            if tracer is not None:
+                tracer.mark(f"L{index}")
             with TIMER.phase("ihc"):
                 if index == 0:
                     post, y = layer.attn_ihc.pre(streams.streams)
@@ -798,6 +801,10 @@ class Hy4Decoder:
                 self._lane_streams = (torch.cuda.Stream(device=self.device),
                                       torch.cuda.Stream(device=self.device))
             streams = self._lane_streams
+            tracer = getattr(getattr(self.collectives, "transport", None), "tracer", None)
+            if tracer is not None:
+                tracer.name_stream(streams[0], "lane0")
+                tracer.name_stream(streams[1], "lane1")
             for stream in streams:
                 stream.wait_stream(main)
         steps = [self._half_steps(*halves[index], half_shape) for index in (0, 1)]
