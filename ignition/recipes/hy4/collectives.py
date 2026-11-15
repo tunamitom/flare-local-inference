@@ -542,7 +542,8 @@ class PcieDcpTransport:
     recorded in `surfaces()`.
     """
 
-    def __init__(self, *, group, device, pools, rank, world_size, total_heads):
+    def __init__(self, *, group, device, pools, rank, world_size, total_heads,
+                 all_reduce=None, reduce_width=None):
         self.group = group
         self.device = torch.device(device)
         self.rank = rank
@@ -551,14 +552,23 @@ class PcieDcpTransport:
         self._pools = pools            # {(width, kind): pool}
         self._plans = {}               # (surface, rows, width, lse_base) -> plan
         self._prepared = 0
+        self._ar = all_reduce          # consult15 §2 lever 1: b12x PCIe all-reduce
+        self.reduce_width = None if reduce_width is None else int(reduce_width)
+        self._ar_plans = {}            # rows -> (plan, channel)
 
     # -- construction ------------------------------------------------------
 
     @classmethod
     def from_process_group(cls, process_group, device, *, total_heads, query_widths,
-                           value_width, max_rows):
+                           value_width, max_rows, reduce_width=None):
         """One channel pool per wire geometry (the query gather's absorbed and
-        unabsorbed widths, and the 512-wide latent partials)."""
+        unabsorbed widths, and the 512-wide latent partials).
+
+        `reduce_width` (consult15 §2 lever 1) additionally builds the b12x
+        PCIe all-reduce pool over the biggest `[rows, reduce_width]` BF16
+        reduction the body runs (`max_rows` rows) — the c1 cells' runtime and
+        arms (c1-unit-costs.md §1: oneshot at 1 row, rsag above).
+        """
         from b12x.comm.pcie.pcie_dcp_a2a import PCIeDCPA2APool
 
         import torch.distributed as dist
@@ -580,8 +590,18 @@ class PcieDcpTransport:
             max_batch_size=max_rows, total_heads=total_heads,
             head_dim=value_width, query_head_dim=value_width, single_channel=True)
         _trace(f"PCIeDCPA2APool partials width={value_width} done")
+        all_reduce = None
+        if reduce_width is not None:
+            from ignition.preparation.collectives import create_all_reduce_runtime
+
+            _trace(f"PCIeAllReduce width={reduce_width} rows={max_rows}")
+            all_reduce = create_all_reduce_runtime(
+                process_group, device, max_tokens=max_rows, hidden_size=int(reduce_width))
+            all_reduce.prepare_channels(("h4:allreduce",))
+            _trace(f"PCIeAllReduce width={reduce_width} rows={max_rows} done")
         return cls(group=process_group, device=device, pools=pools,
-                   rank=rank, world_size=world_size, total_heads=total_heads)
+                   rank=rank, world_size=world_size, total_heads=total_heads,
+                   all_reduce=all_reduce, reduce_width=reduce_width)
 
     def bind(self, rank):
         if rank != self.rank:
@@ -593,7 +613,9 @@ class PcieDcpTransport:
         return {
             "all_gather_heads": "PCIeDCPA2APool.all_gather_heads (prepared plans)",
             "lse_reduce_scatter": "PCIeDCPA2APool.lse_reduce_scatter (prepared plans, base-2)",
-            "all_reduce": "torch.distributed control group (unit costs: c1-unit-costs.md §5)",
+            "all_reduce": ("b12x PCIeAllReduce (oneshot at 1 row, rsag above; "
+                           "prepared plans per row shape)" if self._ar is not None
+                           else "torch.distributed control group (unit costs: c1-unit-costs.md §5)"),
             "all_gather": "torch.distributed control group",
             "exchange_scores": "torch.distributed control group",
             "stage_candidates": "torch.distributed control group",
@@ -603,6 +625,10 @@ class PcieDcpTransport:
         for pool in self._pools.values():
             pool.close()
         self._pools = {}
+        if self._ar is not None:
+            self._ar.close()
+            self._ar = None
+        self._ar_plans = {}
 
     # -- prepared plans (no JIT at run time) -------------------------------
 
@@ -675,6 +701,57 @@ class PcieDcpTransport:
     def _total_heads(self):
         return self.total_heads
 
+    def prepare_all_reduce(self, session, rows, *, name=None):
+        """Prepare the b12x PCIe all-reduce plan for `rows` at the reduce width.
+
+        consult15 §2 lever 1 — the c1 cells' arms (c1-unit-costs.md §1, the
+        w8/w4prod allreduce cells): `oneshot` (remote_push_full) at 1 row,
+        `rsag` (remote_push_rsag) above, threads 256 / blocks 16. Prepared
+        through the same session + CollectiveRequirement form as the DCP
+        gather/lse plans (the bench's `benchmark_pcie_allreduce_transports`
+        prepare path, minus graph replay).
+        """
+        from dataclasses import replace
+
+        from b12x.comm.pcie import _oneshot_preparation as oneshot
+        from b12x.preparation import CollectiveRequirement, FrozenMapping
+
+        if self._ar is None:
+            raise RuntimeError("no all-reduce runtime (construct with reduce_width)")
+        rows = int(rows)
+        if rows in self._ar_plans:
+            return self._ar_plans[rows][0]
+        inp = torch.zeros((rows, self.reduce_width), dtype=torch.bfloat16, device=self.device)
+        out = torch.empty_like(inp)
+        target = self._ar._prepared_channel_for_stream(None, None)
+        query = oneshot.query_from_runtime(
+            target, surface="OneshotAllReduce.all_reduce", call={"inp": inp, "out": out})
+        transport = "remote_push_full" if rows <= 1 else "remote_push_rsag"
+        if not query.call["payload_ready_region_packs"]:
+            raise RuntimeError(
+                "the b12x all-reduce pool has no payload-ready region for "
+                f"rows={rows} (remote_push arms unavailable at this setup)")
+        call = {**query.call, "transport": transport, "threads": 256, "blocks": 16}
+        query = replace(query, call=FrozenMapping(call))
+        plan = oneshot.plan(query, runtime=target)
+
+        def prime(state):
+            return oneshot._prepare_plain_call(state, inp=inp, out=out)
+
+        label = name or f"ar-{rows}-{self.reduce_width}"
+        session.prepare(
+            (plan.request(
+                name=label,
+                collective=CollectiveRequirement(key=label, ranks=tuple(range(self.world_size))),
+                prepare_call=prime,
+            ),),
+            coordinator=lambda progress: progress.ready_collectives[0].key
+            if progress.ready_collectives else None,
+        )
+        self._ar_plans[rows] = (plan, target)
+        self._prepared += 1
+        return plan
+
     def _total_heads_local(self):
         return self.total_heads // self.world_size
 
@@ -727,9 +804,29 @@ class PcieDcpTransport:
         return tuple(zip(scores, indices))
 
     def all_reduce(self, value):
-        import torch.distributed as dist
-
         from .profile import TIMER
+
+        if self._ar is not None:
+            # consult15 §2 lever 1: the b12x PCIe all-reduce over the prepared
+            # pool (oneshot at 1 row, rsag above) — GPU to GPU, no host wire.
+            if (value.dim() != 2 or value.dtype != torch.bfloat16
+                    or int(value.shape[1]) != self.reduce_width):
+                raise RuntimeError(
+                    f"unprepared all-reduce value {tuple(value.shape)} {value.dtype}; "
+                    f"the GPU path reduces [rows, {self.reduce_width}] BF16")
+            entry = self._ar_plans.get(int(value.shape[0]))
+            if entry is None:
+                raise RuntimeError(
+                    f"no prepared all-reduce plan for rows={int(value.shape[0])}; "
+                    "plans bind before the run — there is no JIT at run time")
+            plan, target = entry
+            inp = value.contiguous()
+            out = torch.empty_like(inp)
+            _trace(f"all_reduce(gpu) rows={int(value.shape[0])}")
+            result = target.all_reduce(inp, plan=plan, out=out)
+            _trace(f"all_reduce(gpu) rows={int(value.shape[0])} done")
+            return result
+        import torch.distributed as dist
 
         _trace(f"all_reduce shape={tuple(value.shape)}")
         with TIMER.phase("host.d2h"):
