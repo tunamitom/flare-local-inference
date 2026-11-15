@@ -244,8 +244,24 @@ class PreparedHy4Rank:
             from b12x.preparation import PreparationSession
 
             # ONE session and ONE scratch per rank: the layer loop is serial.
-            preparation = session if isinstance(session, PreparationSession) else \
-                PreparationSession(device=self.device, autotune=False, compile_workers=0)
+            # consult18 E1: HY4_MOE_AUTOTUNE=1 races b12x's candidate configs for
+            # the routed experts on its realistic routing mix
+            # (statistical_shared_mix_v1: diffuse / lognormal-skewed / correlated +
+            # whole-batch reuse — not the all-zero priming routes) and persists the
+            # selections (HY4_TUNE_CACHE), so only the first boot pays the race.
+            import os as _os
+
+            tune = (_os.environ.get("HY4_MOE_AUTOTUNE") or "") not in ("", "0")
+            if isinstance(session, PreparationSession):
+                preparation = session
+            elif tune:
+                preparation = PreparationSession(
+                    device=self.device, autotune=True,
+                    compile_workers=int(_os.environ.get("HY4_TUNE_WORKERS") or 4),
+                    cache_dir=_os.environ.get("HY4_TUNE_CACHE") or "/state/b12x-tune")
+            else:
+                preparation = PreparationSession(device=self.device, autotune=False,
+                                                 compile_workers=0)
             first = fused_layers[0].mlp.routed
             scratch = FusedWireScratch(device=self.device, max_tokens=capacity,
                                        hidden=first.hidden, top_k=first.top_k)
