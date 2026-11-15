@@ -226,6 +226,22 @@ class PreparedHy4Rank:
                 cell.caps = self.index_cache.physical_caps(
                     layer_id, num_q_heads=self.model_config.text["index_n_heads"],
                     max_page_table_width=self.cache.capacity)
+        # M2: the fused routed-experts plans bind here (one prepared b12x op per
+        # sparse layer over the loader's packed experts — the levers' basic
+        # fused execution, before the consult10 packed-projection/GEMV knobs).
+        # Capacity = the widest call the body can feed the MoE (prefill chunks
+        # are `prefill_chunk_size` wide; decode/verify feed rows x 1 tokens).
+        # `warm` runs the extremes so no plan preparation lands inside a step
+        # or a graph capture (KernelPlanBook's no-JIT-at-run-time contract).
+        from .moe import FusedRoutedExperts
+
+        capacity = max(self.settings.prefill_chunk_size, self.settings.request_capacity)
+        for layer in self.weights.layers:
+            fused = getattr(layer.mlp, "routed", None)
+            if isinstance(fused, FusedRoutedExperts):
+                fused.wire(session=session, max_tokens=capacity)
+                fused.warm()
+                layer.mlp._prepared = fused
         return self
 
 

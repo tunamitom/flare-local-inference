@@ -168,6 +168,126 @@ class ReferenceRoutedExperts:
         return final.to(x.dtype)
 
 
+class FusedRoutedExperts:
+    """The fused GPU routed-experts execution (`MoEBlock._prepared` seam).
+
+    One `ignition.components.moe.PreparedRoutedExperts` over the loader's
+    packed experts (`Hy4WeightLoader.load_resident_experts` -> `load_fp4_experts`,
+    the b12x `fused_moe` W4A16 kernel path — NOT the torch reference loop),
+    prepared at `max_tokens` rows and called per forward at ANY row count at or
+    under that capacity. The call-shaped output is the contract difference
+    from the component's functional `__call__` (which allocates the PREPARED
+    layout): `prepared_moe_out` validates the output against the CALL's rows
+    (`output must have shape (rows, hidden)`), so the wrapper allocates the
+    caller's shape and keeps one persistent byte workspace + scale storage
+    across calls (the layer loop is serial per rank).
+
+    Call signature matches the `MoEBlock._routed_forward` seam exactly:
+    `_prepared(x, ids=topk_indices, weights=topk_weights)`. Route IDs arrive
+    as the torch router's int64 indices and are narrowed to the kernel's int32
+    contract; route weights are FP32 `sigmoid + bias` renormalised weights.
+
+    Construction is two-phase: `load`/`__init__` take the prepared expert
+    planes from the loader session; `wire` builds the b12x plan and binding
+    state at `wire_operators` time (plans bind there — there is no JIT at run
+    time). Calling before `wire` raises instead of planning inside a step.
+    """
+
+    def __init__(self, experts, *, hidden, top_k, device, name):
+        if hidden < 1 or top_k < 1:
+            raise ValueError("fused routed experts require positive geometry")
+        self.experts = experts          # `fused_moe.PreparedExperts` (loader)
+        self.hidden = hidden
+        self.max_tokens = None          # set at `wire` from the call-shape catalogue
+        self.top_k = top_k
+        self.device = device
+        self.name = name
+        self.op = None                  # `PreparedRoutedExperts` after `wire`
+        self._workspace = None          # persistent byte scratch (serial layers)
+        self._storage = None            # persistent scale storage views
+        self.calls = 0
+
+    @property
+    def wired(self):
+        return self.op is not None
+
+    def wire(self, *, session, max_tokens):
+        """Build the prepared operator and its persistent scratch (idempotent)."""
+        if self.op is not None:
+            return self
+        if type(max_tokens) is not int or max_tokens < 1:
+            raise ValueError("fused routed experts need a positive max_tokens call capacity")
+        self.max_tokens = max_tokens
+        import torch
+        from b12x.preparation import PreparationSession
+        from ignition.components.moe import PreparedRoutedExperts
+
+        if isinstance(session, PreparationSession):
+            preparation = session
+        else:
+            # The recipe's `wire_operators(session="prepared")` sentinel: one
+            # long-lived session owning the MoE plans for the rank's lifetime.
+            preparation = PreparationSession(device=self.device, autotune=False,
+                                             compile_workers=0)
+            self._session = preparation
+        source = torch.zeros((self.max_tokens, self.hidden), dtype=torch.bfloat16,
+                             device=self.device)
+        ids = torch.zeros((self.max_tokens, self.top_k), dtype=torch.int32,
+                          device=self.device)
+        weights = torch.full((self.max_tokens, self.top_k), 1.0 / self.top_k,
+                             dtype=torch.float32, device=self.device)
+        output = torch.zeros_like(source)
+        self.op = PreparedRoutedExperts(source, self.experts, ids, weights, output,
+                                        session=preparation, name=self.name)
+        self.op.functional(session=preparation)
+        self._workspace = torch.empty(self.op.workspace_nbytes, dtype=torch.uint8,
+                                      device=self.device)
+        self._storage = [torch.empty_strided(shape, stride, dtype=dtype,
+                                             device=self.device)
+                         for shape, stride, dtype in self.op.scale_layouts]
+        return self
+
+    def warm(self):
+        """Run one call at the extremes so no plan preparation lands in a step."""
+        import torch
+        for rows in (1, self.max_tokens):
+            x = torch.zeros((rows, self.hidden), dtype=torch.bfloat16, device=self.device)
+            ids = torch.zeros((rows, self.top_k), dtype=torch.int32, device=self.device)
+            weights = torch.full((rows, self.top_k), 1.0 / self.top_k,
+                                 dtype=torch.float32, device=self.device)
+            self.forward(x, ids, weights)
+        self.calls = 0
+        return self
+
+    def forward(self, x, topk_indices, topk_weights):
+        """The fused experts' weighted mixture over the routed tokens."""
+        import torch
+        from b12x.moe.fused_moe._binding_ops import prepared_moe_out
+
+        if self.op is None:
+            raise RuntimeError(
+                f"{self.name}: fused routed experts called before wire_operators "
+                "bound the prepared plan — there is no JIT at run time")
+        rows = x.shape[0]
+        if rows > self.max_tokens:
+            raise ValueError(
+                f"{self.name}: fused routed experts see {rows} rows above the "
+                f"prepared capacity {self.max_tokens}")
+        if x.shape[1] != self.hidden or x.dtype != torch.bfloat16:
+            raise ValueError(f"{self.name}: routed input must be BF16 [rows, {self.hidden}]")
+        ids = topk_indices.to(torch.int32).contiguous()
+        weights = topk_weights.float().contiguous()
+        output = torch.zeros((rows, self.hidden), dtype=x.dtype, device=x.device)
+        prepared_moe_out(x, weights, ids, output, self._workspace, self.op.scale_inputs,
+                         self._storage, self.op.plan.handle, True, None, None, None,
+                         None, None, False, self.op.precision.get("a4_prefill"))
+        self.calls += 1
+        return output
+
+    def __call__(self, x, *, ids, weights):
+        return self.forward(x, ids, weights)
+
+
 @dataclass
 class MoEBlock:
     """One sparse layer's MoE: router + routed experts + shared expert."""

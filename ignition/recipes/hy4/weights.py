@@ -379,6 +379,76 @@ class Hy4WeightLoader(DirectWeightLoader):
             for name in stacks:
                 del self._sources[name]
 
+    def load_resident_experts(self, prefix, resident, *, intermediate_range,
+                             swiglu_limit=None, **packing):
+        """Serve one MoE block's experts from RESIDENT rank-sliced packed bytes.
+
+        The GPU streaming path cannot materialize the export's all-expert fused
+        tensors (a full `gate_up_proj.weight` is ~3 GiB; the w13 8-rank
+        construction OOMed loading them whole), and `load_tensor(extent=)`
+        keeps the transfer over the checkpoint's byte ranges. So `resident`
+        supplies the rank's SLICE in `ReferenceRoutedExperts.from_packed`'s key
+        form (`gate_up_proj.weight` = [E, 2*local, hidden//2], the gate half
+        first, plus per-contract block scales and per-expert gains) and the
+        per-expert aliases below are LOCAL views; `load_fp4_experts` is told the
+        LOCAL intermediate with no further range, so the planes it builds are
+        byte-identical to `load_quantized_experts`'s full-tensor path at the
+        same world size (the slicing is `state.py`'s, proven bit-exact in the
+        M2 boundary work). Called inside the loader session, like `load_experts`.
+        """
+        if expert_format(self.quantization, prefix) != ("nvfp4", "a16"):
+            raise ValueError(f"{prefix}: expected W4A16 NVFP4 packed experts")
+        if swiglu_limit is None:
+            swiglu_limit = self.config.text["swiglu_limit"]
+        count = self.config.experts
+        first, last = intermediate_range
+        local = last - first
+        hidden = self.config.hidden
+        fused, fused_scale, fused_gain = (resident[f"{prefix}.gate_up_proj.{suffix}"]
+                                          for suffix in contract.PACKED_SUFFIXES)
+        down, down_scale, down_gain = (resident[f"{prefix}.down_proj.{suffix}"]
+                                       for suffix in contract.PACKED_SUFFIXES)
+        for name, source, shape in (
+                (f"{prefix}.gate_up_proj.weight", fused, (count, 2 * local, hidden // 2)),
+                (f"{prefix}.gate_up_proj.weight_scale", fused_scale, (count, 2 * local, hidden // 16)),
+                (f"{prefix}.gate_up_proj.weight_scale_2", fused_gain, (count,)),
+                (f"{prefix}.down_proj.weight", down, (count, hidden, local // 2)),
+                (f"{prefix}.down_proj.weight_scale", down_scale, (count, hidden, local // 16)),
+                (f"{prefix}.down_proj.weight_scale_2", down_gain, (count,))):
+            if tuple(source.shape) != shape:
+                raise ValueError(
+                    f"{name}: resident rank slice has shape {tuple(source.shape)}, "
+                    f"the packed expert contract at this range is {shape}")
+        stacks = {}
+        for index in range(count):
+            target = f"{prefix}.experts.{index}"
+            stacks |= {
+                f"{target}.gate_proj.weight": fused[index, :local],
+                f"{target}.up_proj.weight": fused[index, local:],
+                f"{target}.down_proj.weight": down[index],
+                f"{target}.gate_proj.weight_scale": fused_scale[index, :local],
+                f"{target}.up_proj.weight_scale": fused_scale[index, local:],
+                f"{target}.down_proj.weight_scale": down_scale[index],
+                f"{target}.gate_proj.weight_scale_2": fused_gain[index:index + 1],
+                f"{target}.up_proj.weight_scale_2": fused_gain[index:index + 1],
+                f"{target}.down_proj.weight_scale_2": down_gain[index:index + 1],
+            }
+        for name, source in stacks.items():
+            self._sources[name] = source
+        try:
+            return self.load_fp4_experts(
+                tuple(f"{prefix}.experts.{index}" for index in range(count)),
+                hidden_size=hidden, intermediate_size=local,
+                intermediate_range=None,
+                format="nvfp4", activation_mode="a16",
+                swiglu_limit=swiglu_limit, swiglu_clamp_after_silu=False,
+                scale_compression=self.expert_scale_compression,
+                scale_scratch=self.expert_scale_scratch((local + 127) // 128 * 128),
+                **packing)
+        finally:
+            for name in stacks:
+                del self._sources[name]
+
     def load_experts(self, prefix, *, intermediate_range=None, swiglu_limit=None, **packing):
         """Load one MoE block's routed experts into the W4A16 NVFP4 runtime form.
 

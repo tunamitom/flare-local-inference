@@ -433,9 +433,24 @@ def _moe_state(builder, prefix, *, dense=False):
                     packed_sources[name] = load_sliced(name, down_scale_extent)
                 else:  # per-expert gains: whole first axis
                     packed_sources[name] = load_sliced(name, (slice(None),))
-        routed = ReferenceRoutedExperts.from_packed(
-            packed_sources, expert_prefix, swiglu_limit=c["swiglu_limit"])
         builder.used.update(packed_sources)
+        if loader.device.type == "cuda":
+            # M2 lever: the fused GPU routed-experts path. The rank keeps ONLY
+            # the fused b12x planes (holding the reference's packed bytes as
+            # well would double the weights); the torch reference loop stays
+            # the CPU dry-run / gate contract (`ReferenceRoutedExperts`).
+            from .moe import FusedRoutedExperts
+
+            experts = loader.load_resident_experts(
+                expert_prefix, packed_sources,
+                intermediate_range=sharding.expert_range,
+                swiglu_limit=c["swiglu_limit"])
+            routed = FusedRoutedExperts(
+                experts, hidden=hidden, top_k=c["num_experts_per_tok"],
+                device=loader.device, name=f"{expert_prefix}.fused")
+        else:
+            routed = ReferenceRoutedExperts.from_packed(
+                packed_sources, expert_prefix, swiglu_limit=c["swiglu_limit"])
     else:
         for projection in ("gate_up_proj", "down_proj"):
             builder.take(f"{expert_prefix}.{projection}")
