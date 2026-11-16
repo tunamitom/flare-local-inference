@@ -459,12 +459,17 @@ class Hy4Decoder:
             self._lane_scratch_pools = []
         while len(self._lane_scratch_pools) < lanes - 1:
             self._lane_scratch_pools.append({})
-        for layer in self.weights.layers:
-            layer.attention.bind_plan_book(book)
-            layer.attention.prepare_plans(shapes, sink_variants=sink_variants,
-                                          scratch_pool=scratch_pool,
-                                          expanded_partials=self.partial_wire == "expanded",
-                                          lane_pools=self._lane_scratch_pools[:lanes - 1])
+        attentions = [layer.attention for layer in self.weights.layers]
+        if getattr(self.weights, "draft", None) is not None:
+            # consult18 P4: the MTP draft's CP attention binds the same shapes
+            # (decode steps, prefill-shaped prompt absorption).
+            attentions.append(self.weights.draft.attention)
+        for attention in attentions:
+            attention.bind_plan_book(book)
+            attention.prepare_plans(shapes, sink_variants=sink_variants,
+                                    scratch_pool=scratch_pool,
+                                    expanded_partials=self.partial_wire == "expanded",
+                                    lane_pools=self._lane_scratch_pools[:lanes - 1])
         return self
 
     # --- entry points ------------------------------------------------------
@@ -515,7 +520,8 @@ class Hy4Decoder:
         return self.forward(token_ids, request_rows=request_rows, state=state,
                             call_shape=call_shape)
 
-    def draft_absorb(self, next_tokens, prev_hidden, *, request_rows=None, cache=None):
+    def draft_absorb(self, next_tokens, prev_hidden, *, request_rows=None, cache=None,
+                     logits="all"):
         """Teacher-forced prompt absorption into the draft KV (finding F fix).
 
         `next_tokens` [rows, k] are the SHIFTED prompt tokens (row t holds the
@@ -564,8 +570,17 @@ class Hy4Decoder:
         selected = torch.cat(sels, dim=1)
         for row, start in zip(rows.tolist(), starts.tolist()):
             self._draft_positions[row] = start + k
-        logits = self._draft_logits(hidden.reshape(-1, hidden.shape[-1]))
-        return (logits.reshape(next_tokens.shape[0], k, -1), hidden, selected)
+        # consult18 P4: `logits="last"` heads only each row's last absorbed
+        # position (the speculative round's first draft), "none" skips the head
+        # (prompt absorption): [rows, 1, V] / None.
+        if logits == "none":
+            return None, hidden, selected
+        if logits == "last":
+            last = hidden[:, -1, :]
+            return (self._draft_logits(last.reshape(-1, last.shape[-1]))
+                    .reshape(next_tokens.shape[0], 1, -1), hidden, selected)
+        out = self._draft_logits(hidden.reshape(-1, hidden.shape[-1]))
+        return (out.reshape(next_tokens.shape[0], k, -1), hidden, selected)
 
     def draft_step(self, next_tokens, prev_hidden, *, request_rows=None, cache=None):
         """One chained MTP draft step; returns (logits [rows, V], hidden [rows, H]).

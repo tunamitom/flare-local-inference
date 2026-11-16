@@ -264,6 +264,9 @@ class PreparedHy4Rank:
         capacity = max(self.settings.prefill_chunk_size, self.settings.request_capacity)
         fused_layers = [layer for layer in self.weights.layers
                         if isinstance(getattr(layer.mlp, "routed", None), FusedRoutedExperts)]
+        draft = getattr(self.weights, "draft", None)
+        if draft is not None and isinstance(getattr(draft.mlp, "routed", None), FusedRoutedExperts):
+            fused_layers.append(draft)   # consult18 P4: the MTP draft's routed experts
         if fused_layers:
             from b12x.preparation import PreparationSession
 
