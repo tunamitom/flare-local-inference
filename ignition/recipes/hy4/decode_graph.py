@@ -248,6 +248,15 @@ class DecodeGraphs:
         began = time.perf_counter()
         if self.pool is None:
             self.pool = torch.cuda.graph_pool_handle()
+            # A captured graph holds raw CUfunction handles: from here on no
+            # compiled b12x program may be reclaimed (an LRU-evicted module
+            # unloads and the next replay segfaults in cuGraphLaunch — dg23).
+            try:
+                from b12x._lib.compile_plan import pin_programs
+            except ImportError:  # b12x without program pinning
+                pin_programs = None
+            if pin_programs is not None:
+                pin_programs()
         if len(self.graphs) >= self.keep:
             self.uncaptured += 1
             return None

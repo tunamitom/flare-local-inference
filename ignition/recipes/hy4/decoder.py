@@ -1055,6 +1055,11 @@ class Hy4Decoder:
             raise RuntimeError("capture_mlp_graphs needs the lane streams (run an overlapped pair first)")
         hidden = self.config.hidden
         graphs = {}
+        try:
+            from b12x._lib.compile_plan import pin_programs
+            pin_programs()  # graph-referenced modules must never be reclaimed
+        except ImportError:
+            pass
         torch.cuda.synchronize(self.device)
         for lane_index, stream in enumerate(streams[:getattr(self, "lanes", 1)]):
             pool = torch.cuda.graph_pool_handle()
