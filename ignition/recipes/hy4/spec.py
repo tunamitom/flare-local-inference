@@ -38,6 +38,7 @@ class SpeculativeGreedy:
         # (needs its plans bound at boot: verify_shape(T), T = 2 .. k + 1)
         self.decode_rows = bool(decode_rows)
         self.rounds = self.accepted = self.verify_reruns = self.draft_flags = 0
+        self.filter_fallbacks = 0
         self._generator = None
 
     @property
@@ -76,7 +77,7 @@ class SpeculativeGreedy:
             entry["uniform"].uniform_(generator=self._generator)
         return entry
 
-    def _absorb(self, start, tokens, hidden, sample=False):
+    def _absorb(self, start, tokens, hidden, sample=False, filtered=False):
         """Draft rows start .. start+len-1 in prepared widths; the last chunk's
         (token [1], hidden [w, H], flag) device outputs (and, sampling, the
         last chunk's draft-score entry)."""
@@ -89,12 +90,12 @@ class SpeculativeGreedy:
             hid.copy_(hidden[lo:lo + w].reshape(1, w, -1))
             entry = self._noise("draft", w) if sample else None
             greedy, h, flag = g.run_spec("draft", row=self.row, start=start + lo, count=w,
-                                         call_shape=self._shape(w), sample=sample)
+                                         call_shape=self._shape(w), sample=sample, filtered=filtered)
             out = (greedy, h, flag, entry)
             lo += w
         return out
 
-    def generate(self, *, start, bonus, hidden, emit, temperature=0.0):
+    def generate(self, *, start, bonus, hidden, emit, temperature=0.0, top_k=0, top_p=1.0):
         """Rounds from committed length `start` with `bonus` emitted at `start`
         and `hidden` [H] the target's post-norm hidden at `start - 1` (the
         prompt's last row: its draft row is re-absorbed with the real token).
@@ -103,15 +104,25 @@ class SpeculativeGreedy:
         next round no longer fits the graphs (the caller decodes on from P)."""
         d, g, k, row = self.decoder, self.graphs, self.k, self.row
         sample = float(temperature or 0.0) > 0.0
+        filtered = sample and (int(top_k or 0) > 0 or float(top_p if top_p is not None else 1.0) < 1.0)
         if sample:
             # consult18 P5: speculative sampling at this temperature (spec_sample.py)
             g.spec_inv_temp().fill_(1.0 / float(temperature))
             ventry = g.spec_sample_state("verify", k + 1)
+            if filtered:
+                # consult18 P7: top-k / top-p on device (filter_scores); a round whose
+                # nucleus is not covered by the gathered candidates emits nothing and
+                # hands the request back to plain decoding
+                tk, tp = g.spec_filter_params()
+                tk.fill_(int(top_k or 0))
+                tp.fill_(float(top_p if top_p is not None else 1.0))
         P, c = int(start), int(start) - 1
         pend_tokens, pend_hidden = [int(bonus)], hidden.reshape(1, -1)
         while self.eligible(P, c):
-            greedy, h, fl, aentry = self._absorb(c, pend_tokens, pend_hidden, sample=sample)
+            greedy, h, fl, aentry = self._absorb(c, pend_tokens, pend_hidden, sample=sample,
+                                                 filtered=filtered)
             flags = [fl.clone()]
+            covs = [aentry["out_cov"].clone()] if filtered else []
             vt, _ = g.spec_inputs("verify", k + 1)
             vt[:, :1].fill_(int(bonus))
             vt[0, 1:2].copy_(greedy[:1])
@@ -123,19 +134,32 @@ class SpeculativeGreedy:
                 sh.copy_(h[-1:].reshape(1, 1, -1))
                 dentry = self._noise("draft", 1) if sample else None
                 greedy, h, fl = g.run_spec("draft", row=row, start=P + j - 1, count=1,
-                                           call_shape=self._shape(1), sample=sample)
+                                           call_shape=self._shape(1), sample=sample, filtered=filtered)
                 flags.append(fl.clone())
+                if filtered:
+                    covs.append(dentry["out_cov"].clone())
                 vt[0, j + 1:j + 2].copy_(greedy[:1])
                 if sample:
                     ventry["q_in"][j:j + 1].copy_(dentry["out_q"])
             if sample:
                 self._noise("verify", k + 1)
             vg, vh, vf = g.run_spec("verify", row=row, start=P, count=k + 1,
-                                    call_shape=self._shape(k + 1), sample=sample)
+                                    call_shape=self._shape(k + 1), sample=sample, filtered=filtered)
             parts = [vt[0], vg, torch.stack(flags + [vf]).to(torch.long)]
             if sample:
                 parts.append(ventry["out_accept"].to(torch.long))
+            if filtered:
+                parts.append(torch.stack(covs + [ventry["out_cov"]]).to(torch.long))
             host = torch.cat(parts).tolist()
+            if filtered:
+                cov_host = host[-(k + 1):]
+                host = host[:-(k + 1)]
+                if not all(cov_host):
+                    # the nucleus ran past the gathered candidates: nothing of this
+                    # round is emitted; plain decoding continues from P (its KV
+                    # writes at P.. are rewritten there)
+                    self.filter_fallbacks += 1
+                    return None, (P, bonus)
             drafts, target = host[1:k + 1], host[k + 1:2 * k + 2]
             flag_host = host[2 * k + 2:3 * k + 3]
             self.draft_flags += sum(flag_host[:-1])
@@ -150,8 +174,17 @@ class SpeculativeGreedy:
                     from .spec_sample import verify_sample
 
                     lo_v, hi_v = d.weights.sharding.vocabulary_range
+                    sp = logits[0, :, lo_v:hi_v].float() * g.spec_inv_temp()
+                    if filtered:
+                        from .spec_sample import filter_scores
+
+                        sp, cov = filter_scores(d.collectives, sp, *g.spec_filter_params(),
+                                                vocabulary_range=(lo_v, hi_v))
+                        if not bool(cov):
+                            self.filter_fallbacks += 1
+                            return None, (P, bonus)
                     accept_t, tokens_t = verify_sample(
-                        d.collectives, logits[0, :, lo_v:hi_v].float() * g.spec_inv_temp(),
+                        d.collectives, sp,
                         ventry["q_in"], vt[0, 1:], ventry["uniform"], ventry["noise"],
                         vocabulary_range=(lo_v, hi_v))
                     target = [int(x) for x in tokens_t.tolist()]
@@ -189,7 +222,8 @@ class SpeculativeGreedy:
         while start + k + 1 < min(int(max_context), g.capacity):
             if not self.eligible(start, start - k - 1):
                 break
-            for mode in ((False, True) if sample else (False,)):
+            modes = ((False, False), (True, False), (True, True)) if sample else ((False, False),)
+            for mode, filt in modes:
                 for w in (x for x in ABSORB_WIDTHS if x <= k + 1):
                     toks, hid = g.spec_inputs("draft", w)
                     toks.zero_()
@@ -197,13 +231,13 @@ class SpeculativeGreedy:
                     if mode:
                         self._noise("draft", w)
                     g.run_spec("draft", row=self.row, start=start - w, count=w,
-                               call_shape=self._shape(w), sample=mode)
+                               call_shape=self._shape(w), sample=mode, filtered=filt)
                 toks, _ = g.spec_inputs("verify", k + 1)
                 toks.zero_()
                 if mode:
                     self._noise("verify", k + 1)
                 g.run_spec("verify", row=self.row, start=start, count=k + 1,
-                           call_shape=self._shape(k + 1), sample=mode)
+                           call_shape=self._shape(k + 1), sample=mode, filtered=filt)
             start = g.index_width(start + k + 2) * g.world + k + 2
         torch.cuda.synchronize(g.device)
         return g.captures - before
@@ -211,4 +245,5 @@ class SpeculativeGreedy:
     def stats(self):
         return {"k": self.k, "rounds": self.rounds, "accepted": self.accepted,
                 "tokens_per_round": round((self.accepted + self.rounds) / max(self.rounds, 1), 3),
-                "verify_reruns": self.verify_reruns, "draft_flags": self.draft_flags}
+                "verify_reruns": self.verify_reruns, "draft_flags": self.draft_flags,
+                "filter_fallbacks": self.filter_fallbacks}

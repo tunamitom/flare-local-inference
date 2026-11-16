@@ -98,3 +98,61 @@ def verify_sample(collectives, target_scores, draft_scores, drafts, uniforms, no
     scores = torch.cat([torch.log(residual), sp[k:]], dim=0)
     tokens = sample_tokens(collectives, scores, noise, vocabulary_range=vocabulary_range)
     return accept, tokens
+
+
+# --------------------------------------------------------------------------
+# consult18 P7: top-k / top-p filtering over the vocabulary shards
+# --------------------------------------------------------------------------
+TOPK_CAP = 64
+
+
+def filter_scores(collectives, scores, top_k, top_p, *, vocabulary_range, offer_width=None):
+    """The serve sampler's top-k then top-p filter on sharded scores, on device.
+
+    `scores` [rows, V/w] FP32 (temperature-scaled); `top_k` int64 [1] (0: off,
+    <= TOPK_CAP); `top_p` FP32 [1] (>= 1: off). top-k keeps every score >= the
+    global k-th largest (ties kept, as `logits < kth` drops); top-p keeps the
+    largest-probability tokens through the one whose cumulative probability
+    first reaches p (at least one). Each rank offers its local top candidates
+    over the score gather; the merged candidates give both thresholds.
+    Returns `(filtered scores, covered)`: `covered` [] bool is False when the
+    gathered candidates do not reach p (the nucleus extends past them) — the
+    caller must not use the result then. Ties at the top-p threshold are all
+    kept. Capture-safe; identical on every rank."""
+    rows, width = (int(v) for v in scores.shape)
+    s = scores.float()
+    world = int(getattr(collectives, "world_size", 1)) if collectives is not None else 1
+    offer = int(offer_width or getattr(getattr(collectives, "transport", None), "score_offer", None)
+                or 256)
+    cap = min(TOPK_CAP, width)
+    # top-k: the global k-th largest score
+    local_k = s.topk(cap, dim=-1).values                                    # [rows, cap]
+    got = _exchange_rows(collectives, local_k)                              # [rows, world, cap]
+    merged = got.reshape(rows, -1).sort(dim=-1, descending=True).values     # [rows, world*cap]
+    k = top_k.reshape(()).clamp(min=1, max=int(merged.shape[1])).long()
+    kth = merged.index_select(1, (k - 1).reshape(1)).reshape(rows)
+    kth = torch.where(top_k.reshape(()) > 0, kth, torch.full_like(kth, NEG))
+    s = torch.where(s >= kth.unsqueeze(1), s, torch.full_like(s, NEG))
+    # top-p: the global log-sum-exp and the merged top candidates
+    m = min(max(offer - 1, 1), width)
+    local_m = s.topk(m, dim=-1).values                                      # [rows, m]
+    pack = torch.cat([torch.logsumexp(s, dim=-1, keepdim=True), local_m], dim=1)
+    got = _exchange_rows(collectives, pack)                                 # [rows, world, 1+m]
+    lse = torch.logsumexp(got[:, :, 0], dim=1, keepdim=True)                # [rows, 1]
+    cand = got[:, :, 1:].reshape(rows, -1).sort(dim=-1, descending=True).values
+    probs = torch.exp(cand - lse)
+    cum = probs.cumsum(dim=-1)
+    p = top_p.reshape(()).float()
+    keep = (cum - probs) < p                                                # exclusive cumsum < p
+    keep[:, 0] = True
+    last = keep.sum(dim=-1, keepdim=True) - 1
+    thr = cand.gather(1, last).reshape(rows)
+    use_p = p < 1.0
+    thr = torch.where(use_p, thr, torch.full_like(thr, NEG))
+    # The merged list is the exact global order only above B, the largest
+    # last-offered score of any rank (a rank's un-offered tokens are <= its
+    # last offer): the threshold is exact iff it lies strictly above B.
+    bound = got[:, :, -1].max(dim=1).values
+    covered = (thr > bound) | ~use_p
+    s = torch.where(s >= thr.unsqueeze(1), s, torch.full_like(s, NEG))
+    return s, covered.all()

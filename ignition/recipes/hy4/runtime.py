@@ -72,6 +72,8 @@ ALLOWED = {
     # order): strict alternation, or the lane with less compute before its
     # next collective first
     "overlap_order": ("alternate", "short_first"),
+    # consult18 P7: top-k / top-p sampled requests speculate (device filter)
+    "spec_filter": ("off", "on"),
 }
 DEFAULTS = {"index_scores": "fp32",
             "ihc": os.environ.get("HY4_IHC") or "default",
@@ -93,7 +95,8 @@ DEFAULTS = {"index_scores": "fp32",
             "wire": os.environ.get("HY4_WIRE") or "bf16",
             "spec": os.environ.get("HY4_SPEC") or "off",
             "spec_sample": os.environ.get("HY4_SPEC_SAMPLE") or "off",
-            "overlap_order": os.environ.get("HY4_OVERLAP_ORDER") or "alternate"}
+            "overlap_order": os.environ.get("HY4_OVERLAP_ORDER") or "alternate",
+            "spec_filter": os.environ.get("HY4_SPEC_FILTER") or "off"}
 for _key, _value in DEFAULTS.items():
     if _value not in ALLOWED[_key]:
         raise ValueError(f"runtime default {_key}={_value!r} must be one of {ALLOWED[_key]}")

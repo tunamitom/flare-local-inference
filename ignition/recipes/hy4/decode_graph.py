@@ -314,8 +314,19 @@ class DecodeGraphs:
             buf = self._spec_inv_temp = torch.ones((1,), dtype=torch.float32, device=self.device)
         return buf
 
+    def spec_filter_params(self):
+        """consult18 P7: the request's top-k (int64, 0 off) / top-p (FP32, >= 1 off),
+        read by the "filtered" sampling graphs."""
+        params = getattr(self, "_spec_filter", None)
+        if params is None:
+            params = self._spec_filter = (torch.zeros((1,), dtype=torch.long, device=self.device),
+                                          torch.ones((1,), dtype=torch.float32, device=self.device))
+        return params
+
     def spec_sample_state(self, kind, count):
         entry = self._spec_state(kind, count)
+        if "out_cov" not in entry:
+            entry["out_cov"] = torch.ones((), dtype=torch.bool, device=self.device)
         if "noise" not in entry:
             vocab = int(self.decoder.weights.head.shape[0])
             rows = count if kind == "verify" else 1
@@ -366,7 +377,7 @@ class DecodeGraphs:
         args = entry["args"]
         return args[1:1 + per], args[1 + per:1 + 2 * per], args[1 + 2 * per:1 + 3 * per]
 
-    def _body_verify(self, row, call_shape, width, count, sample=False):
+    def _body_verify(self, row, call_shape, width, count, sample=False, filtered=False):
         from .lanes import use_lane
 
         d = self.decoder
@@ -387,10 +398,16 @@ class DecodeGraphs:
                 tokens, rows, positions, token_rows, visible, visible_max, state=None,
                 return_hidden=True, call_shape=call_shape, logits_rows="all", gather=False)
             if sample:
-                from .spec_sample import verify_sample
+                from .spec_sample import filter_scores, verify_sample
 
+                sp = logits.reshape(count, -1).float() * self.spec_inv_temp()
+                if filtered:
+                    top_k, top_p = self.spec_filter_params()
+                    sp, covered = filter_scores(d.collectives, sp, top_k, top_p,
+                                                vocabulary_range=d.weights.sharding.vocabulary_range)
+                    entry["out_cov"].copy_(covered)
                 accept, greedy = verify_sample(
-                    d.collectives, logits.reshape(count, -1).float() * self.spec_inv_temp(),
+                    d.collectives, sp,
                     entry["q_in"], entry["tokens"][0, 1:], entry["uniform"], entry["noise"],
                     vocabulary_range=d.weights.sharding.vocabulary_range)
                 entry["out_accept"].copy_(accept)
@@ -398,7 +415,7 @@ class DecodeGraphs:
                 greedy = d.greedy_tokens(logits.reshape(count, -1))
         return self._emit(entry, greedy, normed.reshape(count, -1), self._flag(deferred))
 
-    def _body_draft(self, row, call_shape, width, count, sample=False):
+    def _body_draft(self, row, call_shape, width, count, sample=False, filtered=False):
         from .lanes import use_lane
 
         d = self.decoder
@@ -419,6 +436,13 @@ class DecodeGraphs:
                 from .spec_sample import sample_tokens
 
                 scores = d.head_logits(hidden[-1:]) * self.spec_inv_temp()
+                if filtered:
+                    from .spec_sample import filter_scores
+
+                    top_k, top_p = self.spec_filter_params()
+                    scores, covered = filter_scores(d.collectives, scores, top_k, top_p,
+                                                    vocabulary_range=d.weights.sharding.vocabulary_range)
+                    entry["out_cov"].copy_(covered)
                 entry["out_q"].copy_(scores)
                 greedy = sample_tokens(d.collectives, scores, entry["noise"],
                                        vocabulary_range=d.weights.sharding.vocabulary_range)
@@ -450,7 +474,7 @@ class DecodeGraphs:
             return torch.stack([f.reshape(()) for f in flags]).any()
         return torch.zeros((), dtype=torch.bool, device=self.device)
 
-    def run_spec(self, kind, *, row, start, count, call_shape, sample=False):
+    def run_spec(self, kind, *, row, start, count, call_shape, sample=False, filtered=False):
         """One verify ("verify") or MTP ("draft") forward of `count` tokens at
         `start` over the static inputs (`spec_inputs`): `(greedy tokens [T] or
         [1], post-norm hidden [T, H], deferred flag)` — the (kind, T) static
@@ -459,17 +483,18 @@ class DecodeGraphs:
         eagerly through the same body."""
         width = self.index_width(start + count)
         key = (kind, int(row), int(count), width, call_shape.name)
+        filtered = bool(sample and filtered)
         if sample:
-            key = key + ("sample",)
+            key = key + (("sample", "filtered") if filtered else ("sample",))
             self.spec_sample_state(kind, count)
         entry = self._spec_state(kind, count)
         self._stage_spec(entry, row, start, count)
         body = self._body_verify if kind == "verify" else self._body_draft
         graph = self.graphs.get(key)
         if graph is None:
-            out = body(row, call_shape, width, count, sample)
+            out = body(row, call_shape, width, count, sample, filtered)
             self.eager_steps += 1
-            self._capture(key, lambda: body(row, call_shape, width, count, sample))
+            self._capture(key, lambda: body(row, call_shape, width, count, sample, filtered))
             return out
         graph, outputs, _ = graph
         self.graphs.move_to_end(key)
