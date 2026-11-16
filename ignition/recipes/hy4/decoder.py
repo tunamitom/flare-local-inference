@@ -558,6 +558,13 @@ class Hy4Decoder:
         # written records (write-once draft KV — the W5 cache-diff decision).
         limit = int(getattr(self.weights.draft.attention.selection.cache,
                             "max_q_rows", k))
+        import os as _os
+
+        cap = int(_os.environ.get("HY4_ABSORB_ROWS") or 0)
+        if cap > 0:
+            # consult18 P9: absorption pieces bounded independent of the prefill
+            # chunk (a 2,048-row chunk's pair absorbs 4,096 rows): batching only
+            limit = min(limit, cap)
         outs, sels = [], []
         for lo in range(0, k, limit):
             hi = min(lo + limit, k)

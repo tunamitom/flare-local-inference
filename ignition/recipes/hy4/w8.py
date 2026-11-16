@@ -241,3 +241,34 @@ def _quantize_replacing(attention):
         w = replace(w, o_proj=Int8Weight.quantize(w.o_proj))
     attention.weights = w
     return released
+
+
+class Bf16HeadView:
+    """consult18 P9: the FP32 `lm_head` stand-in over its BF16 checkpoint values
+    (the FP32 head is their exact upcast): `x @ view.T` is cuBLAS BF16 x BF16
+    with FP32 accumulate and output — the FP32 head's products, summation order
+    aside (bit-identical at one row, round-7 head_check). Frees the FP32 copy
+    (354 MB per rank); `.shape` / `.dtype` / `.device` read like the FP32 head."""
+
+    def __init__(self, head16):
+        self.head16 = head16
+        self.shape = head16.shape
+        self.dtype = torch.float32
+        self.device = head16.device
+
+    @property
+    def T(self):
+        return _Bf16HeadTransposed(self.head16)
+
+
+class _Bf16HeadTransposed:
+    def __init__(self, head16):
+        self.head16 = head16
+
+    def __rmatmul__(self, x):
+        lead = x.shape[:-1]
+        x2 = x.reshape(-1, x.shape[-1])
+        if x2.dtype != torch.bfloat16:
+            x2 = x2.to(torch.bfloat16)      # the BF16 hidden's FP32 upcast: exact
+        out = torch.mm(x2, self.head16.T, out_dtype=torch.float32)
+        return out.reshape(*lead, int(self.head16.shape[0]))
