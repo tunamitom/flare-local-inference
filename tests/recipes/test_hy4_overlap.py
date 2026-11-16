@@ -408,3 +408,48 @@ def test_decode_graph_body_equals_exact_decode(worlds, world, prompt):
     for exact, graphed in zip(run(False), run(True)):
         for want, got in zip(exact, graphed):
             assert torch.equal(got, want), f"world {world}: rel {rel_error(got, want)}"
+
+
+@pytest.mark.parametrize("world", (1, 2, 8))
+def test_tail_graph_body_equals_exact_forward(worlds, world):
+    """consult18 P2: the captured prefill-tail body (T tokens of one row, T a
+    multiple of the world; device-computed owned indices and slots; the
+    indexer at a width bucket) gives the exact forward's bits — every row's
+    logits, then a decode step that reads the tail's KV records."""
+    from ignition.recipes.hy4.collectives import SimulatedGroup
+    from ignition.recipes.hy4.decode_graph import DecodeGraphs
+
+    count = 8
+
+    def scenario(graph):
+        def body(decoder):
+            _, tokens = golden_tokens()
+            batch = torch.tensor([tokens[:HALF + count]], dtype=torch.long)
+            decoder.forward(batch[:, :HALF], logits_rows="all")
+            decoder.append([0], HALF)
+            tail = batch[:, HALF:HALF + count]
+            shape = decoder.default_call_shape((1, count))
+            if graph:
+                graphs = DecodeGraphs(decoder, granule=2)
+                start = decoder._row_lengths[0]
+                tokens_buf = graphs._stage_tail(tail, start)
+                width = graphs.index_width(start + count)
+                local, flag = graphs._body_tail(0, shape, width, tokens_buf, True)
+                assert not bool(flag)
+                out = decoder.collectives.gather_logits(
+                    local, vocabulary_range=decoder.weights.sharding.vocabulary_range)
+            else:
+                out = decoder.forward(tail, logits_rows="all")
+            decoder.append([0], count)
+            step = decoder.decode_step(torch.tensor([[5]], dtype=torch.long))
+            return [out, step]
+        return body
+
+    def run(graph):
+        if world == 1:
+            return [scenario(graph)(decoder) for decoder in fresh_decoders(worlds[1])]
+        return run_wired(worlds[world], scenario(graph), group=SimulatedGroup(world))
+
+    for exact, graphed in zip(run(False), run(True)):
+        for want, got in zip(exact, graphed):
+            assert torch.equal(got, want), f"world {world}: rel {rel_error(got, want)}"

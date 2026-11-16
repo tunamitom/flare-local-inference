@@ -283,6 +283,12 @@ class Hy4Cache:
         self._forward_memo.pop(id(tokens), None)
         self._forward_memo[id(tokens)] = (tokens, positions, kept, slot, safe)
 
+    def begin_forward_device(self, tokens, positions, kept, slots):
+        """consult18 P2 tail graphs: `begin_forward_host`'s `(kept, slots)` already
+        computed on device (fixed shapes; the caller checked the bounds on host)."""
+        self._forward_memo.pop(id(tokens), None)
+        self._forward_memo[id(tokens)] = (tokens, positions, kept, slots)
+
     def end_forward(self):
         self._forward_memo.clear()
 
@@ -669,17 +675,41 @@ class Hy4Decoder:
 
         on_device = token_ids.is_cuda or getattr(self, "_sync_free_on_cpu", False)  # CPU: tests
         mode = SWITCHES.get("sync_free")
-        sync_free = (getattr(self, "_sync_free_allowed", True) and on_device
-                     and (mode == "on" or (mode == "decode" and int(token_ids.shape[1]) == 1))
-                     and int(token_ids.shape[0]) == 1
-                     and (request_rows is None or len(request_rows) == 1)
-                     and not (token_ids.is_cuda and torch.cuda.is_current_stream_capturing()))
+        graphs = getattr(self, "decode_graphs", None)
+        one_row = (getattr(self, "_sync_free_allowed", True) and on_device
+                   and int(token_ids.shape[0]) == 1
+                   and (request_rows is None or len(request_rows) == 1)
+                   and not (token_ids.is_cuda and torch.cuda.is_current_stream_capturing()))
+        tail_graph = False
+        if (one_row and graphs is not None and SWITCHES.get("prefill_graph") == "on"
+                and int(token_ids.shape[1]) > 1):
+            row_id = 0 if request_rows is None else int(request_rows[0])
+            tail_graph = graphs.accepts_tail(
+                token_ids, row=row_id, start=int(getattr(self, "_row_lengths", {}).get(row_id, 0)),
+                call_shape=call_shape, state=state, return_hidden=return_hidden)
+        sync_free = one_row and (tail_graph or mode == "on"
+                                 or (mode == "decode" and int(token_ids.shape[1]) == 1))
         if sync_free:
             row_id = 0 if request_rows is None else int(request_rows[0])
             start = int(self._row_lengths.get(row_id, 0))
             width = int(token_ids.shape[1])
-            graphs = getattr(self, "decode_graphs", None)
-            if (graphs is not None and SWITCHES.get("decode_graph") == "on"
+            if tail_graph:
+                # consult18 P2: the captured single-row prefill forward (the
+                # prompt's tail); logits for every row are computed in the
+                # graph, the requested one is sliced and gathered here.
+                local, flag = graphs.run_tail(token_ids, row=row_id, start=start,
+                                              call_shape=call_shape,
+                                              need_logits=logits_rows != "none")
+                if logits_rows == "none":
+                    result = None
+                else:
+                    if logits_rows != "all":
+                        index = width - 1 if logits_rows == "last" else int(logits_rows)
+                        local = local[:, index:index + 1, :].contiguous()
+                    result = self.collectives.gather_logits(
+                        local, vocabulary_range=self.weights.sharding.vocabulary_range)
+                flags = [flag]
+            elif (graphs is not None and SWITCHES.get("decode_graph") == "on"
                     and graphs.accepts(token_ids, row=row_id, start=start, call_shape=call_shape,
                                        state=state, return_hidden=return_hidden,
                                        logits_rows=logits_rows)):

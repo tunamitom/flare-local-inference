@@ -53,6 +53,9 @@ ALLOWED = {
     # consult18 P2 (numerics class): decode rows through the decode-capacity MoE
     # op (FusedRoutedExperts.wire_decode_op; b12x small-M split-K schedule)
     "moe_decode_op": ("off", "on", "alt"),
+    # consult18 P2: single-row prefill forwards of T tokens (T % world == 0,
+    # T <= 512: the prompt's tail) replay a captured graph (DecodeGraphs.run_tail)
+    "prefill_graph": ("off", "on"),
 }
 DEFAULTS = {"index_scores": "fp32",
             "ihc": os.environ.get("HY4_IHC") or "default",
@@ -68,7 +71,8 @@ DEFAULTS = {"index_scores": "fp32",
             "sel_fused": os.environ.get("HY4_SEL_FUSED") or "off",
             "root_logits": os.environ.get("HY4_ROOT_LOGITS") or "off",
             "route_fused": os.environ.get("HY4_ROUTE_FUSED") or "off",
-            "moe_decode_op": os.environ.get("HY4_MOE_DECODE") or "off"}
+            "moe_decode_op": os.environ.get("HY4_MOE_DECODE") or "off",
+            "prefill_graph": os.environ.get("HY4_PREFILL_GRAPH") or "off"}
 for _key, _value in DEFAULTS.items():
     if _value not in ALLOWED[_key]:
         raise ValueError(f"runtime default {_key}={_value!r} must be one of {ALLOWED[_key]}")

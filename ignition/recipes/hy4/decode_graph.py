@@ -62,6 +62,11 @@ class DecodeGraphs:
         if self.device.type == "cuda":
             self._host = self._host.pin_memory()
         self._args = torch.zeros((3,), dtype=torch.long, device=self.device)
+        self._tail_tokens = {}           # T -> [1, T] static token buffer
+        self._tail_host = torch.zeros((1,), dtype=torch.long)
+        if self.device.type == "cuda":
+            self._tail_host = self._tail_host.pin_memory()
+        self._tail_start = torch.zeros((1,), dtype=torch.long, device=self.device)
         self.graphs = collections.OrderedDict()
         self.pool = None
         self.captures = self.replays = self.eager_steps = 0
@@ -134,6 +139,90 @@ class DecodeGraphs:
             flag = torch.zeros((), dtype=torch.bool, device=self.device)
         return logits, flag
 
+    # -- single-row prefill forwards of T tokens (the prompt's tail) -------
+    TAIL_MAX = 512
+
+    def accepts_tail(self, token_ids, *, row, start, call_shape, state, return_hidden):
+        """A one-row forward of T tokens, T a multiple of the world (every rank
+        owns exactly T / world of them: fixed-shape KV writes), T <= TAIL_MAX
+        (sub-chunk forwards: kernel collectives, no copy-engine exchange)."""
+        width = int(token_ids.shape[1])
+        return (token_ids.is_cuda and int(token_ids.shape[0]) == 1 and width > 1
+                and width % self.world == 0 and width <= self.TAIL_MAX
+                and state is None and not return_hidden and call_shape.is_prefill_graph
+                and start + width <= self.capacity
+                and (start + width - 1) // self.world < self.local_capacity
+                and 0 <= row < int(self.decoder.cache.rows))
+
+    def _stage_tail(self, token_ids, start):
+        width = int(token_ids.shape[1])
+        buf = self._tail_tokens.get(width)
+        if buf is None:
+            buf = self._tail_tokens[width] = torch.zeros((1, width), dtype=torch.long,
+                                                         device=self.device)
+        buf.copy_(token_ids)
+        self._tail_host[0] = start
+        self._tail_start.copy_(self._tail_host, non_blocking=True)
+        return buf
+
+    def _body_tail(self, row, call_shape, width, tokens, need_logits):
+        from .lanes import use_lane
+
+        d = self.decoder
+        count = int(tokens.shape[1])
+        start = self._tail_start
+        positions = start + torch.arange(count, dtype=torch.long, device=self.device)
+        rows = torch.full((1,), row, dtype=torch.long, device=self.device)
+        token_rows = d._token_rows((1, count), rows)
+        visible = positions + 1
+        # begin_forward_host's (kept, slots) from the device start: the owned
+        # tokens are i = first + world * j, first = (rank - start) mod world.
+        per = count // self.world
+        first = torch.remainder(self.rank - start, self.world)
+        j = torch.arange(per, dtype=torch.long, device=self.device)
+        kept = first + self.world * j
+        slots = row * self.local_capacity + torch.div(start + first, self.world,
+                                                      rounding_mode="floor") + j
+        d.cache.begin_forward_device(token_rows, positions, kept, slots)
+        geometry = {"owned_max": max(width, 1), "base": row * self.local_capacity}
+        deferred = getattr(d.collectives, "deferred_checks", None)
+        if deferred is not None:
+            deferred.clear()
+        with use_lane(0, overlap=False, geometry=geometry, sync_free=True):
+            logits = d._layers_and_head(
+                tokens, rows, positions, token_rows, visible, None, state=None,
+                return_hidden=False, call_shape=call_shape,
+                logits_rows="all" if need_logits else "none", gather=False)
+        flags = list(deferred) if deferred else []
+        if deferred is not None:
+            deferred.clear()
+        if flags:
+            flag = torch.stack([f.reshape(()) for f in flags]).any()
+        else:
+            flag = torch.zeros((), dtype=torch.bool, device=self.device)
+        return logits, flag
+
+    def run_tail(self, token_ids, *, row, start, call_shape, need_logits):
+        """One single-row forward of T tokens: `(local-shard logits [1, T, V/w]
+        or None, deferred flag)` — captured per (T, indexer width bucket)."""
+        count = int(token_ids.shape[1])
+        width = self.index_width(start + count)
+        key = ("tail", int(row), count, width, call_shape.name, bool(need_logits))
+        tokens = self._stage_tail(token_ids, start)
+        entry = self.graphs.get(key)
+        if entry is None:
+            logits, flag = self._body_tail(row, call_shape, width, tokens, need_logits)
+            self.eager_steps += 1
+            logits = None if logits is None else logits.clone()
+            flag = flag.clone()
+            self._capture(key, lambda: self._body_tail(row, call_shape, width, tokens, need_logits))
+            return logits, flag
+        graph, logits, flag = entry
+        self.graphs.move_to_end(key)
+        graph.replay()
+        self.replays += 1
+        return logits, flag
+
     # -- capture ----------------------------------------------------------
     def _comm_capture_contexts(self, stack):
         """Enter every b12x channel's capture context (DCP pools, one-shot)."""
@@ -144,11 +233,11 @@ class DecodeGraphs:
             stack.enter_context(pool.capture())
         seen = set()
         for _, target, arm in getattr(transport, "_ar_plans", {}).values():
-            if arm in ("oneshot", "pull", "rsag") and id(target) not in seen:
+            if arm in ("oneshot", "pull", "rsag", "twoshot") and id(target) not in seen:
                 seen.add(id(target))
                 stack.enter_context(target.capture())
 
-    def _capture(self, key, row, call_shape, width, logits_rows):
+    def _capture(self, key, body):
         import time
 
         began = time.perf_counter()
@@ -160,7 +249,7 @@ class DecodeGraphs:
         with contextlib.ExitStack() as stack:
             self._comm_capture_contexts(stack)
             with torch.cuda.graph(graph, pool=self.pool):
-                logits, flag = self._body(row, call_shape, width, logits_rows)
+                logits, flag = body()
         self.graphs[key] = (graph, logits, flag)
         self.captures += 1
         self.capture_s += time.perf_counter() - began
@@ -179,7 +268,7 @@ class DecodeGraphs:
             logits, flag = self._body(row, call_shape, width, logits_rows)
             self.eager_steps += 1
             logits, flag = logits.clone(), flag.clone()
-            self._capture(key, row, call_shape, width, logits_rows)
+            self._capture(key, lambda: self._body(row, call_shape, width, logits_rows))
             return logits, flag
         graph, logits, flag = entry
         self.graphs.move_to_end(key)
@@ -225,4 +314,4 @@ class DecodeGraphs:
     def stats(self):
         return {"captures": self.captures, "replays": self.replays,
                 "eager_steps": self.eager_steps, "capture_s": round(self.capture_s, 3),
-                "buckets": [k[1] for k in self.graphs]}
+                "buckets": [k[1] if k[0] != "tail" else ("tail", k[2], k[3]) for k in self.graphs]}
