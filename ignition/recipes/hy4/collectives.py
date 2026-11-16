@@ -1767,9 +1767,9 @@ class PcieDcpTransport:
         )
         self._lane_ar_plans[(lane_index, rows)] = (plan, ring, "dma")
         ring.min_bytes = rows * self.reduce_width * 2
-        if not getattr(ring, "_fp8", ""):
-            # Eager replay needs a lossless ring (b12x refuses it for the
-            # compressed wires, B12X_PCIE_DMA_FP8).
+        if getattr(ring, "_fp8", "") not in ("a2a", "i8_a2a", "mx_a2a"):
+            # Eager replay covers the lossless ring and the ring-topology
+            # compressed wires (B12X_PCIE_DMA_FP8 ag / i8 / mx / *_ring).
             ring.prepare_eager_replay(torch.bfloat16, max_elements=rows * self.reduce_width,
                                       state=plan.prepared.state)
         return plan
