@@ -868,26 +868,31 @@ def main():
         from b12x.preparation import PreparationSession
 
         session = PreparationSession(device=device, autotune=False, compile_workers=1)
+        # consult18 P2: the one-row (decode) collective plans may race their
+        # launch geometry (b12x autotune, collective at boot); the math per
+        # element does not depend on threads / block limits.
+        dsession = (PreparationSession(device=device, autotune=True, compile_workers=1)
+                    if os.environ.get("HY4_DECODE_AUTOTUNE") == "1" else session)
         # Prepared plans only (no JIT at run time): the decode shape gathers the
         # absorbed width at 1 query row; every prepared prefill width gathers
         # the unabsorbed width at `w` query rows; the LSE reduce-scatter is
         # 512-wide latent partials, base 2, at every query-row count.
-        transport.prepare_gather(session, 1, absorbed)
+        transport.prepare_gather(dsession, 1, absorbed)
         for w in PREFILL_WIDTHS:
             transport.prepare_gather(session, w, unabsorbed)
         if expanded is None:
             for w in (1, *PREFILL_WIDTHS):
-                transport.prepare_lse(session, w, values, lse_base="base2")
+                transport.prepare_lse(dsession if w == 1 else session, w, values, lse_base="base2")
         else:
             # Decode merges latents at one row; prefill merges expanded values.
-            transport.prepare_lse(session, 1, values, lse_base="base2")
+            transport.prepare_lse(dsession, 1, values, lse_base="base2")
             for w in PREFILL_WIDTHS:
                 transport.prepare_lse(session, w, expanded, lse_base="base2")
         # consult15 §2 lever 1: one b12x PCIe all-reduce plan per body row
         # shape (decode 1 row + every prepared prefill width) — oneshot at 1
         # row, rsag above (c1-unit-costs.md §1's arm choice).
         for w in (1, *PREFILL_WIDTHS):
-            transport.prepare_all_reduce(session, w)
+            transport.prepare_all_reduce(dsession if w == 1 else session, w)
         if uses_dma and args.dma_replay:
             graphs = transport.prepare_dma_replay()
             trace(rank, f"all-reduce: {graphs} ring replay graph(s) captured")
@@ -897,7 +902,7 @@ def main():
         if score_offer is not None:
             # consult17: the offer gather at every row count the body runs.
             for w in (1, *PREFILL_WIDTHS):
-                transport.prepare_score_gather(session, w)
+                transport.prepare_score_gather(dsession if w == 1 else session, w)
         trace(rank, "transport plans prepared")
 
         # ---- phase A: measure the fixed costs with a negligible KV cache ----
