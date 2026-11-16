@@ -309,6 +309,20 @@ class PreparedHy4Rank:
             scratch.seal()
             if small_scratch is not None:
                 small_scratch.seal()
+            import os as _os
+
+            decode_tokens = int(_os.environ.get("HY4_MOE_DECODE_OP") or 0)
+            if decode_tokens > 0 and small_scratch is None:
+                # consult18 P2 (numerics class): decode-capacity MoE ops compiled
+                # with the b12x small-M split-K schedule, one shared workspace;
+                # runtime switch moe_decode_op selects them.
+                from .moe import wire_decode_ops
+
+                spec = (_os.environ.get("HY4_MOE_DECODE_ENV")
+                        or "B12X_W4A16_SMALL_M_SPLITK=1,B12X_W4A16_SMALL_M_OCCUPANCY=1")
+                env = dict(item.split("=", 1) for item in spec.split(",") if item)
+                wire_decode_ops([layer.mlp.routed for layer in fused_layers],
+                                tokens=decode_tokens, env=env)
             self.fused_session, self.fused_scratch = preparation, scratch
             self.fused_small_scratch = small_scratch
         return self

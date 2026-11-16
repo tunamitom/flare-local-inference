@@ -465,6 +465,35 @@ class FusedRoutedExperts:
             self._wire_small(preparation, small_scratch)
         return self
 
+    def plan_decode_op(self, *, tokens):
+        """consult18 P2 (numerics class): plan one more A16 op at a decode
+        capacity (`tokens` rows) — call under the b12x env overrides the op
+        should compile with (wire_decode_ops sets them). Selected per call by
+        runtime switch `moe_decode_op` for calls of at most `tokens` rows on
+        lane 0; its workspace/storage are bound by `bind_decode_scratch`."""
+        import torch
+        from b12x.preparation import PreparationSession
+        from ignition.components.moe import PreparedRoutedExperts
+
+        if self.op is None:
+            raise RuntimeError(f"{self.name}: wire the main op first")
+        session = PreparationSession(device=self.device, autotune=False, compile_workers=0)
+        source = torch.zeros((tokens, self.hidden), dtype=torch.bfloat16, device=self.device)
+        ids = torch.zeros((tokens, self.top_k), dtype=torch.int32, device=self.device)
+        weights = torch.full((tokens, self.top_k), 1.0 / self.top_k, dtype=torch.float32,
+                             device=self.device)
+        op = PreparedRoutedExperts(source, self.experts, ids, weights, torch.zeros_like(source),
+                                   session=session, name=f"{self.name}.decode", a4_prefill=False)
+        op.functional(session=session)
+        self._decode_session = session
+        self.decode_op = op
+        self.decode_tokens = int(tokens)
+        return op
+
+    def bind_decode_scratch(self, workspace, storage):
+        self._decode_workspace, self._decode_storage = workspace, storage
+
+
     def warm(self):
         """Run one call at the extremes so no plan preparation lands in a step."""
         import torch
@@ -510,6 +539,15 @@ class FusedRoutedExperts:
                 raise RuntimeError(f"{self.name}: lane {current} has no small-call A16 scratch")
             op, workspace, storage = self.small_op, self._small_workspace, self._small_storage
             a4 = False
+        decode_op = getattr(self, "decode_op", None)
+        if decode_op is not None and rows <= self.decode_tokens and current == 0:
+            from .runtime import SWITCHES
+
+            if SWITCHES.get("moe_decode_op") == "on":
+                # consult18 P2 (numerics class): the decode-capacity A16 op built
+                # under HY4_MOE_DECODE_ENV (b12x small-M split-K schedule).
+                op, workspace, storage = decode_op, self._decode_workspace, self._decode_storage
+                a4 = False
         amax, layer = (self.amax, 0) if self.amax is not None else (None, None)
         prepared_moe_out(x, weights, ids, output, workspace, op.scale_inputs,
                          storage, op.plan.handle, True, None, amax, layer,
@@ -519,6 +557,49 @@ class FusedRoutedExperts:
 
     def __call__(self, x, *, ids, weights):
         return self.forward(x, ids, weights)
+
+
+def wire_decode_ops(routed, *, tokens, env):
+    """Plan every layer's decode op under `env` (set only while planning and
+    warming: the main ops keep their plans), over ONE shared workspace and
+    scale storage (the layer loop is serial). Returns the workspace bytes."""
+    import os as _os
+
+    import torch
+
+    from .runtime import SWITCHES
+
+    saved = {key: _os.environ.get(key) for key in env}
+    _os.environ.update(env)
+    try:
+        ops = [fused.plan_decode_op(tokens=tokens) for fused in routed]
+        nbytes = max(op.workspace_nbytes for op in ops)
+        layouts = ops[0].scale_layouts
+        if any(op.scale_layouts != layouts for op in ops):
+            raise ValueError("the decode MoE ops disagree on their scale layouts")
+        device = routed[0].device
+        workspace = torch.empty(nbytes, dtype=torch.uint8, device=device)
+        storage = [torch.empty_strided(shape, stride, dtype=dtype, device=device)
+                   for shape, stride, dtype in layouts]
+        before = SWITCHES.get("moe_decode_op")
+        SWITCHES["moe_decode_op"] = "on"
+        try:
+            for fused in routed:
+                fused.bind_decode_scratch(workspace, storage)
+                x = torch.zeros((1, fused.hidden), dtype=torch.bfloat16, device=device)
+                ids = torch.zeros((1, fused.top_k), dtype=torch.int32, device=device)
+                w = torch.full((1, fused.top_k), 1.0 / fused.top_k, dtype=torch.float32, device=device)
+                fused.forward(x, ids, w)
+        finally:
+            SWITCHES["moe_decode_op"] = before
+        torch.cuda.synchronize(device)
+        return nbytes
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                _os.environ.pop(key, None)
+            else:
+                _os.environ[key] = value
 
 
 @dataclass

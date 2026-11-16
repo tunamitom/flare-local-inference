@@ -50,6 +50,9 @@ ALLOWED = {
     "root_logits": ("off", "on"),
     # consult18 P2: the MoE route in one launch (fused_ops.moe_route; bit-identical)
     "route_fused": ("off", "on"),
+    # consult18 P2 (numerics class): decode rows through the decode-capacity MoE
+    # op (FusedRoutedExperts.wire_decode_op; b12x small-M split-K schedule)
+    "moe_decode_op": ("off", "on"),
 }
 DEFAULTS = {"index_scores": "fp32",
             "ihc": os.environ.get("HY4_IHC") or "default",
@@ -64,7 +67,8 @@ DEFAULTS = {"index_scores": "fp32",
             "ihc_split": os.environ.get("HY4_IHC_SPLIT") or "off",
             "sel_fused": os.environ.get("HY4_SEL_FUSED") or "off",
             "root_logits": os.environ.get("HY4_ROOT_LOGITS") or "off",
-            "route_fused": os.environ.get("HY4_ROUTE_FUSED") or "off"}
+            "route_fused": os.environ.get("HY4_ROUTE_FUSED") or "off",
+            "moe_decode_op": os.environ.get("HY4_MOE_DECODE") or "off"}
 for _key, _value in DEFAULTS.items():
     if _value not in ALLOWED[_key]:
         raise ValueError(f"runtime default {_key}={_value!r} must be one of {ALLOWED[_key]}")
