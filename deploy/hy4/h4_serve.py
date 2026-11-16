@@ -154,18 +154,31 @@ def prompt_plan(n, widths, *, pad=True, room=None, forward_cost_rows=128):
 
 
 class Sampler:
-    def __init__(self, tokenizer, eos_id, seed):
+    def __init__(self, tokenizer, eos_id, seed, device=None):
         import torch
         self.tok = tokenizer
         self.eos = eos_id
         self.gen = torch.Generator(device="cpu")
         self.gen.manual_seed(seed)
+        self.device = device if os.environ.get("HY4_GPU_SAMPLER", "1") == "1" else None
+        self.gen_cuda = None
 
     def step(self, logits_row, params, produced, max_new):
         """Sample one token from [V] FP32 logits. Returns (token, done, finish)."""
         import torch
-        row = logits_row.float().cpu()
         temperature = float(params.get("temperature", 0.9) or 0.0)
+        if temperature > 0.0 and self.device is not None:
+            # consult18 P6: the sampling math (softmax / top-k / top-p sort /
+            # multinomial over the full vocabulary) on rank 0's GPU — 1.6 ms of
+            # host CPU per token otherwise; the same distribution.
+            row = logits_row.to(self.device, non_blocking=True).float()
+            if self.gen_cuda is None:
+                self.gen_cuda = torch.Generator(device=self.device)
+                self.gen_cuda.manual_seed(int(self.gen.initial_seed()))
+            gen = self.gen_cuda
+        else:
+            row = logits_row.float().cpu()
+            gen = self.gen
         if temperature <= 0.0:
             tok = int(torch.argmax(row))
         else:
@@ -182,7 +195,7 @@ class Sampler:
                 drop = sorted_idx[cut > 0]
                 logits[drop] = float("-inf")
             probs = torch.softmax(logits, dim=-1)
-            tok = int(torch.multinomial(probs, 1, generator=self.gen).item())
+            tok = int(torch.multinomial(probs, 1, generator=gen).item())
         done, finish = False, None
         if tok == self.eos and not params.get("ignore_eos"):
             done, finish = True, "stop"
@@ -929,6 +942,19 @@ def main():
             load_s = round(time.monotonic() - t0, 1)
             trace(rank, f"constructed ({load_s} s, {built.memory_report['weights_bytes']} B weights, "
                         f"cache {cache_capacity} global/row x {cache_rows} rows)")
+            if os.environ.get("HY4_W8") == "1":
+                # consult18 P6: INT8 (W8A16, group-128 scales) storage of every
+                # attention's same-input pack + o_proj (w8.py) — before the plan
+                # book and the pool sizing, so the released BF16 feeds the KV pool.
+                from ignition.recipes.hy4.w8 import quantize_attention
+                keep = os.environ.get("HY4_W8_KEEP_BF16", "1") == "1"   # prefill stays exact BF16
+                released = sum(quantize_attention(layer.attention, keep_bf16=keep)
+                               for layer in built.weights.layers)
+                if getattr(built.weights, "draft", None) is not None:
+                    released += quantize_attention(built.weights.draft.attention, keep_bf16=keep)
+                torch.cuda.empty_cache()
+                trace(rank, f"w8: attention pack + o_proj INT8 for <= 16-row calls"
+                            f"{' (BF16 kept for prefill)' if keep else ''}, {released / 2**30:.2f} GB BF16 released")
             built.decoder.partial_wire = args.partial_wire   # before the plan book binds the folds
             built.wire_operators(session="prepared")
             shp = {w: built.decoder.default_call_shape((1, w)) for w in PREFILL_WIDTHS}
@@ -1202,7 +1228,7 @@ def main():
                     tok.chat_template = fh.read()
             ctx.tok = tok
             eos_id = tok.eos_token_id if tok.eos_token_id is not None else 120025
-            ctx.sampler = Sampler(tok, eos_id, seed=int(time.time()) & 0xFFFFFFFF)
+            ctx.sampler = Sampler(tok, eos_id, seed=int(time.time()) & 0xFFFFFFFF, device=ctx.device)
             serve_http(ctx)
             trace(rank, f"listening on {ctx.bind} as {ctx.served_names[0]}")
         while True:
