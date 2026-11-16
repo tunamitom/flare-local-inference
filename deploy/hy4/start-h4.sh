@@ -26,8 +26,8 @@ set -euo pipefail
 NAME="${NAME:-h4}"
 PORT="${LLM_PORT:-8001}"
 TP=8
-IMAGE="${IMAGE:-local/flare:rt-h4-cp8-dg12}"
-IMAGE_SHA="${IMAGE_SHA:-sha256:2597ba5fce9d9fd3cc27196050e07f564e8f93367effef93833cf6a020c29399}"
+IMAGE="${IMAGE:-local/flare:rt-h4-cp8-dg15}"
+IMAGE_SHA="${IMAGE_SHA:-sha256:ab62ba3de315f7ae9a29d1a335905329d885304e04dcc81a34b7137a35bc1c09}"
 PKG_LINK="${PKG_DIR:-/opt/models/Hy4-nvfp4-w4a16-mse-gpu}"
 SERVED_NAME="${SERVED_NAME:-smart}"
 MAX_CONCURRENCY="${MAX_CONCURRENCY:-1}"
@@ -244,7 +244,7 @@ docker run -d --name "$NAME" --network host --init --cap-add SYS_PTRACE \
       --lse-transport ce-relay --gather-transport ce-relay \
       --selection-wire dcp \
       --partial-wire expanded \
-      --overlap 1 --profile-phases 0 \
+      --overlap 1 --profile-phases 0 --chunk "${H4_CHUNK:-1024}" \
       --profile-steps 64
 # Keep the container log (lost with the container otherwise). Background only
 # the follower: backgrounding the whole list forks a subshell that keeps the

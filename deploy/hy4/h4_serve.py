@@ -361,7 +361,11 @@ def run_generate(ctx, cmd):
             if params.get("nll"):
                 # consult18 stage 0b: every row's full-vocabulary logits (a probe,
                 # not a serving path), scored against the next prompt token.
-                logits = decoder.forward(t, call_shape=ctx.shapes[w], logits_rows="all")
+                decoder.logits_root_host = True       # rank 0's host only (see decoder)
+                try:
+                    logits = decoder.forward(t, call_shape=ctx.shapes[w], logits_rows="all")
+                finally:
+                    decoder.logits_root_host = False
                 if ctx.rank == 0:
                     targets = ids[pos + 1:pos + real + 1]
                     rows = len(targets)
