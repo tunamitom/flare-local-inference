@@ -97,7 +97,10 @@ def test_one_row_decode_shape_is_distinct_from_the_verification_shape():
     verify = verify_shape(4)
     assert DECODE_ONE_ROW.name == "decode" and verify.name == "verify"
     assert DECODE_ONE_ROW.is_decode_graph and verify.is_decode_graph
-    assert DECODE_ONE_ROW.mla_mode == "decode" and verify.mla_mode == "verify"
+    # Distinct shapes and plans; consult18 P4: both run the unified decode
+    # kernel (independent single-token queries; b12x "verify" mode is the
+    # multi-group prefill kernel, 4.7x slower per layer at two rows).
+    assert DECODE_ONE_ROW.mla_mode == "decode" and verify.mla_mode == "decode"
     assert DECODE_ONE_ROW != verify and DECODE_ONE_ROW.rows == 1 and verify.rows == 4
     prefill = prefill_shape(1, 128)
     assert prefill.is_prefill_graph and prefill.mla_mode == "extend"

@@ -151,12 +151,15 @@ class CallShape:
     def mla_mode(self):
         """The `sparse_mla` plan mode for this shape (`Caps.mode`).
 
-        One plan per call shape: `"decode"` (the one-row serving step),
-        `"verify"` (the verification rows) and `"extend"` (prefill chunks) are
-        DISTINCT plan shapes — the one-row decode graph is not the
-        verification graph (consult7 §5).
+        One plan per call shape: the one-row decode step, the verification rows
+        and the prefill chunks are DISTINCT plans — the one-row decode graph is
+        not the verification graph (consult7 §5). consult18 P4: the verification
+        rows are independent single-token queries (each its own selected keys
+        and length), so their plan runs the unified split-K DECODE kernel at
+        `rows` query rows; b12x's "verify" mode is the multi-group prefill
+        kernel (dg26c graph census: 39.5 vs 8.4 us per layer at two rows).
         """
-        return {"decode": "decode", "verify": "verify", "prefill": "extend"}[self.name]
+        return {"decode": "decode", "verify": "decode", "prefill": "extend"}[self.name]
 
     @property
     def short_context_bypass(self):
