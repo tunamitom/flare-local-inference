@@ -242,14 +242,6 @@ def warm_up(ctx):
                 decoder.forward_overlapped(pair, half_shape=ctx.shapes[w], logits_rows="none")
                 torch.cuda.synchronize(dev)
             decoder.complete([0], pair)
-            from ignition.recipes.hy4 import runtime
-            if runtime.SWITCHES.get("graph_moe") == "on" or os.environ.get("HY4_AB_FILE"):
-                # consult18 P1: per-lane CUDA graphs of the MLP block (captured
-                # outside the overlap, after its plans and lane streams exist).
-                t_cap = time.monotonic()
-                n_graphs = decoder.capture_mlp_graphs(w)
-                trace(ctx.rank, f"mlp graphs: {n_graphs} captured at {w} rows in "
-                                f"{time.monotonic() - t_cap:.1f} s")
     for _ in range(2):
         t = torch.full((1, 1), 1, dtype=torch.int64, device=dev)
         decoder.decode_step(t, call_shape=ctx.decode_shape)

@@ -5,7 +5,9 @@
 # (image tag/ID, launcher name, the b12x SHA baked into the image).
 set -eu
 here="$(cd "$(dirname "$0")" && pwd)"
-cp /opt/h4/h4_serve.py "$here/h4_serve.py"
+# The serve runner comes OUT OF THE RUNNING CONTAINER (the host copy may hold
+# edits for the next cut that are not served yet).
+docker exec h4 cat /opt/h4/h4_serve.py > "$here/h4_serve.py"
 cp /opt/h4/start-h4.sh "$here/start-h4.sh"
 cp /home/tom/.h4-image-build/Dockerfile "$here/Dockerfile"
 cp /opt/h4/healthcheck-src.sh "$here/healthcheck-src.sh"
@@ -20,7 +22,7 @@ cat > "$here/SERVED.md" <<MD
 - Launcher pin: \`$img\` (\`$sha\`); running container image: \`$running\`
 - Production launcher snapshot: \`$(basename "$snap")\`
 - flashinfer/b12x (branch hy4 of tunamitom/flashinfer) baked into the image: \`$fi_sha\`
-- Files here are byte copies of /opt/h4/h4_serve.py, /opt/h4/start-h4.sh,
+- Files here are byte copies of the running container's /opt/h4/h4_serve.py, /opt/h4/start-h4.sh,
   ~/.h4-image-build/Dockerfile and /opt/h4/healthcheck-src.sh.
 MD
 echo "synced: $img ($running), b12x $fi_sha"
