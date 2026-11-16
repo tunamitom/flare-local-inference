@@ -418,12 +418,12 @@ class DecodeGraphs:
             if sample:
                 from .spec_sample import sample_tokens
 
-                scores = (hidden[-1:].float() @ d.weights.head.T) * self.spec_inv_temp()
+                scores = d.head_logits(hidden[-1:]) * self.spec_inv_temp()
                 entry["out_q"].copy_(scores)
                 greedy = sample_tokens(d.collectives, scores, entry["noise"],
                                        vocabulary_range=d.weights.sharding.vocabulary_range)
             else:
-                greedy = d.greedy_tokens(hidden[-1:].float() @ d.weights.head.T)
+                greedy = d.greedy_tokens(d.head_logits(hidden[-1:]))
         return self._emit(entry, greedy, hidden.reshape(count, -1), self._flag(deferred))
 
     @staticmethod

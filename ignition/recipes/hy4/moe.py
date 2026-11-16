@@ -752,8 +752,19 @@ class MoEBlock:
             # bitwise the same as the loose weights (content gates are exact).
             with TIMER.phase("moe.route_shared"):
                 logits = x.float() @ self._router_f32_t(packed)
-                shared_gate = x @ packed.rows("shared_gate").T
-                shared_up = x @ packed.rows("shared_up").T
+                from .w8 import in_decode_scope
+
+                g0, g1 = packed.slices["shared_gate"]
+                u0, u1 = packed.slices["shared_up"]
+                if g1 == u0 and in_decode_scope(x):
+                    # consult18 P7: decode-family rows run shared gate + up as ONE
+                    # GEMM over the adjacent packed rows (cuBLAS picks a slow
+                    # kernel for each 256-row slice at one row: 8.7 vs 3.1 us).
+                    gate_up = x @ packed.packed[g0:u1].T
+                    shared_gate, shared_up = gate_up[:, :g1 - g0], gate_up[:, g1 - g0:]
+                else:
+                    shared_gate = x @ packed.rows("shared_gate").T
+                    shared_up = x @ packed.rows("shared_up").T
                 _, topk_weights, topk_indices = self._route_from_logits(logits)
         else:
             shared_gate = shared_up = None

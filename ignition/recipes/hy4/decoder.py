@@ -619,10 +619,25 @@ class Hy4Decoder:
         return self.collectives.argmax_tokens(
             logits, vocabulary_range=self.weights.sharding.vocabulary_range)
 
+    def head_logits(self, x):
+        """FP32 logits over this rank's vocabulary shard: `x.float() @ head.T`.
+        consult18 P7: decode-family rows (w8.decode_scope) read a BF16 copy of
+        the head (`_head_bf16`, the checkpoint's own values — the FP32 head is
+        an upcast) through cuBLAS with FP32 output: half the bytes, the same
+        FP32 math up to summation order."""
+        head16 = getattr(self, "_head_bf16", None)
+        if head16 is not None:
+            from .w8 import in_decode_scope
+
+            if in_decode_scope(x):
+                x2 = x.reshape(-1, x.shape[-1]).to(torch.bfloat16)
+                return torch.mm(x2, head16.T, out_dtype=torch.float32)
+        return x.float() @ self.weights.head.T
+
     def _draft_logits(self, hidden):
         """The shared head over the draft hidden: full-vocabulary FP32 logits
         (the vocabulary shards gathered under tensor parallelism)."""
-        logits = hidden.float() @ self.weights.head.T
+        logits = self.head_logits(hidden)
         if int(getattr(self.collectives, "world_size", 1)) > 1:
             logits = self.collectives.gather_logits(
                 logits, vocabulary_range=self.weights.sharding.vocabulary_range)
@@ -940,7 +955,7 @@ class Hy4Decoder:
             logits = None
         else:
             with TIMER.phase("head"):
-                logits = normed.float() @ self.weights.head.T
+                logits = self.head_logits(normed)
                 logits = logits.reshape(token_ids.shape[0], token_ids.shape[1], -1)
                 if logits_rows != "all":
                     token = token_ids.shape[1] - 1 if logits_rows == "last" else logits_rows
