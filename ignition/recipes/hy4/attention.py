@@ -360,6 +360,22 @@ class Hy4LayerAttention:
             raise ValueError(
                 f"absorb_queries: {heads} heads is neither this rank's shard "
                 f"({self.heads}) nor the full head count ({self.absorb_wuk.shape[0]})")
+        rows = int(q_unabsorbed.shape[0])
+        if (q_unabsorbed.is_cuda and rows > 16 and q_unabsorbed.dtype == wuk.dtype
+                and q_unabsorbed.ndim == 3):
+            from .runtime import SWITCHES
+
+            if SWITCHES.get("absorb_out") == "direct":
+                # consult18 P9: the per-head GEMM writes straight into the query
+                # (the same cuBLAS batched GEMM, only its output stride differs),
+                # the rope columns are copied beside it — no [rows, heads, 576] cat.
+                lora = int(wuk.shape[-1])
+                out = torch.empty((rows, heads, lora + q_unabsorbed.shape[-1] - self.qk_nope),
+                                  dtype=q_unabsorbed.dtype, device=q_unabsorbed.device)
+                torch.bmm(q_unabsorbed[..., :self.qk_nope].transpose(0, 1), wuk,
+                          out=out[..., :lora].transpose(0, 1))
+                out[..., lora:].copy_(q_unabsorbed[..., self.qk_nope:])
+                return out
         absorbed_nope = torch.einsum("rhi,hio->rho", q_unabsorbed[..., :self.qk_nope], wuk)
         return torch.cat((absorbed_nope, q_unabsorbed[..., self.qk_nope:]), dim=-1)
 

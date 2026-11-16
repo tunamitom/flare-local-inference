@@ -775,7 +775,19 @@ class MoEBlock:
                     gate_up = x @ packed.packed[g0:u1].T
                     shared_gate, shared_up = gate_up[:, :g1 - g0], gate_up[:, g1 - g0:]
                 else:
-                    logits = x.float() @ self._router_f32_t(packed)
+                    logits = None
+                    if x.is_cuda and x.dtype == torch.bfloat16 and x.ndim == 2:
+                        from .runtime import SWITCHES
+
+                        if SWITCHES.get("router_mm") == "bf16":
+                            # consult18 P9 (numerics class): tensor-core router logits,
+                            # BF16 checkpoint values in, FP32 accumulate and out —
+                            # the FP32 router's products, summation order aside
+                            # (1,024-row chunks: 124 -> 16 us; 2 of 630,784 real
+                            # routing decisions differ).
+                            logits = torch.mm(x, packed.rows("router").T, out_dtype=torch.float32)
+                    if logits is None:
+                        logits = x.float() @ self._router_f32_t(packed)
                     shared_gate = x @ packed.rows("shared_gate").T
                     shared_up = x @ packed.rows("shared_up").T
                 _, topk_weights, topk_indices = self._route_from_logits(logits)

@@ -209,6 +209,46 @@ def _ihc_pp_chunks_kernel(x_ptr, residual_ptr, prev_post_ptr, fn_ptr, out_ptr, p
 
 
 @triton.jit
+def _ihc_pp_chunks_rows_kernel(x_ptr, residual_ptr, prev_post_ptr, fn_ptr, out_ptr, part_ptr,
+                               H, K, NC, ROWS, BLOCK_K: tl.constexpr, R: tl.constexpr):
+    """`_ihc_pp_chunks_kernel` for R rows of one chunk per program: the chunk's
+    eight `fn` vectors are loaded once instead of once per row (32 KB per row at
+    BLOCK_K 1,024); each row's sums are the same 1-D reductions — the same bits."""
+    t0 = tl.program_id(0).to(tl.int64) * R
+    c = tl.program_id(1)
+    k = c * BLOCK_K
+    offs = k + tl.arange(0, BLOCK_K)
+    si = offs // H
+    d = offs - si * H
+    f0 = tl.load(fn_ptr + 0 * K + offs).to(tl.float32)
+    f1 = tl.load(fn_ptr + 1 * K + offs).to(tl.float32)
+    f2 = tl.load(fn_ptr + 2 * K + offs).to(tl.float32)
+    f3 = tl.load(fn_ptr + 3 * K + offs).to(tl.float32)
+    f4 = tl.load(fn_ptr + 4 * K + offs).to(tl.float32)
+    f5 = tl.load(fn_ptr + 5 * K + offs).to(tl.float32)
+    f6 = tl.load(fn_ptr + 6 * K + offs).to(tl.float32)
+    f7 = tl.load(fn_ptr + 7 * K + offs).to(tl.float32)
+    for r in tl.static_range(R):
+        t = t0 + r
+        if t < ROWS:
+            rv = tl.load(residual_ptr + t * K + offs).to(tl.float32)
+            xv = tl.load(x_ptr + t * H + d).to(tl.float32)
+            p = tl.load(prev_post_ptr + t * 4 + si)
+            ob = (p * xv + rv).to(tl.bfloat16).to(tl.float32)
+            tl.store(out_ptr + t * K + offs, ob.to(tl.bfloat16))
+            base = part_ptr + (t * NC + c) * 9
+            tl.store(base + 0, tl.sum(ob * ob))
+            tl.store(base + 1, tl.sum(ob * f0))
+            tl.store(base + 2, tl.sum(ob * f1))
+            tl.store(base + 3, tl.sum(ob * f2))
+            tl.store(base + 4, tl.sum(ob * f3))
+            tl.store(base + 5, tl.sum(ob * f4))
+            tl.store(base + 6, tl.sum(ob * f5))
+            tl.store(base + 7, tl.sum(ob * f6))
+            tl.store(base + 8, tl.sum(ob * f7))
+
+
+@triton.jit
 def _ihc_pp_gates(part_ptr, scale_ptr, base_ptr, t, K, NC, magnitude, hc_eps, norm_eps):
     sq = 0.0
     a0 = 0.0
@@ -308,8 +348,17 @@ def ihc_post_pre_split(x, residual, prev_post, fn, hc_scale, hc_base, *, magnitu
     nc, nd = k_all // block_k, hidden // block_d
     parts = torch.empty((rows, nc, 9), dtype=torch.float32, device=residual.device)
     sqy = torch.empty((rows, nd), dtype=torch.float32, device=residual.device)
-    _ihc_pp_chunks_kernel[(rows, nc)](x, residual, prev_post, fn, out, parts, hidden, k_all, nc,
-                                      BLOCK_K=block_k, num_warps=num_warps)
+    from .runtime import SWITCHES
+
+    per = 8 if rows >= 512 and SWITCHES.get("ihc_rows") == "8" else 1
+    if per > 1:
+        # consult18 P9: 8 rows per program (bit-identical; 63 -> 50 us at 1,024 rows)
+        _ihc_pp_chunks_rows_kernel[(triton.cdiv(rows, per), nc)](
+            x, residual, prev_post, fn, out, parts, hidden, k_all, nc, rows, BLOCK_K=block_k, R=per,
+            num_warps=num_warps)
+    else:
+        _ihc_pp_chunks_kernel[(rows, nc)](x, residual, prev_post, fn, out, parts, hidden, k_all, nc,
+                                          BLOCK_K=block_k, num_warps=num_warps)
     _ihc_pp_collapse_kernel[(rows, nd)](parts, hc_scale, hc_base, out, post, y, sqy, hidden, k_all,
                                         nc, nd, float(magnitude), float(hc_eps), float(norm_eps),
                                         BLOCK_D=block_d, FUSE_NORM=norm_weight is not None,

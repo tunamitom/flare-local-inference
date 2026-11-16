@@ -74,6 +74,15 @@ ALLOWED = {
     "overlap_order": ("alternate", "short_first"),
     # consult18 P7: top-k / top-p sampled requests speculate (device filter)
     "spec_filter": ("off", "on"),
+    # consult18 P9 (round 8): prefill absorb_queries writes the absorbed GEMM
+    # straight into the [rows, heads, kv_lora + rope] query (no cat; exact)
+    "absorb_out": ("cat", "direct"),
+    # consult18 P9 (numerics class): prefill-row MoE router logits by cuBLAS
+    # BF16-in / FP32-out tensor cores instead of the FP32 SIMT GEMM
+    "router_mm": ("f32", "bf16"),
+    # consult18 P9: iHC post_pre chunk kernel with 8 rows per program at >= 512
+    # rows (the chunk's fn vectors loaded once per 8 rows; bit-identical)
+    "ihc_rows": ("1", "8"),
 }
 DEFAULTS = {"index_scores": "fp32",
             "ihc": os.environ.get("HY4_IHC") or "default",
@@ -96,7 +105,10 @@ DEFAULTS = {"index_scores": "fp32",
             "spec": os.environ.get("HY4_SPEC") or "off",
             "spec_sample": os.environ.get("HY4_SPEC_SAMPLE") or "off",
             "overlap_order": os.environ.get("HY4_OVERLAP_ORDER") or "alternate",
-            "spec_filter": os.environ.get("HY4_SPEC_FILTER") or "off"}
+            "spec_filter": os.environ.get("HY4_SPEC_FILTER") or "off",
+            "absorb_out": os.environ.get("HY4_ABSORB_OUT") or "cat",
+            "router_mm": os.environ.get("HY4_ROUTER_MM") or "f32",
+            "ihc_rows": os.environ.get("HY4_IHC_ROWS") or "1"}
 for _key, _value in DEFAULTS.items():
     if _value not in ALLOWED[_key]:
         raise ValueError(f"runtime default {_key}={_value!r} must be one of {ALLOWED[_key]}")
