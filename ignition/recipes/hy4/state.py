@@ -96,20 +96,28 @@ class IhcBoundary:
         return prefill if SWITCHES.get("ihc") == "tuned" else default
 
     def _split_config(self, streams):
-        """The default plan's launch config when the split decode form applies
-        (`ihc_split` on, fewer than PREFILL_MIN_ROWS rows, a bound plan)."""
-        if self.plan is None or int(streams.shape[0]) >= self.PREFILL_MIN_ROWS:
-            return None
+        """The launch config of the plan this call would run when the split form
+        applies (`ihc_split` on): below PREFILL_MIN_ROWS rows always; at prefill
+        rows when that plan runs at most 2 warps (the tuned prefill plan: 168 ->
+        132 us at 1,024 rows; at 8 warps the split loses there)."""
         from .runtime import SWITCHES
 
         if SWITCHES.get("ihc_split") != "on":
             return None
-        config = getattr(self, "_plan_config", None)
+        plan = self._choose(streams, self.plan, self.prefill_plan)
+        if plan is None:
+            return None
+        cache = getattr(self, "_plan_configs", None)
+        if cache is None:
+            cache = self._plan_configs = {}
+        config = cache.get(id(plan))
         if config is None:
             from b12x.norm.mhc._ihc_impl import _prepared_state
 
-            config = self._plan_config = _prepared_state(self.plan).config
+            config = cache[id(plan)] = _prepared_state(plan).config
         if config.backend != "triton_fused":
+            return None
+        if int(streams.shape[0]) >= self.PREFILL_MIN_ROWS and config.num_warps > 2:
             return None
         return config
 
