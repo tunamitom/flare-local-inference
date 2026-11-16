@@ -26,8 +26,8 @@ set -euo pipefail
 NAME="${NAME:-h4}"
 PORT="${LLM_PORT:-8001}"
 TP=8
-IMAGE="${IMAGE:-local/flare:rt-h4-cp8-dg16}"
-IMAGE_SHA="${IMAGE_SHA:-sha256:d87237f7fb6a4b25df31ba1c68f60a98fdfe907a2272859df9466ba56ab7dd11}"
+IMAGE="${IMAGE:-local/flare:rt-h4-cp8-dg21}"
+IMAGE_SHA="${IMAGE_SHA:-sha256:59af68f52a24de62c9a62daebf7bbd7eebc4157035525f8440f749776a812ce8}"
 PKG_LINK="${PKG_DIR:-/opt/models/Hy4-nvfp4-w4a16-mse-gpu}"
 SERVED_NAME="${SERVED_NAME:-smart}"
 MAX_CONCURRENCY="${MAX_CONCURRENCY:-1}"
@@ -208,7 +208,8 @@ docker run -d --name "$NAME" --network host --init --cap-add SYS_PTRACE \
   -e HY4_ROUTE_FUSED="${HY4_ROUTE_FUSED:-on}" \
   -e HY4_MOE_DECODE="${HY4_MOE_DECODE:-on}" \
   -e HY4_PREFILL_GRAPH="${HY4_PREFILL_GRAPH:-on}" \
-  -e HY4_DECODE_AUTOTUNE="${HY4_DECODE_AUTOTUNE:-1}" \
+  -e HY4_WIRE="${HY4_WIRE:-int8}" \
+  -e HY4_DECODE_AUTOTUNE="${HY4_DECODE_AUTOTUNE:-0}" \
   -e HY4_MOE_DECODE_OP="${HY4_MOE_DECODE_OP:-1}" \
   -e HY4_MOE_DECODE_ENV="${HY4_MOE_DECODE_ENV:-}" \
   -e HY4_MOE_DECODE_ENV_ALT="${HY4_MOE_DECODE_ENV_ALT:-B12X_W4A16_SMALL_M_OCCUPANCY=1}" \
@@ -226,6 +227,7 @@ docker run -d --name "$NAME" --network host --init --cap-add SYS_PTRACE \
   -e B12X_W4A16_STABLE_ROUTE_PACK="${B12X_W4A16_STABLE_ROUTE_PACK:-1}" \
   -e B12X_W4A16_COOP_RESERVE_SMS="${B12X_W4A16_COOP_RESERVE_SMS:-2}" \
   -e B12X_W4A16_SMALL_M_SPLITK="${B12X_W4A16_SMALL_M_SPLITK:-1}" \
+  -e B12X_PCIE_DMA_FP8="${B12X_PCIE_DMA_FP8:-}" \
   -e B12X_PCIE_DMA_SINGLE_CTA_WAITS="${B12X_PCIE_DMA_SINGLE_CTA_WAITS:-1}" \
   -e HY4_OVERLAP_ADMISSION_UNSAFE="${HY4_OVERLAP_ADMISSION_UNSAFE:-}" \
   -v "$PKG_DIR":/model:ro \
@@ -245,7 +247,7 @@ docker run -d --name "$NAME" --network host --init --cap-add SYS_PTRACE \
       --lse-transport ce-relay --gather-transport ce-relay \
       --selection-wire dcp \
       --partial-wire expanded \
-      --overlap 1 --profile-phases 0 --chunk "${H4_CHUNK:-1024}" \
+      --overlap 1 --profile-phases 0 --chunk "${H4_CHUNK:-1024}" --dma-replay "${H4_DMA_REPLAY:-1}" \
       --profile-steps 64
 # Keep the container log (lost with the container otherwise). Background only
 # the follower: backgrounding the whole list forks a subshell that keeps the
