@@ -225,3 +225,65 @@ def test_spec_decode_rows_match_prefill_family(mtp_worlds, world):
         for name, index in (("verify hidden", 1), ("absorb hidden", 3), ("decode after", 4)):
             assert rel_error(got[index], want[index]) < 1e-4, \
                 f"world {world} rank {rank} {name}: {rel_error(got[index], want[index])}"
+
+
+@pytest.mark.parametrize("world", (2, 8))
+def test_spec_sample_bodies_match_reference_math(mtp_worlds, world):
+    """consult18 P5: the sampling verify / draft bodies (temperature 0.7, fixed
+    noise and uniforms) emit what `verify_sample` / `sample_tokens` give on the
+    eager forward's own logits shard and the draft's scores."""
+    from ignition.recipes.hy4.collectives import SimulatedGroup
+    from ignition.recipes.hy4.decode_graph import DecodeGraphs
+    from ignition.recipes.hy4.spec_sample import sample_tokens, verify_sample
+
+    prompt, temp = 20, 0.7
+
+    def body(decoder):
+        _, tokens = golden_tokens()
+        ids = torch.tensor([tokens], dtype=torch.long)
+        _, hidden, _ = decoder.forward(ids[:, :prompt], return_hidden=True)
+        decoder.append([0], prompt)
+        decoder.draft_absorb(ids[:, 1:prompt], hidden[:, :prompt - 1], logits="none")
+        g = DecodeGraphs(decoder, granule=2)
+        g.spec_inv_temp().fill_(1.0 / temp)
+        rank = decoder.collectives.rank
+        gen = torch.Generator().manual_seed(11 + rank)
+        vr = decoder.weights.sharding.vocabulary_range
+        # draft T=1 in sampling mode vs the reference on the same scores
+        entry = g.spec_sample_state("draft", 1)
+        entry["noise"].uniform_(generator=gen)
+        toks, hid = g.spec_inputs("draft", 1)
+        toks.copy_(ids[:, prompt:prompt + 1])
+        hid.copy_(hidden[:, prompt - 1:prompt])
+        en = g._spec_state("draft", 1)
+        g._stage_spec(en, 0, prompt - 1, 1)
+        d_tok, d_hid, _ = g._body_draft(0, decoder.default_call_shape((1, 1)),
+                                        g.index_width(prompt), 1, True)
+        want_scores = (d_hid[-1:].float() @ decoder.weights.head.T) / temp
+        want_tok = sample_tokens(decoder.collectives, want_scores, entry["noise"], vocabulary_range=vr)
+        draft = (d_tok.clone(), want_tok, entry["out_q"].clone(), want_scores)
+        # verify T=3 in sampling mode vs verify_sample on the eager forward's shard
+        ventry = g.spec_sample_state("verify", 3)
+        ventry["noise"].uniform_(generator=gen)
+        ventry["uniform"].uniform_(generator=gen)
+        ventry["q_in"].copy_(torch.randn(ventry["q_in"].shape, generator=gen))
+        vt, _ = g.spec_inputs("verify", 3)
+        vt.copy_(ids[:, prompt:prompt + 3])
+        g._stage_spec(ventry, 0, prompt, 3)
+        v_tok, _, _ = g._body_verify(0, decoder.default_call_shape((1, 3)), g.index_width(prompt + 3),
+                                     3, True)
+        got = (v_tok.clone(), ventry["out_accept"].clone())
+        full = decoder.forward(ids[:, prompt:prompt + 3], logits_rows="all")
+        lo, hi = vr
+        want = verify_sample(decoder.collectives, full[0, :, lo:hi].float() / temp, ventry["q_in"],
+                             vt[0, 1:], ventry["uniform"], ventry["noise"], vocabulary_range=vr)
+        return draft, got, want
+
+    group = SimulatedGroup(world)
+    results = group.run([lambda col, d=d: body(d) for d in _decoders(mtp_worlds[world], group)])
+    for rank, (draft, got, want) in enumerate(results):
+        assert torch.equal(draft[0], draft[1]), f"rank {rank}: draft sample"
+        assert torch.allclose(draft[2], draft[3]), f"rank {rank}: draft scores"
+        assert torch.equal(got[0], want[1]), f"rank {rank}: verify tokens {got[0]} vs {want[1]}"
+        assert torch.equal(got[1], want[0]), f"rank {rank}: accept {got[1]} vs {want[0]}"
+        assert torch.equal(results[0][1][0], got[0]), "ranks disagree"
