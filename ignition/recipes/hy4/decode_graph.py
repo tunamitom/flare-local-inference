@@ -193,7 +193,7 @@ class DecodeGraphs:
         eager first step writes one record of `row` at the bucket's first
         position; the caller releases the row afterwards. Returns the buckets."""
         d = self.decoder
-        starts = [0] if self._short_bypass(call_shape) else []
+        starts = [min(64, self.topk - 1)] if self._short_bypass(call_shape) else []
         start = self.topk
         while start < min(int(max_context), self.capacity):
             starts.append(start)
@@ -212,6 +212,15 @@ class DecodeGraphs:
             captured.append(self.bucket(start))
         torch.cuda.synchronize(self.device)
         return captured
+
+    def replay_all(self):
+        """Replay every captured bucket once (boot self-test; collective — every
+        rank holds the same buckets in the same order). The inputs are the last
+        staged step's; the caller releases the row afterwards."""
+        for graph, _, _ in self.graphs.values():
+            graph.replay()
+        torch.cuda.synchronize(self.device)
+        return len(self.graphs)
 
     def stats(self):
         return {"captures": self.captures, "replays": self.replays,
