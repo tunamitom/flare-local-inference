@@ -327,6 +327,14 @@ def run_generate(ctx, cmd):
     WATCH.reset()   # consult17: HY4_FINITE_WATCH=1 names the first non-finite tensor per request
     decoder.release([0])
     n = len(ids)
+    # consult18 P4: greedy requests decode by MTP speculation (spec.py); the
+    # prefill then also absorbs every prompt row into the draft KV.
+    from ignition.recipes.hy4 import runtime as _rt
+    spec = getattr(ctx, "spec", None)
+    use_spec = (spec is not None and _rt.SWITCHES.get("spec") == "on" and n > 1
+                and max_new > 1 and not params.get("nll")
+                and float(params.get("temperature", 0.9) or 0.0) <= 0.0)
+    last_hidden = None
     if n == 1:
         t = torch.tensor([[ids[0]]], dtype=torch.int64, device=dev)
         logits = decoder.decode_step(t, call_shape=decode_shape)
@@ -389,32 +397,73 @@ def run_generate(ctx, cmd):
                             t, half_shape=ctx.shapes[full],
                             logits_rows=real - 1 if last else "none")
                         torch.cuda.synchronize(dev)
+                elif use_spec:
+                    logits, post = decoder.forward_overlapped(
+                        t, half_shape=ctx.shapes[full], logits_rows=real - 1 if last else "none",
+                        return_hidden=True)
                 else:
                     logits = decoder.forward_overlapped(
                         t, half_shape=ctx.shapes[full], logits_rows=real - 1 if last else "none")
+            elif use_spec:
+                logits, post, _ = decoder.forward(t, call_shape=ctx.shapes[w],
+                                                  logits_rows=real - 1 if last else "none",
+                                                  return_hidden=True)
             else:
                 logits = decoder.forward(t, call_shape=ctx.shapes[w],
                                          logits_rows=real - 1 if last else "none")
             decoder.append([0], real)
+            if use_spec:
+                # prompt absorption: draft rows pos .. pos+w-1 with the target's
+                # post-norm hidden and each row's next prompt token (the last
+                # prompt row's is a placeholder: round 1 re-absorbs it with the
+                # first generated token; padded rows are rewritten before read).
+                nxt = ids[pos + 1:pos + 1 + w]
+                nxt = nxt + [ids[-1]] * (w - len(nxt))
+                decoder._draft_positions[0] = pos
+                decoder.draft_absorb(torch.tensor([nxt], dtype=torch.int64, device=dev), post,
+                                     logits="none")
+                last_hidden = post[0, real - 1].clone()
             pos += real
         ctx.last_nll = (nll_sum, nll_count) if params.get("nll") and ctx.rank == 0 else None
     out = []
-    while True:
+
+    def sample(logits):
         if ctx.rank == 0:
             nxt, done, finish = ctx.sampler.step(logits[:, -1, :], params, len(out), max_new)
         else:
             nxt = done = finish = None
         obj = [nxt, done, finish]
         dist.broadcast_object_list(obj, src=0)
-        nxt, done, finish = obj
-        out.append(nxt)
-        if done:
-            break
-        t = torch.tensor([[nxt]], dtype=torch.int64, device=dev)
+        return obj
+
+    nxt, done, finish = sample(logits)
+    out.append(nxt)
+    if not done and use_spec and last_hidden is not None:
+        if not hasattr(ctx, "eos_all"):
+            box = [ctx.sampler.eos if ctx.rank == 0 else None]
+            dist.broadcast_object_list(box, src=0)
+            ctx.eos_all = box[0]
+
+        def emit(tok):
+            # the sampler's stop rules, decided identically on every rank
+            produced = len(out)
+            out.append(int(tok))
+            if tok == ctx.eos_all and not params.get("ignore_eos"):
+                return "stop"
+            if produced + 1 >= max_new:
+                return "length"
+            return None
+
+        finish, rest = spec.generate(start=n, bonus=nxt, hidden=last_hidden, emit=emit)
+        done = finish is not None
+    while not done:
+        t = torch.tensor([[out[-1]]], dtype=torch.int64, device=dev)
         logits = decoder.decode_step(t, call_shape=decode_shape)
         decoder.complete([0], t)
         if WATCH.finding is not None and "generated_tokens" not in WATCH.finding:
             WATCH.finding["generated_tokens"] = len(out)   # decode steps completed before it
+        nxt, done, finish = sample(logits)
+        out.append(nxt)
     finding = WATCH.take()
     if finding is not None:
         finding.setdefault("generated_tokens", 0)          # 0 = during the prompt
@@ -445,6 +494,8 @@ def run_generate(ctx, cmd):
                         f"{mx['lse']:.3e}, {lane_checked['all_reduce']} ring sums max rel-L2 "
                         f"{mx['all_reduce']:.3e}, {lane_checked.get('ar_projection', 0)} ring-sum "
                         f"projections max {mx.get('ar_projection', 0.0):.3e} vs gloo (post-loop)")
+    if use_spec:
+        trace(ctx.rank, f"spec: {spec.stats()}")
     graphs = getattr(decoder, "decode_graphs", None)
     if graphs is not None and (graphs.replays or graphs.captures):
         trace(ctx.rank, f"decode graphs: {graphs.stats()}, sync-free reruns "
@@ -805,7 +856,11 @@ def main():
             # consult17 (lever 9): with expanded partials only the one-row
             # decode still uses the latent pool, so it shrinks to one row.
             extra_value_widths=() if expanded is None else (expanded,),
-            value_max_rows=None if expanded is None else 1,
+            # consult18 P4: the decode-family verify rows merge latents too.
+            value_max_rows=None if expanded is None else (
+                int(os.environ.get("HY4_SPEC_K") or 0) + 1
+                if os.environ.get("HY4_MTP") == "1" and os.environ.get("HY4_SPEC_DECODE_ROWS") == "1"
+                and int(os.environ.get("HY4_SPEC_K") or 0) > 0 else 1),
             dma=uses_dma, kernel_rows=args.all_reduce_kernel_rows or None,
             lanes=2 if args.overlap else 1, lane_rows=CHUNK,
             ce_lse_rows=args.ce_rows if args.lse_transport.startswith("ce") else None,
@@ -830,14 +885,17 @@ def main():
                     f"(local offer {args.local_offer or 'full'})")
         trace(rank, "transport constructed")
 
-        settings = PreparationConfig(devices=tuple(range(world)), mtp=False,
+        MTP = os.environ.get("HY4_MTP") == "1"     # consult18 P4: the MTP draft block
+        SPEC_ROWS = (tuple(range(2, int(os.environ.get("HY4_SPEC_K") or 0) + 2))
+                     if MTP and os.environ.get("HY4_SPEC_DECODE_ROWS") == "1" else ())
+        settings = PreparationConfig(devices=tuple(range(world)), mtp=MTP,
                                      prefill_chunk_size=CHUNK)
 
         def construct_and_wire(cache_rows, cache_capacity):
             """One construction + operator wiring + the boot's full plan book."""
             t0 = time.monotonic()
             built = construct_rank(args.snapshot, settings, rank=rank, device=device, pinned=True,
-                                   mtp=False, cache_rows=cache_rows, cache_capacity=cache_capacity,
+                                   mtp=MTP, cache_rows=cache_rows, cache_capacity=cache_capacity,
                                    world_size=world, collectives=collectives, fused_cache=True)
             load_s = round(time.monotonic() - t0, 1)
             trace(rank, f"constructed ({load_s} s, {built.memory_report['weights_bytes']} B weights, "
@@ -847,6 +905,11 @@ def main():
             shp = {w: built.decoder.default_call_shape((1, w)) for w in PREFILL_WIDTHS}
             decode_shape = built.decoder.default_call_shape((1, 1))
             all_shapes = [decode_shape] + [shp[w] for w in PREFILL_WIDTHS]
+            if SPEC_ROWS:
+                # consult18 P4: the decode-family verification shapes of the
+                # speculative verify / draft re-absorption (T = 2 .. k + 1)
+                from ignition.recipes.hy4.wiring import verify_shape
+                all_shapes += [verify_shape(t) for t in SPEC_ROWS]
             if world > 1:
                 # The CP partial binds the UNBOUND sink at every call shape
                 # (D2/D6); only the graph-capture shapes also need the world-1
@@ -878,6 +941,11 @@ def main():
         # the unabsorbed width at `w` query rows; the LSE reduce-scatter is
         # 512-wide latent partials, base 2, at every query-row count.
         transport.prepare_gather(dsession, 1, absorbed)
+        for w in SPEC_ROWS:
+            # consult18 P4: the decode-family verify rows gather absorbed queries
+            # and merge latent partials, like the one-row decode step
+            transport.prepare_gather(session, w, absorbed)
+            transport.prepare_lse(session, w, values, lse_base="base2")
         for w in PREFILL_WIDTHS:
             transport.prepare_gather(session, w, unabsorbed)
         if expanded is None:
@@ -950,7 +1018,7 @@ def main():
         # card — the phase-A weights left with it — and is NOT the budget.)
         budget = free_a + cache_a - args.headroom
         # cache bytes ~= rows * (capacity / world) * (78*656 + 21*256 real residency)
-        per_global = args.rows * (78 * 656 + 21 * 256) / world
+        per_global = args.rows * ((78 + int(MTP)) * 656 + (21 + int(MTP)) * 256) / world
         capacity = args.capacity if args.capacity > 0 else int(budget // per_global) & ~1023
         trace(rank, f"phase A: fixed(book+ctx+runtime)={fixed_bytes} B, torn-down free={free_post} B, "
                     f"headroom={args.headroom} B -> capacity {capacity} global/row")
@@ -1025,7 +1093,7 @@ def main():
                 "service": "h4", "snapshot": args.snapshot,
                 "world": world,
                 "topology": "TP8+CP8 on switches B+D (8 cards; 0000:11:00.0 is NOT in the serve)",
-                "mtp": False, "max_concurrency": args.max_concurrency,
+                "mtp": MTP, "max_concurrency": args.max_concurrency,
                 "served_names": list(ctx.served_names), "port": args.port,
                 "max_context": args.max_context,
                 "cache": {"rows": args.rows, "capacity_global_per_row": capacity,
@@ -1076,6 +1144,22 @@ def main():
                             f"{time.monotonic() - t_cap:.1f} s")
             else:
                 trace(rank, "decode graphs: armed (one capture per width bucket on first use)")
+            spec_k = int(os.environ.get("HY4_SPEC_K") or 0)
+            if MTP and spec_k > 0:
+                # consult18 P4: MTP speculation (greedy requests, runtime switch
+                # "spec"); its draft / verify graphs are captured per width
+                # bucket up to the decode prewarm context, now.
+                from ignition.recipes.hy4.spec import SpeculativeGreedy
+                ctx.spec = SpeculativeGreedy(ctx.decoder, k=spec_k, decode_rows=bool(SPEC_ROWS))
+                if upto > 0:
+                    t_cap = time.monotonic()
+                    captured = ctx.spec.prewarm(max_context=upto)
+                    replayed = ctx.decoder.decode_graphs.replay_all()
+                    ctx.decoder.release([0])
+                    trace(rank, f"spec graphs: k={spec_k} decode_rows={bool(SPEC_ROWS)}, "
+                                f"{captured} captured up to {upto} "
+                                f"tokens, all graphs replayed ({replayed}) in "
+                                f"{time.monotonic() - t_cap:.1f} s")
 
         # ---- serving loop --------------------------------------------------
         if rank == 0:
