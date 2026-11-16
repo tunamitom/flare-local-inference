@@ -564,7 +564,7 @@ class Hy4Decoder:
         selected = torch.cat(sels, dim=1)
         for row, start in zip(rows.tolist(), starts.tolist()):
             self._draft_positions[row] = start + k
-        logits = hidden.reshape(-1, hidden.shape[-1]).float() @ self.weights.head.T
+        logits = self._draft_logits(hidden.reshape(-1, hidden.shape[-1]))
         return (logits.reshape(next_tokens.shape[0], k, -1), hidden, selected)
 
     def draft_step(self, next_tokens, prev_hidden, *, request_rows=None, cache=None):
@@ -588,18 +588,22 @@ class Hy4Decoder:
         hidden, _, _ = self._draft(next_tokens, prev_hidden, starts, rows, cache)
         for row, start in zip(rows.tolist(), starts.tolist()):
             self._draft_positions[row] = start + 1
-        return hidden.float() @ self.weights.head.T, hidden
+        return self._draft_logits(hidden), hidden
+
+    def _draft_logits(self, hidden):
+        """The shared head over the draft hidden: full-vocabulary FP32 logits
+        (the vocabulary shards gathered under tensor parallelism)."""
+        logits = hidden.float() @ self.weights.head.T
+        if int(getattr(self.collectives, "world_size", 1)) > 1:
+            logits = self.collectives.gather_logits(
+                logits, vocabulary_range=self.weights.sharding.vocabulary_range)
+        return logits
 
     def _draft(self, next_tokens, prev_hidden, positions, rows, cache):
         """Shared draft body: embed, run the block at `positions`; (hidden, attended, selected)."""
         cache = self.cache if cache is None else cache
         if cache.world != 1:
-            # D7: MTP is out of the P5 diff — the draft block follows the same
-            # CP rules (records at layer 78 + `_DRAFT_PAGE_BYTES` pages, local
-            # candidates -> exchange -> hand-back, head gather -> partial ->
-            # reduce-scatter -> one sink fold) when MTP serving lands, not now.
-            raise NotImplementedError(
-                "the MTP draft block has no context-parallel path yet (W6 D7: out of P5 scope)")
+            return self._draft_cp(next_tokens, prev_hidden, positions, rows, cache)
         token_rows = self._token_rows(next_tokens.shape, rows)
         visible = positions + 1
         next_embeds = self.weights.embed[next_tokens.reshape(-1)].to(self.compute_dtype)
@@ -607,6 +611,46 @@ class Hy4Decoder:
             next_embeds, prev_hidden.to(self.compute_dtype).reshape(-1, prev_hidden.shape[-1]),
             positions, cache, visible, token_rows=token_rows)
         return hidden, attended, selected
+
+    def _draft_cp(self, next_tokens, prev_hidden, positions, rows, cache, *, call_shape=None,
+                  visible_max=None):
+        """consult18 P4: the MTP draft block under context + tensor parallelism.
+
+        The same map as `MtpBlock.forward` with the target layers' distributed
+        pieces: the vocabulary-sharded embedding (+ all-reduce), the replicated
+        `eh_proj` merge and norms, the CP attention of layer `config.layers`
+        through `_attention` (owned record/index-key writes, local candidates
+        -> score exchange -> hand-back, head gather -> partial -> LSE
+        reduce-scatter -> one sink fold -> gated head-shard o_proj) + all-reduce,
+        and the intermediate-sharded MoE + all-reduce. Returns (hidden after
+        `final_layernorm`, None, this rank's local selection)."""
+        from types import SimpleNamespace
+
+        draft = self.weights.draft
+        eps = self.config.text["rms_norm_eps"]
+        if cache is not self.cache:
+            raise ValueError("the CP draft path writes the decoder's own cache")
+        shape = tuple(next_tokens.shape)
+        token_rows = self._token_rows(shape, rows)
+        visible = positions + 1
+        if call_shape is None:
+            call_shape = self.default_call_shape(shape)
+        embeds = self.collectives.embed_lookup(
+            next_tokens.reshape(-1), self.weights.embed,
+            vocabulary_range=self.weights.sharding.vocabulary_range).to(self.compute_dtype)
+        embeds = torch.where((positions == 0).unsqueeze(-1), 0, embeds)
+        h = draft.embed_merge(embeds, prev_hidden.to(self.compute_dtype).reshape(-1, embeds.shape[-1]))
+        x = rms_norm(h, draft.input_norm, eps)
+        layer = SimpleNamespace(attention=draft.attention, index=self.config.layers)
+        attn_out = self._attention(layer, x, positions, token_rows, visible, call_shape=call_shape,
+                                   visible_max=visible_max)
+        h = h + self.collectives.all_reduce(attn_out)
+        x = rms_norm(h, draft.post_attention_norm, eps)
+        mlp_out = draft.mlp.forward(x, overlap_shared=call_shape.overlap_shared_expert)
+        h = h + self.collectives.all_reduce(mlp_out)
+        hidden = rms_norm(h, draft.final_norm, eps)
+        selected, _ = draft.attention.selection.buffers(rows=x.shape[0])
+        return hidden, None, selected
 
     def forward(self, token_ids, *, request_rows=None, state=None, return_hidden=False,
                 call_shape=None, logits_rows="all"):
