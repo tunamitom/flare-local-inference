@@ -318,3 +318,47 @@ def test_absorb_with_target_embeddings_is_bit_equal(mtp_worlds, world):
     for rank, (la, ha, lb, hb) in enumerate(group.run([lambda col, d=d: body(d)
                                                        for d in _decoders(mtp_worlds[world], group)])):
         assert torch.equal(la, lb) and torch.equal(ha, hb), f"world {world} rank {rank}"
+
+
+@pytest.mark.parametrize("world", (2, 8))
+def test_int8_attention_weights_match_dequantized_reference(mtp_worlds, world):
+    """consult18 P6: INT8 storage of the same-input pack + o_proj (w8.py) gives
+    exactly the forward of a model whose weights ARE the dequantized values
+    (one packed GEMM split vs per-slice GEMMs: equal on CPU fp32), and a
+    decode step after it."""
+    from dataclasses import replace
+
+    from ignition.recipes.hy4.collectives import SimulatedGroup
+    from ignition.recipes.hy4.w8 import Int8Weight, quantize_attention
+
+    def run(mode):
+        def body(decoder):
+            for layer in decoder.weights.layers:
+                attn = layer.attention
+                w = attn.weights
+                if mode == "int8":
+                    quantize_attention(attn)
+                elif mode == "dequant":
+                    pk = w.packed_input
+                    ok_pack = pk is not None and pk.packed.shape[1] % 128 == 0
+                    deq = Int8Weight.quantize(pk.packed).dequant() if ok_pack else pk.packed
+                    pk2 = replace(pk, packed=deq)
+                    o = (Int8Weight.quantize(w.o_proj).dequant() if w.o_proj.shape[1] % 128 == 0
+                         else w.o_proj)
+                    attn.weights = replace(w, packed_input=pk2, o_proj=o)
+            _, tokens = golden_tokens()
+            ids = torch.tensor([tokens], dtype=torch.long)
+            out = decoder.forward(ids[:, :20], logits_rows="all")
+            decoder.append([0], 20)
+            step = decoder.decode_step(torch.tensor([[5]], dtype=torch.long))
+            return out, step
+        return body
+
+    results = {}
+    for mode in ("dequant", "int8"):
+        group = SimulatedGroup(world)
+        results[mode] = group.run([lambda col, d=d, m=mode: run(m)(d)
+                                   for d in _decoders(mtp_worlds[world], group)])
+    for rank, (a, b) in enumerate(zip(results["dequant"], results["int8"])):
+        for name, x, y in (("forward", a[0], b[0]), ("decode", a[1], b[1])):
+            assert rel_error(y, x) < 1e-5, f"world {world} rank {rank} {name}: {rel_error(y, x)}"

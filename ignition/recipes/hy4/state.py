@@ -426,6 +426,15 @@ def _attention_state(builder, layer, prefix, selection):
     # GEMM for `q_a_proj` + `kv_a_proj` + `linear_gate` + the indexer `wk`.
     attention_weights = replace(
         attention_weights, packed_input=PackedInputProjections.build(attention_weights))
+    # consult18 P6: the loose same-input weights become VIEWS of the packed rows
+    # (the same values; the separate loaded copies — ~56 MB per layer per rank —
+    # are released).
+    packed = attention_weights.packed_input
+    attention_weights = replace(
+        attention_weights, q_a_proj=packed.rows("q_a_proj"), kv_a_proj=packed.rows("kv_a_proj"),
+        gate_proj=packed.rows("linear_gate"),
+        indexer=(None if attention_weights.indexer is None
+                 else replace(attention_weights.indexer, wk=packed.rows("indexer_wk"))))
     return Hy4LayerAttention(
         weights=attention_weights,
         config=config, sharding=sharding, selection=selection, device=builder.loader.device)
@@ -536,10 +545,14 @@ def _moe_state(builder, prefix, *, dense=False):
                   f"{expert_prefix}.up_proj.weight": stacks[f"{expert_prefix}.up_proj.weight"][:, first:last],
                   f"{expert_prefix}.down_proj.weight": stacks[f"{expert_prefix}.down_proj.weight"][:, :, first:last]}
         routed = ReferenceRoutedExperts.from_bf16(sliced, expert_prefix, swiglu_limit=c["swiglu_limit"])
+    # consult7 §5: router + shared gate/up pack at load; consult18 P6: the loose
+    # weights become views of the packed rows (the loaded copies are released).
+    packed_moe = PackedMoEInputProjections.build(router, shared)
+    router = replace(router, gate=packed_moe.rows("router"))
+    shared = replace(shared, gate_proj=packed_moe.rows("shared_gate"),
+                     up_proj=packed_moe.rows("shared_up"))
     return MoEBlock(router=router, shared=shared, routed=routed, config=config,
-                    device=loader.device,
-                    # consult7 §5: router + shared gate/up pack at load.
-                    packed_input=PackedMoEInputProjections.build(router, shared))
+                    device=loader.device, packed_input=packed_moe)
 
 
 def build_model_state(loader, config, sharding, *, selections, mtp=True):

@@ -303,9 +303,22 @@ class Hy4LayerAttention:
             gate_raw = x @ w.gate_proj.T.to(x.dtype)
             self._stash_gate(x, gate_raw)
             return LayerProjections(q_resid, q, latent, index_keys, gate_raw)
-        q_a_raw = x @ packed.rows("q_a_proj").T
-        kv_raw = x @ packed.rows("kv_a_proj").T
-        gate_raw = x @ packed.rows("linear_gate").T.to(x.dtype)
+        from .w8 import Int8Weight
+
+        if isinstance(packed.packed, Int8Weight):
+            # consult18 P6: INT8 storage — ONE GEMM over every packed row (the
+            # bitwise-per-slice contract is moot once quantized), then split.
+            full = packed.packed.linear(x)
+
+            def cols(name):
+                first, last = packed.slices[name]
+                return full[:, first:last].contiguous()
+
+            q_a_raw, kv_raw, gate_raw = cols("q_a_proj"), cols("kv_a_proj"), cols("linear_gate")
+        else:
+            q_a_raw = x @ packed.rows("q_a_proj").T
+            kv_raw = x @ packed.rows("kv_a_proj").T
+            gate_raw = x @ packed.rows("linear_gate").T.to(x.dtype)
         q_resid = rms_norm(q_a_raw, w.q_a_norm, self.config.text["rms_norm_eps"])
         q = (q_resid @ w.q_b_proj.T).view(-1, self.heads, self.qk_nope + self.qk_rope)
         q = apply_interleaved_rope(q, positions, rope_dim=self.qk_rope, theta=self.rope_theta)
