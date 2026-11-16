@@ -675,16 +675,29 @@ class Hy4LayerAttention:
             for base in torch.unique(slot_base).tolist() if width else ():
                 members = (slot_base == base).nonzero(as_tuple=True)[0]
                 groups.append((base, members, int(owned[members].max())))
+        from .runtime import SWITCHES
+
+        # consult18 E4 (A/B switch "index_scores"): "bf16" contracts BF16 query
+        # and key operands with FP32 accumulation and FP32 output (tensor
+        # cores); "fp32" (default) is the FP32 contraction.
+        low = SWITCHES.get("index_scores") == "bf16"
+        q_low = q.to(torch.bfloat16) if low else None
         for base, members, live in groups:
             if not live:
                 continue
-            keys = key_table[base:base + live].float()
+            keys = key_table[base:base + live]
+            keys = keys.to(torch.bfloat16) if low else keys.float()
             block = max(1, self.INDEX_SCORE_BLOCK_BYTES // (n_heads * live * 4))
             span = rows if members is None else int(members.numel())
             for start in range(0, span, block):
                 part = (slice(start, min(start + block, rows)) if members is None
                         else members[start:start + block])
-                scores = torch.relu_(q[part].reshape(-1, head_dim) @ keys.T).view(-1, n_heads, live)
+                if low:
+                    product = torch.mm(q_low[part].reshape(-1, head_dim), keys.T,
+                                       out_dtype=torch.float32)
+                else:
+                    product = q[part].reshape(-1, head_dim) @ keys.T
+                scores = torch.relu_(product).view(-1, n_heads, live)
                 logits[part, :live] = torch.einsum("rh,rhw->rw", weights[part], scores)
         # Causal masking over the token's owned live keys (world 1: `owned` is
         # exactly the visible cache length).

@@ -35,3 +35,22 @@ def test_a4_scales_are_multipliers_with_the_widest_range_for_unrouted_experts(tm
     assert torch.allclose(intermediates, torch.tensor([gscale / 10.0, gscale / 20.0, gscale / 20.0]))
     monkeypatch.delenv("HY4_MOE_A4")
     assert moe.a4_activation_scales("model.layers.3.mlp.experts", rank=5) is None
+
+
+def test_runtime_ab_switches(tmp_path):
+    import json
+
+    import pytest
+
+    from ignition.recipes.hy4 import runtime
+
+    path = tmp_path / "ab.json"
+    assert runtime.load(str(path)) == {"index_scores": "fp32"}      # no file: defaults
+    path.write_text(json.dumps({"index_scores": "bf16"}))
+    assert runtime.load(str(path))["index_scores"] == "bf16"
+    assert runtime.SWITCHES["index_scores"] == "bf16"
+    path.write_text(json.dumps({"index_scores": "fp16"}))
+    with pytest.raises(ValueError):
+        runtime.load(str(path))
+    path.unlink()
+    assert runtime.load(str(path))["index_scores"] == "fp32"
