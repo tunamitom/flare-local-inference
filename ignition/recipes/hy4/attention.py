@@ -305,7 +305,9 @@ class Hy4LayerAttention:
             return LayerProjections(q_resid, q, latent, index_keys, gate_raw)
         from .w8 import Int8Weight
 
-        if isinstance(packed.packed, Int8Weight):
+        rows_in = int(x.numel() // x.shape[-1])
+        if isinstance(packed.packed, Int8Weight) and (packed.packed.bf16 is None
+                                                     or (x.is_cuda and rows_in <= 16)):
             # consult18 P6: INT8 storage — ONE GEMM over every packed row (the
             # bitwise-per-slice contract is moot once quantized), then split.
             full = packed.packed.linear(x)

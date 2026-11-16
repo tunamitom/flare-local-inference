@@ -23,13 +23,16 @@ GEMV_ROWS = 16
 class Int8Weight:
     """`[N, K]` INT8 weight with FP32 scales `[N, K / GROUP]`; logical dtype BF16."""
 
-    def __init__(self, q, scale, dtype=torch.bfloat16):
+    def __init__(self, q, scale, dtype=torch.bfloat16, bf16=None):
         self.q = q
         self.scale = scale
         self.dtype = dtype
+        # consult18 P6: optional original weight for the many-row (prefill)
+        # GEMMs — prefill then stays bit-exact; only <= GEMV_ROWS rows read INT8.
+        self.bf16 = bf16
 
     @classmethod
-    def quantize(cls, w, *, chunk=512):
+    def quantize(cls, w, *, chunk=512, keep=False):
         n, k = (int(v) for v in w.shape)
         if k % GROUP:
             raise ValueError(f"INT8 weight: K={k} is not a multiple of {GROUP}")
@@ -41,7 +44,7 @@ class Int8Weight:
             s = (g.abs().amax(dim=2, keepdim=True) / 127.0).clamp_min(1e-12)
             q[lo:hi] = torch.round(g / s).clamp(-127, 127).to(torch.int8).view(hi - lo, k)
             scale[lo:hi] = s.squeeze(2)
-        return cls(q, scale, w.dtype)
+        return cls(q, scale, w.dtype, bf16=w if keep else None)
 
     @property
     def shape(self):
@@ -58,7 +61,8 @@ class Int8Weight:
     def __getitem__(self, index):
         if not isinstance(index, slice):
             raise TypeError("Int8Weight supports row slices only")
-        return Int8Weight(self.q[index], self.scale[index], self.dtype)
+        return Int8Weight(self.q[index], self.scale[index], self.dtype,
+                          bf16=None if self.bf16 is None else self.bf16[index])
 
     @property
     def T(self):
@@ -78,6 +82,8 @@ class Int8Weight:
         x2 = x.reshape(-1, k)
         if x2.is_cuda and x2.shape[0] <= GEMV_ROWS and self.dtype == torch.bfloat16:
             out = _gemv_cuda(x2.to(torch.bfloat16).contiguous(), self.q, self.scale)
+        elif self.bf16 is not None:
+            return x @ self.bf16.T          # the original op, bit-exact
         else:
             out = torch.nn.functional.linear(x2.to(self.dtype), self.dequant())
         return out.reshape(*lead, int(self.q.shape[0]))
@@ -166,7 +172,7 @@ def _dequant_cuda(q, scale):
     return out
 
 
-def quantize_attention(attention):
+def quantize_attention(attention, *, keep_bf16=False):
     """Replace one attention's same-input pack and `o_proj` with INT8 storage;
     the loose same-input weights become row views of the INT8 pack (no BF16
     reference remains). Returns the BF16 bytes released."""
@@ -178,13 +184,13 @@ def quantize_attention(attention):
     if (packed is not None and not isinstance(packed.packed, Int8Weight)
             and packed.packed.shape[1] % GROUP == 0):
         released += packed.packed.numel() * packed.packed.element_size()
-        q_pack = replace(packed, packed=Int8Weight.quantize(packed.packed))
+        q_pack = replace(packed, packed=Int8Weight.quantize(packed.packed, keep=keep_bf16))
         w = replace(w, packed_input=q_pack, q_a_proj=q_pack.rows("q_a_proj"),
                     kv_a_proj=q_pack.rows("kv_a_proj"), gate_proj=q_pack.rows("linear_gate"),
                     indexer=(None if w.indexer is None
                              else replace(w.indexer, wk=q_pack.rows("indexer_wk"))))
     if not isinstance(w.o_proj, Int8Weight) and w.o_proj.shape[1] % GROUP == 0:
         released += w.o_proj.numel() * w.o_proj.element_size()
-        w = replace(w, o_proj=Int8Weight.quantize(w.o_proj))
+        w = replace(w, o_proj=Int8Weight.quantize(w.o_proj, keep=keep_bf16))
     attention.weights = w
-    return released
+    return 0 if keep_bf16 else released
