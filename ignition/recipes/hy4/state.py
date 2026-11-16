@@ -95,6 +95,24 @@ class IhcBoundary:
 
         return prefill if SWITCHES.get("ihc") == "tuned" else default
 
+    def _split_config(self, streams):
+        """The default plan's launch config when the split decode form applies
+        (`ihc_split` on, fewer than PREFILL_MIN_ROWS rows, a bound plan)."""
+        if self.plan is None or int(streams.shape[0]) >= self.PREFILL_MIN_ROWS:
+            return None
+        from .runtime import SWITCHES
+
+        if SWITCHES.get("ihc_split") != "on":
+            return None
+        config = getattr(self, "_plan_config", None)
+        if config is None:
+            from b12x.norm.mhc._ihc_impl import _prepared_state
+
+            config = self._plan_config = _prepared_state(self.plan).config
+        if config.backend != "triton_fused":
+            return None
+        return config
+
     def pre(self, streams):
         """`(post [rows, 4] FP32, y [rows, hidden])` from streams `[rows, 4, hidden]`."""
         w = self.weights
@@ -129,6 +147,18 @@ class IhcBoundary:
             from b12x.norm.mhc import ihc
 
             w = nxt.weights
+            split = self._split_config(streams)
+            if split is not None:
+                # consult18 P2: decode rows over (row, chunk) grids — the same
+                # bits as the one-program-per-row kernel at the plan's config
+                # (harness/ihc_split_check.py), 12.3 vs 73.7 us per call.
+                from .fused_ops import ihc_post_pre_split
+
+                return ihc_post_pre_split(
+                    branch, streams, prev_post, w.fn, w.scale, w.base, magnitude=nxt.magnitude,
+                    hc_eps=nxt.hc_eps, norm_eps=nxt.norm_eps, norm_weight=norm_weight,
+                    layernorm_eps=self.norm_eps, block_k=split.block_k, block_d=split.block_d,
+                    num_warps=split.num_warps)
             return ihc.run_post_pre(branch, streams, prev_post, w.fn, w.scale, w.base,
                                     magnitude=nxt.magnitude, hc_eps=nxt.hc_eps,
                                     norm_eps=nxt.norm_eps, norm_weight=norm_weight,

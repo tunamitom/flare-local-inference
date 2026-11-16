@@ -20,7 +20,7 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-__all__ = ["merge_head_major", "rms_norm", "rope_interleaved"]
+__all__ = ["ihc_post_pre_split", "merge_head_major", "rms_norm", "rope_interleaved"]
 
 _INV_FREQ = {}
 
@@ -156,3 +156,153 @@ def rms_norm(x, weight, eps):
         _rms_tail_kernel[(rows, triton.cdiv(N, block))](flat, ms, weight.contiguous(), out, N,
                                                         float(eps), BLOCK=block)
     return out.view(x.shape)
+
+
+# --------------------------------------------------------------------------
+# consult18 P2: the iHC sublayer boundary (`run_post_pre`) for decode rows.
+# b12x's `_ihc_post_pre_kernel` runs ONE program per token row: at one decode
+# row one CTA streams the 786 KB FP32 `fn` and four 6144-wide passes (117.7 us
+# per call, 155 calls = 18.3 ms of a 51.5 ms 16k decode step). The same math in
+# three launches over (row, chunk) grids. Bit-identical by construction: every
+# chunk's `tl.sum` is the original's (same BLOCK_K / BLOCK_D, same expression,
+# same num_warps), and the chunk partials are accumulated in the original's
+# sequential order from 0.0; the gates, RMS and stores are its expressions.
+# --------------------------------------------------------------------------
+@triton.jit
+def _ihc_pp_chunks_kernel(x_ptr, residual_ptr, prev_post_ptr, fn_ptr, out_ptr, part_ptr,
+                          H, K, NC, BLOCK_K: tl.constexpr):
+    t = tl.program_id(0).to(tl.int64)
+    c = tl.program_id(1)
+    k = c * BLOCK_K
+    offs = k + tl.arange(0, BLOCK_K)
+    si = offs // H
+    d = offs - si * H
+    rv = tl.load(residual_ptr + t * K + offs).to(tl.float32)
+    xv = tl.load(x_ptr + t * H + d).to(tl.float32)
+    p = tl.load(prev_post_ptr + t * 4 + si)
+    ob = (p * xv + rv).to(tl.bfloat16).to(tl.float32)
+    tl.store(out_ptr + t * K + offs, ob.to(tl.bfloat16))
+    base = part_ptr + (t * NC + c) * 9
+    tl.store(base + 0, tl.sum(ob * ob))
+    tl.store(base + 1, tl.sum(ob * tl.load(fn_ptr + 0 * K + offs).to(tl.float32)))
+    tl.store(base + 2, tl.sum(ob * tl.load(fn_ptr + 1 * K + offs).to(tl.float32)))
+    tl.store(base + 3, tl.sum(ob * tl.load(fn_ptr + 2 * K + offs).to(tl.float32)))
+    tl.store(base + 4, tl.sum(ob * tl.load(fn_ptr + 3 * K + offs).to(tl.float32)))
+    tl.store(base + 5, tl.sum(ob * tl.load(fn_ptr + 4 * K + offs).to(tl.float32)))
+    tl.store(base + 6, tl.sum(ob * tl.load(fn_ptr + 5 * K + offs).to(tl.float32)))
+    tl.store(base + 7, tl.sum(ob * tl.load(fn_ptr + 6 * K + offs).to(tl.float32)))
+    tl.store(base + 8, tl.sum(ob * tl.load(fn_ptr + 7 * K + offs).to(tl.float32)))
+
+
+@triton.jit
+def _ihc_pp_gates(part_ptr, scale_ptr, base_ptr, t, K, NC, magnitude, hc_eps, norm_eps):
+    sq = 0.0
+    a0 = 0.0
+    a1 = 0.0
+    a2 = 0.0
+    a3 = 0.0
+    a4 = 0.0
+    a5 = 0.0
+    a6 = 0.0
+    a7 = 0.0
+    for c in range(0, NC):
+        base = part_ptr + (t * NC + c) * 9
+        sq += tl.load(base + 0)
+        a0 += tl.load(base + 1)
+        a1 += tl.load(base + 2)
+        a2 += tl.load(base + 3)
+        a3 += tl.load(base + 4)
+        a4 += tl.load(base + 5)
+        a5 += tl.load(base + 6)
+        a6 += tl.load(base + 7)
+        a7 += tl.load(base + 8)
+    rms = tl.rsqrt(sq / K + norm_eps)
+    s_pre = tl.load(scale_ptr + 0)
+    s_post = tl.load(scale_ptr + 1)
+    pre0 = tl.sigmoid((a0 * rms) * s_pre + tl.load(base_ptr + 0)) + hc_eps
+    pre1 = tl.sigmoid((a1 * rms) * s_pre + tl.load(base_ptr + 1)) + hc_eps
+    pre2 = tl.sigmoid((a2 * rms) * s_pre + tl.load(base_ptr + 2)) + hc_eps
+    pre3 = tl.sigmoid((a3 * rms) * s_pre + tl.load(base_ptr + 3)) + hc_eps
+    post0 = magnitude * tl.sigmoid((a4 * rms) * s_post + tl.load(base_ptr + 4)) + hc_eps
+    post1 = magnitude * tl.sigmoid((a5 * rms) * s_post + tl.load(base_ptr + 5)) + hc_eps
+    post2 = magnitude * tl.sigmoid((a6 * rms) * s_post + tl.load(base_ptr + 6)) + hc_eps
+    post3 = magnitude * tl.sigmoid((a7 * rms) * s_post + tl.load(base_ptr + 7)) + hc_eps
+    return pre0, pre1, pre2, pre3, post0, post1, post2, post3
+
+
+@triton.jit
+def _ihc_pp_collapse_kernel(part_ptr, scale_ptr, base_ptr, out_ptr, post_ptr, y_ptr, sqy_ptr,
+                            H, K, NC, ND, magnitude, hc_eps, norm_eps,
+                            BLOCK_D: tl.constexpr, FUSE_NORM: tl.constexpr):
+    t = tl.program_id(0).to(tl.int64)
+    j = tl.program_id(1)
+    pre0, pre1, pre2, pre3, post0, post1, post2, post3 = _ihc_pp_gates(
+        part_ptr, scale_ptr, base_ptr, t, K, NC, magnitude, hc_eps, norm_eps)
+    if j == 0:
+        tl.store(post_ptr + t * 4 + 0, post0)
+        tl.store(post_ptr + t * 4 + 1, post1)
+        tl.store(post_ptr + t * 4 + 2, post2)
+        tl.store(post_ptr + t * 4 + 3, post3)
+    offs = j * BLOCK_D + tl.arange(0, BLOCK_D)
+    o0 = tl.load(out_ptr + t * K + 0 * H + offs).to(tl.float32)
+    o1 = tl.load(out_ptr + t * K + 1 * H + offs).to(tl.float32)
+    o2 = tl.load(out_ptr + t * K + 2 * H + offs).to(tl.float32)
+    o3 = tl.load(out_ptr + t * K + 3 * H + offs).to(tl.float32)
+    y = pre0 * o0 + pre1 * o1 + pre2 * o2 + pre3 * o3
+    if FUSE_NORM:
+        yb = y.to(tl.bfloat16).to(tl.float32)
+        tl.store(sqy_ptr + t * ND + j, tl.sum(yb * yb))
+    else:
+        tl.store(y_ptr + t * H + offs, y.to(tl.bfloat16))
+
+
+@triton.jit
+def _ihc_pp_norm_kernel(part_ptr, scale_ptr, base_ptr, out_ptr, y_ptr, sqy_ptr, norm_weight_ptr,
+                        H, K, NC, ND, magnitude, hc_eps, norm_eps, layernorm_eps,
+                        BLOCK_D: tl.constexpr):
+    t = tl.program_id(0).to(tl.int64)
+    j = tl.program_id(1)
+    pre0, pre1, pre2, pre3, post0, post1, post2, post3 = _ihc_pp_gates(
+        part_ptr, scale_ptr, base_ptr, t, K, NC, magnitude, hc_eps, norm_eps)
+    sqy = 0.0
+    for i in range(0, ND):
+        sqy += tl.load(sqy_ptr + t * ND + i)
+    rmsy = tl.rsqrt(sqy / H + layernorm_eps)
+    offs = j * BLOCK_D + tl.arange(0, BLOCK_D)
+    o0 = tl.load(out_ptr + t * K + 0 * H + offs).to(tl.float32)
+    o1 = tl.load(out_ptr + t * K + 1 * H + offs).to(tl.float32)
+    o2 = tl.load(out_ptr + t * K + 2 * H + offs).to(tl.float32)
+    o3 = tl.load(out_ptr + t * K + 3 * H + offs).to(tl.float32)
+    y = pre0 * o0 + pre1 * o1 + pre2 * o2 + pre3 * o3
+    yb = y.to(tl.bfloat16).to(tl.float32)
+    tl.store(y_ptr + t * H + offs, (yb * rmsy * tl.load(norm_weight_ptr + offs)).to(tl.bfloat16))
+
+
+def ihc_post_pre_split(x, residual, prev_post, fn, hc_scale, hc_base, *, magnitude, hc_eps,
+                       norm_eps, norm_weight=None, layernorm_eps, block_k, block_d, num_warps):
+    """`run_post_pre` (b12x iHC) over (row, chunk) grids: `(out_streams, post, y)`,
+    the same bits as the one-program-per-row kernel at the same launch config."""
+    hidden = int(residual.shape[-1])
+    k_all = 4 * hidden
+    rows = residual.numel() // k_all
+    outer = tuple(residual.shape[:-2])
+    out = torch.empty_like(residual)
+    post = torch.empty(outer + (4,), dtype=torch.float32, device=residual.device)
+    y = torch.empty(outer + (hidden,), dtype=torch.bfloat16, device=residual.device)
+    if prev_post.ndim == residual.ndim and prev_post.shape[-1] == 1:
+        prev_post = prev_post.squeeze(-1)
+    nc, nd = k_all // block_k, hidden // block_d
+    parts = torch.empty((rows, nc, 9), dtype=torch.float32, device=residual.device)
+    sqy = torch.empty((rows, nd), dtype=torch.float32, device=residual.device)
+    _ihc_pp_chunks_kernel[(rows, nc)](x, residual, prev_post, fn, out, parts, hidden, k_all, nc,
+                                      BLOCK_K=block_k, num_warps=num_warps)
+    _ihc_pp_collapse_kernel[(rows, nd)](parts, hc_scale, hc_base, out, post, y, sqy, hidden, k_all,
+                                        nc, nd, float(magnitude), float(hc_eps), float(norm_eps),
+                                        BLOCK_D=block_d, FUSE_NORM=norm_weight is not None,
+                                        num_warps=num_warps)
+    if norm_weight is not None:
+        _ihc_pp_norm_kernel[(rows, nd)](parts, hc_scale, hc_base, out, y, sqy, norm_weight, hidden,
+                                        k_all, nc, nd, float(magnitude), float(hc_eps),
+                                        float(norm_eps), float(layernorm_eps), BLOCK_D=block_d,
+                                        num_warps=num_warps)
+    return out, post, y

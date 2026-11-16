@@ -39,6 +39,9 @@ ALLOWED = {
     # "on" replays a captured step (lazily captured per indexer width bucket)
     # instead of launching ~10k kernels from the host per token.
     "decode_graph": ("off", "on"),
+    # consult18 P2: iHC post_pre below PREFILL_MIN_ROWS rows over (row, chunk)
+    # grids (fused_ops.ihc_post_pre_split; bit-identical, 6x at one row)
+    "ihc_split": ("off", "on"),
 }
 DEFAULTS = {"index_scores": "fp32",
             "ihc": os.environ.get("HY4_IHC") or "default",
@@ -49,7 +52,8 @@ DEFAULTS = {"index_scores": "fp32",
             "graph_moe": os.environ.get("HY4_GRAPH_MOE") or "off",
             "comm_token": os.environ.get("HY4_COMM_TOKEN") or "on",
             "sync_free": os.environ.get("HY4_SYNC_FREE") or "off",
-            "decode_graph": os.environ.get("HY4_DECODE_GRAPH") or "off"}
+            "decode_graph": os.environ.get("HY4_DECODE_GRAPH") or "off",
+            "ihc_split": os.environ.get("HY4_IHC_SPLIT") or "off"}
 for _key, _value in DEFAULTS.items():
     if _value not in ALLOWED[_key]:
         raise ValueError(f"runtime default {_key}={_value!r} must be one of {ALLOWED[_key]}")
