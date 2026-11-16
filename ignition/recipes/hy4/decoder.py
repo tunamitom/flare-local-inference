@@ -776,9 +776,16 @@ class Hy4Decoder:
                 # consult18 P2: the captured single-row prefill forward (the
                 # prompt's tail); logits for every row are computed in the
                 # graph, the requested one is sliced and gathered here.
-                local, flag = graphs.run_tail(token_ids, row=row_id, start=start,
-                                              call_shape=call_shape,
-                                              need_logits=logits_rows != "none")
+                tail_hidden = None
+                if return_hidden:
+                    local, normed, pre, flag = graphs.run_tail(
+                        token_ids, row=row_id, start=start, call_shape=call_shape,
+                        need_logits=logits_rows != "none", need_hidden=True)
+                    tail_hidden = (normed, pre)
+                else:
+                    local, flag = graphs.run_tail(token_ids, row=row_id, start=start,
+                                                  call_shape=call_shape,
+                                                  need_logits=logits_rows != "none")
                 if logits_rows == "none":
                     result = None
                 else:
@@ -787,6 +794,8 @@ class Hy4Decoder:
                         local = local[:, index:index + 1, :].contiguous()
                     result = self.collectives.gather_logits(
                         local, vocabulary_range=self.weights.sharding.vocabulary_range)
+                if tail_hidden is not None:
+                    result = (result, *tail_hidden)
                 flags = [flag]
             elif (graphs is not None and SWITCHES.get("decode_graph") == "on"
                     and graphs.accepts(token_ids, row=row_id, start=start, call_shape=call_shape,

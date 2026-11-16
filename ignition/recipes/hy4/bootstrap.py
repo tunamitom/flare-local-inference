@@ -314,8 +314,11 @@ class PreparedHy4Rank:
                 small_scratch.seal()
             import os as _os
 
-            decode_tokens = int(_os.environ.get("HY4_MOE_DECODE_OP") or 0)
-            if decode_tokens > 0 and small_scratch is None:
+            # "1" or "1,4": the decode op capacities (consult18 P4: the verify rows)
+            decode_caps = tuple(int(x) for x in (_os.environ.get("HY4_MOE_DECODE_OP") or "0").split(",")
+                                if x.strip() and int(x) > 0)
+            decode_tokens = decode_caps if len(decode_caps) > 1 else (decode_caps[0] if decode_caps else 0)
+            if decode_caps and small_scratch is None:
                 # consult18 P2 (numerics class): decode-capacity MoE ops compiled
                 # with the b12x small-M split-K schedule, one shared workspace;
                 # runtime switch moe_decode_op selects them.

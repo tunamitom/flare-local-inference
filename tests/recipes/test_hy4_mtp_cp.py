@@ -174,3 +174,54 @@ def test_spec_graph_bodies_equal_eager(mtp_worlds, world):
     for rank, (exact, graphed) in enumerate(zip(run(False), run(True))):
         for name, want, got in zip(names, exact, graphed):
             assert torch.equal(got, want), f"world {world} rank {rank} {name}: {got} vs {want}"
+
+
+@pytest.mark.parametrize("world", (2, 8))
+def test_spec_decode_rows_match_prefill_family(mtp_worlds, world):
+    """consult18 P4: the verify (T=4) and the draft re-absorption (T=3) as the
+    decode-family verification shape (T query rows of one request row, the
+    owner-side absorbed query wiring) against the same forwards as one
+    prefill-family row — the same greedy tokens and FP32 hidden within the
+    query-wiring rounding, and the following decode step reads equal KV."""
+    from ignition.recipes.hy4.collectives import SimulatedGroup
+    from ignition.recipes.hy4.decode_graph import DecodeGraphs
+    from ignition.recipes.hy4.wiring import verify_shape
+
+    prompt = 20
+
+    def scenario(decode_rows):
+        def body(decoder):
+            _, tokens = golden_tokens()
+            ids = torch.tensor([tokens], dtype=torch.long)
+            _, hidden, _ = decoder.forward(ids[:, :prompt], return_hidden=True)
+            decoder.append([0], prompt)
+            decoder.draft_absorb(ids[:, 1:prompt], hidden[:, :prompt - 1], logits="none")
+            g = DecodeGraphs(decoder, granule=2)
+
+            def shape(count):
+                return verify_shape(count) if decode_rows else decoder.default_call_shape((1, count))
+
+            toks, _ = g.spec_inputs("verify", 4)
+            toks.copy_(ids[:, prompt:prompt + 4])
+            v_greedy, v_hidden, _ = _spec_body(g, "verify", prompt, 4, shape(4))
+            v_greedy, v_hidden = v_greedy.clone(), v_hidden.clone()
+            decoder.append([0], 4)
+            toks, hid = g.spec_inputs("draft", 3)
+            toks.copy_(ids[:, prompt:prompt + 3])
+            hid.copy_(torch.cat([hidden[:, prompt - 1:prompt], v_hidden[None, :2]], dim=1))
+            a_greedy, a_hidden, _ = _spec_body(g, "draft", prompt - 1, 3, shape(3))
+            step = decoder.decode_step(torch.tensor([[5]], dtype=torch.long))
+            return [v_greedy.reshape(-1), v_hidden, a_greedy.reshape(-1), a_hidden.clone(), step]
+        return body
+
+    def run(decode_rows):
+        group = SimulatedGroup(world)
+        return group.run([lambda col, d=d: scenario(decode_rows)(d)
+                          for d in _decoders(mtp_worlds[world], group)])
+
+    for rank, (want, got) in enumerate(zip(run(False), run(True))):
+        assert torch.equal(got[0], want[0]), f"world {world} rank {rank}: verify greedy"
+        assert torch.equal(got[2], want[2]), f"world {world} rank {rank}: absorb greedy"
+        for name, index in (("verify hidden", 1), ("absorb hidden", 3), ("decode after", 4)):
+            assert rel_error(got[index], want[index]) < 1e-4, \
+                f"world {world} rank {rank} {name}: {rel_error(got[index], want[index])}"

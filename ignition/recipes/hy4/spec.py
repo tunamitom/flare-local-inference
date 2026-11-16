@@ -28,12 +28,15 @@ ABSORB_WIDTHS = (4, 3, 2, 1)
 
 
 class SpeculativeGreedy:
-    def __init__(self, decoder, *, k=3, row=0):
+    def __init__(self, decoder, *, k=3, row=0, decode_rows=False):
         if not 1 <= int(k) <= 7:
             raise ValueError("speculation depth k must be in 1..7 (verify T = k + 1 <= 8)")
         self.decoder = decoder
         self.k = int(k)
         self.row = int(row)
+        # consult18 P4: T > 1 forwards as the decode-family verification shape
+        # (needs its plans bound at boot: verify_shape(T), T = 2 .. k + 1)
+        self.decode_rows = bool(decode_rows)
         self.rounds = self.accepted = self.verify_reruns = self.draft_flags = 0
 
     @property
@@ -41,6 +44,10 @@ class SpeculativeGreedy:
         return getattr(self.decoder, "decode_graphs", None)
 
     def _shape(self, count):
+        if self.decode_rows and count > 1:
+            from .wiring import verify_shape
+
+            return verify_shape(count)
         return self.decoder.default_call_shape((1, count))
 
     def eligible(self, start, cursor):
@@ -103,7 +110,7 @@ class SpeculativeGreedy:
                 # a narrow selection in the verify may be inexact: the exact
                 # eager forward rewrites the same KV slots and decides instead
                 self.verify_reruns += 1
-                logits, post, _ = d.forward(vt.clone(), call_shape=self._shape(k + 1),
+                logits, post, _ = d.forward(vt.clone(), call_shape=d.default_call_shape((1, k + 1)),
                                             logits_rows="all", return_hidden=True)
                 target = [int(x) for x in logits[0].float().argmax(dim=-1).tolist()]
                 vh = post[0]

@@ -488,6 +488,12 @@ class FusedRoutedExperts:
         self._decode_session = session
         self.decode_op = op
         self.decode_tokens = int(tokens)
+        # consult18 P4: one op per decode capacity (1 row; the k+1 verify rows)
+        if not hasattr(self, "decode_ops"):
+            self.decode_ops = {}
+            self._decode_sessions = []
+        self.decode_ops[int(tokens)] = op
+        self._decode_sessions.append(session)
         return op
 
     def bind_decode_scratch(self, workspace, storage):
@@ -540,14 +546,17 @@ class FusedRoutedExperts:
             op, workspace, storage = self.small_op, self._small_workspace, self._small_storage
             a4 = False
         decode_op = getattr(self, "decode_op", None)
-        if decode_op is not None and rows <= self.decode_tokens and current == 0:
+        caps = [cap for cap in getattr(self, "decode_ops", {}) if rows <= cap]
+        if decode_op is not None and caps and current == 0:
             from .runtime import SWITCHES
 
             mode = SWITCHES.get("moe_decode_op")
             if mode == "on":
                 # consult18 P2 (numerics class): the decode-capacity A16 op built
-                # under HY4_MOE_DECODE_ENV (b12x small-M split-K schedule).
-                op, workspace, storage = decode_op, self._decode_workspace, self._decode_storage
+                # under HY4_MOE_DECODE_ENV (b12x small-M split-K schedule), the
+                # smallest capacity that holds the call (P4: 1 row, verify rows).
+                op, workspace, storage = (self.decode_ops[min(caps)], self._decode_workspace,
+                                          self._decode_storage)
                 a4 = False
             elif mode == "alt" and getattr(self, "decode_op_alt", None) is not None:
                 # the control arm: same capacity, built under HY4_MOE_DECODE_ENV_ALT
@@ -577,8 +586,11 @@ def wire_decode_ops(routed, *, tokens, env, alt_env=None):
 
     saved = {key: _os.environ.get(key) for key in (*env, *(alt_env or {}))}
     _os.environ.update(env)
+    capacities = sorted({int(t) for t in (tokens if isinstance(tokens, (tuple, list)) else (tokens,))},
+                        reverse=True)
+    tokens = capacities[-1]            # the smallest: the one-row decode op
     try:
-        ops = [fused.plan_decode_op(tokens=tokens) for fused in routed]
+        ops = [fused.plan_decode_op(tokens=cap) for cap in capacities for fused in routed]
         if alt_env is not None:
             for key in env:
                 _os.environ.pop(key, None)
@@ -586,6 +598,7 @@ def wire_decode_ops(routed, *, tokens, env, alt_env=None):
             for fused in routed:
                 main = fused.decode_op
                 fused.decode_op_alt = fused.plan_decode_op(tokens=tokens)
+                fused.decode_ops[tokens] = main
                 fused.decode_op = main
             ops += [fused.decode_op_alt for fused in routed]
             for key in alt_env:

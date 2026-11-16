@@ -154,7 +154,7 @@ class DecodeGraphs:
         width = int(token_ids.shape[1])
         return (token_ids.is_cuda and int(token_ids.shape[0]) == 1 and width > 1
                 and width % self.world == 0 and width <= self.TAIL_MAX
-                and state is None and not return_hidden and call_shape.is_prefill_graph
+                and state is None and call_shape.is_prefill_graph
                 and start + width <= self.capacity
                 and (start + width - 1) // self.world < self.local_capacity
                 and 0 <= row < int(self.decoder.cache.rows))
@@ -170,7 +170,7 @@ class DecodeGraphs:
         self._tail_start.copy_(self._tail_host, non_blocking=True)
         return buf
 
-    def _body_tail(self, row, call_shape, width, tokens, need_logits):
+    def _body_tail(self, row, call_shape, width, tokens, need_logits, need_hidden=False):
         from .lanes import use_lane
 
         d = self.decoder
@@ -194,9 +194,9 @@ class DecodeGraphs:
         if deferred is not None:
             deferred.clear()
         with use_lane(0, overlap=False, geometry=geometry, sync_free=True):
-            logits = d._layers_and_head(
+            out = d._layers_and_head(
                 tokens, rows, positions, token_rows, visible, None, state=None,
-                return_hidden=False, call_shape=call_shape,
+                return_hidden=need_hidden, call_shape=call_shape,
                 logits_rows="all" if need_logits else "none", gather=False)
         flags = list(deferred) if deferred else []
         if deferred is not None:
@@ -205,28 +205,39 @@ class DecodeGraphs:
             flag = torch.stack([f.reshape(()) for f in flags]).any()
         else:
             flag = torch.zeros((), dtype=torch.bool, device=self.device)
-        return logits, flag
+        if need_hidden:
+            # consult18 P4: the post-norm (MTP feed) and pre-norm hidden too
+            logits, normed, pre = out
+            return logits, normed, pre, flag
+        return out, flag
 
-    def run_tail(self, token_ids, *, row, start, call_shape, need_logits):
+    def run_tail(self, token_ids, *, row, start, call_shape, need_logits, need_hidden=False):
         """One single-row forward of T tokens: `(local-shard logits [1, T, V/w]
-        or None, deferred flag)` — captured per (T, indexer width bucket)."""
+        or None, deferred flag)` — captured per (T, indexer width bucket);
+        `need_hidden`: `(logits, post-norm hidden [1, T, H], pre-norm hidden,
+        flag)` (graph-pool tensors: read them before the next replay)."""
         count = int(token_ids.shape[1])
         width = self.index_width(start + count)
         key = ("tail", int(row), count, width, call_shape.name, bool(need_logits))
+        if need_hidden:
+            key = key + ("hidden",)
         tokens = self._stage_tail(token_ids, start)
         entry = self.graphs.get(key)
+
+        def body():
+            return self._body_tail(row, call_shape, width, tokens, need_logits, need_hidden)
+
         if entry is None:
-            logits, flag = self._body_tail(row, call_shape, width, tokens, need_logits)
+            out = body()
             self.eager_steps += 1
-            logits = None if logits is None else logits.clone()
-            flag = flag.clone()
-            self._capture(key, lambda: self._body_tail(row, call_shape, width, tokens, need_logits))
-            return logits, flag
-        graph, logits, flag = entry
+            out = tuple(None if x is None else x.clone() for x in out)
+            self._capture(key, body)
+            return out
+        graph, outputs, flag = entry
         self.graphs.move_to_end(key)
         graph.replay()
         self.replays += 1
-        return logits, flag
+        return outputs if need_hidden else (outputs, flag)
 
     # -- consult18 P4: speculative verify + MTP draft forwards -------------
     # A verify forward is T = k + 1 target tokens of one row; a draft forward
@@ -251,7 +262,16 @@ class DecodeGraphs:
                 and start + 1 > self.topk and start + count <= self.capacity
                 and (start + self.world - 1) // self.world + per - 1 < self.local_capacity
                 and 0 <= row < int(self.decoder.cache.rows)
-                and call_shape.is_decode_graph == (count == 1))
+                and (call_shape.is_decode_graph == (count == 1)
+                     or self._decode_rows(call_shape, count)))
+
+    @staticmethod
+    def _decode_rows(call_shape, count):
+        """consult18 P4: T > 1 tokens of ONE request row run as the decode-family
+        verification shape — T query rows of one token each, all mapped to the
+        same cache row at consecutive positions (owner-side absorbed queries,
+        the decode attention kernel, the decode MoE op)."""
+        return count > 1 and call_shape.name == "verify" and call_shape.rows == count
 
     def _spec_state(self, kind, count):
         key = (kind, int(count))
@@ -326,10 +346,9 @@ class DecodeGraphs:
 
         d = self.decoder
         entry = self._spec_state("verify", count)
-        tokens = entry["tokens"]
+        tokens, rows = self._spec_rows(entry["tokens"], row, call_shape, count)
         positions = entry["args"][0:1] + torch.arange(count, dtype=torch.long, device=self.device)
-        rows = torch.full((1,), row, dtype=torch.long, device=self.device)
-        token_rows = d._token_rows((1, count), rows)
+        token_rows = d._token_rows(tuple(tokens.shape), rows)
         visible = positions + 1
         kept, slot, safe = self._spec_slots(entry)
         d.cache.begin_forward_static(token_rows, positions, slot=slot, safe=safe, kept=kept)
@@ -350,9 +369,9 @@ class DecodeGraphs:
 
         d = self.decoder
         entry = self._spec_state("draft", count)
-        tokens, hidden_in = entry["tokens"], entry["hidden"]
+        tokens, rows = self._spec_rows(entry["tokens"], row, call_shape, count)
+        hidden_in = entry["hidden"]
         positions = entry["args"][0:1] + torch.arange(count, dtype=torch.long, device=self.device)
-        rows = torch.full((1,), row, dtype=torch.long, device=self.device)
         geometry = {"owned_max": max(width, 1), "base": row * self.local_capacity}
         deferred = getattr(d.collectives, "deferred_checks", None)
         if deferred is not None:
@@ -371,6 +390,15 @@ class DecodeGraphs:
         entry["out_hidden"].copy_(hidden)
         entry["out_flag"].copy_(flag)
         return entry["out_tokens"], entry["out_hidden"], entry["out_flag"]
+
+    def _spec_rows(self, tokens, row, call_shape, count):
+        """The static `[1, T]` tokens as the forward's `(token_ids, rows)`:
+        `[T, 1]` over T query rows of request row `row` for the decode-family
+        verification shape, else `[1, T]` over one row."""
+        if self._decode_rows(call_shape, count):
+            return (tokens.reshape(count, 1),
+                    torch.full((count,), row, dtype=torch.long, device=self.device))
+        return tokens, torch.full((1,), row, dtype=torch.long, device=self.device)
 
     def _flag(self, deferred):
         flags = list(deferred) if deferred else []
