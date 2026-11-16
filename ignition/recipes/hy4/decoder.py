@@ -1218,7 +1218,10 @@ class Hy4Decoder:
                     out.append(finished.value)
             return out
 
-        if flags and bool(torch.stack(flags).any()):
+        from .runtime import SWITCHES as _switches
+
+        probe = _switches.get("wire_probe", "off") != "off"   # timing probe: no reruns
+        if flags and bool(torch.stack(flags).any()) and not probe:
             self.overlap_reruns = getattr(self, "overlap_reruns", 0) + 1
             results = single_lane()
         elif (_os.environ.get("HY4_OVERLAP_VERIFY") or "") not in ("", "0"):
