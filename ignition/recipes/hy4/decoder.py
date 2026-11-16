@@ -525,7 +525,7 @@ class Hy4Decoder:
                             call_shape=call_shape)
 
     def draft_absorb(self, next_tokens, prev_hidden, *, request_rows=None, cache=None,
-                     logits="all"):
+                     logits="all", next_embeds=None):
         """Teacher-forced prompt absorption into the draft KV (finding F fix).
 
         `next_tokens` [rows, k] are the SHIFTED prompt tokens (row t holds the
@@ -563,8 +563,10 @@ class Hy4Decoder:
             hi = min(lo + limit, k)
             positions = (starts.reshape(-1, 1)
                          + torch.arange(lo, hi, device=self.device)).reshape(-1)
-            hidden, _, selected = self._draft(next_tokens[:, lo:hi], prev_hidden[:, lo:hi],
-                                              positions, rows, cache)
+            hidden, _, selected = self._draft(
+                next_tokens[:, lo:hi], prev_hidden[:, lo:hi], positions, rows, cache,
+                embeds=None if next_embeds is None else next_embeds.reshape(
+                    next_tokens.shape[0], k, -1)[:, lo:hi].reshape(-1, next_embeds.shape[-1]))
             outs.append(hidden.reshape(next_tokens.shape[0], hi - lo, -1))
             # snapshot: `select` hands back the selection cell's LIVE buffer
             # (shared with `sparse_mla.bind`), and the next chunk's
@@ -626,11 +628,11 @@ class Hy4Decoder:
                 logits, vocabulary_range=self.weights.sharding.vocabulary_range)
         return logits
 
-    def _draft(self, next_tokens, prev_hidden, positions, rows, cache):
+    def _draft(self, next_tokens, prev_hidden, positions, rows, cache, embeds=None):
         """Shared draft body: embed, run the block at `positions`; (hidden, attended, selected)."""
         cache = self.cache if cache is None else cache
         if cache.world != 1:
-            return self._draft_cp(next_tokens, prev_hidden, positions, rows, cache)
+            return self._draft_cp(next_tokens, prev_hidden, positions, rows, cache, embeds=embeds)
         token_rows = self._token_rows(next_tokens.shape, rows)
         visible = positions + 1
         next_embeds = self.weights.embed[next_tokens.reshape(-1)].to(self.compute_dtype)
@@ -640,7 +642,7 @@ class Hy4Decoder:
         return hidden, attended, selected
 
     def _draft_cp(self, next_tokens, prev_hidden, positions, rows, cache, *, call_shape=None,
-                  visible_max=None, static_slots=None):
+                  visible_max=None, static_slots=None, embeds=None):
         """consult18 P4: the MTP draft block under context + tensor parallelism.
 
         The same map as `MtpBlock.forward` with the target layers' distributed
@@ -662,9 +664,14 @@ class Hy4Decoder:
         visible = positions + 1
         if call_shape is None:
             call_shape = self.default_call_shape(shape)
-        embeds = self.collectives.embed_lookup(
-            next_tokens.reshape(-1), self.weights.embed,
-            vocabulary_range=self.weights.sharding.vocabulary_range).to(self.compute_dtype)
+        if embeds is None:
+            embeds = self.collectives.embed_lookup(
+                next_tokens.reshape(-1), self.weights.embed,
+                vocabulary_range=self.weights.sharding.vocabulary_range).to(self.compute_dtype)
+        else:
+            # consult18 P5: the caller's all-reduced embeddings of exactly these
+            # tokens (the target forward's next rows) — the same values
+            embeds = embeds.to(self.compute_dtype)
         embeds = torch.where((positions == 0).unsqueeze(-1), 0, embeds)
         h = draft.embed_merge(embeds, prev_hidden.to(self.compute_dtype).reshape(-1, embeds.shape[-1]))
         x = rms_norm(h, draft.input_norm, eps)
@@ -875,6 +882,7 @@ class Hy4Decoder:
             embeds = self.collectives.embed_lookup(
                 token_ids.reshape(-1), self.weights.embed,
                 vocabulary_range=self.weights.sharding.vocabulary_range).to(self.compute_dtype)
+        self._publish_embeds(token_ids, embeds)
         WATCH.check("embed", -1, embeds=embeds)
         streams = StreamState.begin(embeds)
         if state is not None:
@@ -1005,6 +1013,7 @@ class Hy4Decoder:
             embeds = self.collectives.embed_lookup(
                 token_ids.reshape(-1), self.weights.embed,
                 vocabulary_range=self.weights.sharding.vocabulary_range).to(self.compute_dtype)
+        self._publish_embeds(token_ids, embeds)
         PROBE.add("embed", -1, embeds)
         streams = StreamState.begin(embeds)
         post = y = None
@@ -1364,6 +1373,11 @@ class Hy4Decoder:
                 raise RuntimeError(f"overlapped pair differs from the single-lane pair by "
                                    f"rel-L2 {error:.3e} (single-lane noise {floor:.3e})")
         self.overlap_pairs = getattr(self, "overlap_pairs", 0) + 1
+        sink = getattr(self, "embed_sink", None)
+        if sink is not None:
+            parts = [sink.pop(id(halves[i][0]), None) for i in (0, 1)]
+            if all(p is not None for p in parts):
+                sink[id(token_ids)] = torch.cat(parts, dim=0)
         normed = torch.cat(results, dim=0)
         self.cache.end_forward()
         if logits_rows == "none":
@@ -1383,6 +1397,15 @@ class Hy4Decoder:
             # consult18 P4: the post-norm hidden of both halves (the MTP feed).
             return logits, normed.reshape(1, 2 * half, -1)
         return logits
+
+    def _publish_embeds(self, token_ids, embeds):
+        """consult18 P5: a caller-set `embed_sink` dict receives every eager
+        forward's all-reduced token embeddings, keyed by `id(token_ids)` (the
+        prompt absorption reuses them — the draft embeds the NEXT tokens, i.e.
+        the target's next rows). Never under CUDA graph capture."""
+        sink = getattr(self, "embed_sink", None)
+        if sink is not None and not (embeds.is_cuda and torch.cuda.is_current_stream_capturing()):
+            sink[id(token_ids)] = embeds
 
     def _rows(self, token_ids, request_rows):
         rows = token_ids.shape[0]

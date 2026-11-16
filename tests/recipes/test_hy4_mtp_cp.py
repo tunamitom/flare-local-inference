@@ -287,3 +287,34 @@ def test_spec_sample_bodies_match_reference_math(mtp_worlds, world):
         assert torch.equal(got[0], want[1]), f"rank {rank}: verify tokens {got[0]} vs {want[1]}"
         assert torch.equal(got[1], want[0]), f"rank {rank}: accept {got[1]} vs {want[0]}"
         assert torch.equal(results[0][1][0], got[0]), "ranks disagree"
+
+
+@pytest.mark.parametrize("world", (2, 8))
+def test_absorb_with_target_embeddings_is_bit_equal(mtp_worlds, world):
+    """consult18 P5: the prompt absorption may reuse the target forward's
+    all-reduced embeddings (row t's next token is the target's row t+1): the
+    published embeddings shifted by one give bit-equal draft outputs."""
+    from ignition.recipes.hy4.collectives import SimulatedGroup
+
+    def body(decoder):
+        _, tokens = golden_tokens()
+        ids = torch.tensor([tokens], dtype=torch.long)
+        n = 20
+        decoder.embed_sink = {}
+        t = ids[:, :n]
+        _, hidden, _ = decoder.forward(t, return_hidden=True)
+        emb = decoder.embed_sink.pop(id(t))
+        decoder.embed_sink = None
+        decoder.append([0], n)
+        nxt_ids = torch.cat([ids[:, 1:n], ids[:, n - 1:n]], dim=1)
+        nxt_emb = torch.cat([emb[1:], emb[-1:]], dim=0)
+        decoder._draft_positions[0] = 0
+        a = decoder.draft_absorb(nxt_ids, hidden, logits="all")
+        decoder._draft_positions[0] = 0
+        b = decoder.draft_absorb(nxt_ids, hidden, logits="all", next_embeds=nxt_emb)
+        return a[0], a[1], b[0], b[1]
+
+    group = SimulatedGroup(world)
+    for rank, (la, ha, lb, hb) in enumerate(group.run([lambda col, d=d: body(d)
+                                                       for d in _decoders(mtp_worlds[world], group)])):
+        assert torch.equal(la, lb) and torch.equal(ha, hb), f"world {world} rank {rank}"
