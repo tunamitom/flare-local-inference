@@ -45,7 +45,7 @@ class DecodeGraphs:
     """Captured one-row decode steps, one per (row, width bucket, logits form)."""
 
     GRANULE = 1024     # owned keys per width bucket
-    KEEP = 8           # captured buckets kept (least recently used out)
+    KEEP = 16          # captured buckets kept (least recently used out)
 
     def __init__(self, decoder, *, granule=None, keep=None):
         self.decoder = decoder
@@ -186,6 +186,32 @@ class DecodeGraphs:
         graph.replay()
         self.replays += 1
         return logits, flag
+
+    def prewarm(self, *, max_context, row=0, call_shape, logits_rows="all"):
+        """Capture the short bucket and every width bucket up to `max_context`
+        at boot (collective: every rank runs the same steps). Each bucket's
+        eager first step writes one record of `row` at the bucket's first
+        position; the caller releases the row afterwards. Returns the buckets."""
+        d = self.decoder
+        starts = [0] if self._short_bypass(call_shape) else []
+        start = self.topk
+        while start < min(int(max_context), self.capacity):
+            starts.append(start)
+            # the first position of the next bucket
+            start = (self.index_width(start + 1) * self.world)
+        captured = []
+        token = torch.zeros((1, 1), dtype=torch.long, device=self.device)
+        for start in starts:
+            d._row_lengths = getattr(d, "_row_lengths", {})
+            d._row_lengths[row] = start
+            if not self.accepts(token, row=row, start=start, call_shape=call_shape, state=None,
+                                return_hidden=False, logits_rows=logits_rows):
+                continue
+            self.run(token, row=row, start=start, call_shape=call_shape,
+                     logits_rows=logits_rows)
+            captured.append(self.bucket(start))
+        torch.cuda.synchronize(self.device)
+        return captured
 
     def stats(self):
         return {"captures": self.captures, "replays": self.replays,
