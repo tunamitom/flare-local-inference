@@ -45,7 +45,12 @@ class DecodeGraphs:
     """Captured one-row decode steps, one per (row, width bucket, logits form)."""
 
     GRANULE = 1024     # owned keys per width bucket
-    KEEP = 16          # captured buckets kept (least recently used out)
+    # Captured graphs are NEVER destroyed: every boot that destroyed one (the
+    # phase-A teardown, dg3; LRU eviction, dg11) then segfaulted in
+    # cuGraphLaunch replaying another graph of the shared pool; boots that
+    # never destroyed one replayed thousands of steps cleanly. Past KEEP
+    # graphs a new key runs eagerly (uncaptured) instead of evicting.
+    KEEP = 256
 
     def __init__(self, decoder, *, granule=None, keep=None):
         self.decoder = decoder
@@ -69,7 +74,7 @@ class DecodeGraphs:
         self._tail_start = torch.zeros((1,), dtype=torch.long, device=self.device)
         self.graphs = collections.OrderedDict()
         self.pool = None
-        self.captures = self.replays = self.eager_steps = 0
+        self.captures = self.replays = self.eager_steps = self.uncaptured = 0
         self.capture_s = 0.0
 
     # -- shapes ---------------------------------------------------------
@@ -243,8 +248,9 @@ class DecodeGraphs:
         began = time.perf_counter()
         if self.pool is None:
             self.pool = torch.cuda.graph_pool_handle()
-        while len(self.graphs) >= self.keep:
-            self.graphs.popitem(last=False)
+        if len(self.graphs) >= self.keep:
+            self.uncaptured += 1
+            return None
         graph = torch.cuda.CUDAGraph()
         with contextlib.ExitStack() as stack:
             self._comm_capture_contexts(stack)
@@ -313,5 +319,6 @@ class DecodeGraphs:
 
     def stats(self):
         return {"captures": self.captures, "replays": self.replays,
-                "eager_steps": self.eager_steps, "capture_s": round(self.capture_s, 3),
+                "eager_steps": self.eager_steps, "uncaptured": self.uncaptured,
+                "capture_s": round(self.capture_s, 3),
                 "buckets": [k[1] if k[0] != "tail" else ("tail", k[2], k[3]) for k in self.graphs]}
