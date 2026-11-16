@@ -140,6 +140,13 @@ def _rms_tail_kernel(x_ptr, ms_ptr, w_ptr, out_ptr, N, eps, BLOCK: tl.constexpr)
     tl.store(out_ptr + row * N + offs, y.to(out_ptr.dtype.element_ty), mask=live)
 
 
+@triton.jit
+def _square_f32_kernel(x_ptr, out_ptr, N, BLOCK: tl.constexpr):
+    i = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    v = tl.load(x_ptr + i, mask=i < N).to(tl.float32)
+    tl.store(out_ptr + i, v * v, mask=i < N)
+
+
 def rms_norm(x, weight, eps):
     """`attention.rms_norm` with the elementwise tail in one kernel (bitwise the
     same): the mean of squares stays torch's own reduction (its order), then
@@ -148,7 +155,14 @@ def rms_norm(x, weight, eps):
     flat = x.reshape(-1, N)
     if not flat.is_contiguous():
         flat = flat.contiguous()
-    ms = flat.float().square().mean(-1)
+    if flat.is_cuda:
+        sq = torch.empty(flat.shape, dtype=torch.float32, device=flat.device)
+        n_el = int(flat.numel())
+        if n_el:
+            _square_f32_kernel[(triton.cdiv(n_el, 4096),)](flat, sq, n_el, BLOCK=4096)
+        ms = sq.mean(-1)
+    else:
+        ms = flat.float().square().mean(-1)
     out = torch.empty_like(flat)
     rows = int(flat.shape[0])
     if rows:
@@ -490,3 +504,4 @@ def moe_route(logits, bias, *, top_k, scale, norm):
                                EB=triton.next_power_of_2(experts), K=top_k, NORM=bool(norm),
                                num_warps=4)
     return w, ids
+
