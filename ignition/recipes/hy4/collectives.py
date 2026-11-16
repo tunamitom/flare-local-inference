@@ -2585,6 +2585,28 @@ class PcieDcpCollectives:
             return logits if gathered is None else gathered
         return self.transport.all_gather(logits.contiguous())
 
+    def argmax_tokens(self, logits, *, vocabulary_range):
+        """consult18 P4: greedy tokens on device, the same on every rank: `[rows]` int64.
+
+        Each rank offers its shard's (max, first argmax as a global vocabulary
+        id) per row over the score gather (the selection exchange's offer
+        channel: a pure copy of FP32 bits). The winner is the largest value,
+        ties to the lowest rank, i.e. the lowest vocabulary id: exactly
+        `torch.argmax` over the gathered full row (ids < 2**24 are exact in
+        FP32). No host read, so it is capture-safe at every prepared row count."""
+        rows = int(logits.shape[0])
+        local = logits.reshape(rows, -1)
+        idx = local.argmax(dim=-1)
+        val = local.gather(1, idx.unsqueeze(1)).reshape(rows).float()
+        width = int(getattr(self.transport, "score_offer", None) or 2)
+        offer = torch.full((rows, width), float("-inf"), dtype=torch.float32, device=local.device)
+        offer[:, 0] = val
+        offer[:, 1] = (idx + int(vocabulary_range[0])).float()
+        got = self.transport.exchange_scores(offer, plan=self._plan("selection_exchange", None))
+        stacked = torch.stack([g[:, :2] for g in got], dim=1)          # [rows, world, 2]
+        best = stacked[:, :, 0].argmax(dim=1)                          # first max: lowest rank
+        return stacked[torch.arange(rows, device=local.device), best, 1].long()
+
     def fused_handback_ok(self):
         """The fused selection + hand-back serves the scores-only exchange
         without the selection audit (the audit compares merge_topk outputs)."""

@@ -228,6 +228,182 @@ class DecodeGraphs:
         self.replays += 1
         return logits, flag
 
+    # -- consult18 P4: speculative verify + MTP draft forwards -------------
+    # A verify forward is T = k + 1 target tokens of one row; a draft forward
+    # is T rows of the MTP block (T = 1: a chained draft step; T > 1: the
+    # re-absorption of the accepted rows with the target's hidden). T < world
+    # in practice, so a rank owns 0 or 1 of the tokens: the writes are
+    # PREDICATED — per = ceil(T / world) (kept, slot, safe) entries, slot -1
+    # where the rank owns no token (the record writer skips it; the index-key
+    # store rewrites a distinct valid slot with its own value). Both return
+    # greedy tokens computed on device (`argmax_tokens`) and the hidden.
+    SPEC_MAX = 8
+    SPEC_RING = 64
+
+    def spec_per(self, count):
+        return -(-int(count) // self.world)
+
+    def accepts_spec(self, count, *, row, start, call_shape):
+        """Fixed-shape spec forwards past the short-context bypass, with room
+        for the predicated slots of every rank (a rank-independent bound)."""
+        per = self.spec_per(count)
+        return (self.device.type == "cuda" and 1 <= count <= self.SPEC_MAX
+                and start + 1 > self.topk and start + count <= self.capacity
+                and (start + self.world - 1) // self.world + per - 1 < self.local_capacity
+                and 0 <= row < int(self.decoder.cache.rows)
+                and call_shape.is_decode_graph == (count == 1))
+
+    def _spec_state(self, kind, count):
+        key = (kind, int(count))
+        state = getattr(self, "_spec", None)
+        if state is None:
+            state = self._spec = {}
+            self._spec_ring = []
+            self._spec_ring_at = 0
+        entry = state.get(key)
+        if entry is None:
+            d = self.decoder
+            hidden = int(d.config.hidden)
+            per = self.spec_per(count)
+            entry = state[key] = {
+                "tokens": torch.zeros((1, count), dtype=torch.long, device=self.device),
+                "hidden": torch.zeros((1, count, hidden), dtype=d.compute_dtype,
+                                      device=self.device),
+                "args": torch.zeros((1 + 3 * per,), dtype=torch.long, device=self.device),
+                "per": per,
+                # Outputs live OUTSIDE the graph pool: graphs sharing a pool reuse
+                # each other's freed intermediates, so a graph's own outputs are
+                # overwritten by the next replay of a graph captured before it
+                # (dg24: the re-absorb's outputs clobbered by the verify).
+                "out_tokens": torch.zeros((count if kind == "verify" else 1,), dtype=torch.long,
+                                          device=self.device),
+                "out_hidden": torch.zeros((count, hidden), dtype=d.compute_dtype,
+                                          device=self.device),
+                "out_flag": torch.zeros((), dtype=torch.bool, device=self.device),
+            }
+        return entry
+
+    def spec_inputs(self, kind, count):
+        """The static (tokens [1, T], hidden [1, T, H]) inputs of a spec forward
+        (`hidden` feeds draft forwards only); fill them before `run_spec`."""
+        entry = self._spec_state(kind, count)
+        return entry["tokens"], entry["hidden"]
+
+    def _spec_host(self, n):
+        """A pinned staging vector from a ring: a round stages several forwards
+        before its one host sync, so a buffer is never rewritten while its
+        asynchronous H2D copy may still be pending."""
+        if self._spec_ring_at >= len(self._spec_ring):
+            buf = torch.zeros((1 + 3 * self.spec_per(self.SPEC_MAX),), dtype=torch.long)
+            if self.device.type == "cuda":
+                buf = buf.pin_memory()
+            self._spec_ring.append(buf)
+        buf = self._spec_ring[self._spec_ring_at]
+        self._spec_ring_at = (self._spec_ring_at + 1) % self.SPEC_RING
+        return buf[:n]
+
+    def _stage_spec(self, entry, row, start, count):
+        per = entry["per"]
+        first = (self.rank - start) % self.world
+        base = row * self.local_capacity + (start + first) // self.world
+        host = self._spec_host(1 + 3 * per)
+        host[0] = start
+        for j in range(per):
+            i = first + self.world * j
+            owned = i < count
+            host[1 + j] = i if owned else 0
+            host[1 + per + j] = base + j if owned else -1
+            host[1 + 2 * per + j] = base + j
+        entry["args"].copy_(host, non_blocking=True)
+
+    def _spec_slots(self, entry):
+        per = entry["per"]
+        args = entry["args"]
+        return args[1:1 + per], args[1 + per:1 + 2 * per], args[1 + 2 * per:1 + 3 * per]
+
+    def _body_verify(self, row, call_shape, width, count):
+        from .lanes import use_lane
+
+        d = self.decoder
+        entry = self._spec_state("verify", count)
+        tokens = entry["tokens"]
+        positions = entry["args"][0:1] + torch.arange(count, dtype=torch.long, device=self.device)
+        rows = torch.full((1,), row, dtype=torch.long, device=self.device)
+        token_rows = d._token_rows((1, count), rows)
+        visible = positions + 1
+        kept, slot, safe = self._spec_slots(entry)
+        d.cache.begin_forward_static(token_rows, positions, slot=slot, safe=safe, kept=kept)
+        geometry = {"owned_max": max(width, 1), "base": row * self.local_capacity}
+        deferred = getattr(d.collectives, "deferred_checks", None)
+        if deferred is not None:
+            deferred.clear()
+        visible_max = self.topk + 1 if call_shape.is_decode_graph else None
+        with use_lane(0, overlap=False, geometry=geometry, sync_free=True):
+            logits, normed, _ = d._layers_and_head(
+                tokens, rows, positions, token_rows, visible, visible_max, state=None,
+                return_hidden=True, call_shape=call_shape, logits_rows="all", gather=False)
+            greedy = d.greedy_tokens(logits.reshape(count, -1))
+        return self._emit(entry, greedy, normed.reshape(count, -1), self._flag(deferred))
+
+    def _body_draft(self, row, call_shape, width, count):
+        from .lanes import use_lane
+
+        d = self.decoder
+        entry = self._spec_state("draft", count)
+        tokens, hidden_in = entry["tokens"], entry["hidden"]
+        positions = entry["args"][0:1] + torch.arange(count, dtype=torch.long, device=self.device)
+        rows = torch.full((1,), row, dtype=torch.long, device=self.device)
+        geometry = {"owned_max": max(width, 1), "base": row * self.local_capacity}
+        deferred = getattr(d.collectives, "deferred_checks", None)
+        if deferred is not None:
+            deferred.clear()
+        visible_max = self.topk + 1 if call_shape.is_decode_graph else None
+        with use_lane(0, overlap=False, geometry=geometry, sync_free=True):
+            hidden, _, _ = d._draft_cp(tokens, hidden_in, positions, rows, d.cache,
+                                       call_shape=call_shape, visible_max=visible_max,
+                                       static_slots=self._spec_slots(entry))
+            greedy = d.greedy_tokens(hidden[-1:].float() @ d.weights.head.T)
+        return self._emit(entry, greedy, hidden.reshape(count, -1), self._flag(deferred))
+
+    @staticmethod
+    def _emit(entry, greedy, hidden, flag):
+        entry["out_tokens"].copy_(greedy.reshape(-1))
+        entry["out_hidden"].copy_(hidden)
+        entry["out_flag"].copy_(flag)
+        return entry["out_tokens"], entry["out_hidden"], entry["out_flag"]
+
+    def _flag(self, deferred):
+        flags = list(deferred) if deferred else []
+        if deferred is not None:
+            deferred.clear()
+        if flags:
+            return torch.stack([f.reshape(()) for f in flags]).any()
+        return torch.zeros((), dtype=torch.bool, device=self.device)
+
+    def run_spec(self, kind, *, row, start, count, call_shape):
+        """One verify ("verify") or MTP ("draft") forward of `count` tokens at
+        `start` over the static inputs (`spec_inputs`): `(greedy tokens [T] or
+        [1], post-norm hidden [T, H], deferred flag)` — the (kind, T) static
+        output buffers, valid until the next forward of the same (kind, T).
+        Captured per (kind, T, indexer width bucket); the first call runs
+        eagerly through the same body."""
+        width = self.index_width(start + count)
+        key = (kind, int(row), int(count), width, call_shape.name)
+        entry = self._spec_state(kind, count)
+        self._stage_spec(entry, row, start, count)
+        body = self._body_verify if kind == "verify" else self._body_draft
+        graph = self.graphs.get(key)
+        if graph is None:
+            out = body(row, call_shape, width, count)
+            self.eager_steps += 1
+            self._capture(key, lambda: body(row, call_shape, width, count))
+            return out
+        graph, outputs, _ = graph
+        self.graphs.move_to_end(key)
+        graph.replay()
+        self.replays += 1
+        return outputs
+
     # -- capture ----------------------------------------------------------
     def _comm_capture_contexts(self, stack):
         """Enter every b12x channel's capture context (DCP pools, one-shot)."""
@@ -264,8 +440,11 @@ class DecodeGraphs:
         with contextlib.ExitStack() as stack:
             self._comm_capture_contexts(stack)
             with torch.cuda.graph(graph, pool=self.pool):
-                logits, flag = body()
-        self.graphs[key] = (graph, logits, flag)
+                out = body()
+        if len(out) == 2:
+            self.graphs[key] = (graph, out[0], out[1])
+        else:       # spec forwards: (graph, all outputs, flag)
+            self.graphs[key] = (graph, tuple(out), out[-1])
         self.captures += 1
         self.capture_s += time.perf_counter() - began
         return self.graphs[key]
@@ -330,4 +509,5 @@ class DecodeGraphs:
         return {"captures": self.captures, "replays": self.replays,
                 "eager_steps": self.eager_steps, "uncaptured": self.uncaptured,
                 "capture_s": round(self.capture_s, 3),
-                "buckets": [k[1] if k[0] != "tail" else ("tail", k[2], k[3]) for k in self.graphs]}
+                "buckets": [k[1] if not isinstance(k[0], str) else (k[0], k[2], k[3])
+                            for k in self.graphs]}

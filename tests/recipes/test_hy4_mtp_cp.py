@@ -94,3 +94,83 @@ def test_cp_draft_matches_world_one(mtp_worlds, world):
                                  ("chain logits", ref[2], got[2])):
             assert rel_error(have, want) < 1e-3, f"world {world} rank {rank} {name}: {rel_error(have, want)}"
         assert got[3] == ref[3], f"world {world} rank {rank}: chain {got[3]} != {ref[3]}"
+
+
+def _spec_body(graphs, kind, start, count, shape):
+    entry = graphs._spec_state(kind, count)
+    graphs._stage_spec(entry, 0, start, count)
+    width = graphs.index_width(start + count)
+    body = graphs._body_verify if kind == "verify" else graphs._body_draft
+    return body(0, shape, width, count)
+
+
+@pytest.mark.parametrize("world", (2, 8))
+def test_spec_graph_bodies_equal_eager(mtp_worlds, world):
+    """consult18 P4: the captured speculative bodies (verify T=4 and MTP draft
+    T=3 / T=1 with predicated writes, device-side greedy tokens) against the
+    eager forward / draft_absorb / draft_step — bit-equal hidden, the same
+    greedy tokens, and a following decode step (reads the verify's KV) and
+    draft step (reads the draft KV) bit-equal."""
+    from ignition.recipes.hy4.collectives import SimulatedGroup
+    from ignition.recipes.hy4.decode_graph import DecodeGraphs
+
+    prompt = 20
+
+    def scenario(graph):
+        def body(decoder):
+            _, tokens = golden_tokens()
+            ids = torch.tensor([tokens], dtype=torch.long)
+            _, hidden, _ = decoder.forward(ids[:, :prompt], return_hidden=True)
+            decoder.append([0], prompt)
+            decoder.draft_absorb(ids[:, 1:prompt], hidden[:, :prompt - 1], logits="none")
+            verify = ids[:, prompt:prompt + 4]
+            g = DecodeGraphs(decoder, granule=2)
+            if graph:
+                toks, _ = g.spec_inputs("verify", 4)
+                toks.copy_(verify)
+                v_greedy, v_hidden, flag = _spec_body(
+                    g, "verify", prompt, 4, decoder.default_call_shape((1, 4)))
+                assert not bool(flag)
+            else:
+                logits, vh, _ = decoder.forward(verify, return_hidden=True)
+                v_greedy, v_hidden = logits[0].argmax(dim=-1), vh[0]
+            decoder.append([0], 4)
+            # re-absorb rows prompt-1 .. prompt+1 (target hidden), then one step
+            nxt = ids[:, prompt:prompt + 3]
+            prev = torch.cat([hidden[:, prompt - 1:prompt], v_hidden[None, :2]], dim=1)
+            if graph:
+                toks, hid = g.spec_inputs("draft", 3)
+                toks.copy_(nxt)
+                hid.copy_(prev)
+                a_greedy, a_hidden, _ = _spec_body(
+                    g, "draft", prompt - 1, 3, decoder.default_call_shape((1, 3)))
+                toks1, hid1 = g.spec_inputs("draft", 1)
+                toks1.copy_(a_greedy.reshape(1, 1))
+                hid1.copy_(a_hidden[-1:].reshape(1, 1, -1))
+                s_greedy, s_hidden, _ = _spec_body(
+                    g, "draft", prompt + 2, 1, decoder.default_call_shape((1, 1)))
+                decoder._draft_positions[0] = prompt + 3
+            else:
+                decoder._draft_positions[0] = prompt - 1
+                dl, dh, _ = decoder.draft_absorb(nxt, prev, logits="last")
+                a_greedy, a_hidden = dl.reshape(1, -1).argmax(dim=-1), dh[0]
+                sl, sh = decoder.draft_step(a_greedy.reshape(1, 1), dh[:, -1])
+                s_greedy, s_hidden = sl.argmax(dim=-1), sh
+            step = decoder.decode_step(torch.tensor([[5]], dtype=torch.long))
+            dl2, _ = decoder.draft_step(torch.tensor([[7]], dtype=torch.long), s_hidden.reshape(1, -1))
+            return [v_greedy.reshape(-1), v_hidden, a_greedy.reshape(-1), a_hidden.reshape(3, -1),
+                    s_greedy.reshape(-1), s_hidden.reshape(1, -1), step, dl2]
+        return body
+
+    def run(graph):
+        from tests.recipes.test_hy4_mtp_cp import _decoders  # noqa: F401
+
+        group = SimulatedGroup(world)
+        return group.run([lambda col, d=d: scenario(graph)(d)
+                          for d in _decoders(mtp_worlds[world], group)])
+
+    names = ("verify greedy", "verify hidden", "absorb greedy", "absorb hidden",
+             "step greedy", "step hidden", "decode after", "draft after")
+    for rank, (exact, graphed) in enumerate(zip(run(False), run(True))):
+        for name, want, got in zip(names, exact, graphed):
+            assert torch.equal(got, want), f"world {world} rank {rank} {name}: {got} vs {want}"

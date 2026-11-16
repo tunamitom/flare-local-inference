@@ -273,13 +273,17 @@ class Hy4Cache:
         self._forward_memo.pop(id(tokens), None)
         self._forward_memo[id(tokens)] = (tokens, positions, kept, slots)
 
-    def begin_forward_static(self, tokens, positions, *, slot, safe):
+    def begin_forward_static(self, tokens, positions, *, slot, safe, kept=None):
         """consult18 P2 decode graphs: `begin_forward` for ONE token with
         device-resident slots (fixed shapes, no host value). `slot` [1] is the
         token's physical slot on its owning rank and -1 elsewhere (the fused
         record writer skips negative slots); `safe` [1] is always a valid slot
-        (the owner's slot; elsewhere any in-row slot, rewritten unchanged)."""
-        kept = torch.zeros((1,), dtype=torch.long, device=self.device)
+        (the owner's slot; elsewhere any in-row slot, rewritten unchanged).
+        consult18 P4: `kept` [n] (default [0]) are the forward's token indices
+        behind `slot`/`safe` [n] — a T-token forward on a rank owning fewer
+        than n of them carries -1 slots (distinct `safe` slots) for the rest."""
+        if kept is None:
+            kept = torch.zeros((1,), dtype=torch.long, device=self.device)
         self._forward_memo.pop(id(tokens), None)
         self._forward_memo[id(tokens)] = (tokens, positions, kept, slot, safe)
 
@@ -605,6 +609,14 @@ class Hy4Decoder:
             self._draft_positions[row] = start + 1
         return self._draft_logits(hidden), hidden
 
+    def greedy_tokens(self, logits):
+        """consult18 P4: greedy tokens `[rows]` from this rank's vocabulary-shard
+        logits `[rows, V/w]`, on device and identical on every rank."""
+        if int(getattr(self.collectives, "world_size", 1)) == 1:
+            return logits.reshape(int(logits.shape[0]), -1).argmax(dim=-1)
+        return self.collectives.argmax_tokens(
+            logits, vocabulary_range=self.weights.sharding.vocabulary_range)
+
     def _draft_logits(self, hidden):
         """The shared head over the draft hidden: full-vocabulary FP32 logits
         (the vocabulary shards gathered under tensor parallelism)."""
@@ -628,7 +640,7 @@ class Hy4Decoder:
         return hidden, attended, selected
 
     def _draft_cp(self, next_tokens, prev_hidden, positions, rows, cache, *, call_shape=None,
-                  visible_max=None):
+                  visible_max=None, static_slots=None):
         """consult18 P4: the MTP draft block under context + tensor parallelism.
 
         The same map as `MtpBlock.forward` with the target layers' distributed
@@ -657,8 +669,16 @@ class Hy4Decoder:
         h = draft.embed_merge(embeds, prev_hidden.to(self.compute_dtype).reshape(-1, embeds.shape[-1]))
         x = rms_norm(h, draft.input_norm, eps)
         layer = SimpleNamespace(attention=draft.attention, index=self.config.layers)
-        attn_out = self._attention(layer, x, positions, token_rows, visible, call_shape=call_shape,
-                                   visible_max=visible_max)
+        if static_slots is not None:
+            # consult18 P4 draft graphs: predicated owned writes (device slots).
+            kept, slot, safe = static_slots
+            cache.begin_forward_static(token_rows, positions, slot=slot, safe=safe, kept=kept)
+        try:
+            attn_out = self._attention(layer, x, positions, token_rows, visible,
+                                       call_shape=call_shape, visible_max=visible_max)
+        finally:
+            if static_slots is not None:
+                cache._forward_memo.pop(id(token_rows), None)
         h = h + self.collectives.all_reduce(attn_out)
         x = rms_norm(h, draft.post_attention_norm, eps)
         mlp_out = draft.mlp.forward(x, overlap_shared=call_shape.overlap_shared_expert)
@@ -1078,7 +1098,7 @@ class Hy4Decoder:
         self._mlp_graphs = graphs
         return len(graphs)
 
-    def forward_overlapped(self, token_ids, *, half_shape, logits_rows="none"):
+    def forward_overlapped(self, token_ids, *, half_shape, logits_rows="none", return_hidden=False):
         """consult18 stage D: one prefill chunk as two halves on two lanes.
 
         Half A (the first `half_shape.tokens` positions) runs on lane 0's
@@ -1350,6 +1370,9 @@ class Hy4Decoder:
                 logits = self.collectives.gather_logits(
                     logits, vocabulary_range=self.weights.sharding.vocabulary_range)
         TIMER.forward_end()
+        if return_hidden:
+            # consult18 P4: the post-norm hidden of both halves (the MTP feed).
+            return logits, normed.reshape(1, 2 * half, -1)
         return logits
 
     def _rows(self, token_ids, request_rows):

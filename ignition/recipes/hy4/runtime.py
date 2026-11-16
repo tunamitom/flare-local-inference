@@ -61,6 +61,10 @@ ALLOWED = {
     # consult18 P3 (numerics class): the CE head gather / LSE partials over an
     # INT8 wire (one FP32 scale per row-head vector)
     "wire": ("bf16", "int8"),
+    # consult18 P4: greedy (temperature 0) requests decode by MTP speculation —
+    # draft k tokens with the MTP block, verify k + 1 in one target forward
+    # (spec.py; numerics class: the verify forward is a T-token forward)
+    "spec": ("off", "on"),
 }
 DEFAULTS = {"index_scores": "fp32",
             "ihc": os.environ.get("HY4_IHC") or "default",
@@ -79,7 +83,8 @@ DEFAULTS = {"index_scores": "fp32",
             "moe_decode_op": os.environ.get("HY4_MOE_DECODE") or "off",
             "prefill_graph": os.environ.get("HY4_PREFILL_GRAPH") or "off",
             "wire_probe": "off",
-            "wire": os.environ.get("HY4_WIRE") or "bf16"}
+            "wire": os.environ.get("HY4_WIRE") or "bf16",
+            "spec": os.environ.get("HY4_SPEC") or "off"}
 for _key, _value in DEFAULTS.items():
     if _value not in ALLOWED[_key]:
         raise ValueError(f"runtime default {_key}={_value!r} must be one of {ALLOWED[_key]}")
