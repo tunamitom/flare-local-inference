@@ -355,10 +355,57 @@ def test_int8_attention_weights_match_dequantized_reference(mtp_worlds, world):
         return body
 
     results = {}
-    for mode in ("dequant", "int8"):
-        group = SimulatedGroup(world)
-        results[mode] = group.run([lambda col, d=d, m=mode: run(m)(d)
-                                   for d in _decoders(mtp_worlds[world], group)])
+    saved = [[layer.attention.weights for layer in r.weights.layers] for r in mtp_worlds[world]]
+    try:
+        for mode in ("dequant", "int8"):
+            group = SimulatedGroup(world)
+            results[mode] = group.run([lambda col, d=d, m=mode: run(m)(d)
+                                       for d in _decoders(mtp_worlds[world], group)])
+            for r, ws in zip(mtp_worlds[world], saved):
+                for layer, w in zip(r.weights.layers, ws):
+                    layer.attention.weights = w
+    finally:
+        for r, ws in zip(mtp_worlds[world], saved):
+            for layer, w in zip(r.weights.layers, ws):
+                layer.attention.weights = w
     for rank, (a, b) in enumerate(zip(results["dequant"], results["int8"])):
         for name, x, y in (("forward", a[0], b[0]), ("decode", a[1], b[1])):
             assert rel_error(y, x) < 1e-5, f"world {world} rank {rank} {name}: {rel_error(y, x)}"
+
+
+@pytest.mark.parametrize("world", (2, 8))
+def test_int8_copies_change_only_decode_scope(mtp_worlds, world):
+    """consult18 P6: with the BF16 fields kept (quantize_attention(keep_bf16=True))
+    every call outside w8.decode_scope() is the original BF16 computation — the
+    forward and the decode step are bit-equal to an unquantized model (the INT8
+    copies are read only by CUDA decode-family bodies)."""
+    from ignition.recipes.hy4.collectives import SimulatedGroup
+    from ignition.recipes.hy4.w8 import quantize_attention
+
+    def run(quantize):
+        def body(decoder):
+            if quantize:
+                for layer in decoder.weights.layers:
+                    quantize_attention(layer.attention, keep_bf16=True)
+                    assert layer.attention.weights.w8_pack is not None
+            _, tokens = golden_tokens()
+            ids = torch.tensor([tokens], dtype=torch.long)
+            out = decoder.forward(ids[:, :20], logits_rows="all")
+            decoder.append([0], 20)
+            step = decoder.decode_step(torch.tensor([[5]], dtype=torch.long))
+            return out, step
+        return body
+
+    results = {}
+    saved = [[layer.attention.weights for layer in r.weights.layers] for r in mtp_worlds[world]]
+    try:
+        for q in (False, True):
+            group = SimulatedGroup(world)
+            results[q] = group.run([lambda col, d=d, q=q: run(q)(d)
+                                    for d in _decoders(mtp_worlds[world], group)])
+    finally:
+        for r, ws in zip(mtp_worlds[world], saved):
+            for layer, w in zip(r.weights.layers, ws):
+                layer.attention.weights = w
+    for rank, (a, b) in enumerate(zip(results[False], results[True])):
+        assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1]), f"world {world} rank {rank}"

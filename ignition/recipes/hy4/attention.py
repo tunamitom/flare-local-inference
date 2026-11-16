@@ -197,6 +197,10 @@ class AttentionWeights:
     sink: torch.Tensor            # [heads_local] FP32 (`learnable_sink_param`)
     indexer: IndexerWeights | None  # None on `shared` layers
     packed_input: PackedInputProjections | None = None  # same-input pack (load time)
+    # consult18 P6: INT8 copies read only by the decode-family bodies
+    # (w8.decode_scope); every other call uses the BF16 fields above, unchanged.
+    w8_pack: object = None        # w8.Int8Weight over `packed_input.packed`
+    w8_o_proj: object = None      # w8.Int8Weight of `o_proj`
 
     @property
     def heads(self):
@@ -303,13 +307,15 @@ class Hy4LayerAttention:
             gate_raw = x @ w.gate_proj.T.to(x.dtype)
             self._stash_gate(x, gate_raw)
             return LayerProjections(q_resid, q, latent, index_keys, gate_raw)
-        from .w8 import Int8Weight, int8_rows_ok
+        from .w8 import Int8Weight, in_decode_scope
 
-        if isinstance(packed.packed, Int8Weight) and (
-                packed.packed.bf16 is None or int8_rows_ok(packed.packed, x.reshape(-1, x.shape[-1]))):
+        w8 = w.w8_pack if (w.w8_pack is not None and in_decode_scope(x)) else None
+        if w8 is None and isinstance(packed.packed, Int8Weight):
+            w8 = packed.packed
+        if w8 is not None:
             # consult18 P6: INT8 storage — ONE GEMM over every packed row (the
             # bitwise-per-slice contract is moot once quantized), then split.
-            full = packed.packed.linear(x)
+            full = w8.linear(x)
 
             def cols(name):
                 first, last = packed.slices[name]
@@ -939,7 +945,13 @@ class Hy4LayerAttention:
             gate_raw = x @ self.weights.gate_proj.T.to(x.dtype)
         gate = torch.sigmoid(gate_raw)
         gated = attn_output * gate.view(attn_output.shape[0], self.heads, self.v_head)
-        return gated.reshape(gated.shape[0], -1).contiguous() @ self.weights.o_proj.T
+        o_proj = self.weights.o_proj
+        if self.weights.w8_o_proj is not None:
+            from .w8 import in_decode_scope
+
+            if in_decode_scope(gated):
+                o_proj = self.weights.w8_o_proj
+        return gated.reshape(gated.shape[0], -1).contiguous() @ o_proj.T
 
 
 def rms_norm(x, weight, eps):

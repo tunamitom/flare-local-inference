@@ -36,6 +36,13 @@ def decode_scope():
         _DECODE_SCOPE.reset(token)
 
 
+def in_decode_scope(x):
+    """A decode-family call that may read the INT8 copies: CUDA, <= GEMV_ROWS rows,
+    inside `decode_scope()`."""
+    return (_DECODE_SCOPE.get() and x.is_cuda
+            and int(x.numel() // max(int(x.shape[-1]), 1)) <= GEMV_ROWS)
+
+
 def int8_rows_ok(weight, x2):
     """Whether this call reads the INT8 copy."""
     return (x2.is_cuda and x2.shape[0] <= GEMV_ROWS and weight.dtype == torch.bfloat16
@@ -195,6 +202,23 @@ def _dequant_cuda(q, scale):
 
 
 def quantize_attention(attention, *, keep_bf16=False):
+    """With `keep_bf16`, the BF16 fields stay exactly as loaded and the INT8 copies
+    go to `w8_pack` / `w8_o_proj` (read only inside `decode_scope()`): every other
+    call is the original code path. Without it, INT8 replaces the BF16 storage."""
+    if keep_bf16:
+        from dataclasses import replace as _replace
+
+        w = attention.weights
+        packed = w.packed_input
+        pack8 = (Int8Weight.quantize(packed.packed)
+                 if packed is not None and packed.packed.shape[1] % GROUP == 0 else None)
+        o8 = Int8Weight.quantize(w.o_proj) if w.o_proj.shape[1] % GROUP == 0 else None
+        attention.weights = _replace(w, w8_pack=pack8, w8_o_proj=o8)
+        return 0
+    return _quantize_replacing(attention)
+
+
+def _quantize_replacing(attention):
     """Replace one attention's same-input pack and `o_proj` with INT8 storage;
     the loose same-input weights become row views of the INT8 pack (no BF16
     reference remains). Returns the BF16 bytes released."""
@@ -206,13 +230,13 @@ def quantize_attention(attention, *, keep_bf16=False):
     if (packed is not None and not isinstance(packed.packed, Int8Weight)
             and packed.packed.shape[1] % GROUP == 0):
         released += packed.packed.numel() * packed.packed.element_size()
-        q_pack = replace(packed, packed=Int8Weight.quantize(packed.packed, keep=keep_bf16))
+        q_pack = replace(packed, packed=Int8Weight.quantize(packed.packed))
         w = replace(w, packed_input=q_pack, q_a_proj=q_pack.rows("q_a_proj"),
                     kv_a_proj=q_pack.rows("kv_a_proj"), gate_proj=q_pack.rows("linear_gate"),
                     indexer=(None if w.indexer is None
                              else replace(w.indexer, wk=q_pack.rows("indexer_wk"))))
     if not isinstance(w.o_proj, Int8Weight) and w.o_proj.shape[1] % GROUP == 0:
         released += w.o_proj.numel() * w.o_proj.element_size()
-        w = replace(w, o_proj=Int8Weight.quantize(w.o_proj, keep=keep_bf16))
+        w = replace(w, o_proj=Int8Weight.quantize(w.o_proj))
     attention.weights = w
-    return 0 if keep_bf16 else released
+    return released
