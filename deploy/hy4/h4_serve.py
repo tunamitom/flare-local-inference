@@ -1043,7 +1043,9 @@ def main():
             if cmd["op"] == "generate":
                 try:
                     profile_dir = os.environ.get("HY4_TORCH_PROFILE") or ""
+                    min_new = int(os.environ.get("HY4_TORCH_PROFILE_MIN_NEW") or 0)
                     if (profile_dir and len(cmd.get("tokens") or ()) >= 4096
+                            and int(cmd.get("max_new") or 0) >= min_new
                             and not getattr(ctx, "profiled", False)):
                         # consult18 census: CUDA-only kernel trace (CUPTI, no host
                         # activity tracing) of ONE large request on every rank.
