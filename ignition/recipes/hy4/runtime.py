@@ -25,13 +25,26 @@ ALLOWED = {
     "host_trim": ("off", "on"),
     # one multi-flag wait launch per CE exchange instead of one per source
     "batched_waits": ("off", "on"),
+    # per-lane CUDA graphs of the MLP block inside the overlap
+    "graph_moe": ("off", "on"),
+    # the overlap's comm token (one collective in flight per rank) vs per-lane
+    # ordering (each lane's collectives in its own order on its own channels)
+    "comm_token": ("on", "off"),
+    # single-lane forwards (prefill tails / single chunks / decode) without host
+    # reads: host geometry, host-side bounds, deferred selection checks
+    # "decode": one-token steps only (the measured win: +2.3 % at 16k c1; the
+    # host-bound prefill tail is 0.8 % slower sync-free)
+    "sync_free": ("off", "decode", "on"),
 }
 DEFAULTS = {"index_scores": "fp32",
             "ihc": os.environ.get("HY4_IHC") or "default",
             "fused_rope": os.environ.get("HY4_FUSED_ROPE") or "off",
             "fused_merge": os.environ.get("HY4_FUSED_MERGE") or "off",
             "host_trim": os.environ.get("HY4_HOST_TRIM") or "off",
-            "batched_waits": os.environ.get("HY4_BATCHED_WAITS") or "off"}
+            "batched_waits": os.environ.get("HY4_BATCHED_WAITS") or "off",
+            "graph_moe": os.environ.get("HY4_GRAPH_MOE") or "off",
+            "comm_token": os.environ.get("HY4_COMM_TOKEN") or "on",
+            "sync_free": os.environ.get("HY4_SYNC_FREE") or "off"}
 for _key, _value in DEFAULTS.items():
     if _value not in ALLOWED[_key]:
         raise ValueError(f"runtime default {_key}={_value!r} must be one of {ALLOWED[_key]}")

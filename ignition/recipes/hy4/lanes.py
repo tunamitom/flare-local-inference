@@ -15,7 +15,7 @@ import contextvars
 from contextlib import contextmanager
 
 __all__ = ["SECTIONS", "exclusive", "geometry", "lane", "overlapped", "require_exclusive",
-           "use_lane"]
+           "sync_free", "use_lane"]
 
 _LANE = contextvars.ContextVar("hy4_lane", default=0)
 _OVERLAPPED = contextvars.ContextVar("hy4_overlapped", default=False)
@@ -25,6 +25,9 @@ _GEOMETRY = contextvars.ContextVar("hy4_geometry", default=None)
 # The overlapped loop's mutual-exclusion section (the comm token): work that
 # must never share the card with another lane's peer-waiting kernels runs in it.
 _EXCLUSIVE = contextvars.ContextVar("hy4_exclusive", default=None)
+# consult18 P1/P2: a single-lane forward running sync-free (host geometry,
+# deferred selection checks) — the overlap's no-host-read rules without lanes.
+_SYNC_FREE = contextvars.ContextVar("hy4_sync_free", default=False)
 
 
 def lane():
@@ -45,6 +48,11 @@ def geometry():
 _IN_SECTION = contextvars.ContextVar("hy4_in_section", default=False)
 # Exclusive sections entered inside overlapped halves (the serve reports it).
 SECTIONS = [0]
+
+
+def sync_free():
+    """True inside an overlapped half or a sync-free single-lane forward."""
+    return bool(_SYNC_FREE.get()) or bool(_OVERLAPPED.get())
 
 
 @contextmanager
@@ -74,14 +82,16 @@ def require_exclusive(what):
 
 
 @contextmanager
-def use_lane(index, *, overlap=False, geometry=None, exclusive=None):
+def use_lane(index, *, overlap=False, geometry=None, exclusive=None, sync_free=False):
     token = _LANE.set(int(index))
     marker = _OVERLAPPED.set(bool(overlap))
     shape = _GEOMETRY.set(geometry)
     section = _EXCLUSIVE.set(exclusive)
+    free = _SYNC_FREE.set(bool(sync_free))
     try:
         yield
     finally:
+        _SYNC_FREE.reset(free)
         _EXCLUSIVE.reset(section)
         _GEOMETRY.reset(shape)
         _OVERLAPPED.reset(marker)

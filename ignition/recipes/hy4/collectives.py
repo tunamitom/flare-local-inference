@@ -2060,9 +2060,22 @@ class PcieDcpTransport:
         sms = torch.cuda.get_device_properties(self.device).multi_processor_count
         reserve = cooperative_reserve_sms(sms)
         single = env_flag("PCIE_DMA_SINGLE_CTA_WAITS")
-        if reserve >= self.PEER_WAIT_STREAMS and single:
-            return f"reserve {reserve} of {sms} SMs >= {self.PEER_WAIT_STREAMS} single-CTA peer waits"
+        # consult18 P1: with the comm token off each lane keeps one collective in
+        # flight on its own channels, so the resident peer waits are bounded by
+        # PEER_WAIT_STREAMS PER LANE.
+        in_flight = 1 if self._token_active() else max(int(getattr(self, "lanes", 2) or 2), 2)
+        need = self.PEER_WAIT_STREAMS * in_flight
+        if reserve >= need and single:
+            return (f"reserve {reserve} of {sms} SMs >= {need} single-CTA peer waits "
+                    f"({in_flight} collective(s) in flight)")
         return None
+
+    def _token_active(self):
+        """The comm token's state for this call: HY4_OVERLAP_COMM_TOKEN at
+        construction AND the `comm_token` runtime switch (A/B per request)."""
+        from .runtime import SWITCHES
+
+        return self.overlap_comm_token and SWITCHES.get("comm_token", "on") != "off"
 
     # -- consult18 D (fix C): one collective in flight per rank -----------
     # b12x's PCIe runtimes are single ordered channels ("callers must not
@@ -2076,7 +2089,7 @@ class PcieDcpTransport:
     def _comm_token(self):
         from .lanes import overlapped
 
-        if not (self.overlap_comm_token and overlapped() and self.device.type == "cuda"):
+        if not (self._token_active() and overlapped() and self.device.type == "cuda"):
             yield
             return
         stream = torch.cuda.current_stream()
@@ -2322,11 +2335,12 @@ class PcieDcpCollectives:
     def embed_lookup(self, token_ids, embed, *, vocabulary_range):
         first, last = vocabulary_range
         inside = (token_ids >= first) & (token_ids < last)
-        from .lanes import overlapped
+        from .lanes import sync_free
 
-        if overlapped():
+        if sync_free():
             # consult18 D: no host read inside the overlapped loop (the masked
-            # assignment below syncs through nonzero); same values.
+            # assignment below syncs through nonzero); same values. Also the
+            # sync-free single-lane forward (consult18 P1/P2).
             rows = (token_ids - first).clamp(0, int(embed.shape[0]) - 1)
             out = torch.where(inside.reshape(-1, 1), embed[rows.reshape(-1)],
                               embed.new_zeros(()))
@@ -2349,14 +2363,14 @@ class PcieDcpCollectives:
     def merge_topk(self, candidate_scores, candidate_positions, *, topk):
         if self.exchange_mode == "scores-only":
             plan = self._plan("selection_exchange", None)
-            from .lanes import overlapped
+            from .lanes import overlapped, sync_free
 
             values, positions = scores_only_merge(
                 lambda scores: self.transport.exchange_scores(scores, plan=plan),
                 candidate_scores, candidate_positions,
                 topk=topk, world=self.world_size, rank=self.rank,
                 local_offer=self.local_offer or None,
-                deferred=self.deferred_checks if overlapped() else None)
+                deferred=self.deferred_checks if sync_free() else None)
             if self.audit and not overlapped():
                 exact_values, exact_positions = merge_candidate_topk(
                     self.transport.stage_candidates(

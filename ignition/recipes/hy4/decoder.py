@@ -233,6 +233,34 @@ class Hy4Cache:
         # consult18 stage D: one entry per in-flight forward (two halves).
         self._forward_memo[id(tokens)] = (tokens, positions, kept, slots)
 
+    def begin_forward_host(self, tokens, positions, *, row, start):
+        """`begin_forward` for ONE request row at the contiguous positions
+        `[start, start + len(positions))`, with every bounds check and the
+        ownership filter done on host integers (consult18 P1/P2: no device
+        read). Same `(kept, slots)` values as the device path: kept are the
+        token indices `i` with `(start + i) % world == rank`, slots are
+        `row * local_capacity + (start + i) // world`."""
+        width = int(positions.shape[0])
+        if start < 0 or start + width > self.capacity:
+            raise IndexError(f"cache position out of range: a row holds {self.capacity} slots")
+        if not 0 <= int(row) < self.rows:
+            raise IndexError(f"cache row out of range: {self.rows} request rows")
+        last_local = (start + width - 1) // self.world if width else 0
+        if last_local >= self.local_capacity:
+            raise IndexError(
+                f"cache local slot out of range: a row holds {self.local_capacity} local "
+                f"slots (capacity {self.capacity}, world {self.world})")
+        first = (self.rank - start) % self.world
+        # No owned token (decode on a non-owning rank): an empty range, not an
+        # arange whose start passes its end.
+        count = (width - first + self.world - 1) // self.world if first < width else 0
+        kept = (first + self.world * torch.arange(count, device=self.device, dtype=torch.long))
+        local0 = (start + first) // self.world
+        slots = (int(row) * self.local_capacity + local0
+                 + torch.arange(count, device=self.device, dtype=torch.long))
+        self._forward_memo.pop(id(tokens), None)
+        self._forward_memo[id(tokens)] = (tokens, positions, kept, slots)
+
     def end_forward(self):
         self._forward_memo.clear()
 
@@ -588,8 +616,84 @@ class Hy4Decoder:
                 f"tokens={call_shape.tokens}) does not match the forward's "
                 f"{tuple(token_ids.shape)}")
         self.trace.append(("call_shape", call_shape))
+        import os as _os
+
+        if (_os.environ.get("HY4_PLAIN_SYNC_CENSUS") and token_ids.is_cuda
+                and not torch.cuda.is_current_stream_capturing()):
+            # consult18 P1 census: every distinct synchronizing site of a plain
+            # forward (prefill tails / single chunks / decode), printed once.
+            previous = torch.cuda.get_sync_debug_mode()
+            _sync_site_reporter.install(getattr(self.collectives, "rank", 0))
+            torch.cuda.set_sync_debug_mode("warn")
+            try:
+                return self._forward_body(token_ids, request_rows=request_rows, state=state,
+                                          return_hidden=return_hidden, call_shape=call_shape,
+                                          logits_rows=logits_rows)
+            finally:
+                torch.cuda.set_sync_debug_mode(previous)
+                _sync_site_reporter.uninstall()
+        return self._forward_body(token_ids, request_rows=request_rows, state=state,
+                                  return_hidden=return_hidden, call_shape=call_shape,
+                                  logits_rows=logits_rows)
+
+    def _forward_body(self, token_ids, *, request_rows, state, return_hidden, call_shape,
+                      logits_rows):
         TIMER.forward_begin(call_shape.name)   # W29: no-op unless --profile-steps armed
         rows = self._rows(token_ids, request_rows)
+        # consult18 P1/P2: a single-row forward can run sync-free — positions,
+        # bounds, ownership and the indexer geometry from host-known row
+        # lengths; the selection checks deferred to one read at the end.
+        from .runtime import SWITCHES
+
+        on_device = token_ids.is_cuda or getattr(self, "_sync_free_on_cpu", False)  # CPU: tests
+        mode = SWITCHES.get("sync_free")
+        sync_free = (getattr(self, "_sync_free_allowed", True) and on_device
+                     and (mode == "on" or (mode == "decode" and int(token_ids.shape[1]) == 1))
+                     and int(token_ids.shape[0]) == 1
+                     and (request_rows is None or len(request_rows) == 1)
+                     and not (token_ids.is_cuda and torch.cuda.is_current_stream_capturing()))
+        if sync_free:
+            row_id = 0 if request_rows is None else int(request_rows[0])
+            start = int(self._row_lengths.get(row_id, 0))
+            width = int(token_ids.shape[1])
+            positions = torch.arange(start, start + width, device=self.device, dtype=torch.long)
+            token_rows = self._token_rows(token_ids.shape, rows)
+            visible = positions + 1
+            self.cache.begin_forward_host(token_rows, positions, row=row_id, start=start)
+            visible_max = (start + width
+                           if self.collectives.world_size > 1 and call_shape.short_context_bypass
+                           and call_shape.is_decode_graph else None)
+            world = int(getattr(self.collectives, "world_size", 1))
+            rank = int(getattr(self.collectives, "rank", 0))
+            end = start + width
+            geometry = {"owned_max": (max(end - rank, 0) + world - 1) // world,
+                        "base": row_id * int(getattr(self.cache, "local_capacity", 0))}
+            deferred = getattr(self.collectives, "deferred_checks", None)
+            if deferred is not None:
+                deferred.clear()
+            from .lanes import use_lane
+
+            with use_lane(0, overlap=False, geometry=geometry, sync_free=True):
+                result = self._layers_and_head(
+                    token_ids, rows, positions, token_rows, visible, visible_max, state=state,
+                    return_hidden=return_hidden, call_shape=call_shape, logits_rows=logits_rows)
+            flags = list(deferred) if deferred else []
+            if deferred is not None:
+                deferred.clear()
+            if flags and bool(torch.stack([f.reshape(()) for f in flags]).any()):
+                # A narrow scores-only cut needed the full re-offer (or the
+                # exactness test fired): redo the forward on the exact path
+                # (same rows, same slots; it rewrites this forward's records).
+                self.sync_free_reruns = getattr(self, "sync_free_reruns", 0) + 1
+                self._sync_free_allowed = False
+                try:
+                    return self._forward_body(token_ids, request_rows=request_rows, state=state,
+                                              return_hidden=return_hidden, call_shape=call_shape,
+                                              logits_rows=logits_rows)
+                finally:
+                    self._sync_free_allowed = True
+            self.sync_free_forwards = getattr(self, "sync_free_forwards", 0) + 1
+            return result
         positions = self._positions(token_ids.shape, rows)
         token_rows = self._token_rows(token_ids.shape, rows)
         visible = positions + 1  # each query's causal cache length
@@ -600,6 +704,12 @@ class Hy4Decoder:
         visible_max = (int(visible.max())
                        if self.collectives.world_size > 1 and call_shape.short_context_bypass
                        and call_shape.is_decode_graph else None)
+        return self._layers_and_head(token_ids, rows, positions, token_rows, visible, visible_max,
+                                     state=state, return_hidden=return_hidden,
+                                     call_shape=call_shape, logits_rows=logits_rows)
+
+    def _layers_and_head(self, token_ids, rows, positions, token_rows, visible, visible_max, *,
+                         state, return_hidden, call_shape, logits_rows):
         # Vocabulary-sharded embedding (D5): masked lookup over this rank's
         # shard + all-reduce (identity at world 1).
         WATCH.begin_forward(call_shape.name, positions)   # consult17: no-op unless armed
@@ -759,7 +869,7 @@ class Hy4Decoder:
                     attn_out, streams.streams, post, layer.ffn_ihc,
                     norm_weight=layer.post_attention_norm)
             PROBE.add("y_ffn_in", index, y)
-            mlp_out = layer.mlp.forward(y, overlap_shared=call_shape.overlap_shared_expert)
+            mlp_out = self._mlp_forward(layer, index, y, call_shape)
             PROBE.add("moe", index, mlp_out)
             with TIMER.phase("comm.all_reduce.mlp"):
                 mlp_out = self.collectives.all_reduce(mlp_out)
@@ -771,6 +881,60 @@ class Hy4Decoder:
             hidden = self.weights.hc_head.merge(streams.streams)
             normed = rms_norm(hidden, self.weights.norm, self.config.text["rms_norm_eps"])
         return normed
+
+    # -- consult18 P1: per-lane CUDA graphs of the MLP block -----------------
+    # The overlapped prefill is host-bound; the MLP block (router, shared
+    # expert, prepared routed experts) is ~18 % of the host time, has fixed
+    # shapes at the lane's row count and reads nothing on the host. Each lane's
+    # layer gets one graph, captured outside the overlap (capture_mlp_graphs),
+    # replayed inside it when the `graph_moe` switch is on. Per lane one graph
+    # pool and one static input/output pair (the lane's graphs run in order on
+    # the lane's stream), so the memory is one layer's temporaries.
+    def _mlp_forward(self, layer, index, y, call_shape):
+        graphs = getattr(self, "_mlp_graphs", None)
+        if graphs and y.is_cuda:
+            from .lanes import lane, overlapped
+            from .runtime import SWITCHES
+
+            if SWITCHES.get("graph_moe") == "on" and overlapped():
+                entry = graphs.get((lane(), index))
+                if entry is not None and int(y.shape[0]) == entry[3]:
+                    graph, static_in, static_out, _ = entry
+                    static_in.copy_(y)
+                    graph.replay()
+                    return static_out
+        return layer.mlp.forward(y, overlap_shared=call_shape.overlap_shared_expert)
+
+    def capture_mlp_graphs(self, rows):
+        """Capture every layer's MLP block per lane at `rows` (call after the
+        warm overlapped pair: the lane streams and plans exist). Returns the
+        number of graphs."""
+        import torch
+
+        from .lanes import use_lane
+
+        streams = getattr(self, "_lane_streams", None)
+        if streams is None:
+            raise RuntimeError("capture_mlp_graphs needs the lane streams (run an overlapped pair first)")
+        hidden = self.config.hidden
+        graphs = {}
+        torch.cuda.synchronize(self.device)
+        for lane_index, stream in enumerate(streams[:getattr(self, "lanes", 1)]):
+            pool = torch.cuda.graph_pool_handle()
+            static_in = torch.zeros((rows, hidden), dtype=self.compute_dtype, device=self.device)
+            static_out = torch.empty_like(static_in)
+            with use_lane(lane_index, overlap=False):
+                for index, layer in enumerate(self.weights.layers):
+                    shape = self.default_call_shape((1, rows))
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph, pool=pool, stream=stream):
+                        out = layer.mlp.forward(static_in,
+                                                overlap_shared=shape.overlap_shared_expert)
+                        static_out.copy_(out)
+                    graphs[(lane_index, index)] = (graph, static_in, static_out, rows)
+        torch.cuda.synchronize(self.device)
+        self._mlp_graphs = graphs
+        return len(graphs)
 
     def forward_overlapped(self, token_ids, *, half_shape, logits_rows="none"):
         """consult18 stage D: one prefill chunk as two halves on two lanes.

@@ -69,3 +69,37 @@ def _check_switches(runtime, path):
         runtime.load(str(path))
     path.unlink()
     assert runtime.load(str(path))["index_scores"] == "fp32"
+
+
+def test_begin_forward_host_matches_the_device_path():
+    """consult18 P1/P2: host-side bounds/ownership give the device path's
+    `(kept, slots)` for every rank, start and width — decode (width 1) on a
+    rank that does not own the token included (kept is empty there)."""
+    from ignition.recipes.hy4.decoder import Hy4Cache
+
+    class Cache:
+        owner = Hy4Cache.owner
+        local = Hy4Cache.local
+        slots_for = Hy4Cache.slots_for
+        _slots = Hy4Cache._slots
+        _owned_slots = Hy4Cache._owned_slots
+        begin_forward_host = Hy4Cache.begin_forward_host
+
+        def __init__(self, rank, world=8, capacity=4096, rows=2):
+            self.rank, self.world, self.capacity, self.rows = rank, world, capacity, rows
+            self.local_capacity = capacity // world
+            self.device = torch.device("cpu")
+            self._forward_memo = {}
+
+    for rank in range(8):
+        for row in (0, 1):
+            for start, width in ((0, 1), (5, 1), (7, 1), (1000, 1), (8, 64), (13, 57), (100, 1024),
+                                 (4000, 96)):
+                cache = Cache(rank)
+                tokens = torch.full((width,), row, dtype=torch.long)
+                positions = torch.arange(start, start + width, dtype=torch.long)
+                want_kept, want_slots = cache._owned_slots(tokens, positions)
+                cache.begin_forward_host(tokens, positions, row=row, start=start)
+                got_kept, got_slots = cache._owned_slots(tokens, positions)
+                assert torch.equal(got_kept, want_kept), (rank, row, start, width)
+                assert torch.equal(got_slots, want_slots), (rank, row, start, width)

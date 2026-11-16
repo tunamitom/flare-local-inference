@@ -315,3 +315,43 @@ def test_exclusive_section_wraps_cooperative_launch():
     assert entered == ["in", "out"]
     assert lanes.SECTIONS[0] == before + 1
     lanes.require_exclusive("after the lane")        # section factory reset
+
+
+@pytest.mark.parametrize("world", (1, 2, 8))
+def test_sync_free_single_lane_forward_is_bit_identical(worlds, world):
+    """consult18 P1/P2: the sync-free single-row forward (host positions,
+    bounds, ownership and indexer geometry; deferred selection checks) gives
+    the same bits as the device-reading forward — two prefill halves and three
+    decode steps, every rank."""
+    from ignition.recipes.hy4 import runtime
+    from ignition.recipes.hy4.collectives import SimulatedGroup
+
+    def scenario(free):
+        def body(decoder):
+            decoder._sync_free_on_cpu = True
+            runtime.SWITCHES["sync_free"] = "on" if free else "off"
+            try:
+                _, tokens = golden_tokens()
+                batch = torch.tensor([tokens[:2 * HALF]], dtype=torch.long)
+                out = [decoder.forward(batch[:, :HALF], logits_rows="all")]
+                decoder.append([0], HALF)
+                out.append(decoder.forward(batch[:, HALF:], logits_rows="all"))
+                decoder.append([0], HALF)
+                for token in (7, 11, 3):
+                    out.append(decoder.decode_step(torch.tensor([[token]], dtype=torch.long)))
+                    decoder.append([0], 1)
+                ran = getattr(decoder, "sync_free_forwards", 0)
+                assert ran == (5 if free else 0), f"sync-free forwards {ran}"
+                return out
+            finally:
+                runtime.SWITCHES["sync_free"] = runtime.DEFAULTS["sync_free"]
+        return body
+
+    def run(free):
+        if world == 1:
+            return [scenario(free)(decoder) for decoder in fresh_decoders(worlds[1])]
+        return run_wired(worlds[world], scenario(free), group=SimulatedGroup(world))
+
+    for exact, free in zip(run(False), run(True)):
+        for want, got in zip(exact, free):
+            assert torch.equal(got, want), f"world {world}: rel {rel_error(got, want)}"
