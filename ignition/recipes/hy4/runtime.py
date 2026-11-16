@@ -58,6 +58,9 @@ ALLOWED = {
     "prefill_graph": ("off", "on"),
     # consult18 P3 timing probe (garbage results): CE gather/LSE at half bytes
     "wire_probe": ("off", "ce_half"),
+    # consult18 P3 (numerics class): the CE head gather / LSE partials over an
+    # INT8 wire (one FP32 scale per row-head vector)
+    "wire": ("bf16", "int8"),
 }
 DEFAULTS = {"index_scores": "fp32",
             "ihc": os.environ.get("HY4_IHC") or "default",
@@ -75,7 +78,8 @@ DEFAULTS = {"index_scores": "fp32",
             "route_fused": os.environ.get("HY4_ROUTE_FUSED") or "off",
             "moe_decode_op": os.environ.get("HY4_MOE_DECODE") or "off",
             "prefill_graph": os.environ.get("HY4_PREFILL_GRAPH") or "off",
-            "wire_probe": "off"}
+            "wire_probe": "off",
+            "wire": os.environ.get("HY4_WIRE") or "bf16"}
 for _key, _value in DEFAULTS.items():
     if _value not in ALLOWED[_key]:
         raise ValueError(f"runtime default {_key}={_value!r} must be one of {ALLOWED[_key]}")

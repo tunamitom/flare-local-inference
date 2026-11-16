@@ -986,9 +986,101 @@ class CeExchange:
     def _lse_offset(self, bank, half, source):
         return self.lse_base + ((bank * 2 + half) * self.world + source) * self.lse_slot
 
+    def _lse_relay_int8(self, partials, lses):
+        """consult18 P3 (numerics class): the LSE reduce-scatter relay over an
+        INT8 wire (one FP32 scale per (head, row) vector of the partials; the
+        LSEs stay FP32; this rank's own partials stay exact)."""
+        from .fused_ops import dequant_rows_int8, quant_rows_int8
+
+        rows, heads, width = (int(v) for v in partials.shape)
+        head_major = partials.permute(1, 0, 2)
+        if not head_major.is_contiguous():
+            head_major = head_major.contiguous()
+        lse_major = lses.float().t().contiguous()
+        hpr, me = self.hpr, self.rank
+        n = hpr * rows
+        soff = self._align(n * width)
+        lse_bytes = n * 4
+        q_all = torch.empty((heads * rows, width), dtype=torch.int8, device=self.device)
+        s_all = torch.empty((heads * rows,), dtype=torch.float32, device=self.device)
+        quant_rows_int8(head_major.view(heads * rows, width), q_all, s_all)
+
+        def block(owner, offset):
+            first = owner * n
+            return ((offset, q_all[first].data_ptr(), n * width),
+                    (offset + soff, s_all[first:].data_ptr(), n * 4),
+                    (offset + self.lse_part, lse_major[owner * hpr].data_ptr(), lse_bytes))
+
+        def views(bank, half):
+            first = self.lse_base + (bank * 2 + half) * self.world * self.lse_slot
+            slots = self._memory[first:first + self.world * self.lse_slot] \
+                .view(self.world, self.lse_slot)
+            q = slots[:, :n * width].view(torch.int8).view(self.world, n, width)
+            sc = slots[:, soff:soff + n * 4].view(torch.float32).view(self.world, n)
+            ls = slots[:, self.lse_part:self.lse_part + lse_bytes].view(torch.float32) \
+                .view(self.world, hpr, rows)
+            return q, sc, ls
+
+        bank = self._bank("lse")
+        self._start()
+        partner = self.partner
+        if partner is None:
+            raise RuntimeError("the LSE relay needs two islands")
+        for dest in self.local:
+            other = relay_partner(dest, self.world, len(self.local) + 1)
+            copies = (*block(dest, self._lse_offset(bank, 0, me)),
+                      *block(other, self._lse_offset(bank, 1, me)))
+            self._send_block(self._local_stream, dest, copies, (me,), "lse", ("lse1", dest))
+        q0, s0, l0 = views(bank, 0)
+        q1, s1, l1 = views(bank, 1)
+        own = slice(me * hpr, (me + 1) * hpr)
+        partner_heads = slice(partner * hpr, (partner + 1) * hpr)
+        l0[me].copy_(lse_major[own])
+        l1[me].copy_(lse_major[partner_heads])
+        self._await_all("lse", self.local)
+        sources = sorted((me, *self.local))
+        mine4_in = torch.empty((len(sources), hpr, rows, width), dtype=partials.dtype,
+                               device=self.device)
+        theirs4_in = torch.empty_like(mine4_in)
+        for k, src in enumerate(sources):
+            if src == me:
+                mine4_in[k].copy_(head_major[own])
+                theirs4_in[k].copy_(head_major[partner_heads])
+            else:
+                dequant_rows_int8(q0[src], s0[src], mine4_in[k].view(n, width))
+                dequant_rows_int8(q1[src], s1[src], theirs4_in[k].view(n, width))
+        switch = self._switch_index
+        mine4, mine4_lse = _merge_head_major(mine4_in, l0.index_select(0, switch))
+        out4, out4_lse = _merge_head_major(theirs4_in, l1.index_select(0, switch))
+        # Phase 2, across the link: the merged block for the partner's heads, INT8.
+        q4 = torch.empty((n, width), dtype=torch.int8, device=self.device)
+        s4 = torch.empty((n,), dtype=torch.float32, device=self.device)
+        quant_rows_int8(out4.to(torch.bfloat16).contiguous().view(n, width), q4, s4)
+        out4_lse = out4_lse.contiguous()
+        main = torch.cuda.current_stream()
+        merged = self._event("lse-merged")
+        merged.record(main)
+        self._cross_stream.wait_event(merged)
+        base = self._lse_offset(bank, 0, me)
+        self._send_block(self._cross_stream, partner,
+                         ((base, q4.data_ptr(), n * width), (base + soff, s4.data_ptr(), n * 4),
+                          (base + self.lse_part, out4_lse.data_ptr(), lse_bytes)),
+                         (me,), "lse", ("lse2", partner))
+        self._await("lse", partner)
+        theirs_partner = torch.empty((n, width), dtype=partials.dtype, device=self.device)
+        dequant_rows_int8(q0[partner], s0[partner], theirs_partner)
+        both = torch.stack((mine4, theirs_partner.view(hpr, rows, width).float()))
+        both_lse = torch.stack((mine4_lse, l0[partner]))
+        out, lse = _merge_head_major(both, both_lse)
+        result = out.to(partials.dtype).permute(1, 0, 2).contiguous(), lse.t().contiguous()
+        self._drain()
+        return result
+
     def lse_reduce_scatter(self, partials, lses, *, relay=False):
         """`[rows, heads, width]` partials + `[rows, heads]` base-2 LSE over
         ALL heads -> this rank's merged head shard `(out, lse)`."""
+        if relay and self._wire_int8():
+            return self._lse_relay_int8(partials, lses)
         rows, heads, width = (int(v) for v in partials.shape)
         head_major = partials.permute(1, 0, 2)
         if not head_major.is_contiguous():
@@ -1095,8 +1187,74 @@ class CeExchange:
         return tuple(received[origin] for origin in range(self.world))
 
     # -- head all-gather --------------------------------------------------
+    @staticmethod
+    def _wire_int8():
+        from .runtime import SWITCHES
+
+        return SWITCHES.get("wire") == "int8"
+
+    @staticmethod
+    def _align(n):
+        return (int(n) + 255) // 256 * 256
+
+    def _all_gather_heads_int8(self, local, *, relay):
+        """consult18 P3 (numerics class): the head gather over an INT8 wire —
+        one FP32 scale per (row, head) vector; every rank (this one included)
+        attends with the same dequantized queries."""
+        from .fused_ops import dequant_rows_int8, quant_rows_int8
+
+        rows, hpr, width = (int(v) for v in local.shape)
+        n = rows * hpr
+        soff = self._align(n * width)
+        nbytes = soff + n * 4
+        me = self.rank
+        bank = self._bank("gather")
+
+        def offset(origin):
+            return self.gather_base + (bank * self.world + origin) * self.gather_slot
+
+        staging = torch.empty(nbytes, dtype=torch.uint8, device=self.device)
+        q_own = staging[:n * width].view(torch.int8).view(n, width)
+        s_own = staging[soff:soff + n * 4].view(torch.float32)
+        quant_rows_int8(local.contiguous().view(n, width), q_own, s_own)
+        self._start()
+        own = ((offset(me), staging.data_ptr(), nbytes),)
+        if not relay:
+            for dest in (*self.cross, *self.local):
+                stream = self._cross_stream if dest in self.cross else self._local_stream
+                self._send_block(stream, dest, own, (me,), "gather", ("gather", dest))
+        else:
+            partner = self.partner
+            if partner is None:
+                raise RuntimeError("the gather relay needs two islands")
+            self._send_block(self._cross_stream, partner, own, (me,), "gather", ("g-x", partner))
+            for dest in self.local:
+                self._send_block(self._local_stream, dest, own, (me,), "gather", ("g-own", dest))
+            with torch.cuda.stream(self._local_stream):
+                self._await("gather", partner, relay=True)
+            forward = ((offset(partner), self.ptrs[me] + offset(partner), nbytes),)
+            for dest in self.local:
+                self._send_block(self._local_stream, dest, forward, (partner,), "gather",
+                                 ("g-fwd", dest))
+        slots = self._memory[offset(0):offset(0) + self.world * self.gather_slot] \
+            .view(self.world, self.gather_slot)
+        out = torch.empty((self.world, n, width), dtype=torch.bfloat16, device=self.device)
+        dequant_rows_int8(q_own, s_own, out[me])
+        self._await_all("gather", (*self.cross, *self.local))
+        for origin in range(self.world):
+            if origin == me:
+                continue
+            dequant_rows_int8(slots[origin, :n * width].view(torch.int8).view(n, width),
+                              slots[origin, soff:soff + n * 4].view(torch.float32), out[origin])
+        gathered = out.view(self.world, rows, hpr, width).permute(1, 0, 2, 3) \
+            .reshape(rows, self.world * hpr, width)
+        self._drain()
+        return gathered
+
     def all_gather_heads(self, local, *, relay=False):
         """`[rows, heads // world, width]` -> `[rows, heads, width]` (rank-major)."""
+        if self._wire_int8():
+            return self._all_gather_heads_int8(local, relay=relay)
         rows, hpr, width = (int(v) for v in local.shape)
         source = local.contiguous()
         nbytes = rows * hpr * width * 2

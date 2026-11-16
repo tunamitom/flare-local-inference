@@ -20,7 +20,7 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-__all__ = ["ihc_post_pre_split", "moe_route", "scores_only_select", "merge_head_major", "rms_norm", "rope_interleaved"]
+__all__ = ["dequant_rows_int8", "ihc_post_pre_split", "quant_rows_int8", "moe_route", "scores_only_select", "merge_head_major", "rms_norm", "rope_interleaved"]
 
 _INV_FREQ = {}
 
@@ -505,3 +505,50 @@ def moe_route(logits, bias, *, top_k, scale, norm):
                                num_warps=4)
     return w, ids
 
+
+
+# --------------------------------------------------------------------------
+# consult18 P3 (numerics class): INT8 wire for the CE head gather / LSE
+# partials — symmetric INT8 per row (one FP32 scale per `width` values).
+# --------------------------------------------------------------------------
+@triton.jit
+def _quant_rows_int8_kernel(x_ptr, q_ptr, s_ptr, N, W, BLOCK_W: tl.constexpr, ROWS: tl.constexpr):
+    r = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
+    c = tl.arange(0, BLOCK_W)
+    mask = (r[:, None] < N) & (c[None, :] < W)
+    x = tl.load(x_ptr + r[:, None].to(tl.int64) * W + c[None, :], mask=mask, other=0.0).to(tl.float32)
+    amax = tl.max(tl.abs(x), axis=1)
+    scale = tl.where(amax > 0, amax / 127.0, 1.0)
+    q = libdevice.rint(x / scale[:, None])
+    q = tl.minimum(tl.maximum(q, -127.0), 127.0)
+    tl.store(q_ptr + r[:, None].to(tl.int64) * W + c[None, :], q.to(tl.int8), mask=mask)
+    tl.store(s_ptr + r, scale, mask=r < N)
+
+
+@triton.jit
+def _dequant_rows_int8_kernel(q_ptr, s_ptr, out_ptr, N, W, BLOCK_W: tl.constexpr, ROWS: tl.constexpr):
+    r = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
+    c = tl.arange(0, BLOCK_W)
+    mask = (r[:, None] < N) & (c[None, :] < W)
+    q = tl.load(q_ptr + r[:, None].to(tl.int64) * W + c[None, :], mask=mask, other=0).to(tl.float32)
+    s = tl.load(s_ptr + r, mask=r < N, other=0.0)
+    tl.store(out_ptr + r[:, None].to(tl.int64) * W + c[None, :], (q * s[:, None]).to(tl.bfloat16),
+             mask=mask)
+
+
+def quant_rows_int8(x, q_out, s_out):
+    """`x` [N, W] (contiguous) -> `q_out` int8 [N, W], `s_out` FP32 [N] (amax / 127)."""
+    n, w = (int(v) for v in x.shape)
+    rows = max(1, 4096 // triton.next_power_of_2(w))
+    _quant_rows_int8_kernel[(triton.cdiv(n, rows),)](x, q_out, s_out, n, w,
+                                                     BLOCK_W=triton.next_power_of_2(w), ROWS=rows,
+                                                     num_warps=4)
+
+
+def dequant_rows_int8(q, s, out):
+    """int8 [N, W] x FP32 [N] -> BF16 `out` [N, W]."""
+    n, w = (int(v) for v in q.shape)
+    rows = max(1, 4096 // triton.next_power_of_2(w))
+    _dequant_rows_int8_kernel[(triton.cdiv(n, rows),)](q, s, out, n, w,
+                                                       BLOCK_W=triton.next_power_of_2(w), ROWS=rows,
+                                                       num_warps=4)
