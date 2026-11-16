@@ -853,8 +853,13 @@ class Hy4Decoder:
             # decode step returns the local shard (the gather runs on host).
             if gather:
                 with TIMER.phase("comm.logits_gather"):
+                    # consult18: the NLL probe's all-row logits go to rank 0's
+                    # host only (a 2,048-row chunk's full-vocabulary FP32 logits
+                    # are ~1 GB; all-gathered on every device they OOM).
+                    root = ({"root_host": True} if getattr(self, "logits_root_host", False)
+                            else {})
                     logits = self.collectives.gather_logits(
-                        logits, vocabulary_range=self.weights.sharding.vocabulary_range)
+                        logits, vocabulary_range=self.weights.sharding.vocabulary_range, **root)
                 WATCH.check("comm.logits_gather", len(self.weights.layers), zero=True,
                             logits=logits)
         TIMER.forward_end()
