@@ -26,8 +26,8 @@ set -euo pipefail
 NAME="${NAME:-h4}"
 PORT="${LLM_PORT:-8001}"
 TP=8
-IMAGE="${IMAGE:-local/flare:rt-h4-cp8-dg5}"
-IMAGE_SHA="${IMAGE_SHA:-sha256:79af23f224f36cfce9a74ab9a9fdad1f5d431dea7fe0024ebf88575b97b54309}"
+IMAGE="${IMAGE:-local/flare:rt-h4-cp8-dg6}"
+IMAGE_SHA="${IMAGE_SHA:-sha256:5b9c83c54e60df6af5ca07bc464ae716c879644eb6a73a3714609910eed38bcc}"
 PKG_LINK="${PKG_DIR:-/opt/models/Hy4-nvfp4-w4a16-mse-gpu}"
 SERVED_NAME="${SERVED_NAME:-smart}"
 MAX_CONCURRENCY="${MAX_CONCURRENCY:-1}"
@@ -191,7 +191,7 @@ docker run -d --name "$NAME" --network host --init --cap-add SYS_PTRACE \
   -e HY4_LANE_AUDIT_EVERY="${HY4_LANE_AUDIT_EVERY:-}" \
   -e HY4_HANGWATCH_S="${HY4_HANGWATCH_S:-}" \
   -e HY4_TRACE="${HY4_TRACE:-}" \
-  -e HY4_AB_FILE="${HY4_AB_FILE:-}" \
+  -e HY4_AB_FILE="${HY4_AB_FILE:-/state/hy4-ab.json}" \
   -e HY4_IHC="${HY4_IHC:-tuned}" \
   -e HY4_FUSED_ROPE="${HY4_FUSED_ROPE:-on}" \
   -e HY4_FUSED_MERGE="${HY4_FUSED_MERGE:-on}" \
@@ -203,6 +203,8 @@ docker run -d --name "$NAME" --network host --init --cap-add SYS_PTRACE \
   -e HY4_SYNC_FREE="${HY4_SYNC_FREE:-decode}" \
   -e HY4_DECODE_GRAPH="${HY4_DECODE_GRAPH:-on}" \
   -e HY4_IHC_SPLIT="${HY4_IHC_SPLIT:-on}" \
+  -e HY4_SEL_FUSED="${HY4_SEL_FUSED:-on}" \
+  -e HY4_ROOT_LOGITS="${HY4_ROOT_LOGITS:-on}" \
   -e HY4_DECODE_GRAPH_PREWARM="${HY4_DECODE_GRAPH_PREWARM:-}" \
   -e HY4_DEV_EXEC="${HY4_DEV_EXEC:-1}" \
   -e HY4_TORCH_PROFILE="${HY4_TORCH_PROFILE:-}" \
