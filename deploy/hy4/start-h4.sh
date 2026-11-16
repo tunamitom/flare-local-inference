@@ -26,8 +26,8 @@ set -euo pipefail
 NAME="${NAME:-h4}"
 PORT="${LLM_PORT:-8001}"
 TP=8
-IMAGE="${IMAGE:-local/flare:rt-h4-cp8-dg21}"
-IMAGE_SHA="${IMAGE_SHA:-sha256:59af68f52a24de62c9a62daebf7bbd7eebc4157035525f8440f749776a812ce8}"
+IMAGE="${IMAGE:-local/flare:rt-h4-cp8-dg22}"
+IMAGE_SHA="${IMAGE_SHA:-sha256:522df99fdd62da6c916bfb786d94387dbe5649ac978d54b3f35314e47abdded0}"
 PKG_LINK="${PKG_DIR:-/opt/models/Hy4-nvfp4-w4a16-mse-gpu}"
 SERVED_NAME="${SERVED_NAME:-smart}"
 MAX_CONCURRENCY="${MAX_CONCURRENCY:-1}"
@@ -209,6 +209,7 @@ docker run -d --name "$NAME" --network host --init --cap-add SYS_PTRACE \
   -e HY4_MOE_DECODE="${HY4_MOE_DECODE:-on}" \
   -e HY4_PREFILL_GRAPH="${HY4_PREFILL_GRAPH:-on}" \
   -e HY4_WIRE="${HY4_WIRE:-int8}" \
+  -e HY4_AB_MLP_GRAPHS="${HY4_AB_MLP_GRAPHS:-1}" \
   -e HY4_DECODE_AUTOTUNE="${HY4_DECODE_AUTOTUNE:-0}" \
   -e HY4_MOE_DECODE_OP="${HY4_MOE_DECODE_OP:-1}" \
   -e HY4_MOE_DECODE_ENV="${HY4_MOE_DECODE_ENV:-}" \
