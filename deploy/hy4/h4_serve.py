@@ -967,6 +967,11 @@ def main():
                     # consult18 P7: decode-family head reads a BF16 copy (the
                     # checkpoint's values; the FP32 head is their upcast)
                     built.decoder._head_bf16 = built.weights.head.to(torch.bfloat16)
+                    if os.environ.get("HY4_HEAD_FP32_DROP") == "1":
+                        # consult18 P9: every head call reads the BF16 copy (FP32 out);
+                        # the FP32 upcast (354 MB/rank) is released
+                        from ignition.recipes.hy4.w8 import Bf16HeadView
+                        built.weights.head = Bf16HeadView(built.decoder._head_bf16)
                 torch.cuda.empty_cache()
                 trace(rank, f"w8: attention pack + o_proj INT8 for <= 16-row calls"
                             f"{' (BF16 kept for prefill)' if keep else ''}, {released / 2**30:.2f} GB BF16 released")

@@ -26,8 +26,8 @@ set -euo pipefail
 NAME="${NAME:-h4}"
 PORT="${LLM_PORT:-8001}"
 TP=8
-IMAGE="${IMAGE:-local/flare:rt-h4-cp8-dg40}"
-IMAGE_SHA="${IMAGE_SHA:-sha256:fc1220e192004b388ac02e9132e4416f46027bc072d2de73c2afb35f5ff75378}"
+IMAGE="${IMAGE:-local/flare:rt-h4-cp8-dg48}"
+IMAGE_SHA="${IMAGE_SHA:-sha256:ff5c88204572d2333fbdc1f46837221c10d107bdf8b366a3c240100ab782f8b6}"
 PKG_LINK="${PKG_DIR:-/opt/models/Hy4-nvfp4-w4a16-mse-gpu}"
 SERVED_NAME="${SERVED_NAME:-smart}"
 MAX_CONCURRENCY="${MAX_CONCURRENCY:-1}"
@@ -217,8 +217,13 @@ docker run -d --name "$NAME" --network host --init --cap-add SYS_PTRACE \
   -e HY4_W8="${HY4_W8:-1}" \
   -e HY4_HEAD_BF16="${HY4_HEAD_BF16:-1}" \
   -e HY4_SPEC_FILTER="${HY4_SPEC_FILTER:-on}" \
+  -e HY4_ABSORB_OUT="${HY4_ABSORB_OUT:-direct}" \
+  -e HY4_IHC_ROWS="${HY4_IHC_ROWS:-8}" \
+  -e HY4_ROUTER_MM="${HY4_ROUTER_MM:-bf16}" \
+  -e HY4_HEAD_FP32_DROP="${HY4_HEAD_FP32_DROP:-1}" \
+  -e HY4_ABSORB_ROWS="${HY4_ABSORB_ROWS:-1024}" \
   -e HY4_GPU_SAMPLER="${HY4_GPU_SAMPLER:-1}" \
-  -e HY4_AB_MLP_GRAPHS="${HY4_AB_MLP_GRAPHS:-1}" \
+  -e HY4_AB_MLP_GRAPHS="${HY4_AB_MLP_GRAPHS:-}" \
   -e HY4_DECODE_AUTOTUNE="${HY4_DECODE_AUTOTUNE:-0}" \
   -e HY4_MOE_DECODE_OP="${HY4_MOE_DECODE_OP:-1,4}" \
   -e HY4_MOE_DECODE_ENV="${HY4_MOE_DECODE_ENV:-}" \
@@ -257,7 +262,7 @@ docker run -d --name "$NAME" --network host --init --cap-add SYS_PTRACE \
       --lse-transport ce-relay --gather-transport ce-relay \
       --selection-wire dcp \
       --partial-wire expanded \
-      --overlap 1 --profile-phases 0 --chunk "${H4_CHUNK:-1024}" --dma-replay "${H4_DMA_REPLAY:-1}" \
+      --overlap 1 --profile-phases 0 --chunk "${H4_CHUNK:-2048}" --dma-replay "${H4_DMA_REPLAY:-1}" \
       --profile-steps 64
 # Keep the container log (lost with the container otherwise). Background only
 # the follower: backgrounding the whole list forks a subshell that keeps the
