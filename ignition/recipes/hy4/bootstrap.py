@@ -217,10 +217,34 @@ class PreparedHy4Rank:
                 shared_plans[key] = ihc.plan(caps, invocation=invocation)
             return shared_plans[key]
 
+        # consult18 (tuned plans): prefill-row plans with the best configs of
+        # iHC's own tuning space at the 1,024-row chunk (harness/ihc_sweep.py:
+        # post_pre 0.157 -> 0.099 ms, pre 0.131 -> 0.075 ms vs IHC_TUNING[6144]);
+        # decode keeps the default plans (no gain at one row).
+        from b12x.norm.mhc._ihc_tuning import IhcConfig
+
+        hidden = self.model_config.hidden
+        tuned_configs = {
+            "post_pre": IhcConfig(hidden_size=hidden, block_k=1024, block_d=512, num_warps=2),
+            "pre": IhcConfig(hidden_size=hidden, block_k=512, block_d=512, num_warps=1),
+        }
+        prefill_caps = ihc.Caps(device=self.device, max_tokens=self.settings.prefill_chunk_size,
+                                hidden_size=hidden)
+        tuned_plans = {}
+
+        def tuned_for(operation, boundary):
+            key = (operation, boundary.magnitude, boundary.hc_eps, boundary.norm_eps)
+            if key not in tuned_plans:
+                tuned_plans[key] = ihc.plan(prefill_caps, invocation=plan_for(operation, boundary).invocation,
+                                            override=tuned_configs[operation])
+            return tuned_plans[key]
+
         for layer in self.weights.layers:
             for boundary in (layer.attn_ihc, layer.ffn_ihc):
                 boundary.plan = plan_for("post_pre", boundary)
                 boundary.pre_plan = plan_for("pre", boundary)
+                boundary.prefill_plan = tuned_for("post_pre", boundary)
+                boundary.prefill_pre_plan = tuned_for("pre", boundary)
         for layer_id, cell in self.selections.items():
             if cell.kind == "full":
                 # `physical_caps` pins `topk`/`max_q_rows`/`output_index_space`

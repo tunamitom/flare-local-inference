@@ -45,10 +45,13 @@ def test_runtime_ab_switches(tmp_path):
     from ignition.recipes.hy4 import runtime
 
     path = tmp_path / "ab.json"
-    assert runtime.load(str(path)) == {"index_scores": "fp32"}      # no file: defaults
+    assert runtime.load(str(path)) == runtime.DEFAULTS              # no file: defaults
+    assert runtime.DEFAULTS["index_scores"] == "fp32"
     path.write_text(json.dumps({"index_scores": "bf16"}))
     assert runtime.load(str(path))["index_scores"] == "bf16"
     assert runtime.SWITCHES["index_scores"] == "bf16"
+    path.write_text(json.dumps({"index_scores": "bf16", "ihc": "tuned"}))
+    assert runtime.load(str(path)) == {"index_scores": "bf16", "ihc": "tuned"}
     path.write_text(json.dumps({"index_scores": "fp16"}))
     with pytest.raises(ValueError):
         runtime.load(str(path))

@@ -12,8 +12,15 @@ import os
 
 ALLOWED = {
     "index_scores": ("fp32", "bf16"),
+    # consult18 layer-wise tuned plans: the iHC boundary plans at prefill row
+    # counts — "default" (IHC_TUNING[6144]) or "tuned" (the measured best of
+    # iHC's own tuning space at 1,024 rows; decode always keeps the default).
+    "ihc": ("default", "tuned"),
 }
-DEFAULTS = {"index_scores": "fp32"}
+DEFAULTS = {"index_scores": "fp32",
+            "ihc": os.environ.get("HY4_IHC") or "default"}
+if DEFAULTS["ihc"] not in ALLOWED["ihc"]:
+    raise ValueError(f"HY4_IHC={DEFAULTS['ihc']!r} must be one of {ALLOWED['ihc']}")
 SWITCHES = dict(DEFAULTS)
 
 

@@ -74,11 +74,26 @@ class IhcBoundary:
         # the operator's lazy default (the CPU path never binds any).
         self.pre_plan = None
         self.post_plan = None
+        # consult18 (tuned plans): prefill-row plans with the measured iHC
+        # configs, chosen per call by `runtime.SWITCHES["ihc"]`.
+        self.prefill_plan = None
+        self.prefill_pre_plan = None
 
     def _reference(self):
         from b12x.norm.mhc import ihc
 
         return ihc
+
+    PREFILL_MIN_ROWS = 64
+
+    def _choose(self, streams, default, prefill):
+        """The tuned prefill plan for prefill-sized calls when the `ihc` switch
+        says so; the default plan otherwise (decode, short calls)."""
+        if prefill is None or int(streams.shape[0]) < self.PREFILL_MIN_ROWS:
+            return default
+        from .runtime import SWITCHES
+
+        return prefill if SWITCHES.get("ihc") == "tuned" else default
 
     def pre(self, streams):
         """`(post [rows, 4] FP32, y [rows, hidden])` from streams `[rows, 4, hidden]`."""
@@ -88,7 +103,7 @@ class IhcBoundary:
 
             return ihc.run_pre(streams, w.fn, w.scale, w.base,
                                magnitude=self.magnitude, hc_eps=self.hc_eps, norm_eps=self.norm_eps,
-                               plan=self.pre_plan)  # prepared plan: no JIT at run time
+                               plan=self._choose(streams, self.pre_plan, self.prefill_pre_plan))
         ihc = self._reference()
         return ihc.ihc_pre_reference(streams, w.fn, w.scale, w.base,
                                      magnitude=self.magnitude, hc_eps=self.hc_eps, norm_eps=self.norm_eps)
@@ -117,7 +132,8 @@ class IhcBoundary:
             return ihc.run_post_pre(branch, streams, prev_post, w.fn, w.scale, w.base,
                                     magnitude=nxt.magnitude, hc_eps=nxt.hc_eps,
                                     norm_eps=nxt.norm_eps, norm_weight=norm_weight,
-                                    layernorm_eps=self.norm_eps, plan=self.plan)
+                                    layernorm_eps=self.norm_eps,
+                                    plan=self._choose(streams, self.plan, self.prefill_plan))
         ihc = self._reference()
         w = nxt.weights
         return ihc.ihc_post_pre_reference(branch, streams, prev_post, w.fn, w.scale, w.base,
