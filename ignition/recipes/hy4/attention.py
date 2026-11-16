@@ -303,11 +303,10 @@ class Hy4LayerAttention:
             gate_raw = x @ w.gate_proj.T.to(x.dtype)
             self._stash_gate(x, gate_raw)
             return LayerProjections(q_resid, q, latent, index_keys, gate_raw)
-        from .w8 import Int8Weight
+        from .w8 import Int8Weight, int8_rows_ok
 
-        rows_in = int(x.numel() // x.shape[-1])
-        if isinstance(packed.packed, Int8Weight) and (packed.packed.bf16 is None
-                                                     or (x.is_cuda and rows_in <= 16)):
+        if isinstance(packed.packed, Int8Weight) and (
+                packed.packed.bf16 is None or int8_rows_ok(packed.packed, x.reshape(-1, x.shape[-1]))):
             # consult18 P6: INT8 storage — ONE GEMM over every packed row (the
             # bitwise-per-slice contract is moot once quantized), then split.
             full = packed.packed.linear(x)

@@ -14,10 +14,32 @@ Triton GEMV that dequantizes in registers (FP32 accumulation, half the bytes);
 more rows (prefill) dequantize the weight to BF16 (one Triton pass) and use the
 cuBLAS GEMM — the same values the quality gate measured.
 """
+import contextlib
+import contextvars
+
 import torch
 
 GROUP = 128
 GEMV_ROWS = 16
+# INT8 reads are scoped to the decode-family bodies (decode step, verify rows,
+# draft forwards — DecodeGraphs) when the BF16 original is kept: every prefill
+# call, short tails included, stays the original BF16 op.
+_DECODE_SCOPE = contextvars.ContextVar("hy4_w8_decode_scope", default=False)
+
+
+@contextlib.contextmanager
+def decode_scope():
+    token = _DECODE_SCOPE.set(True)
+    try:
+        yield
+    finally:
+        _DECODE_SCOPE.reset(token)
+
+
+def int8_rows_ok(weight, x2):
+    """Whether this call reads the INT8 copy."""
+    return (x2.is_cuda and x2.shape[0] <= GEMV_ROWS and weight.dtype == torch.bfloat16
+            and (weight.bf16 is None or _DECODE_SCOPE.get()))
 
 
 class Int8Weight:
@@ -80,7 +102,7 @@ class Int8Weight:
         k = int(self.q.shape[1])
         lead = x.shape[:-1]
         x2 = x.reshape(-1, k)
-        if x2.is_cuda and x2.shape[0] <= GEMV_ROWS and self.dtype == torch.bfloat16:
+        if int8_rows_ok(self, x2):
             out = _gemv_cuda(x2.to(torch.bfloat16).contiguous(), self.q, self.scale)
         elif self.bf16 is not None:
             return x @ self.bf16.T          # the original op, bit-exact

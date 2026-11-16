@@ -40,6 +40,8 @@ import contextlib
 
 import torch
 
+from .w8 import decode_scope as w8_decode_scope
+
 
 class DecodeGraphs:
     """Captured one-row decode steps, one per (row, width bucket, logits form)."""
@@ -130,7 +132,7 @@ class DecodeGraphs:
         # The bypass test reads only this bound: width 0 is the short-context
         # bucket (<= top-k), any other bucket is past top-k (accepts()).
         visible_max = self.topk if width == 0 else self.topk + 1
-        with use_lane(0, overlap=False, geometry=geometry, sync_free=True):
+        with use_lane(0, overlap=False, geometry=geometry, sync_free=True), w8_decode_scope():
             logits = d._layers_and_head(
                 self._token, rows, positions, token_rows, visible, visible_max, state=None,
                 return_hidden=False, call_shape=call_shape, logits_rows=logits_rows,
@@ -380,7 +382,7 @@ class DecodeGraphs:
         if deferred is not None:
             deferred.clear()
         visible_max = self.topk + 1 if call_shape.is_decode_graph else None
-        with use_lane(0, overlap=False, geometry=geometry, sync_free=True):
+        with use_lane(0, overlap=False, geometry=geometry, sync_free=True), w8_decode_scope():
             logits, normed, _ = d._layers_and_head(
                 tokens, rows, positions, token_rows, visible, visible_max, state=None,
                 return_hidden=True, call_shape=call_shape, logits_rows="all", gather=False)
@@ -409,7 +411,7 @@ class DecodeGraphs:
         if deferred is not None:
             deferred.clear()
         visible_max = self.topk + 1 if call_shape.is_decode_graph else None
-        with use_lane(0, overlap=False, geometry=geometry, sync_free=True):
+        with use_lane(0, overlap=False, geometry=geometry, sync_free=True), w8_decode_scope():
             hidden, _, _ = d._draft_cp(tokens, hidden_in, positions, rows, d.cache,
                                        call_shape=call_shape, visible_max=visible_max,
                                        static_slots=self._spec_slots(entry))

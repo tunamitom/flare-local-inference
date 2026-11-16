@@ -68,6 +68,10 @@ ALLOWED = {
     # consult18 P5: temperature-only sampled requests speculate too (exact
     # speculative sampling over the vocabulary shards, spec_sample.py)
     "spec_sample": ("off", "on"),
+    # consult18 P6: the overlapped pair's host step order (= device comm-token
+    # order): strict alternation, or the lane with less compute before its
+    # next collective first
+    "overlap_order": ("alternate", "short_first"),
 }
 DEFAULTS = {"index_scores": "fp32",
             "ihc": os.environ.get("HY4_IHC") or "default",
@@ -88,7 +92,8 @@ DEFAULTS = {"index_scores": "fp32",
             "wire_probe": "off",
             "wire": os.environ.get("HY4_WIRE") or "bf16",
             "spec": os.environ.get("HY4_SPEC") or "off",
-            "spec_sample": os.environ.get("HY4_SPEC_SAMPLE") or "off"}
+            "spec_sample": os.environ.get("HY4_SPEC_SAMPLE") or "off",
+            "overlap_order": os.environ.get("HY4_OVERLAP_ORDER") or "alternate"}
 for _key, _value in DEFAULTS.items():
     if _value not in ALLOWED[_key]:
         raise ValueError(f"runtime default {_key}={_value!r} must be one of {ALLOWED[_key]}")

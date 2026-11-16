@@ -453,3 +453,27 @@ def test_tail_graph_body_equals_exact_forward(worlds, world):
     for exact, graphed in zip(run(False), run(True)):
         for want, got in zip(exact, graphed):
             assert torch.equal(got, want), f"world {world}: rel {rel_error(got, want)}"
+
+
+@pytest.mark.parametrize("world", (1, 2, 8))
+def test_short_first_order_equals_sequential_halves(worlds, world):
+    """consult18 P6: the "short_first" lane step order (host issue order = the
+    comm-token order) changes nothing either — bit-exact vs the sequential halves."""
+    from ignition.recipes.hy4 import runtime
+    from ignition.recipes.hy4.collectives import SimulatedGroup
+
+    def run(mode):
+        if world == 1:
+            return [_scenario(mode)(decoder) for decoder in fresh_decoders(worlds[1])]
+        return run_wired(worlds[world], _scenario(mode), group=SimulatedGroup(world))
+
+    saved = runtime.SWITCHES.get("overlap_order")
+    try:
+        sequential = run("sequential")
+        runtime.SWITCHES["overlap_order"] = "short_first"
+        overlapped = run("overlap")
+    finally:
+        runtime.SWITCHES["overlap_order"] = saved
+    for want_rank, got_rank in zip(sequential, overlapped):
+        for want, got in zip(want_rank, got_rank):
+            assert torch.equal(got, want), f"world {world}: rel {rel_error(got, want)}"

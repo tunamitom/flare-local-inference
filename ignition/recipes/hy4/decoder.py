@@ -1249,43 +1249,94 @@ class Hy4Decoder:
                                        or "UNSAFE (diagnosis boot: no admission regime)")
                 kv_ready = {}
                 finished = [False, False]
-                lane1_layer, lane1_at_start = 0, True
-                while not (finished[0] and finished[1]):
-                    if not finished[0]:
-                        with use_lane(0, overlap=True, geometry=geometries[0],
-                                      exclusive=section), \
-                                (torch.cuda.stream(streams[0]) if cuda else nullcontext()):
-                            try:
-                                label = next(steps[0])
-                            except StopIteration as done:
-                                results[0], finished[0], label = done.value, True, None
-                            if label is not None and label[0] == gate_on:
-                                if cuda:
-                                    event = torch.cuda.Event()
-                                    event.record(streams[0])
-                                    kv_ready[label[1]] = event
-                                else:
-                                    kv_ready[label[1]] = True
-                    if finished[1]:
-                        continue
-                    gated = lane1_at_start and lane1_layer < layers
-                    if gated and lane1_layer not in kv_ready:
-                        if finished[0]:
-                            raise RuntimeError(f"lane 0 finished without layer {lane1_layer}'s records")
-                        continue
+                lane1 = {"layer": 0, "at_start": True}
+                # consult18 P6: the host issue order of the two lanes' steps is
+                # the device comm-token order. "alternate" (the default): one
+                # step each in turn. "short_first": advance the lane whose next
+                # step has less compute ahead of its collective (predicted from
+                # its last label), so a collective that is ready soon is not
+                # queued behind the other lane's MoE all-reduce (dg28: lanes sat
+                # in ~760 us peer-flag waits beside the other lane's MoE). Labels
+                # are the same on every rank, so is the order.
+                from .runtime import SWITCHES as _order_switches
+
+                order = _order_switches.get("overlap_order", "alternate")
+                next_cost = {None: 250, "kv": 100, "scores": 50, "gather": 400, "lse": 150,
+                             "ar_attn": 650, "layer_end": 250}
+                last = [None, None]
+
+                def key(label):
+                    if label is None:
+                        return None
+                    return label[1] if label[0] == "comm" else label[0]
+
+                def step0():
+                    with use_lane(0, overlap=True, geometry=geometries[0],
+                                  exclusive=section), \
+                            (torch.cuda.stream(streams[0]) if cuda else nullcontext()):
+                        try:
+                            label = next(steps[0])
+                        except StopIteration as done:
+                            results[0], finished[0], label = done.value, True, None
+                        if label is not None and label[0] == gate_on:
+                            if cuda:
+                                event = torch.cuda.Event()
+                                event.record(streams[0])
+                                kv_ready[label[1]] = event
+                            else:
+                                kv_ready[label[1]] = True
+                    last[0] = key(label)
+
+                def lane1_gated():
+                    return lane1["at_start"] and lane1["layer"] < layers
+
+                def lane1_ready():
+                    return not finished[1] and not (lane1_gated() and lane1["layer"] not in kv_ready)
+
+                def step1():
+                    gated = lane1_gated()
                     with use_lane(1, overlap=True, geometry=geometries[1],
                                   exclusive=section), \
                             (torch.cuda.stream(streams[1]) if cuda else nullcontext()):
                         if cuda and gated:
-                            streams[1].wait_event(kv_ready[lane1_layer])
+                            streams[1].wait_event(kv_ready[lane1["layer"]])
                         try:
                             label = next(steps[1])
                         except StopIteration as done:
                             results[1], finished[1], label = done.value, True, None
                     if label is not None and label[0] == "layer_end":
-                        lane1_layer, lane1_at_start = label[1] + 1, True
+                        lane1["layer"], lane1["at_start"] = label[1] + 1, True
                     elif label is not None:
-                        lane1_at_start = False
+                        lane1["at_start"] = False
+                    last[1] = key(label)
+
+                previous = 1
+                while not (finished[0] and finished[1]):
+                    if order != "short_first":
+                        if not finished[0]:
+                            step0()
+                        if finished[1]:
+                            continue
+                        if not lane1_ready():
+                            if finished[0]:
+                                raise RuntimeError(
+                                    f"lane 0 finished without layer {lane1['layer']}'s records")
+                            continue
+                        step1()
+                        continue
+                    ready0, ready1 = not finished[0], lane1_ready()
+                    if ready0 and ready1:
+                        c0, c1 = next_cost.get(last[0], 250), next_cost.get(last[1], 250)
+                        pick = 0 if c0 < c1 else 1 if c1 < c0 else 1 - previous
+                    elif ready0:
+                        pick = 0
+                    elif ready1:
+                        pick = 1
+                    else:
+                        raise RuntimeError(
+                            f"lane 0 finished without layer {lane1['layer']}'s records")
+                    (step0 if pick == 0 else step1)()
+                    previous = pick
             finally:
                 if guard:
                     torch.cuda.set_sync_debug_mode(previous_mode)
