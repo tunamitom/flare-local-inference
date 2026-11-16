@@ -354,6 +354,23 @@ def run_generate(ctx, cmd):
         # one overlapped pair — two CHUNK-row halves on two lanes. (Not for
         # the NLL probe: its all-row logits of a pair would be ~1 GB.)
         full = max(ctx.widths)
+        pending = None
+        decoder.embed_sink = {} if use_spec else None
+
+        def absorb_pending(first_next, final=False):
+            """Absorb the previous step's rows; `first_next` [1, H] is the
+            embedding of the token after its last row (None: look it up). A
+            padded step reuses embeddings only as the prompt's final step (its
+            padding repeats the placeholder token)."""
+            p_pos, p_w, p_post, p_emb, p_real = pending
+            nxt = ids[p_pos + 1:p_pos + 1 + p_w]
+            nxt = nxt + [ids[-1]] * (p_w - len(nxt))
+            reuse = p_emb is not None and first_next is not None and (p_real == p_w or final)
+            embeds = torch.cat([p_emb[1:], first_next], dim=0) if reuse else None
+            decoder._draft_positions[0] = p_pos
+            decoder.draft_absorb(torch.tensor([nxt], dtype=torch.int64, device=dev), p_post,
+                                 logits="none", next_embeds=embeds)
+
         steps, index = [], 0
         while index < len(plan):
             pair = (getattr(ctx, "overlap", False) and not params.get("nll")
@@ -422,13 +439,19 @@ def run_generate(ctx, cmd):
                 # post-norm hidden and each row's next prompt token (the last
                 # prompt row's is a placeholder: round 1 re-absorbs it with the
                 # first generated token; padded rows are rewritten before read).
-                nxt = ids[pos + 1:pos + 1 + w]
-                nxt = nxt + [ids[-1]] * (w - len(nxt))
-                decoder._draft_positions[0] = pos
-                decoder.draft_absorb(torch.tensor([nxt], dtype=torch.int64, device=dev), post,
-                                     logits="none")
+                # consult18 P5: one step late, reusing the target's all-reduced
+                # embeddings — row t's next token is the target's row t+1.
+                emb = decoder.embed_sink.pop(id(t), None)
+                decoder.embed_sink.clear()
+                if pending is not None:
+                    absorb_pending(emb[:1] if emb is not None else None)
+                pending = (pos, w, post, emb, real)
                 last_hidden = post[0, real - 1].clone()
             pos += real
+        if use_spec and pending is not None:
+            last_emb = pending[3]
+            absorb_pending(last_emb[-1:] if last_emb is not None else None, final=True)
+        decoder.embed_sink = None
         ctx.last_nll = (nll_sum, nll_count) if params.get("nll") and ctx.rank == 0 else None
     out = []
 
