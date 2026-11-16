@@ -873,6 +873,15 @@ class CeExchange:
         # outside any overlapped loop — see lse_reduce_scatter).
         self._switch_index = torch.tensor(sorted((self.rank, *self.local)), dtype=torch.long,
                                           device=self.device)
+        # consult18 P3 INT8 wire: every source's slot (gather) / the switch's (LSE)
+        # (built here: the overlapped loop must not make host transfers)
+        self._all_sources = torch.arange(self.world, dtype=torch.int32, device=self.device)
+        order = sorted((self.rank, *self.local))
+        self._local_i32 = (
+            torch.tensor(sorted(self.local), dtype=torch.int32, device=self.device),
+            torch.tensor([order.index(src) for src in sorted(self.local)], dtype=torch.int32,
+                         device=self.device),
+            order.index(self.rank), len(order))
 
     # -- flags, counters, events ------------------------------------------
     def _flag_ptr(self, rank, op, source):
@@ -990,7 +999,7 @@ class CeExchange:
         """consult18 P3 (numerics class): the LSE reduce-scatter relay over an
         INT8 wire (one FP32 scale per (head, row) vector of the partials; the
         LSEs stay FP32; this rank's own partials stay exact)."""
-        from .fused_ops import dequant_rows_int8, quant_rows_int8
+        from .fused_ops import dequant_rows_int8, dequant_slots_int8, quant_rows_int8
 
         rows, heads, width = (int(v) for v in partials.shape)
         head_major = partials.permute(1, 0, 2)
@@ -1038,17 +1047,18 @@ class CeExchange:
         l0[me].copy_(lse_major[own])
         l1[me].copy_(lse_major[partner_heads])
         self._await_all("lse", self.local)
-        sources = sorted((me, *self.local))
-        mine4_in = torch.empty((len(sources), hpr, rows, width), dtype=partials.dtype,
-                               device=self.device)
+        local_src, local_dst, me_pos, k = self._local_i32
+        first0 = self.lse_base + (bank * 2 + 0) * self.world * self.lse_slot
+        first1 = self.lse_base + (bank * 2 + 1) * self.world * self.lse_slot
+        slots0 = self._memory[first0:first0 + self.world * self.lse_slot].view(self.world, self.lse_slot)
+        slots1 = self._memory[first1:first1 + self.world * self.lse_slot].view(self.world, self.lse_slot)
+        mine4_in = torch.empty((k, hpr, rows, width), dtype=partials.dtype, device=self.device)
         theirs4_in = torch.empty_like(mine4_in)
-        for k, src in enumerate(sources):
-            if src == me:
-                mine4_in[k].copy_(head_major[own])
-                theirs4_in[k].copy_(head_major[partner_heads])
-            else:
-                dequant_rows_int8(q0[src], s0[src], mine4_in[k].view(n, width))
-                dequant_rows_int8(q1[src], s1[src], theirs4_in[k].view(n, width))
+        # own partials exact; the three in-switch sources dequantized in place
+        mine4_in[me_pos].copy_(head_major[own])
+        theirs4_in[me_pos].copy_(head_major[partner_heads])
+        dequant_slots_int8(slots0, local_src, soff, n, width, mine4_in, local_dst)
+        dequant_slots_int8(slots1, local_src, soff, n, width, theirs4_in, local_dst)
         switch = self._switch_index
         mine4, mine4_lse = _merge_head_major(mine4_in, l0.index_select(0, switch))
         out4, out4_lse = _merge_head_major(theirs4_in, l1.index_select(0, switch))
@@ -1201,7 +1211,7 @@ class CeExchange:
         """consult18 P3 (numerics class): the head gather over an INT8 wire —
         one FP32 scale per (row, head) vector; every rank (this one included)
         attends with the same dequantized queries."""
-        from .fused_ops import dequant_rows_int8, quant_rows_int8
+        from .fused_ops import dequant_slots_int8, quant_rows_int8
 
         rows, hpr, width = (int(v) for v in local.shape)
         n = rows * hpr
@@ -1213,12 +1223,15 @@ class CeExchange:
         def offset(origin):
             return self.gather_base + (bank * self.world + origin) * self.gather_slot
 
-        staging = torch.empty(nbytes, dtype=torch.uint8, device=self.device)
-        q_own = staging[:n * width].view(torch.int8).view(n, width)
-        s_own = staging[soff:soff + n * 4].view(torch.float32)
+        slots = self._memory[offset(0):offset(0) + self.world * self.gather_slot] \
+            .view(self.world, self.gather_slot)
+        mine = slots[me]
+        q_own = mine[:n * width].view(torch.int8).view(n, width)
+        s_own = mine[soff:soff + n * 4].view(torch.float32)
+        # quantized straight into this rank's own slot (sent from there)
         quant_rows_int8(local.contiguous().view(n, width), q_own, s_own)
         self._start()
-        own = ((offset(me), staging.data_ptr(), nbytes),)
+        own = ((offset(me), mine.data_ptr(), nbytes),)
         if not relay:
             for dest in (*self.cross, *self.local):
                 stream = self._cross_stream if dest in self.cross else self._local_stream
@@ -1236,16 +1249,9 @@ class CeExchange:
             for dest in self.local:
                 self._send_block(self._local_stream, dest, forward, (partner,), "gather",
                                  ("g-fwd", dest))
-        slots = self._memory[offset(0):offset(0) + self.world * self.gather_slot] \
-            .view(self.world, self.gather_slot)
         out = torch.empty((self.world, n, width), dtype=torch.bfloat16, device=self.device)
-        dequant_rows_int8(q_own, s_own, out[me])
         self._await_all("gather", (*self.cross, *self.local))
-        for origin in range(self.world):
-            if origin == me:
-                continue
-            dequant_rows_int8(slots[origin, :n * width].view(torch.int8).view(n, width),
-                              slots[origin, soff:soff + n * 4].view(torch.float32), out[origin])
+        dequant_slots_int8(slots, self._all_sources, soff, n, width, out, self._all_sources)
         gathered = out.view(self.world, rows, hpr, width).permute(1, 0, 2, 3) \
             .reshape(rows, self.world * hpr, width)
         self._drain()
