@@ -20,7 +20,7 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-__all__ = ["ihc_post_pre_split", "scores_only_select", "merge_head_major", "rms_norm", "rope_interleaved"]
+__all__ = ["ihc_post_pre_split", "moe_route", "scores_only_select", "merge_head_major", "rms_norm", "rope_interleaved"]
 
 _INV_FREQ = {}
 
@@ -323,8 +323,9 @@ def ihc_post_pre_split(x, residual, prev_post, fn, hc_scale, hc_base, *, magnitu
 # --------------------------------------------------------------------------
 @triton.jit
 def _scores_only_select_kernel(offers_ptr, cand_ptr, pos_ptr, out_val_ptr, out_pos_ptr, flag_ptr,
+                               sel_ptr, cnt_ptr, base_ptr, LCAP,
                                WIDTH, TOPK, KIDX, RANK, OFFER: tl.constexpr, WORLD: tl.constexpr,
-                               NOFF: tl.constexpr, NCAND: tl.constexpr):
+                               NOFF: tl.constexpr, NCAND: tl.constexpr, HANDBACK: tl.constexpr):
     r = tl.program_id(0).to(tl.int64)
     j = tl.arange(0, NOFF)
     stacked = tl.load(offers_ptr + r * (WORLD * OFFER) + j, mask=j < WORLD * OFFER,
@@ -364,27 +365,128 @@ def _scores_only_select_kernel(offers_ptr, cand_ptr, pos_ptr, out_val_ptr, out_p
     bad = tl.sum(broken.to(tl.int32)) > 0
     keep = i < n
     out_mask = i < TOPK
-    tl.store(out_val_ptr + r * TOPK + i, tl.where(keep, v, float("-inf")), mask=out_mask)
-    tl.store(out_pos_ptr + r * TOPK + i, tl.where(keep, p, -1).to(tl.int32), mask=out_mask)
+    merged = tl.where(keep, p, -1)
+    if HANDBACK:
+        # the decoder's position -> slot map + b12x selection_handback_reference:
+        # owned, in-row entries become `p // world + row_base`, compacted
+        # stably to the front, -1 padding, live count.
+        pp = merged.to(tl.int64)
+        local = tl.where(pp >= 0, pp, 0) // WORLD
+        live = out_mask & (pp >= 0) & (local < LCAP) & ((pp % WORLD) == RANK)
+        dest = tl.cumsum(live.to(tl.int32), axis=0) - 1
+        count = tl.sum(live.to(tl.int32))
+        base = tl.load(base_ptr + r)
+        slot = (local + base).to(tl.int32)
+        tl.store(sel_ptr + r * TOPK + dest, slot, mask=live)
+        tl.store(sel_ptr + r * TOPK + i, tl.full((NCAND,), -1, tl.int32), mask=out_mask & (i >= count))
+        tl.store(cnt_ptr + r, count)
+    else:
+        tl.store(out_val_ptr + r * TOPK + i, tl.where(keep, v, float("-inf")), mask=out_mask)
+        tl.store(out_pos_ptr + r * TOPK + i, merged.to(tl.int32), mask=out_mask)
     tl.store(flag_ptr + r, (sat | trunc | bad | nan).to(tl.int8))
 
 
-def scores_only_select(offers, candidate_scores, candidate_positions, *, topk, world, rank):
+def _stacked_offers(offers, world):
+    """`[rows, world, offer]` FP32 over the per-rank offers — a view when they
+    are the rank slices of one gathered tensor (the DCP score gather), else a copy."""
+    first = offers[0]
+    rows, offer = (int(v) for v in first.shape)
+    if (first.dtype == torch.float32 and all(o.dtype == torch.float32 for o in offers)
+            and first.stride() == (world * offer, 1)
+            and all(o.stride() == first.stride() and o.data_ptr() == first.data_ptr() + k * offer * 4
+                    for k, o in enumerate(offers))):
+        return torch.as_strided(first, (rows, world, offer), (world * offer, offer, 1))
+    return torch.stack([o.float() for o in offers], dim=1).contiguous()
+
+
+def scores_only_select(offers, candidate_scores, candidate_positions, *, topk, world, rank,
+                       handback=None):
     """`(values [rows, topk] FP32, positions [rows, topk] int32, flag [] bool)` —
     the sync-free scores-only selection in one launch (see the kernel note).
-    `offers`: the `world` per-rank `[rows, offer]` FP32 offers in rank order."""
+    `offers`: the `world` per-rank `[rows, offer]` FP32 offers in rank order.
+    `handback=(selected [rows, topk] int32, counts [rows] int32, row_base [rows]
+    int64, local_capacity)`: write this rank's compacted local slots + counts
+    (the decoder map + selection hand-back) instead; values/positions are None."""
     rows, width = (int(v) for v in candidate_scores.shape)
     offer = int(offers[0].shape[1])
-    stacked = torch.stack([o.float() for o in offers], dim=1).contiguous()   # [rows, world, offer]
+    stacked = _stacked_offers(offers, world)
     scores = candidate_scores.float().contiguous()
     positions = candidate_positions.contiguous()
-    out_val = torch.empty((rows, topk), dtype=torch.float32, device=scores.device)
-    out_pos = torch.empty((rows, topk), dtype=torch.int32, device=scores.device)
     flags = torch.empty((rows,), dtype=torch.int8, device=scores.device)
+    if handback is None:
+        out_val = torch.empty((rows, topk), dtype=torch.float32, device=scores.device)
+        out_pos = torch.empty((rows, topk), dtype=torch.int32, device=scores.device)
+        sel, cnt, base, lcap = out_pos, flags, flags, 0
+    else:
+        sel, cnt, base, lcap = handback
+        out_val = out_pos = None
     noff = triton.next_power_of_2(world * offer)
     ncand = triton.next_power_of_2(max(width, topk))
-    _scores_only_select_kernel[(rows,)](stacked, scores, positions, out_val, out_pos, flags,
+    _scores_only_select_kernel[(rows,)](stacked, scores, positions,
+                                        flags if out_val is None else out_val,
+                                        sel if out_pos is None else out_pos, flags,
+                                        sel, cnt, base, int(lcap),
                                         width, topk, min(topk, world * offer) - 1, rank,
-                                        OFFER=offer, WORLD=world, NOFF=noff,
-                                        NCAND=ncand, num_warps=8)
-    return out_val, out_pos, flags.any()
+                                        OFFER=offer, WORLD=world, NOFF=noff, NCAND=ncand,
+                                        HANDBACK=handback is not None, num_warps=8)
+    flag = flags[0] if rows == 1 else flags.any()
+    return out_val, out_pos, flag
+
+
+# --------------------------------------------------------------------------
+# consult18 P2: the MoE route (moe._route_from_logits, n_group == 1, top-8 of
+# 256, renormalised, scaled) in one launch per row. torch's behaviour pinned
+# on the card (harness/route_probe.py): sigmoid = 1 / (1 + expf(-x)) (IEEE
+# div); topk(sorted=False) returns the keys above the k-th in ascending index,
+# then the k-th's ties in ascending index; the 8-way sum adds
+# ((a0+a4)+(a2+a6))+((a1+a5)+(a3+a7)). Bit-identical (route_check.py).
+# --------------------------------------------------------------------------
+@triton.jit
+def _moe_route_kernel(logits_ptr, bias_ptr, w_ptr, ids_ptr, E, scale,
+                      EB: tl.constexpr, K: tl.constexpr, NORM: tl.constexpr):
+    r = tl.program_id(0).to(tl.int64)
+    e = tl.arange(0, EB)
+    inside = e < E
+    x = tl.load(logits_ptr + r * E + e, mask=inside, other=0.0)
+    score = libdevice.div_rn(1.0, 1.0 + libdevice.exp(-x))
+    choice = score + tl.load(bias_ptr + e, mask=inside, other=0.0)
+    choice = tl.where(inside, choice, float("-inf"))
+    ordered = tl.sort(choice, descending=True)
+    kth = tl.max(tl.where(e == K - 1, ordered, float("-inf")))
+    gt = choice > kth
+    eq = choice == kth
+    n_gt = tl.sum(gt.to(tl.int32))
+    eq_rank = tl.cumsum(eq.to(tl.int32), axis=0) - 1
+    take = gt | (eq & (eq_rank < K - n_gt))
+    # torch's order: the keys above the k-th in ascending index, then its ties
+    dest = tl.where(gt, tl.cumsum(gt.to(tl.int32), axis=0) - 1, n_gt + eq_rank)
+    a0 = tl.sum(tl.where(take & (dest == 0), score, 0.0))
+    a1 = tl.sum(tl.where(take & (dest == 1), score, 0.0))
+    a2 = tl.sum(tl.where(take & (dest == 2), score, 0.0))
+    a3 = tl.sum(tl.where(take & (dest == 3), score, 0.0))
+    a4 = tl.sum(tl.where(take & (dest == 4), score, 0.0))
+    a5 = tl.sum(tl.where(take & (dest == 5), score, 0.0))
+    a6 = tl.sum(tl.where(take & (dest == 6), score, 0.0))
+    a7 = tl.sum(tl.where(take & (dest == 7), score, 0.0))
+    if NORM:
+        total = ((a0 + a4) + (a2 + a6)) + ((a1 + a5) + (a3 + a7))
+        denom = total + 1e-20
+        w = libdevice.div_rn(score, denom) * scale
+    else:
+        w = score * scale
+    tl.store(w_ptr + r * K + dest, w, mask=take)
+    tl.store(ids_ptr + r * K + dest, e.to(tl.int64), mask=take)
+
+
+def moe_route(logits, bias, *, top_k, scale, norm):
+    """`(weights [rows, top_k] FP32, ids [rows, top_k] int64)` — moe._route_from_logits
+    for n_group == 1 and top_k == 8 in one launch (bit-identical)."""
+    rows, experts = (int(v) for v in logits.shape)
+    if top_k != 8:
+        raise ValueError("moe_route covers the top-8 route (the 8-way sum order is pinned)")
+    w = torch.empty((rows, top_k), dtype=torch.float32, device=logits.device)
+    ids = torch.empty((rows, top_k), dtype=torch.int64, device=logits.device)
+    _moe_route_kernel[(rows,)](logits.contiguous(), bias.contiguous(), w, ids, experts, float(scale),
+                               EB=triton.next_power_of_2(experts), K=top_k, NORM=bool(norm),
+                               num_warps=4)
+    return w, ids

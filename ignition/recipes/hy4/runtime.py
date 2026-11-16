@@ -48,6 +48,8 @@ ALLOWED = {
     # consult18 P2: graph decode steps gather the logits to rank 0 on the host
     # (the sampler's input) instead of an all-gather moved back to the device
     "root_logits": ("off", "on"),
+    # consult18 P2: the MoE route in one launch (fused_ops.moe_route; bit-identical)
+    "route_fused": ("off", "on"),
 }
 DEFAULTS = {"index_scores": "fp32",
             "ihc": os.environ.get("HY4_IHC") or "default",
@@ -61,7 +63,8 @@ DEFAULTS = {"index_scores": "fp32",
             "decode_graph": os.environ.get("HY4_DECODE_GRAPH") or "off",
             "ihc_split": os.environ.get("HY4_IHC_SPLIT") or "off",
             "sel_fused": os.environ.get("HY4_SEL_FUSED") or "off",
-            "root_logits": os.environ.get("HY4_ROOT_LOGITS") or "off"}
+            "root_logits": os.environ.get("HY4_ROOT_LOGITS") or "off",
+            "route_fused": os.environ.get("HY4_ROUTE_FUSED") or "off"}
 for _key, _value in DEFAULTS.items():
     if _value not in ALLOWED[_key]:
         raise ValueError(f"runtime default {_key}={_value!r} must be one of {ALLOWED[_key]}")

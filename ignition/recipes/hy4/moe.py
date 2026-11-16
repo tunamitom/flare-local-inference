@@ -570,6 +570,17 @@ class MoEBlock:
     def _route_from_logits(self, logits):
         c = self.config.text
         experts, top_k = self.router.experts, c["num_experts_per_tok"]
+        if logits.is_cuda and c["n_group"] == 1 and top_k == 8:
+            from .runtime import SWITCHES
+
+            if SWITCHES.get("route_fused") == "on":
+                # consult18 P2: one launch (fused_ops.moe_route, bit-identical)
+                from .fused_ops import moe_route
+
+                weights, ids = moe_route(logits, self._bias_f32(), top_k=top_k,
+                                         scale=c["routed_scaling_factor"],
+                                         norm=c["norm_topk_prob"])
+                return logits, weights, ids
         scores = torch.sigmoid(logits)
         choice = scores + self._bias_f32()
         if c["n_group"] > 1:  # the general group contract; Hy4 runs n_group == 1

@@ -561,7 +561,6 @@ def scores_only_merge(exchange, candidate_scores, candidate_positions, *, topk, 
     width = int(candidate_scores.shape[1])
     offer = width if local_offer is None else min(int(local_offer), width)
     offers = exchange(candidate_scores[:, :offer].contiguous())
-    thresholds, aboves = scores_only_threshold(offers, topk)
     if deferred is not None:
         from .runtime import SWITCHES
 
@@ -576,6 +575,7 @@ def scores_only_merge(exchange, candidate_scores, candidate_positions, *, topk, 
                 offers, candidate_scores, candidate_positions, topk=topk, world=world, rank=rank)
             deferred.append(flag)
             return values, positions
+        thresholds, aboves = scores_only_threshold(offers, topk)
         # consult18 D: inside the overlapped loop no host read — the widen and
         # exactness tests become a device flag the caller checks after the loop
         # (a set flag reruns the pair on the single-lane path).
@@ -584,6 +584,7 @@ def scores_only_merge(exchange, candidate_scores, candidate_positions, *, topk, 
         return select_own_candidates(
             offers, candidate_scores, candidate_positions, topk=topk, world=world, rank=rank,
             local_offer=local_offer, thresholds=thresholds, aboves=aboves, sync_free=True)
+    thresholds, aboves = scores_only_threshold(offers, topk)
     if offer < width and scores_only_offer_saturated(offers, thresholds):
         offers = exchange(candidate_scores.contiguous())
         thresholds, aboves = scores_only_threshold(offers, topk)
@@ -2409,6 +2410,29 @@ class PcieDcpCollectives:
             gathered = self.transport.gather_to_root(logits)
             return logits if gathered is None else gathered
         return self.transport.all_gather(logits.contiguous())
+
+    def fused_handback_ok(self):
+        """The fused selection + hand-back serves the scores-only exchange
+        without the selection audit (the audit compares merge_topk outputs)."""
+        return self.exchange_mode == "scores-only" and not self.audit
+
+    def merge_topk_handback(self, candidate_scores, candidate_positions, *, topk, selected, counts,
+                            base, local_capacity):
+        """consult18 P2 (sync-free): the scores-only offer exchange, then ONE
+        launch doing the selection, the decoder's position->slot map and the
+        selection hand-back into `selected` / `counts` (this rank's compacted
+        local slots); its deferred flag joins `deferred_checks`."""
+        from .fused_ops import scores_only_select
+
+        width = int(candidate_scores.shape[1])
+        offer = width if not self.local_offer else min(int(self.local_offer), width)
+        plan = self._plan("selection_exchange", None)
+        offers = self.transport.exchange_scores(candidate_scores[:, :offer].contiguous(), plan=plan)
+        _, _, flag = scores_only_select(
+            offers, candidate_scores, candidate_positions, topk=topk, world=self.world_size,
+            rank=self.rank, handback=(selected, counts, base.reshape(-1).to(torch.int64).contiguous(),
+                                      int(local_capacity)))
+        self.deferred_checks.append(flag)
 
     def merge_topk(self, candidate_scores, candidate_positions, *, topk):
         if self.exchange_mode == "scores-only":
