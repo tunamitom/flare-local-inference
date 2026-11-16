@@ -189,10 +189,14 @@ class Sampler:
                 logits = logits.masked_fill(logits < kth, float("-inf"))
             top_p = float(params.get("top_p", 1.0) or 1.0)
             if 0.0 < top_p < 1.0:
+                # consult18 P7: keep through the token whose cumulative probability
+                # first reaches top_p (at least one) — the previous rule dropped
+                # every token when the top one alone exceeded top_p (NaN sample)
                 sorted_logits, sorted_idx = torch.sort(logits, descending=True)
                 probs = torch.softmax(sorted_logits, dim=-1)
-                cut = torch.cumsum(probs, dim=-1) - top_p
-                drop = sorted_idx[cut > 0]
+                remove = (torch.cumsum(probs, dim=-1) - probs) >= top_p
+                remove[0] = False
+                drop = sorted_idx[remove]
                 logits[drop] = float("-inf")
             probs = torch.softmax(logits, dim=-1)
             tok = int(torch.multinomial(probs, 1, generator=gen).item())
@@ -347,8 +351,13 @@ def run_generate(ctx, cmd):
     spec_temp = float(params.get("temperature", 0.9) or 0.0)
     # consult18 P5: temperature-only sampling speculates too (spec_sample.py);
     # top-k / top-p requests decode plainly.
-    spec_sampling = (spec_temp > 0.0 and int(params.get("top_k", -1) or -1) <= 0
-                     and float(params.get("top_p", 1.0) or 1.0) >= 1.0)
+    spec_top_k = int(params.get("top_k", -1) or -1)
+    spec_top_p = float(params.get("top_p", 1.0) or 1.0)
+    spec_filtered = spec_top_k > 0 or spec_top_p < 1.0
+    # consult18 P7: top-k (<= 64) / top-p requests speculate too (device filter,
+    # spec_sample.filter_scores; an uncovered nucleus falls back to plain decoding)
+    spec_sampling = (spec_temp > 0.0 and spec_top_k <= 64 and 0.0 < spec_top_p <= 1.0
+                     and (not spec_filtered or _rt.SWITCHES.get("spec_filter") == "on"))
     use_spec = (spec is not None and _rt.SWITCHES.get("spec") == "on" and n > 1
                 and max_new > 1 and not params.get("nll")
                 and (spec_temp <= 0.0 or (spec_sampling and _rt.SWITCHES.get("spec_sample") == "on")))
@@ -496,7 +505,9 @@ def run_generate(ctx, cmd):
             return None
 
         finish, rest = spec.generate(start=n, bonus=nxt, hidden=last_hidden, emit=emit,
-                                     temperature=spec_temp)
+                                     temperature=spec_temp,
+                                     top_k=spec_top_k if 0 < spec_top_k else 0,
+                                     top_p=spec_top_p if spec_top_p < 1.0 else 1.0)
         done = finish is not None
     while not done:
         t = torch.tensor([[out[-1]]], dtype=torch.int64, device=dev)
@@ -952,6 +963,10 @@ def main():
                                for layer in built.weights.layers)
                 if getattr(built.weights, "draft", None) is not None:
                     released += quantize_attention(built.weights.draft.attention, keep_bf16=keep)
+                if os.environ.get("HY4_HEAD_BF16") == "1":
+                    # consult18 P7: decode-family head reads a BF16 copy (the
+                    # checkpoint's values; the FP32 head is their upcast)
+                    built.decoder._head_bf16 = built.weights.head.to(torch.bfloat16)
                 torch.cuda.empty_cache()
                 trace(rank, f"w8: attention pack + o_proj INT8 for <= 16-row calls"
                             f"{' (BF16 kept for prefill)' if keep else ''}, {released / 2**30:.2f} GB BF16 released")
