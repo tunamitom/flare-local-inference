@@ -169,6 +169,97 @@ class ReferenceRoutedExperts:
         return final.to(x.dtype)
 
 
+# consult18 E2 — calibrated A4 prefill MoE.
+# The export is A16 only (no activation scales). A calibration boot
+# (HY4_MOE_CALIBRATE=1) prepares every routed op with b12x's amax epilogue
+# (RoutingSpec.collect_activation_amax) and gives each layer a [1, E, 2]
+# buffer of per-expert [input, intermediate] amax; the serve zeroes them after
+# warm-up and saves them per rank after every request. An A4 boot
+# (HY4_MOE_A4=<dir>) reads them back as b12x activation quantization
+# multipliers (6 * 448 / amax) for the prefill op.
+A4_GSCALE = 6.0 * 448.0
+
+
+class MoeCalibration:
+    """Per-rank registry of the calibration boot's amax buffers."""
+
+    def __init__(self):
+        self.buffers = {}       # expert prefix -> [1, E, 2] FP32 device tensor
+
+    @staticmethod
+    def enabled():
+        import os
+
+        return (os.environ.get("HY4_MOE_CALIBRATE") or "0") not in ("", "0")
+
+    def buffer(self, key, num_experts, device):
+        import torch
+
+        if key not in self.buffers:
+            self.buffers[key] = torch.zeros((1, int(num_experts), 2), dtype=torch.float32,
+                                            device=device)
+        return self.buffers[key]
+
+    def reset(self):
+        for tensor in self.buffers.values():
+            tensor.zero_()
+
+    def save(self, path):
+        import os
+
+        import torch
+
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        host = {key: tensor[0].detach().cpu() for key, tensor in self.buffers.items()}
+        tmp = path + ".tmp"
+        torch.save(host, tmp)
+        os.replace(tmp, path)
+        return len(host)
+
+
+CALIBRATION = MoeCalibration()
+
+
+def a4_activation_scales(expert_prefix, *, rank):
+    """(input, intermediate) quantization multipliers for one layer's experts
+    from the HY4_MOE_A4 sidecar (`<dir>/r<rank>.pt`), or None when A4 is off.
+
+    Experts the calibration never routed take their layer's widest range
+    (b12x shares the input scale as the minimum multiplier anyway)."""
+    import os
+
+    import torch
+
+    root = os.environ.get("HY4_MOE_A4") or ""
+    if not root:
+        return None
+    path = os.path.join(root, f"r{int(rank)}.pt")
+    table = _A4_SIDECARS.get(path)
+    if table is None:
+        table = _A4_SIDECARS[path] = torch.load(path, map_location="cpu")
+    amax = table.get(f"{expert_prefix}.fused")
+    if amax is None:
+        raise KeyError(f"HY4_MOE_A4 sidecar {path} has no calibration for {expert_prefix}")
+    amax = amax.float().clone()
+    for column in (0, 1):
+        widest = float(amax[:, column].max())
+        if not widest > 0:
+            raise ValueError(f"{expert_prefix}: calibration saw no routed tokens (column {column})")
+        amax[:, column] = torch.where(amax[:, column] > 0, amax[:, column],
+                                      torch.full_like(amax[:, column], widest))
+    return (A4_GSCALE / amax[:, 0]).contiguous(), (A4_GSCALE / amax[:, 1]).contiguous()
+
+
+_A4_SIDECARS = {}
+
+
+def a4_min_rows():
+    """Calls above this row count take the A4 prefill op; the rest the A16 op."""
+    import os
+
+    return int(os.environ.get("HY4_MOE_A4_MIN_ROWS") or 64)
+
+
 class FusedWireScratch:
     """Wire-time scratch shared by every fused op of one rank.
 
@@ -243,10 +334,18 @@ class FusedRoutedExperts:
     time). Calling before `wire` raises instead of planning inside a step.
     """
 
-    def __init__(self, experts, *, hidden, top_k, device, name):
+    def __init__(self, experts, *, hidden, top_k, device, name, a4_prefill=False):
         if hidden < 1 or top_k < 1:
             raise ValueError("fused routed experts require positive geometry")
         self.experts = experts          # `fused_moe.PreparedExperts` (loader)
+        # consult18 E2: experts prepared with calibrated A4 capability get two
+        # ops (per-mode wiring): `op` (A4, prefill rows) and `small_op` (A16,
+        # decode and calls of at most `a4_min_rows()` rows).
+        self.a4_prefill = bool(a4_prefill)
+        self.small_op = None
+        self.small_tokens = 0
+        self._small_workspace = self._small_storage = None
+        self.amax = None                # calibration boot: [1, E, 2] amax buffer
         self.hidden = hidden
         self.max_tokens = None          # set at `wire` from the call-shape catalogue
         self.top_k = top_k
@@ -262,7 +361,40 @@ class FusedRoutedExperts:
     def wired(self):
         return self.op is not None
 
-    def wire(self, *, session, max_tokens, scratch=None):
+    def _wire_small(self, preparation, small_scratch):
+        """consult18 E2: the A16 op for decode and short calls over the same
+        A4-capable experts (an A4-prepared op forces A4 on every bind, and A4
+        has prefill-size launches only)."""
+        import torch
+        from ignition.components.moe import PreparedRoutedExperts
+
+        self.small_tokens = min(a4_min_rows(), self.max_tokens)
+        if small_scratch is not None:
+            if ((small_scratch.max_tokens, small_scratch.hidden, small_scratch.top_k)
+                    != (self.small_tokens, self.hidden, self.top_k)):
+                raise ValueError(f"{self.name}: shared small scratch geometry differs from this op")
+            self.small_op = PreparedRoutedExperts(
+                small_scratch.source, self.experts, small_scratch.ids, small_scratch.weights,
+                small_scratch.output, session=preparation, name=f"{self.name}.a16",
+                workspace=small_scratch.arena, a4_prefill=False)
+            self.small_op.functional(session=preparation)
+            self._small_workspace, self._small_storage = small_scratch.adopt(self.small_op)
+            return
+        source = torch.zeros((self.small_tokens, self.hidden), dtype=torch.bfloat16,
+                             device=self.device)
+        ids = torch.zeros((self.small_tokens, self.top_k), dtype=torch.int32, device=self.device)
+        weights = torch.full((self.small_tokens, self.top_k), 1.0 / self.top_k,
+                             dtype=torch.float32, device=self.device)
+        self.small_op = PreparedRoutedExperts(source, self.experts, ids, weights,
+                                              torch.zeros_like(source), session=preparation,
+                                              name=f"{self.name}.a16", a4_prefill=False)
+        self.small_op.functional(session=preparation)
+        self._small_workspace = torch.empty(self.small_op.workspace_nbytes, dtype=torch.uint8,
+                                            device=self.device)
+        self._small_storage = [torch.empty_strided(shape, stride, dtype=dtype, device=self.device)
+                               for shape, stride, dtype in self.small_op.scale_layouts]
+
+    def wire(self, *, session, max_tokens, scratch=None, small_scratch=None):
         """Build the prepared operator and its persistent scratch (idempotent)."""
         if self.op is not None:
             return self
@@ -290,8 +422,17 @@ class FusedRoutedExperts:
 
         from b12x.moe import fused_moe as _fused_moe
 
-        routing = ({"routing": _fused_moe.RoutingSpec(deterministic_output=True)}
-                   if (_os.environ.get("HY4_MOE_DETERMINISTIC") or "") not in ("", "0") else {})
+        spec = {}
+        if (_os.environ.get("HY4_MOE_DETERMINISTIC") or "") not in ("", "0"):
+            spec["deterministic_output"] = True
+        if MoeCalibration.enabled():
+            if self.a4_prefill:
+                raise ValueError(f"{self.name}: HY4_MOE_CALIBRATE and HY4_MOE_A4 are exclusive")
+            spec["collect_activation_amax"] = True
+            self.amax = CALIBRATION.buffer(self.name, self.experts.num_experts, self.device)
+        routing = {"routing": _fused_moe.RoutingSpec(**spec)} if spec else {}
+        if self.a4_prefill:
+            routing["a4_prefill"] = True
         if scratch is not None:
             if ((scratch.max_tokens, scratch.hidden, scratch.top_k)
                     != (self.max_tokens, self.hidden, self.top_k)
@@ -302,6 +443,8 @@ class FusedRoutedExperts:
                 session=preparation, name=self.name, workspace=scratch.arena, **routing)
             self.op.functional(session=preparation)
             self._workspace, self._storage = scratch.adopt(self.op)
+            if self.a4_prefill:
+                self._wire_small(preparation, small_scratch)
             return self
         source = torch.zeros((self.max_tokens, self.hidden), dtype=torch.bfloat16,
                              device=self.device)
@@ -318,12 +461,16 @@ class FusedRoutedExperts:
         self._storage = [torch.empty_strided(shape, stride, dtype=dtype,
                                              device=self.device)
                          for shape, stride, dtype in self.op.scale_layouts]
+        if self.a4_prefill:
+            self._wire_small(preparation, small_scratch)
         return self
 
     def warm(self):
         """Run one call at the extremes so no plan preparation lands in a step."""
         import torch
-        for rows in (1, self.max_tokens):
+        warm_rows = ((1, self.small_tokens, self.small_tokens + 1, self.max_tokens)
+                     if self.small_op is not None else (1, self.max_tokens))
+        for rows in sorted(set(r for r in warm_rows if 0 < r <= self.max_tokens)):
             x = torch.zeros((rows, self.hidden), dtype=torch.bfloat16, device=self.device)
             ids = torch.zeros((rows, self.top_k), dtype=torch.int32, device=self.device)
             weights = torch.full((rows, self.top_k), 1.0 / self.top_k,
@@ -354,11 +501,19 @@ class FusedRoutedExperts:
         from .lanes import lane
 
         current = lane()
+        op = self.op
         workspace, storage = ((self._workspace, self._storage) if current == 0
                               else self._lane_scratch[current])
-        prepared_moe_out(x, weights, ids, output, workspace, self.op.scale_inputs,
-                         storage, self.op.plan.handle, True, None, None, None,
-                         None, None, False, self.op.precision.get("a4_prefill"))
+        a4 = self.op.precision.get("a4_prefill")
+        if self.small_op is not None and rows <= self.small_tokens:
+            if current:
+                raise RuntimeError(f"{self.name}: lane {current} has no small-call A16 scratch")
+            op, workspace, storage = self.small_op, self._small_workspace, self._small_storage
+            a4 = False
+        amax, layer = (self.amax, 0) if self.amax is not None else (None, None)
+        prepared_moe_out(x, weights, ids, output, workspace, op.scale_inputs,
+                         storage, op.plan.handle, True, None, amax, layer,
+                         None, None, False, a4)
         self.calls += 1
         return output
 

@@ -265,13 +265,28 @@ class PreparedHy4Rank:
             first = fused_layers[0].mlp.routed
             scratch = FusedWireScratch(device=self.device, max_tokens=capacity,
                                        hidden=first.hidden, top_k=first.top_k)
+            # consult18 E2: A4-capable experts also wire a small A16 op (decode and
+            # short calls), all of them over a second shared scratch.
+            from .moe import a4_min_rows
+
+            a4_layers = {bool(layer.mlp.routed.a4_prefill) for layer in fused_layers}
+            if len(a4_layers) != 1:
+                raise ValueError("the routed layers disagree on calibrated A4 prefill")
+            small_scratch = (FusedWireScratch(device=self.device,
+                                              max_tokens=min(a4_min_rows(), capacity),
+                                              hidden=first.hidden, top_k=first.top_k)
+                             if a4_layers.pop() else None)
             for layer in fused_layers:
                 fused = layer.mlp.routed
-                fused.wire(session=preparation, max_tokens=capacity, scratch=scratch)
+                fused.wire(session=preparation, max_tokens=capacity, scratch=scratch,
+                           small_scratch=small_scratch)
                 fused.warm()
                 layer.mlp._prepared = fused
             scratch.seal()
+            if small_scratch is not None:
+                small_scratch.seal()
             self.fused_session, self.fused_scratch = preparation, scratch
+            self.fused_small_scratch = small_scratch
         return self
 
 

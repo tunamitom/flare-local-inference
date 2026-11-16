@@ -228,12 +228,20 @@ class PreparedRoutedExperts:
             scale_expansion=self.scale_plan, invocation=invocation, routing=routing,
         )
         route_input_templates = dict(self.route_inputs)
+        # A calibrating plan (RoutingSpec.collect_activation_amax) compiles its
+        # launches with the amax epilogue, so every bind — the prepare-time
+        # prime call and the finalized binding included — carries an amax
+        # buffer. Callers pass their own per call; this one only primes.
+        if routing is not None and getattr(routing, "collect_activation_amax", False):
+            self.amax_prime = torch.zeros((1, experts.num_experts, 2), dtype=torch.float32,
+                                          device=source.device)
+            route_input_templates.update(activation_amax=self.amax_prime, layer_idx=0)
 
         def prepare_call(state):
             scratch = planned_scratch(state.scratch.scratch_specs(), workspace)
             self.scratch = scratch
             route_inputs = dict(route_input_templates)
-            if route_inputs:
+            if "router_logits" in route_inputs:
                 route_inputs["router_logits"] = torch.zeros_like(route_inputs["router_logits"])
                 route_inputs["selected_logits"] = torch.zeros_like(route_inputs["selected_logits"])
                 if "num_valid_tokens" in route_inputs:

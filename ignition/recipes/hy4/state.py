@@ -430,13 +430,21 @@ def _moe_state(builder, prefix, *, dense=False):
                         for projection in ("gate_up_proj", "down_proj")
                         for suffix in ("weight", "weight_scale", "weight_scale_2")}
             builder.used.update(resident)
+            # consult18 E2: HY4_MOE_A4 — calibrated A4 prefill (this rank's
+            # sidecar of per-expert activation multipliers).
+            from .moe import a4_activation_scales
+
+            a4_scales = a4_activation_scales(expert_prefix, rank=sharding.shard.rank)
             experts = loader.load_resident_experts(
                 expert_prefix, resident,
                 intermediate_range=sharding.expert_range,
-                swiglu_limit=c["swiglu_limit"])
+                swiglu_limit=c["swiglu_limit"],
+                **({"a4_prefill": True, "activation_scales": a4_scales}
+                   if a4_scales is not None else {}))
             routed = FusedRoutedExperts(
                 experts, hidden=hidden, top_k=c["num_experts_per_tok"],
-                device=loader.device, name=f"{expert_prefix}.fused")
+                device=loader.device, name=f"{expert_prefix}.fused",
+                a4_prefill=a4_scales is not None)
         else:
             half = (slice(None), slice(first, last), slice(None))
             half_up = (slice(None), slice(inter + first, inter + last), slice(None))

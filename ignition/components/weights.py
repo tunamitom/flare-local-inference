@@ -1396,7 +1396,8 @@ class DirectWeightLoader:
                          weight_name="weight", activation="silu", w13_layout="w13", shared_columns=None,
                          global_scale_name="weight_scale_2", global_scale_kind="multiplier",
                          input_scale_name=None, activation_outer_scale="expert",
-                         swiglu_alpha=None, swiglu_beta=None, a4_prefill=None):
+                         swiglu_alpha=None, swiglu_beta=None, a4_prefill=None,
+                         activation_scales=None):
         """Prepare NVFP4 or MXFP4 experts, optionally compressing their block scales.
 
         The first two projection names fill the first and second w13 halves in that
@@ -1542,7 +1543,20 @@ class DirectWeightLoader:
             record_numeric_tensor(w2)
             record_numeric_tensor(s2)
             shared.exchange()
-        if (activation_mode == "a4" or a4_prefill) and activation_outer_scale == "expert":
+        if (a4_prefill and activation_mode == "a16" and format == "nvfp4"
+                and activation_scales is not None and scale_vectors is None):
+            # Calibrated A4 prefill over an A16 export: the checkpoint's weight
+            # gains plus caller-calibrated activation quantization multipliers
+            # (6 * 448 / amax per expert; the export carries no input_scale).
+            first_scales = torch.tensor(globals13, dtype=torch.float32)
+            if bool((first_scales[:, 0] == first_scales[:, 1]).all()):
+                first_scales = first_scales[:, 0].contiguous()
+            if len(activation_scales) != 2:
+                raise ValueError("activation_scales must be (input, intermediate) vectors")
+            vectors = (first_scales, torch.tensor(globals2, dtype=torch.float32),
+                       *(torch.as_tensor(v, dtype=torch.float32).reshape(-1).contiguous()
+                         for v in activation_scales))
+        elif (activation_mode == "a4" or a4_prefill) and activation_outer_scale == "expert":
             if scale_vectors is None or len(scale_vectors) != 4:
                 raise ValueError("NVFP4 A4 experts require weight and activation scale vectors")
             vectors = scale_vectors
