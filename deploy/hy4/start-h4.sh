@@ -26,8 +26,8 @@ set -euo pipefail
 NAME="${NAME:-h4}"
 PORT="${LLM_PORT:-8001}"
 TP=8
-IMAGE="${IMAGE:-local/flare:rt-h4-cp8-dg27}"
-IMAGE_SHA="${IMAGE_SHA:-sha256:5a7b10dc6ce302a78600d2e082985df402135db0d80151e5e566cceb10ec16af}"
+IMAGE="${IMAGE:-local/flare:rt-h4-cp8-dg30}"
+IMAGE_SHA="${IMAGE_SHA:-sha256:1fc9cbcd11b56773b017c1796175735fe3120ccbf480b81e37bcd1fe8e394389}"
 PKG_LINK="${PKG_DIR:-/opt/models/Hy4-nvfp4-w4a16-mse-gpu}"
 SERVED_NAME="${SERVED_NAME:-smart}"
 MAX_CONCURRENCY="${MAX_CONCURRENCY:-1}"
@@ -213,6 +213,7 @@ docker run -d --name "$NAME" --network host --init --cap-add SYS_PTRACE \
   -e HY4_SPEC="${HY4_SPEC:-on}" \
   -e HY4_SPEC_K="${HY4_SPEC_K:-3}" \
   -e HY4_SPEC_DECODE_ROWS="${HY4_SPEC_DECODE_ROWS:-1}" \
+  -e HY4_SPEC_SAMPLE="${HY4_SPEC_SAMPLE:-on}" \
   -e HY4_AB_MLP_GRAPHS="${HY4_AB_MLP_GRAPHS:-1}" \
   -e HY4_DECODE_AUTOTUNE="${HY4_DECODE_AUTOTUNE:-0}" \
   -e HY4_MOE_DECODE_OP="${HY4_MOE_DECODE_OP:-1,4}" \
@@ -247,7 +248,7 @@ docker run -d --name "$NAME" --network host --init --cap-add SYS_PTRACE \
       --host 0.0.0.0 --port "$PORT" --served-model-name "$SERVED_NAME" \
       --max-concurrency "$MAX_CONCURRENCY" \
       --headroom 2415919104 \
-      --all-reduce-arm "1:oneshot,2-512:twoshot,1024-:dma" \
+      --all-reduce-arm "${H4_AR_ARMS:-1:oneshot,2-4:rsag,8-512:twoshot,1024-:dma}" \
       --all-reduce-kernel-rows 512 \
       --lse-transport ce-relay --gather-transport ce-relay \
       --selection-wire dcp \

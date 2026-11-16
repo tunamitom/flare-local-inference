@@ -331,9 +331,14 @@ def run_generate(ctx, cmd):
     # prefill then also absorbs every prompt row into the draft KV.
     from ignition.recipes.hy4 import runtime as _rt
     spec = getattr(ctx, "spec", None)
+    spec_temp = float(params.get("temperature", 0.9) or 0.0)
+    # consult18 P5: temperature-only sampling speculates too (spec_sample.py);
+    # top-k / top-p requests decode plainly.
+    spec_sampling = (spec_temp > 0.0 and int(params.get("top_k", -1) or -1) <= 0
+                     and float(params.get("top_p", 1.0) or 1.0) >= 1.0)
     use_spec = (spec is not None and _rt.SWITCHES.get("spec") == "on" and n > 1
                 and max_new > 1 and not params.get("nll")
-                and float(params.get("temperature", 0.9) or 0.0) <= 0.0)
+                and (spec_temp <= 0.0 or (spec_sampling and _rt.SWITCHES.get("spec_sample") == "on")))
     last_hidden = None
     if n == 1:
         t = torch.tensor([[ids[0]]], dtype=torch.int64, device=dev)
@@ -454,7 +459,8 @@ def run_generate(ctx, cmd):
                 return "length"
             return None
 
-        finish, rest = spec.generate(start=n, bonus=nxt, hidden=last_hidden, emit=emit)
+        finish, rest = spec.generate(start=n, bonus=nxt, hidden=last_hidden, emit=emit,
+                                     temperature=spec_temp)
         done = finish is not None
     while not done:
         t = torch.tensor([[out[-1]]], dtype=torch.int64, device=dev)
