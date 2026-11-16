@@ -35,6 +35,10 @@ ALLOWED = {
     # "decode": one-token steps only (the measured win: +2.3 % at 16k c1; the
     # host-bound prefill tail is 0.8 % slower sync-free)
     "sync_free": ("off", "decode", "on"),
+    # consult18 P2: CUDA graphs of the one-row decode step (decode_graph.py);
+    # "on" replays a captured step (lazily captured per indexer width bucket)
+    # instead of launching ~10k kernels from the host per token.
+    "decode_graph": ("off", "on"),
 }
 DEFAULTS = {"index_scores": "fp32",
             "ihc": os.environ.get("HY4_IHC") or "default",
@@ -44,7 +48,8 @@ DEFAULTS = {"index_scores": "fp32",
             "batched_waits": os.environ.get("HY4_BATCHED_WAITS") or "off",
             "graph_moe": os.environ.get("HY4_GRAPH_MOE") or "off",
             "comm_token": os.environ.get("HY4_COMM_TOKEN") or "on",
-            "sync_free": os.environ.get("HY4_SYNC_FREE") or "off"}
+            "sync_free": os.environ.get("HY4_SYNC_FREE") or "off",
+            "decode_graph": os.environ.get("HY4_DECODE_GRAPH") or "off"}
 for _key, _value in DEFAULTS.items():
     if _value not in ALLOWED[_key]:
         raise ValueError(f"runtime default {_key}={_value!r} must be one of {ALLOWED[_key]}")

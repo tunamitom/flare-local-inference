@@ -355,3 +355,54 @@ def test_sync_free_single_lane_forward_is_bit_identical(worlds, world):
     for exact, free in zip(run(False), run(True)):
         for want, got in zip(exact, free):
             assert torch.equal(got, want), f"world {world}: rel {rel_error(got, want)}"
+
+
+@pytest.mark.parametrize("world", (1, 2, 8))
+def test_decode_graph_body_equals_exact_decode(worlds, world):
+    """consult18 P2: the captured decode step's body — static device inputs,
+    predicated KV writes (record slot -1 / index-key rewrite off the owner),
+    the indexer at a width BUCKET past the live keys — gives the same bits as
+    the exact decode step, every rank, over steps crossing a bucket edge."""
+    from ignition.recipes.hy4.collectives import SimulatedGroup
+    from ignition.recipes.hy4.decode_graph import DecodeGraphs
+
+    def scenario(graph):
+        def body(decoder):
+            _, tokens = golden_tokens()
+            batch = torch.tensor([tokens[:2 * HALF]], dtype=torch.long)
+            decoder.forward(batch[:, :HALF], logits_rows="all")
+            decoder.append([0], HALF)
+            decoder.forward(batch[:, HALF:], logits_rows="all")
+            decoder.append([0], HALF)
+            graphs = DecodeGraphs(decoder, granule=2)
+            shape = decoder.default_call_shape((1, 1))
+            out = []
+            for token in (7, 11, 3, 5):
+                t = torch.tensor([[token]], dtype=torch.long)
+                start = decoder._row_lengths[0]
+                if graph:
+                    assert graphs.accepts(t, row=0, start=start,
+                                          call_shape=shape, state=None, return_hidden=False,
+                                          logits_rows="all") is False   # CPU: never replayed
+                    graphs._stage(t, 0, start)
+                    width = graphs.index_width(start + 1)
+                    assert width >= (start + 1 + decoder.collectives.world_size - 1) \
+                        // decoder.collectives.world_size
+                    local, flag = graphs._body(0, shape, width, "all")
+                    assert not bool(flag)
+                    out.append(decoder.collectives.gather_logits(
+                        local, vocabulary_range=decoder.weights.sharding.vocabulary_range))
+                else:
+                    out.append(decoder.decode_step(t))
+                decoder.append([0], 1)
+            return out
+        return body
+
+    def run(graph):
+        if world == 1:
+            return [scenario(graph)(decoder) for decoder in fresh_decoders(worlds[1])]
+        return run_wired(worlds[world], scenario(graph), group=SimulatedGroup(world))
+
+    for exact, graphed in zip(run(False), run(True)):
+        for want, got in zip(exact, graphed):
+            assert torch.equal(got, want), f"world {world}: rel {rel_error(got, want)}"

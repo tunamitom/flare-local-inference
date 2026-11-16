@@ -218,6 +218,18 @@ class Hy4Cache:
         self._store(self.index[owner], tokens, positions, keys)
 
     def _store(self, table, tokens, positions, values):
+        memo = self._forward_memo.get(id(tokens))
+        if memo is not None and len(memo) == 5 and memo[0] is tokens and memo[1] is positions:
+            # consult18 P2 decode graphs: one token, fixed shapes. A rank that
+            # does not own it rewrites one valid slot with its own value (a
+            # no-op); the owner stores the token's value — the same bytes as
+            # the indexed assignment below.
+            _, _, kept, slots, safe = memo
+            current = table.index_select(0, safe)
+            fresh = values.to(table.dtype).index_select(0, kept)
+            own = (slots >= 0).reshape(-1, *([1] * (table.dim() - 1)))
+            table.index_copy_(0, safe, torch.where(own, fresh, current))
+            return
         kept, slots = self._owned_slots(tokens, positions)   # store only owned records (D1)
         table[slots] = values.to(table.dtype).index_select(0, kept)
 
@@ -260,6 +272,16 @@ class Hy4Cache:
                  + torch.arange(count, device=self.device, dtype=torch.long))
         self._forward_memo.pop(id(tokens), None)
         self._forward_memo[id(tokens)] = (tokens, positions, kept, slots)
+
+    def begin_forward_static(self, tokens, positions, *, slot, safe):
+        """consult18 P2 decode graphs: `begin_forward` for ONE token with
+        device-resident slots (fixed shapes, no host value). `slot` [1] is the
+        token's physical slot on its owning rank and -1 elsewhere (the fused
+        record writer skips negative slots); `safe` [1] is always a valid slot
+        (the owner's slot; elsewhere any in-row slot, rewritten unchanged)."""
+        kept = torch.zeros((1,), dtype=torch.long, device=self.device)
+        self._forward_memo.pop(id(tokens), None)
+        self._forward_memo[id(tokens)] = (tokens, positions, kept, slot, safe)
 
     def end_forward(self):
         self._forward_memo.clear()
@@ -656,30 +678,46 @@ class Hy4Decoder:
             row_id = 0 if request_rows is None else int(request_rows[0])
             start = int(self._row_lengths.get(row_id, 0))
             width = int(token_ids.shape[1])
-            positions = torch.arange(start, start + width, device=self.device, dtype=torch.long)
-            token_rows = self._token_rows(token_ids.shape, rows)
-            visible = positions + 1
-            self.cache.begin_forward_host(token_rows, positions, row=row_id, start=start)
-            visible_max = (start + width
-                           if self.collectives.world_size > 1 and call_shape.short_context_bypass
-                           and call_shape.is_decode_graph else None)
-            world = int(getattr(self.collectives, "world_size", 1))
-            rank = int(getattr(self.collectives, "rank", 0))
-            end = start + width
-            geometry = {"owned_max": (max(end - rank, 0) + world - 1) // world,
-                        "base": row_id * int(getattr(self.cache, "local_capacity", 0))}
-            deferred = getattr(self.collectives, "deferred_checks", None)
-            if deferred is not None:
-                deferred.clear()
-            from .lanes import use_lane
+            graphs = getattr(self, "decode_graphs", None)
+            if (graphs is not None and SWITCHES.get("decode_graph") == "on"
+                    and graphs.accepts(token_ids, row=row_id, start=start, call_shape=call_shape,
+                                       state=state, return_hidden=return_hidden,
+                                       logits_rows=logits_rows)):
+                # consult18 P2: the captured one-row step (decode_graph.py) —
+                # local-shard logits and the deferred selection flag; the
+                # vocabulary gather and the flag read stay here.
+                local, flag = graphs.run(token_ids, row=row_id, start=start,
+                                         call_shape=call_shape, logits_rows=logits_rows)
+                result = self.collectives.gather_logits(
+                    local, vocabulary_range=self.weights.sharding.vocabulary_range)
+                flags = [flag]
+            else:
+                positions = torch.arange(start, start + width, device=self.device,
+                                         dtype=torch.long)
+                token_rows = self._token_rows(token_ids.shape, rows)
+                visible = positions + 1
+                self.cache.begin_forward_host(token_rows, positions, row=row_id, start=start)
+                visible_max = (start + width
+                               if self.collectives.world_size > 1 and call_shape.short_context_bypass
+                               and call_shape.is_decode_graph else None)
+                world = int(getattr(self.collectives, "world_size", 1))
+                rank = int(getattr(self.collectives, "rank", 0))
+                end = start + width
+                geometry = {"owned_max": (max(end - rank, 0) + world - 1) // world,
+                            "base": row_id * int(getattr(self.cache, "local_capacity", 0))}
+                deferred = getattr(self.collectives, "deferred_checks", None)
+                if deferred is not None:
+                    deferred.clear()
+                from .lanes import use_lane
 
-            with use_lane(0, overlap=False, geometry=geometry, sync_free=True):
-                result = self._layers_and_head(
-                    token_ids, rows, positions, token_rows, visible, visible_max, state=state,
-                    return_hidden=return_hidden, call_shape=call_shape, logits_rows=logits_rows)
-            flags = list(deferred) if deferred else []
-            if deferred is not None:
-                deferred.clear()
+                with use_lane(0, overlap=False, geometry=geometry, sync_free=True):
+                    result = self._layers_and_head(
+                        token_ids, rows, positions, token_rows, visible, visible_max, state=state,
+                        return_hidden=return_hidden, call_shape=call_shape,
+                        logits_rows=logits_rows)
+                flags = list(deferred) if deferred else []
+                if deferred is not None:
+                    deferred.clear()
             if flags and bool(torch.stack([f.reshape(()) for f in flags]).any()):
                 # A narrow scores-only cut needed the full re-offer (or the
                 # exactness test fired): redo the forward on the exact path
@@ -709,7 +747,7 @@ class Hy4Decoder:
                                      call_shape=call_shape, logits_rows=logits_rows)
 
     def _layers_and_head(self, token_ids, rows, positions, token_rows, visible, visible_max, *,
-                         state, return_hidden, call_shape, logits_rows):
+                         state, return_hidden, call_shape, logits_rows, gather=True):
         # Vocabulary-sharded embedding (D5): masked lookup over this rank's
         # shard + all-reduce (identity at world 1).
         WATCH.begin_forward(call_shape.name, positions)   # consult17: no-op unless armed
@@ -780,11 +818,14 @@ class Hy4Decoder:
                     token = token_ids.shape[1] - 1 if logits_rows == "last" else logits_rows
                     logits = logits[:, token:token + 1, :].contiguous()
             # D5: logits come back per vocabulary shard; all-gather to the
-            # sampler (identity at world 1).
-            with TIMER.phase("comm.logits_gather"):
-                logits = self.collectives.gather_logits(
-                    logits, vocabulary_range=self.weights.sharding.vocabulary_range)
-            WATCH.check("comm.logits_gather", len(self.weights.layers), zero=True, logits=logits)
+            # sampler (identity at world 1). `gather=False`: the captured
+            # decode step returns the local shard (the gather runs on host).
+            if gather:
+                with TIMER.phase("comm.logits_gather"):
+                    logits = self.collectives.gather_logits(
+                        logits, vocabulary_range=self.weights.sharding.vocabulary_range)
+                WATCH.check("comm.logits_gather", len(self.weights.layers), zero=True,
+                            logits=logits)
         TIMER.forward_end()
         if return_hidden:
             rows, width = token_ids.shape
