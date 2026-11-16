@@ -115,9 +115,9 @@ def filter_scores(collectives, scores, top_k, top_p, *, vocabulary_range, offer_
     largest-probability tokens through the one whose cumulative probability
     first reaches p (at least one). Each rank offers its local top candidates
     over the score gather; the merged candidates give both thresholds.
-    Returns `(filtered scores, covered)`: `covered` [] bool is False when the
-    gathered candidates do not reach p (the nucleus extends past them) — the
-    caller must not use the result then. Ties at the top-p threshold are all
+    Returns `(filtered scores, covered)`: `covered` [rows] bool is False for a
+    row whose nucleus extends past the gathered candidates — that row's
+    filtered distribution is not the exact one. Ties at the top-p threshold are all
     kept. Capture-safe; identical on every rank."""
     rows, width = (int(v) for v in scores.shape)
     s = scores.float()
@@ -155,4 +155,4 @@ def filter_scores(collectives, scores, top_k, top_p, *, vocabulary_range, offer_
     bound = got[:, :, -1].max(dim=1).values
     covered = (thr > bound) | ~use_p
     s = torch.where(s >= thr.unsqueeze(1), s, torch.full_like(s, NEG))
-    return s, covered.all()
+    return s, covered

@@ -38,7 +38,8 @@ def decode_scope():
 
 def in_decode_scope(x):
     """A decode-family call that may read the INT8 copies: CUDA, <= GEMV_ROWS rows,
-    inside `decode_scope()`."""
+    inside `decode_scope()`. `x` is the matmul's input as it multiplies the
+    weight (rows = every dimension but the last)."""
     return (_DECODE_SCOPE.get() and x.is_cuda
             and int(x.numel() // max(int(x.shape[-1]), 1)) <= GEMV_ROWS)
 

@@ -126,7 +126,7 @@ def test_sharded_filter_matches_full_vocabulary(world, top_k, top_p):
         lo = rank * width
         out, cov = filter_scores(col, logits[:, lo:lo + width], tk, tp,
                                  vocabulary_range=(lo, lo + width), offer_width=96)
-        return out, bool(cov)
+        return out, bool(cov.all())
 
     if world == 1:
         results = [body(None, 0)]
@@ -166,7 +166,7 @@ def test_filtered_speculative_sampling_emits_filtered_target(world, top_k, top_p
         g = torch.Generator().manual_seed(1000 + rank)
         sp, cov_p = filter_scores(col, p_logits[:, lo:lo + width], tk, tp, vocabulary_range=vr, offer_width=64)
         sq, cov_q = filter_scores(col, q_logits[:, lo:lo + width], tk, tp, vocabulary_range=vr, offer_width=64)
-        assert bool(cov_p) and bool(cov_q)
+        assert bool(cov_p.all()) and bool(cov_q.all())
         emitted = []
         for _ in range(TRIALS):
             drafts = torch.stack([sample_tokens(col, sq[i:i + 1], torch.rand((1, width), generator=g),

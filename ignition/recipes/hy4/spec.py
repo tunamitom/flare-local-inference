@@ -122,7 +122,6 @@ class SpeculativeGreedy:
             greedy, h, fl, aentry = self._absorb(c, pend_tokens, pend_hidden, sample=sample,
                                                  filtered=filtered)
             flags = [fl.clone()]
-            covs = [aentry["out_cov"].clone()] if filtered else []
             vt, _ = g.spec_inputs("verify", k + 1)
             vt[:, :1].fill_(int(bonus))
             vt[0, 1:2].copy_(greedy[:1])
@@ -136,8 +135,6 @@ class SpeculativeGreedy:
                 greedy, h, fl = g.run_spec("draft", row=row, start=P + j - 1, count=1,
                                            call_shape=self._shape(1), sample=sample, filtered=filtered)
                 flags.append(fl.clone())
-                if filtered:
-                    covs.append(dentry["out_cov"].clone())
                 vt[0, j + 1:j + 2].copy_(greedy[:1])
                 if sample:
                     ventry["q_in"][j:j + 1].copy_(dentry["out_q"])
@@ -149,17 +146,13 @@ class SpeculativeGreedy:
             if sample:
                 parts.append(ventry["out_accept"].to(torch.long))
             if filtered:
-                parts.append(torch.stack(covs + [ventry["out_cov"]]).to(torch.long))
+                parts.append(ventry["out_cov"].to(torch.long))
             host = torch.cat(parts).tolist()
+            usable = k + 1                     # verified rows whose filtered p is exact
             if filtered:
                 cov_host = host[-(k + 1):]
                 host = host[:-(k + 1)]
-                if not all(cov_host):
-                    # the nucleus ran past the gathered candidates: nothing of this
-                    # round is emitted; plain decoding continues from P (its KV
-                    # writes at P.. are rewritten there)
-                    self.filter_fallbacks += 1
-                    return None, (P, bonus)
+                usable = next((i for i, ok in enumerate(cov_host) if not ok), k + 1)
             drafts, target = host[1:k + 1], host[k + 1:2 * k + 2]
             flag_host = host[2 * k + 2:3 * k + 3]
             self.draft_flags += sum(flag_host[:-1])
@@ -180,9 +173,7 @@ class SpeculativeGreedy:
 
                         sp, cov = filter_scores(d.collectives, sp, *g.spec_filter_params(),
                                                 vocabulary_range=(lo_v, hi_v))
-                        if not bool(cov):
-                            self.filter_fallbacks += 1
-                            return None, (P, bonus)
+                        usable = next((i for i, ok in enumerate(cov.tolist()) if not ok), k + 1)
                     accept_t, tokens_t = verify_sample(
                         d.collectives, sp,
                         ventry["q_in"], vt[0, 1:], ventry["uniform"], ventry["noise"],
@@ -194,11 +185,28 @@ class SpeculativeGreedy:
             n = 0
             if sample:
                 accept = host[3 * k + 3:]
-                while n < k and accept[n]:
+                while n < k and n < usable and accept[n]:
                     n += 1
             else:
                 while n < k and drafts[n] == target[n]:
                     n += 1
+            if n >= usable:
+                # consult18 P7: row n's filtered target is not exact (its nucleus ran
+                # past the gathered candidates). Rows < n were exact: emit the n
+                # accepted drafts, no bonus, and hand the request to plain decoding
+                # at P + n (it samples row n's position from the exact p). The
+                # verify wrote b, d1 .. dn; P .. P+n-1 are committed, d_n pending.
+                self.filter_fallbacks += 1
+                self.rounds += 1
+                self.accepted += n
+                if n == 0:
+                    return None, (P, bonus)
+                d.append([row], n)
+                for tok in drafts[:n]:
+                    finish = emit(tok)
+                    if finish is not None:
+                        return finish, None
+                return None, (P + n, drafts[n - 1])
             self.rounds += 1
             self.accepted += n
             new_hidden = vh[:n + 1].clone()

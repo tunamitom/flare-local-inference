@@ -952,13 +952,16 @@ class Hy4LayerAttention:
             gate_raw = x @ self.weights.gate_proj.T.to(x.dtype)
         gate = torch.sigmoid(gate_raw)
         gated = attn_output * gate.view(attn_output.shape[0], self.heads, self.v_head)
+        flat = gated.reshape(gated.shape[0], -1).contiguous()
         o_proj = self.weights.o_proj
         if self.weights.w8_o_proj is not None:
             from .w8 import in_decode_scope
 
-            if in_decode_scope(gated):
+            # the matmul's own 2-D input: rows = query rows (dg39: the 3-D
+            # [rows, heads, v] tensor counted rows x heads and sent T >= 3 to BF16)
+            if in_decode_scope(flat):
                 o_proj = self.weights.w8_o_proj
-        return gated.reshape(gated.shape[0], -1).contiguous() @ o_proj.T
+        return flat @ o_proj.T
 
 
 def rms_norm(x, weight, eps):

@@ -326,7 +326,10 @@ class DecodeGraphs:
     def spec_sample_state(self, kind, count):
         entry = self._spec_state(kind, count)
         if "out_cov" not in entry:
-            entry["out_cov"] = torch.ones((), dtype=torch.bool, device=self.device)
+            # per verified row: is its filtered target the exact one (draft rows
+            # need no coverage — a draft is exact for whatever q it sampled from)
+            entry["out_cov"] = torch.ones((count if kind == "verify" else 1,), dtype=torch.bool,
+                                          device=self.device)
         if "noise" not in entry:
             vocab = int(self.decoder.weights.head.shape[0])
             rows = count if kind == "verify" else 1
@@ -440,9 +443,8 @@ class DecodeGraphs:
                     from .spec_sample import filter_scores
 
                     top_k, top_p = self.spec_filter_params()
-                    scores, covered = filter_scores(d.collectives, scores, top_k, top_p,
-                                                    vocabulary_range=d.weights.sharding.vocabulary_range)
-                    entry["out_cov"].copy_(covered)
+                    scores, _ = filter_scores(d.collectives, scores, top_k, top_p,
+                                              vocabulary_range=d.weights.sharding.vocabulary_range)
                 entry["out_q"].copy_(scores)
                 greedy = sample_tokens(d.collectives, scores, entry["noise"],
                                        vocabulary_range=d.weights.sharding.vocabulary_range)
