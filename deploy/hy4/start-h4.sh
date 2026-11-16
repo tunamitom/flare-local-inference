@@ -26,8 +26,8 @@ set -euo pipefail
 NAME="${NAME:-h4}"
 PORT="${LLM_PORT:-8001}"
 TP=8
-IMAGE="${IMAGE:-local/flare:rt-h4-cp8-dg4}"
-IMAGE_SHA="${IMAGE_SHA:-sha256:312b6051bae38e8f29b12bf572e6a1e7e12108c8c5bfd4b469885446d9b79302}"
+IMAGE="${IMAGE:-local/flare:rt-h4-cp8-dg5}"
+IMAGE_SHA="${IMAGE_SHA:-sha256:79af23f224f36cfce9a74ab9a9fdad1f5d431dea7fe0024ebf88575b97b54309}"
 PKG_LINK="${PKG_DIR:-/opt/models/Hy4-nvfp4-w4a16-mse-gpu}"
 SERVED_NAME="${SERVED_NAME:-smart}"
 MAX_CONCURRENCY="${MAX_CONCURRENCY:-1}"
@@ -202,6 +202,7 @@ docker run -d --name "$NAME" --network host --init --cap-add SYS_PTRACE \
   -e HY4_PLAIN_SYNC_CENSUS="${HY4_PLAIN_SYNC_CENSUS:-}" \
   -e HY4_SYNC_FREE="${HY4_SYNC_FREE:-decode}" \
   -e HY4_DECODE_GRAPH="${HY4_DECODE_GRAPH:-on}" \
+  -e HY4_IHC_SPLIT="${HY4_IHC_SPLIT:-on}" \
   -e HY4_DECODE_GRAPH_PREWARM="${HY4_DECODE_GRAPH_PREWARM:-}" \
   -e HY4_DEV_EXEC="${HY4_DEV_EXEC:-1}" \
   -e HY4_TORCH_PROFILE="${HY4_TORCH_PROFILE:-}" \
