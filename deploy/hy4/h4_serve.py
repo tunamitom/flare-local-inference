@@ -215,8 +215,9 @@ def warm_up(ctx):
         # forward here, before any overlapped pair (which refuses first-use
         # preparation): the iHC prefill plans of both arms.
         from ignition.recipes.hy4 import runtime
-        for arm in runtime.ALLOWED["ihc"]:
-            runtime.SWITCHES["ihc"] = arm
+        for index in (0, -1):
+            for key, values in runtime.ALLOWED.items():
+                runtime.SWITCHES[key] = values[index]
             t = torch.full((1, widths[0]), 1, dtype=torch.int64, device=dev)
             decoder.forward(t, call_shape=ctx.shapes[widths[0]], logits_rows="none")
             decoder.complete([0], t)
@@ -1033,7 +1034,23 @@ def main():
                 break
             if cmd["op"] == "generate":
                 try:
-                    out, finish = run_generate(ctx, cmd)
+                    profile_dir = os.environ.get("HY4_TORCH_PROFILE") or ""
+                    if (profile_dir and len(cmd.get("tokens") or ()) >= 4096
+                            and not getattr(ctx, "profiled", False)):
+                        # consult18 census: CUDA-only kernel trace (CUPTI, no host
+                        # activity tracing) of ONE large request on every rank.
+                        import torch
+                        from torch.profiler import ProfilerActivity, profile
+                        ctx.profiled = True
+                        torch.cuda.synchronize(ctx.device)
+                        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+                            out, finish = run_generate(ctx, cmd)
+                            torch.cuda.synchronize(ctx.device)
+                        os.makedirs(profile_dir, exist_ok=True)
+                        prof.export_chrome_trace(os.path.join(profile_dir, f"trace-r{rank}.json"))
+                        trace(rank, f"torch profile written: {profile_dir}/trace-r{rank}.json")
+                    else:
+                        out, finish = run_generate(ctx, cmd)
                 except Exception as exc:  # noqa: BLE001
                     if rank == 0:
                         item["error"] = f"{type(exc).__name__}: {exc}"

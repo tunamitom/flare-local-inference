@@ -26,8 +26,8 @@ set -euo pipefail
 NAME="${NAME:-h4}"
 PORT="${LLM_PORT:-8001}"
 TP=8
-IMAGE="${IMAGE:-local/flare:rt-h4-cp8-4602f878}"
-IMAGE_SHA="${IMAGE_SHA:-sha256:a6ff30c156902516d591f7c1a1e698d0f11be00e4629a88f3c70a077acb95891}"
+IMAGE="${IMAGE:-local/flare:rt-h4-cp8-37ede0e3}"
+IMAGE_SHA="${IMAGE_SHA:-sha256:f4a77f8550790af91337d5dfff51ed7e73dca39cd5fa49a3a75e498377b3bf39}"
 PKG_LINK="${PKG_DIR:-/opt/models/Hy4-nvfp4-w4a16-mse-gpu}"
 SERVED_NAME="${SERVED_NAME:-smart}"
 MAX_CONCURRENCY="${MAX_CONCURRENCY:-1}"
@@ -193,6 +193,9 @@ docker run -d --name "$NAME" --network host --init --cap-add SYS_PTRACE \
   -e HY4_TRACE="${HY4_TRACE:-}" \
   -e HY4_AB_FILE="${HY4_AB_FILE:-}" \
   -e HY4_IHC="${HY4_IHC:-tuned}" \
+  -e HY4_FUSED_ROPE="${HY4_FUSED_ROPE:-on}" \
+  -e HY4_FUSED_MERGE="${HY4_FUSED_MERGE:-on}" \
+  -e HY4_TORCH_PROFILE="${HY4_TORCH_PROFILE:-}" \
   -e HY4_STATE_CENSUS="${HY4_STATE_CENSUS:-}" \
   -e HY4_OVERLAP_SYNC_GUARD="${HY4_OVERLAP_SYNC_GUARD:-}" \
   -e HY4_OVERLAP_COMM_TOKEN="${HY4_OVERLAP_COMM_TOKEN:-}" \
