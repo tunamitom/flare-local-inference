@@ -534,8 +534,36 @@ class MoEBlock:
     packed_input: object = None    # `PackedMoEInputProjections` (packed at load)
     overlap_applied: bool = False  # did the shared expert overlap the routed experts?
 
+    def _trim(self):
+        from .runtime import SWITCHES
+
+        return self.device.type == "cuda" and SWITCHES.get("host_trim") == "on"
+
+    def _router_f32_t(self, packed):
+        """`packed.rows("router").float().T`, cached under host_trim (the same
+        values and layout, so the same GEMM)."""
+        if not self._trim():
+            return packed.rows("router").float().T
+        cached = getattr(self, "_router_f32_cache", None)
+        if cached is None:
+            cached = self._router_f32_cache = packed.rows("router").float().T
+        return cached
+
+    def _bias_f32(self):
+        if not self._trim():
+            return self.router.correction_bias.float()
+        cached = getattr(self, "_bias_f32_cache", None)
+        if cached is None:
+            cached = self._bias_f32_cache = self.router.correction_bias.float()
+        return cached
+
     def route(self, x):
         """(router_logits, topk_weights, topk_indices): sigmoid + bias, top-k, renorm, scale."""
+        if self._trim():
+            cached = getattr(self, "_gate_f32_cache", None)
+            if cached is None:
+                cached = self._gate_f32_cache = self.router.gate.float().T
+            return self._route_from_logits(x.float() @ cached)
         logits = x.float() @ self.router.gate.float().T
         return self._route_from_logits(logits)
 
@@ -543,7 +571,7 @@ class MoEBlock:
         c = self.config.text
         experts, top_k = self.router.experts, c["num_experts_per_tok"]
         scores = torch.sigmoid(logits)
-        choice = scores + self.router.correction_bias.float()
+        choice = scores + self._bias_f32()
         if c["n_group"] > 1:  # the general group contract; Hy4 runs n_group == 1
             groups = choice.view(-1, c["n_group"], experts // c["n_group"])
             keep = groups.topk(2, dim=-1)[0].sum(-1)
@@ -591,7 +619,7 @@ class MoEBlock:
             # One packed weight at load; per-projection GEMMs over its rows —
             # bitwise the same as the loose weights (content gates are exact).
             with TIMER.phase("moe.route_shared"):
-                logits = (x.float() @ packed.rows("router").float().T)
+                logits = x.float() @ self._router_f32_t(packed)
                 shared_gate = x @ packed.rows("shared_gate").T
                 shared_up = x @ packed.rows("shared_up").T
                 _, topk_weights, topk_indices = self._route_from_logits(logits)
@@ -601,7 +629,8 @@ class MoEBlock:
                 logits, topk_weights, topk_indices = self.route(x)
         PROBE.add("moe.logits", -2, logits)
         PROBE.add("moe.topk_ids", -2, topk_indices)
-        PROBE.add("moe.topk_ids_sorted", -2, topk_indices.sort(dim=-1).values)
+        if PROBE.records is not None or not self._trim():
+            PROBE.add("moe.topk_ids_sorted", -2, topk_indices.sort(dim=-1).values)
         PROBE.add("moe.topk_weights", -2, topk_weights)
         overlap = bool(overlap_shared) and self.device.type == "cuda"
         self.overlap_applied = bool(overlap_shared)

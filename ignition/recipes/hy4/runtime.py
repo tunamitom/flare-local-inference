@@ -20,11 +20,18 @@ ALLOWED = {
     # eager op chains (fused_ops.py).
     "fused_rope": ("off", "on"),
     "fused_merge": ("off", "on"),
+    # exact host trims: fused RMSNorm tail, cached FP32 router weight/bias,
+    # no probe-only sort when the probe is off.
+    "host_trim": ("off", "on"),
+    # one multi-flag wait launch per CE exchange instead of one per source
+    "batched_waits": ("off", "on"),
 }
 DEFAULTS = {"index_scores": "fp32",
             "ihc": os.environ.get("HY4_IHC") or "default",
             "fused_rope": os.environ.get("HY4_FUSED_ROPE") or "off",
-            "fused_merge": os.environ.get("HY4_FUSED_MERGE") or "off"}
+            "fused_merge": os.environ.get("HY4_FUSED_MERGE") or "off",
+            "host_trim": os.environ.get("HY4_HOST_TRIM") or "off",
+            "batched_waits": os.environ.get("HY4_BATCHED_WAITS") or "off"}
 for _key, _value in DEFAULTS.items():
     if _value not in ALLOWED[_key]:
         raise ValueError(f"runtime default {_key}={_value!r} must be one of {ALLOWED[_key]}")

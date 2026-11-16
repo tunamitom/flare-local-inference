@@ -912,6 +912,24 @@ class CeExchange:
                                          self._wait_ctr(op, source, relay))
         self._mark(f"got {op} src{source}{' relay' if relay else ''} #{self.calls[op]}")
 
+    def _await_all(self, op, sources):
+        """Wait (on the current stream) for every source's data of this call.
+        consult18 P1: with the `batched_waits` switch on, ONE multi-flag wait
+        launch (the same per-source protocol, in the same order) instead of
+        one launch per source."""
+        sources = tuple(sources)
+        from .runtime import SWITCHES
+
+        kernels = self.ring._kernels
+        if (SWITCHES.get("batched_waits") == "on" and len(sources) > 1
+                and hasattr(kernels, "dma_wait_flags")):
+            kernels.dma_wait_flags([self._flag_ptr(self.rank, op, s) for s in sources],
+                                   [self._wait_ctr(op, s, False) for s in sources])
+            self._mark(f"got {op} src{sources} #{self.calls[op]}")
+            return
+        for source in sources:
+            self._await(op, source)
+
     def _drain(self):
         main = torch.cuda.current_stream()
         for stream in (self._cross_stream, self._local_stream, self._flag_stream):
@@ -973,8 +991,7 @@ class CeExchange:
                                  (me,), "lse", ("lse", dest))
             mine[me].copy_(head_major[own])
             mine_lse[me].copy_(lse_major[own])
-            for source in (*self.cross, *self.local):
-                self._await("lse", source)
+            self._await_all("lse", (*self.cross, *self.local))
             result = merge_lse_partials(mine, mine_lse)
             self._drain()
             return result
@@ -994,8 +1011,7 @@ class CeExchange:
         partner_heads = slice(partner * hpr, (partner + 1) * hpr)
         theirs[me].copy_(head_major[partner_heads])
         theirs_lse[me].copy_(lse_major[partner_heads])
-        for source in self.local:
-            self._await("lse", source)
+        self._await_all("lse", self.local)
         # The switch's source slots as a cached DEVICE index: indexing with a
         # Python list uploads it on every call (a host transfer the overlapped
         # loop must not make); index_select gathers the same rows.
@@ -1053,8 +1069,7 @@ class CeExchange:
         received = slots.view(self.world, self.score_slot)[:, :nbytes] \
             .view(torch.float32).view(self.world, rows, width)
         received[me].copy_(source)
-        for origin in (*self.cross, *self.local):
-            self._await("scores", origin)
+        self._await_all("scores", (*self.cross, *self.local))
         self._drain()
         return tuple(received[origin] for origin in range(self.world))
 
@@ -1094,8 +1109,7 @@ class CeExchange:
         received = slots.view(self.world, self.gather_slot)[:, :nbytes] \
             .view(torch.bfloat16).view(self.world, rows, hpr, width)
         received[me].copy_(source)
-        for origin in (*self.cross, *self.local):
-            self._await("gather", origin)
+        self._await_all("gather", (*self.cross, *self.local))
         gathered = received.permute(1, 0, 2, 3).reshape(rows, self.world * hpr, width)
         self._drain()
         return gathered

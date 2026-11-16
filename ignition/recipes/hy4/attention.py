@@ -930,6 +930,13 @@ class Hy4LayerAttention:
 
 def rms_norm(x, weight, eps):
     """`HYV4RMSNorm`: FP32 statistics, one output rounding."""
+    if x.is_cuda:
+        from .runtime import SWITCHES
+
+        if SWITCHES.get("host_trim") == "on":
+            from . import fused_ops
+
+            return fused_ops.rms_norm(x, weight, eps)
     xf = x.float()
     out = xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + eps)
     return (weight.float() * out).to(x.dtype)

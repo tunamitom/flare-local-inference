@@ -20,7 +20,7 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-__all__ = ["merge_head_major", "rope_interleaved"]
+__all__ = ["merge_head_major", "rms_norm", "rope_interleaved"]
 
 _INV_FREQ = {}
 
@@ -125,3 +125,34 @@ def merge_head_major(partials, lses):
     block = min(1024, triton.next_power_of_2(max(W, 1)))
     _merge_kernel[(H * R, triton.cdiv(W, block))](p, lv, out, lse, H * R, W, S=S, BLOCK_W=block)
     return out, lse
+
+
+@triton.jit
+def _rms_tail_kernel(x_ptr, ms_ptr, w_ptr, out_ptr, N, eps, BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    blk = tl.program_id(1)
+    offs = blk * BLOCK + tl.arange(0, BLOCK)
+    live = offs < N
+    x = tl.load(x_ptr + row * N + offs, mask=live, other=0.0).to(tl.float32)
+    w = tl.load(w_ptr + offs, mask=live, other=0.0).to(tl.float32)
+    r = libdevice.rsqrt(libdevice.add_rn(tl.load(ms_ptr + row), eps))
+    y = libdevice.mul_rn(w, libdevice.mul_rn(x, r))
+    tl.store(out_ptr + row * N + offs, y.to(out_ptr.dtype.element_ty), mask=live)
+
+
+def rms_norm(x, weight, eps):
+    """`attention.rms_norm` with the elementwise tail in one kernel (bitwise the
+    same): the mean of squares stays torch's own reduction (its order), then
+    `(w * (x * rsqrt(ms + eps))).to(x.dtype)` runs fused."""
+    N = int(x.shape[-1])
+    flat = x.reshape(-1, N)
+    if not flat.is_contiguous():
+        flat = flat.contiguous()
+    ms = flat.float().square().mean(-1)
+    out = torch.empty_like(flat)
+    rows = int(flat.shape[0])
+    if rows:
+        block = min(2048, triton.next_power_of_2(N))
+        _rms_tail_kernel[(rows, triton.cdiv(N, block))](flat, ms, weight.contiguous(), out, N,
+                                                        float(eps), BLOCK=block)
+    return out.view(x.shape)
