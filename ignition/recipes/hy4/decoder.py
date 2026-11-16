@@ -749,7 +749,8 @@ class Hy4Decoder:
                 flags = list(deferred) if deferred else []
                 if deferred is not None:
                     deferred.clear()
-            if flags and bool(torch.stack([f.reshape(()) for f in flags]).any()):
+            if (flags and bool(torch.stack([f.reshape(()) for f in flags]).any())
+                    and SWITCHES.get("wire_probe", "off") == "off"):
                 # A narrow scores-only cut needed the full re-offer (or the
                 # exactness test fired): redo the forward on the exact path
                 # (same rows, same slots; it rewrites this forward's records).
