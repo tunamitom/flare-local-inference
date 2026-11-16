@@ -243,7 +243,7 @@ def warm_up(ctx):
                 torch.cuda.synchronize(dev)
             decoder.complete([0], pair)
             from ignition.recipes.hy4 import runtime
-            if runtime.SWITCHES.get("graph_moe") == "on" or os.environ.get("HY4_AB_FILE"):
+            if runtime.SWITCHES.get("graph_moe") == "on" or os.environ.get("HY4_AB_MLP_GRAPHS"):
                 # consult18 P1: per-lane CUDA graphs of the MLP block (captured
                 # outside the overlap, after its plans and lane streams exist).
                 t_cap = time.monotonic()
@@ -441,6 +441,10 @@ def run_generate(ctx, cmd):
                         f"{mx['lse']:.3e}, {lane_checked['all_reduce']} ring sums max rel-L2 "
                         f"{mx['all_reduce']:.3e}, {lane_checked.get('ar_projection', 0)} ring-sum "
                         f"projections max {mx.get('ar_projection', 0.0):.3e} vs gloo (post-loop)")
+    graphs = getattr(decoder, "decode_graphs", None)
+    if graphs is not None and (graphs.replays or graphs.captures):
+        trace(ctx.rank, f"decode graphs: {graphs.stats()}, sync-free reruns "
+                        f"{getattr(decoder, 'sync_free_reruns', 0)}")
     pairs = getattr(decoder, "overlap_pairs", 0)
     if pairs:
         # consult18 D: overlapped pairs so far, and how many the post-loop
@@ -520,6 +524,35 @@ def serve_http(ctx):
         def do_POST(self):
             length = int(self.headers.get("Content-Length") or 0)
             raw = self.rfile.read(length)
+            if self.path == "/dev/exec" and os.environ.get("HY4_DEV_EXEC") == "1":
+                # consult18 P2 dev loop (HY4_DEV_EXEC=1 boots only; production
+                # never sets it): every rank execs one script from /state/dev/
+                # (root-owned host directory) inside the live serve; returns
+                # each rank's result/traceback. Serialized with requests.
+                try:
+                    path = json.loads(raw).get("path") or ""
+                    if not (path.startswith("/state/dev/") and ".." not in path
+                            and os.path.isfile(path)):
+                        raise ValueError("path must be a file under /state/dev/")
+                except (ValueError, TypeError, AttributeError) as error:
+                    self._send(400, {"error": str(error)})
+                    return
+                item = {"op": "exec", "path": path, "ev": threading.Event()}
+                with ctx.lock:
+                    if ctx.busy:
+                        self._send(429, {"error": "busy"})
+                        return
+                    ctx.busy = True
+                try:
+                    ctx.q.put(item)
+                    if not item["ev"].wait(timeout=3600):
+                        self._send(504, {"error": "exec did not finish in 3600 s"})
+                        return
+                finally:
+                    with ctx.lock:
+                        ctx.busy = False
+                self._send(200, {"results": item.get("result")})
+                return
             if self.path != "/v1/chat/completions":
                 self._send(404, {"error": {"message": f"no route {self.path}", "type": "not_found"}})
                 return
@@ -1012,6 +1045,29 @@ def main():
                 fh.write("\n")
             trace(rank, f"wrote {args.report}")
 
+        from ignition.recipes.hy4 import runtime as _runtime
+        if _runtime.SWITCHES.get("decode_graph") == "on" or os.environ.get("HY4_AB_FILE"):
+            # consult18 P2: CUDA graphs of the one-row decode step, armed once on
+            # the serving construction after every boot capture/teardown. The
+            # short bucket and the width buckets up to HY4_DECODE_GRAPH_PREWARM
+            # tokens are captured now and replayed once (a graph that cannot
+            # replay fails the boot, not a request); longer contexts capture
+            # their bucket on first use.
+            from ignition.recipes.hy4.decode_graph import DecodeGraphs
+            ctx.decoder.decode_graphs = DecodeGraphs(ctx.decoder)
+            upto = int(os.environ.get("HY4_DECODE_GRAPH_PREWARM") or 65536)
+            if upto > 0:
+                t_cap = time.monotonic()
+                buckets = ctx.decoder.decode_graphs.prewarm(max_context=upto,
+                                                            call_shape=ctx.decode_shape)
+                replayed = ctx.decoder.decode_graphs.replay_all()
+                ctx.decoder.release([0])
+                trace(rank, f"decode graphs: {len(buckets)} buckets {buckets} captured up to "
+                            f"{upto} tokens and replayed ({replayed}) in "
+                            f"{time.monotonic() - t_cap:.1f} s")
+            else:
+                trace(rank, "decode graphs: armed (one capture per width bucket on first use)")
+
         # ---- serving loop --------------------------------------------------
         if rank == 0:
             from transformers import AutoTokenizer
@@ -1032,14 +1088,32 @@ def main():
             # ranks 1..7 block here. (Broadcasting rank 0's own placeholder
             # instead of a queued command shuts the world down immediately.)
             item = ctx.q.get() if rank == 0 else None
-            cmd = None if item is None else {
-                "op": "generate", "tokens": item["tokens"],
-                "max_new": item["max_new"], "params": item["params"]}
+            if item is not None and item.get("op") == "exec":
+                cmd = {"op": "exec", "path": item["path"]}
+            else:
+                cmd = None if item is None else {
+                    "op": "generate", "tokens": item["tokens"],
+                    "max_new": item["max_new"], "params": item["params"]}
             obj = [cmd]
             dist.broadcast_object_list(obj, src=0)
             cmd = obj[0]
             if cmd is None:
                 break
+            if cmd["op"] == "exec":
+                # consult18 P2 dev loop (HY4_DEV_EXEC=1 only, see do_POST).
+                env = {"ctx": ctx, "rank": rank, "result": None, "__name__": "h4_dev_exec"}
+                try:
+                    with open(cmd["path"]) as fh:
+                        exec(compile(fh.read(), cmd["path"], "exec"), env)
+                    local = {"rank": rank, "ok": True, "result": env.get("result")}
+                except Exception:  # noqa: BLE001
+                    local = {"rank": rank, "ok": False, "error": traceback.format_exc()[-6000:]}
+                gathered = [None] * ctx.world
+                dist.all_gather_object(gathered, local)
+                if rank == 0:
+                    item["result"] = gathered
+                    item["ev"].set()
+                continue
             if cmd["op"] == "generate":
                 try:
                     profile_dir = os.environ.get("HY4_TORCH_PROFILE") or ""
