@@ -30,9 +30,10 @@ through its own `capture()` context (graph-buffer registration on exit).
 Capture is collective: the bucket is a function of the global position
 only, so every rank captures the same bucket at the same step.
 
-Scope: one request row, one token, a context past the short-context bypass
-(visible > index_topk; shorter contexts take the eager sync-free step), no
-MTP state, logits "all"/"last".
+Scope: one request row, one token, no MTP state, logits "all"/"last".
+Contexts up to index_topk take the short-context bypass (every visible owned
+key, filled on device by `SelectionCell.fill_visible`): one more bucket
+(width 0) serves all of them.
 """
 import collections
 import contextlib
@@ -77,10 +78,20 @@ class DecodeGraphs:
     def accepts(self, token_ids, *, row, start, call_shape, state, return_hidden, logits_rows):
         return (token_ids.is_cuda and tuple(token_ids.shape) == (1, 1) and state is None
                 and not return_hidden and logits_rows in ("all", "last")
-                and call_shape.is_decode_graph and start + 1 > self.topk
+                and call_shape.is_decode_graph
+                and (start + 1 > self.topk or self._short_bypass(call_shape))
                 and start + 1 <= self.capacity
                 and (start // self.world) < self.local_capacity
                 and 0 <= row < int(self.decoder.cache.rows))
+
+    def _short_bypass(self, call_shape):
+        """Contexts up to top-k take the short-context bypass (every visible
+        owned key, no indexer) — one fixed-shape graph for all of them."""
+        return self.world > 1 and call_shape.short_context_bypass
+
+    def bucket(self, start):
+        """0 = the short-context bypass, else the indexer width bucket."""
+        return 0 if start + 1 <= self.topk else self.index_width(start + 1)
 
     # -- the step body (eager or under capture) -------------------------
     def _stage(self, token_ids, row, start):
@@ -102,12 +113,13 @@ class DecodeGraphs:
         visible = positions + 1
         d.cache.begin_forward_static(token_rows, positions, slot=self._args[1:2],
                                      safe=self._args[2:3])
-        geometry = {"owned_max": width, "base": row * self.local_capacity}
+        geometry = {"owned_max": max(width, 1), "base": row * self.local_capacity}
         deferred = getattr(d.collectives, "deferred_checks", None)
         if deferred is not None:
             deferred.clear()
-        # The short-context bypass test only needs "past top-k" (accepts()).
-        visible_max = self.topk + 1
+        # The bypass test reads only this bound: width 0 is the short-context
+        # bucket (<= top-k), any other bucket is past top-k (accepts()).
+        visible_max = self.topk if width == 0 else self.topk + 1
         with use_lane(0, overlap=False, geometry=geometry, sync_free=True):
             logits = d._layers_and_head(
                 self._token, rows, positions, token_rows, visible, visible_max, state=None,
@@ -157,7 +169,7 @@ class DecodeGraphs:
     # -- the step ---------------------------------------------------------
     def run(self, token_ids, *, row, start, call_shape, logits_rows):
         """One decode step: `(local-shard logits, deferred selection flag)`."""
-        width = self.index_width(start + 1)
+        width = self.bucket(start)
         key = (int(row), width, call_shape.name, logits_rows)
         self._stage(token_ids, row, start)
         entry = self.graphs.get(key)

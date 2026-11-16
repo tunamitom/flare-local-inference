@@ -1024,16 +1024,16 @@ class SelectionCell:
         rows = int(visible.shape[0])
         width = int(selected.shape[1])
         target = selected[:rows]
-        target.fill_(-1)
-        for row in range(rows):
-            vis = int(visible[row])
-            live = 0 if vis <= rank else min((vis - rank + world - 1) // world, width)
-            if live:
-                target[row, :live] = (int(slot_base[row]) + torch.arange(
-                    live, device=target.device)).to(target.dtype)
         lives = torch.where(visible > rank,
                             torch.div(visible - rank + world - 1, world, rounding_mode="floor"),
                             torch.zeros_like(visible)).clamp_max(width)
+        # consult18 P2: on device (no per-row host read; the captured decode
+        # step's short-context form) — the same values as the per-row fill:
+        # `slot_base + j` for the row's first `live` columns, -1 past them.
+        columns = torch.arange(width, device=target.device, dtype=torch.int64).reshape(1, width)
+        slots = slot_base.reshape(-1, 1).to(torch.int64) + columns
+        target.copy_(torch.where(columns < lives.reshape(-1, 1).to(torch.int64), slots,
+                                 torch.full_like(slots, -1)).to(target.dtype))
         counts[:rows].copy_(lives.to(counts.dtype))
         return target, counts[:rows]
 

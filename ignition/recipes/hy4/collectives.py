@@ -1297,6 +1297,16 @@ class PcieDcpTransport:
                 process_group=process_group, device=device,
                 max_batch_size=max_rows, total_heads=world_size,
                 head_dim=words, query_head_dim=words, single_channel=True)
+            # consult18 P2: the one-row (decode) offer gets its own channel.
+            # A captured decode step switches its pools to device-side slot
+            # selection for good; the prefill offers must not share that
+            # channel (an 8k cell measured -1.3 % after one capture with a
+            # shared score pool). The other decode pools (absorbed gather,
+            # latent partials) are decode-only already.
+            pools[(words, "scores1")] = PCIeDCPA2APool.from_process_group(
+                process_group=process_group, device=device,
+                max_batch_size=1, total_heads=world_size,
+                head_dim=words, query_head_dim=words, single_channel=True)
             _trace(f"PCIeDCPA2APool scores words={words} done")
         all_reduce = None
         ring = None
@@ -1418,6 +1428,12 @@ class PcieDcpTransport:
         self._prepared += 1
         return plan
 
+    def _score_pool_key(self, words, rows):
+        """The one-row offer rides its own channel when the transport has it."""
+        if int(rows) == 1 and (int(words), "scores1") in self._pools:
+            return (int(words), "scores1")
+        return (int(words), "scores")
+
     def prepare_score_gather(self, session, rows):
         """Prepare the offer gather for `rows` (consult17: scores off the host)."""
         from b12x.comm.pcie import _dcp_preparation as preparation
@@ -1429,7 +1445,7 @@ class PcieDcpTransport:
         key = ("score_gather", int(rows), words, "")
         if key in self._plans:
             return self._plans[key]
-        runtime = self._pools[(words, "scores")].for_stream()
+        runtime = self._pools[self._score_pool_key(words, rows)].for_stream()
         inp = torch.zeros((rows, 1, words), dtype=torch.bfloat16, device=self.device)
         out = torch.empty((rows, self.world_size, words), dtype=torch.bfloat16,
                           device=self.device)
@@ -2019,7 +2035,7 @@ class PcieDcpTransport:
         _trace(f"score_gather rows={rows} offer={width}")
         if self.tracer is not None:
             self.tracer.mark(f"pool scores rows={rows}")
-        gathered = self._pools[(2 * width, "scores")].for_stream().all_gather_heads(
+        gathered = self._pools[self._score_pool_key(2 * width, rows)].for_stream().all_gather_heads(
             words, None, plan=self._plans[key])
         if self.tracer is not None:
             self.tracer.mark("pool scores done")
