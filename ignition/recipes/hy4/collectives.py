@@ -907,8 +907,15 @@ class CeExchange:
         kernels = self.ring._kernels
         event = self._event(key)
         call = self.calls[op]
+        from .runtime import SWITCHES
+
+        # consult18 P3 TIMING PROBE ONLY (results are garbage): halve the bytes
+        # of the head gather and the LSE partials — the price of FP8 wires.
+        half = SWITCHES.get("wire_probe") == "ce_half" and op in ("gather", "lse")
         with torch.cuda.stream(stream):
             for offset, source, nbytes in copies:
+                if half:
+                    nbytes = max(16, (nbytes // 2) // 16 * 16)
                 kernels.dma_copy(self.ptrs[dest] + offset, source, nbytes)
             self._mark(f"copied {key[0]}->{dest} {op}#{call}", stream)
             event.record(stream)
