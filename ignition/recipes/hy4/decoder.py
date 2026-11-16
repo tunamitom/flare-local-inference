@@ -688,8 +688,9 @@ class Hy4Decoder:
                 # vocabulary gather and the flag read stay here.
                 local, flag = graphs.run(token_ids, row=row_id, start=start,
                                          call_shape=call_shape, logits_rows=logits_rows)
+                root = {"root_host": True} if SWITCHES.get("root_logits") == "on" else {}
                 result = self.collectives.gather_logits(
-                    local, vocabulary_range=self.weights.sharding.vocabulary_range)
+                    local, vocabulary_range=self.weights.sharding.vocabulary_range, **root)
                 flags = [flag]
             else:
                 positions = torch.arange(start, start + width, device=self.device,

@@ -563,6 +563,19 @@ def scores_only_merge(exchange, candidate_scores, candidate_positions, *, topk, 
     offers = exchange(candidate_scores[:, :offer].contiguous())
     thresholds, aboves = scores_only_threshold(offers, topk)
     if deferred is not None:
+        from .runtime import SWITCHES
+
+        if candidate_scores.is_cuda and SWITCHES.get("sel_fused") == "on":
+            # consult18 P2: threshold + flags + own selection in one launch
+            # per row (fused_ops.scores_only_select; bit-identical for the
+            # sorted candidate rows local_candidates produces, and its flag
+            # also fires on any row outside that contract -> exact rerun).
+            from .fused_ops import scores_only_select
+
+            values, positions, flag = scores_only_select(
+                offers, candidate_scores, candidate_positions, topk=topk, world=world, rank=rank)
+            deferred.append(flag)
+            return values, positions
         # consult18 D: inside the overlapped loop no host read — the widen and
         # exactness tests become a device flag the caller checks after the loop
         # (a set flag reruns the pair on the single-lane path).
@@ -2250,6 +2263,22 @@ class PcieDcpTransport:
         with TIMER.phase("host.h2d"):
             return torch.cat(taken, dim=-1).to(value.device)
 
+    def gather_to_root(self, value):
+        """consult18 P2: rank 0 gets every rank's `value` concatenated on its last
+        dim as a HOST tensor (the sampler's input; it samples on the host);
+        other ranks get None. One D2H per rank and a gloo gather — no all-gather
+        and no H2D (the decode step's logits were all-gathered and moved back
+        to the device only for the sampler to copy them out again)."""
+        import torch.distributed as dist
+
+        host = value.contiguous().cpu()
+        if self.rank == 0:
+            taken = [torch.empty_like(host) for _ in range(self.world_size)]
+            dist.gather(host, taken, dst=0, group=self.group)
+            return torch.cat(taken, dim=-1)
+        dist.gather(host, None, dst=0, group=self.group)
+        return None
+
     def _gather_all(self, value):
         """Every rank's copy of `value`, in rank order (the control-group wire)."""
         import torch.distributed as dist
@@ -2366,7 +2395,7 @@ class PcieDcpCollectives:
             out[inside] = embed[token_ids[inside] - first]
         return self.all_reduce(out)
 
-    def gather_logits(self, logits, *, vocabulary_range):
+    def gather_logits(self, logits, *, vocabulary_range, root_host=False):
         first, last = vocabulary_range
         if int(logits.shape[-1]) != last - first:
             raise ValueError(
@@ -2374,6 +2403,11 @@ class PcieDcpCollectives:
                 f"vocabulary range {vocabulary_range}")
         # Vocabulary shards are contiguous rank-major partitions, so rank
         # order is vocab order (the sampler's all-gather).
+        if root_host and hasattr(self.transport, "gather_to_root"):
+            # consult18 P2: the decode step's sampler input — rank 0 only, on
+            # the host (other ranks return their local shard, never read).
+            gathered = self.transport.gather_to_root(logits)
+            return logits if gathered is None else gathered
         return self.transport.all_gather(logits.contiguous())
 
     def merge_topk(self, candidate_scores, candidate_positions, *, topk):

@@ -42,6 +42,12 @@ ALLOWED = {
     # consult18 P2: iHC post_pre below PREFILL_MIN_ROWS rows over (row, chunk)
     # grids (fused_ops.ihc_post_pre_split; bit-identical, 6x at one row)
     "ihc_split": ("off", "on"),
+    # consult18 P2: the sync-free scores-only selection in one launch per row
+    # (fused_ops.scores_only_select; bit-identical, 16 vs 229 us per decode row)
+    "sel_fused": ("off", "on"),
+    # consult18 P2: graph decode steps gather the logits to rank 0 on the host
+    # (the sampler's input) instead of an all-gather moved back to the device
+    "root_logits": ("off", "on"),
 }
 DEFAULTS = {"index_scores": "fp32",
             "ihc": os.environ.get("HY4_IHC") or "default",
@@ -53,7 +59,9 @@ DEFAULTS = {"index_scores": "fp32",
             "comm_token": os.environ.get("HY4_COMM_TOKEN") or "on",
             "sync_free": os.environ.get("HY4_SYNC_FREE") or "off",
             "decode_graph": os.environ.get("HY4_DECODE_GRAPH") or "off",
-            "ihc_split": os.environ.get("HY4_IHC_SPLIT") or "off"}
+            "ihc_split": os.environ.get("HY4_IHC_SPLIT") or "off",
+            "sel_fused": os.environ.get("HY4_SEL_FUSED") or "off",
+            "root_logits": os.environ.get("HY4_ROOT_LOGITS") or "off"}
 for _key, _value in DEFAULTS.items():
     if _value not in ALLOWED[_key]:
         raise ValueError(f"runtime default {_key}={_value!r} must be one of {ALLOWED[_key]}")

@@ -20,7 +20,7 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-__all__ = ["ihc_post_pre_split", "merge_head_major", "rms_norm", "rope_interleaved"]
+__all__ = ["ihc_post_pre_split", "scores_only_select", "merge_head_major", "rms_norm", "rope_interleaved"]
 
 _INV_FREQ = {}
 
@@ -306,3 +306,85 @@ def ihc_post_pre_split(x, residual, prev_post, fn, hc_scale, hc_base, *, magnitu
                                         float(norm_eps), float(layernorm_eps), BLOCK_D=block_d,
                                         num_warps=num_warps)
     return out, post, y
+
+
+# --------------------------------------------------------------------------
+# consult18 P2: the scores-only selection (collectives.scores_only_threshold +
+# scores_only_flags + select_own_candidates, sync-free form) in ONE launch per
+# row. Exact for candidate rows as `local_candidates` produces them — scores
+# descending, tied scores in ascending position (torch.topk sorted: stable
+# radix sort of the index-ordered gather), -inf / -1 padding last: then the
+# selected set is a prefix (every key above the global k-th offered score,
+# then the first `mine` keys of the tied plateau) and the final stable sort is
+# the identity, so values[:n] / positions[:n] then -inf / -1 IS the reference
+# output. The program also checks that ordering on device: a row that breaks
+# it (or carries a NaN) raises the deferred flag, and the caller reruns the
+# forward on the exact path — as for a saturated offer.
+# --------------------------------------------------------------------------
+@triton.jit
+def _scores_only_select_kernel(offers_ptr, cand_ptr, pos_ptr, out_val_ptr, out_pos_ptr, flag_ptr,
+                               WIDTH, TOPK, KIDX, RANK, OFFER: tl.constexpr, WORLD: tl.constexpr,
+                               NOFF: tl.constexpr, NCAND: tl.constexpr):
+    r = tl.program_id(0).to(tl.int64)
+    j = tl.arange(0, NOFF)
+    stacked = tl.load(offers_ptr + r * (WORLD * OFFER) + j, mask=j < WORLD * OFFER,
+                      other=float("-inf"))
+    finite_s = (stacked == stacked) & (stacked != float("inf")) & (stacked != float("-inf"))
+    total = tl.sum(finite_s.to(tl.int32))
+    ordered = tl.sort(stacked, descending=True)
+    kth = tl.max(tl.where(j == KIDX, ordered, float("-inf")))
+    limit = tl.where(total > TOPK, kth, float("-inf"))
+    above = tl.sum((stacked > limit).to(tl.int32))
+    live = limit != float("-inf")
+    owner = j // OFFER
+    earlier = tl.sum(((owner < RANK) & (stacked == limit) & live).to(tl.int32))
+    mine = tl.maximum(TOPK - above - earlier, 0)
+    # saturation: some rank's last offered score is finite and reaches the cut
+    last = (j % OFFER) == OFFER - 1
+    # (the reference checks the offers only when they are narrower than the row)
+    sat = (tl.sum((last & finite_s & (stacked >= limit)).to(tl.int32)) > 0) & (OFFER < WIDTH)
+    nan = tl.sum((stacked != stacked).to(tl.int32)) > 0
+
+    i = tl.arange(0, NCAND)
+    inside = i < WIDTH
+    v = tl.load(cand_ptr + r * WIDTH + i, mask=inside, other=float("-inf"))
+    p = tl.load(pos_ptr + r * WIDTH + i, mask=inside, other=-1)
+    finite_v = (v == v) & (v != float("inf")) & (v != float("-inf"))
+    n_gt = tl.sum((finite_v & (v > limit)).to(tl.int32))
+    n_pl = tl.sum((finite_v & (v == limit)).to(tl.int32))
+    n = n_gt + tl.minimum(n_pl, mine)
+    # truncation: this rank's first un-offered candidate reaches the cut
+    trunc = tl.sum(((i == OFFER) & inside & finite_v & (v >= limit)).to(tl.int32)) > 0
+    # the input contract: descending scores, ties in ascending position, no NaN
+    v_next = tl.load(cand_ptr + r * WIDTH + i + 1, mask=i + 1 < WIDTH, other=float("-inf"))
+    p_next = tl.load(pos_ptr + r * WIDTH + i + 1, mask=i + 1 < WIDTH, other=-1)
+    pair = (i + 1) < WIDTH
+    broken = pair & ((v < v_next) | ((v == v_next) & finite_v & (p >= p_next)))
+    broken = broken | (inside & (v != v))
+    bad = tl.sum(broken.to(tl.int32)) > 0
+    keep = i < n
+    out_mask = i < TOPK
+    tl.store(out_val_ptr + r * TOPK + i, tl.where(keep, v, float("-inf")), mask=out_mask)
+    tl.store(out_pos_ptr + r * TOPK + i, tl.where(keep, p, -1).to(tl.int32), mask=out_mask)
+    tl.store(flag_ptr + r, (sat | trunc | bad | nan).to(tl.int8))
+
+
+def scores_only_select(offers, candidate_scores, candidate_positions, *, topk, world, rank):
+    """`(values [rows, topk] FP32, positions [rows, topk] int32, flag [] bool)` —
+    the sync-free scores-only selection in one launch (see the kernel note).
+    `offers`: the `world` per-rank `[rows, offer]` FP32 offers in rank order."""
+    rows, width = (int(v) for v in candidate_scores.shape)
+    offer = int(offers[0].shape[1])
+    stacked = torch.stack([o.float() for o in offers], dim=1).contiguous()   # [rows, world, offer]
+    scores = candidate_scores.float().contiguous()
+    positions = candidate_positions.contiguous()
+    out_val = torch.empty((rows, topk), dtype=torch.float32, device=scores.device)
+    out_pos = torch.empty((rows, topk), dtype=torch.int32, device=scores.device)
+    flags = torch.empty((rows,), dtype=torch.int8, device=scores.device)
+    noff = triton.next_power_of_2(world * offer)
+    ncand = triton.next_power_of_2(max(width, topk))
+    _scores_only_select_kernel[(rows,)](stacked, scores, positions, out_val, out_pos, flags,
+                                        width, topk, min(topk, world * offer) - 1, rank,
+                                        OFFER=offer, WORLD=world, NOFF=noff,
+                                        NCAND=ncand, num_warps=8)
+    return out_val, out_pos, flags.any()
