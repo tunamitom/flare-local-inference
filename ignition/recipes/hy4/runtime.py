@@ -16,11 +16,18 @@ ALLOWED = {
     # counts — "default" (IHC_TUNING[6144]) or "tuned" (the measured best of
     # iHC's own tuning space at 1,024 rows; decode always keeps the default).
     "ihc": ("default", "tuned"),
+    # consult18 P1 (host-bound prefill): one-kernel, bit-exact replacements of
+    # eager op chains (fused_ops.py).
+    "fused_rope": ("off", "on"),
+    "fused_merge": ("off", "on"),
 }
 DEFAULTS = {"index_scores": "fp32",
-            "ihc": os.environ.get("HY4_IHC") or "default"}
-if DEFAULTS["ihc"] not in ALLOWED["ihc"]:
-    raise ValueError(f"HY4_IHC={DEFAULTS['ihc']!r} must be one of {ALLOWED['ihc']}")
+            "ihc": os.environ.get("HY4_IHC") or "default",
+            "fused_rope": os.environ.get("HY4_FUSED_ROPE") or "off",
+            "fused_merge": os.environ.get("HY4_FUSED_MERGE") or "off"}
+for _key, _value in DEFAULTS.items():
+    if _value not in ALLOWED[_key]:
+        raise ValueError(f"runtime default {_key}={_value!r} must be one of {ALLOWED[_key]}")
 SWITCHES = dict(DEFAULTS)
 
 

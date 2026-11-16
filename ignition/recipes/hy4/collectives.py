@@ -726,6 +726,15 @@ def all_reduce_arm_for(rows, rules):
 def _merge_head_major(partials, lses):
     """FP32 base-2 LSE merge over the source axis: `(out [heads, rows, width] FP32,
     lse [heads, rows])`; rows no source saw get zero / `-inf`."""
+    if partials.is_cuda and int(partials.shape[0]) <= 4:
+        from .runtime import SWITCHES
+
+        if SWITCHES.get("fused_merge") == "on":
+            # consult18 P1: one kernel, bit-identical to the chain below for up to
+            # four sources (the relay's switch-local and pair merges).
+            from .fused_ops import merge_head_major
+
+            return merge_head_major(partials, lses)
     lses = lses.float()
     peak = lses.max(dim=0).values
     peak = torch.where(torch.isfinite(peak), peak, torch.zeros_like(peak))

@@ -65,6 +65,14 @@ def apply_interleaved_rope(x, positions, *, rope_dim, theta):
         raise ValueError("rope_dim must be a positive even number")
     if x.shape[-1] < rope_dim:
         raise ValueError("rotary block exceeds the input width")
+    if x.is_cuda:
+        from .runtime import SWITCHES
+
+        if SWITCHES.get("fused_rope") == "on":
+            # consult18 P1: one kernel, bit-identical to the chain below.
+            from .fused_ops import rope_interleaved
+
+            return rope_interleaved(x, positions, rope_dim=rope_dim, theta=theta)
     pe = x[..., x.shape[-1] - rope_dim:]
     inv_freq = 1.0 / (theta ** (torch.arange(0, rope_dim, 2, device=x.device, dtype=torch.float32) / rope_dim))
     freqs = positions.reshape(-1, 1).float() * inv_freq.reshape(1, -1)
