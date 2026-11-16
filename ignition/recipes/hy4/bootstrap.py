@@ -321,8 +321,11 @@ class PreparedHy4Rank:
                 spec = (_os.environ.get("HY4_MOE_DECODE_ENV")
                         or "B12X_W4A16_SMALL_M_SPLITK=1,B12X_W4A16_SMALL_M_OCCUPANCY=1")
                 env = dict(item.split("=", 1) for item in spec.split(",") if item)
+                alt_spec = _os.environ.get("HY4_MOE_DECODE_ENV_ALT")
+                alt = (dict(item.split("=", 1) for item in alt_spec.split(",") if item)
+                       if alt_spec else None)
                 wire_decode_ops([layer.mlp.routed for layer in fused_layers],
-                                tokens=decode_tokens, env=env)
+                                tokens=decode_tokens, env=env, alt_env=alt)
             self.fused_session, self.fused_scratch = preparation, scratch
             self.fused_small_scratch = small_scratch
         return self

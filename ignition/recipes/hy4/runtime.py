@@ -52,7 +52,7 @@ ALLOWED = {
     "route_fused": ("off", "on"),
     # consult18 P2 (numerics class): decode rows through the decode-capacity MoE
     # op (FusedRoutedExperts.wire_decode_op; b12x small-M split-K schedule)
-    "moe_decode_op": ("off", "on"),
+    "moe_decode_op": ("off", "on", "alt"),
 }
 DEFAULTS = {"index_scores": "fp32",
             "ihc": os.environ.get("HY4_IHC") or "default",

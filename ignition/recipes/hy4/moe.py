@@ -543,10 +543,16 @@ class FusedRoutedExperts:
         if decode_op is not None and rows <= self.decode_tokens and current == 0:
             from .runtime import SWITCHES
 
-            if SWITCHES.get("moe_decode_op") == "on":
+            mode = SWITCHES.get("moe_decode_op")
+            if mode == "on":
                 # consult18 P2 (numerics class): the decode-capacity A16 op built
                 # under HY4_MOE_DECODE_ENV (b12x small-M split-K schedule).
                 op, workspace, storage = decode_op, self._decode_workspace, self._decode_storage
+                a4 = False
+            elif mode == "alt" and getattr(self, "decode_op_alt", None) is not None:
+                # the control arm: same capacity, built under HY4_MOE_DECODE_ENV_ALT
+                op, workspace, storage = (self.decode_op_alt, self._decode_workspace,
+                                          self._decode_storage)
                 a4 = False
         amax, layer = (self.amax, 0) if self.amax is not None else (None, None)
         prepared_moe_out(x, weights, ids, output, workspace, op.scale_inputs,
@@ -559,7 +565,7 @@ class FusedRoutedExperts:
         return self.forward(x, ids, weights)
 
 
-def wire_decode_ops(routed, *, tokens, env):
+def wire_decode_ops(routed, *, tokens, env, alt_env=None):
     """Plan every layer's decode op under `env` (set only while planning and
     warming: the main ops keep their plans), over ONE shared workspace and
     scale storage (the layer loop is serial). Returns the workspace bytes."""
@@ -569,10 +575,22 @@ def wire_decode_ops(routed, *, tokens, env):
 
     from .runtime import SWITCHES
 
-    saved = {key: _os.environ.get(key) for key in env}
+    saved = {key: _os.environ.get(key) for key in (*env, *(alt_env or {}))}
     _os.environ.update(env)
     try:
         ops = [fused.plan_decode_op(tokens=tokens) for fused in routed]
+        if alt_env is not None:
+            for key in env:
+                _os.environ.pop(key, None)
+            _os.environ.update(alt_env)
+            for fused in routed:
+                main = fused.decode_op
+                fused.decode_op_alt = fused.plan_decode_op(tokens=tokens)
+                fused.decode_op = main
+            ops += [fused.decode_op_alt for fused in routed]
+            for key in alt_env:
+                _os.environ.pop(key, None)
+            _os.environ.update(env)
         nbytes = max(op.workspace_nbytes for op in ops)
         layouts = ops[0].scale_layouts
         if any(op.scale_layouts != layouts for op in ops):
@@ -582,14 +600,23 @@ def wire_decode_ops(routed, *, tokens, env):
         storage = [torch.empty_strided(shape, stride, dtype=dtype, device=device)
                    for shape, stride, dtype in layouts]
         before = SWITCHES.get("moe_decode_op")
-        SWITCHES["moe_decode_op"] = "on"
         try:
             for fused in routed:
                 fused.bind_decode_scratch(workspace, storage)
                 x = torch.zeros((1, fused.hidden), dtype=torch.bfloat16, device=device)
                 ids = torch.zeros((1, fused.top_k), dtype=torch.int32, device=device)
                 w = torch.full((1, fused.top_k), 1.0 / fused.top_k, dtype=torch.float32, device=device)
+                SWITCHES["moe_decode_op"] = "on"
                 fused.forward(x, ids, w)
+                if alt_env is not None:
+                    for key in env:
+                        _os.environ.pop(key, None)
+                    _os.environ.update(alt_env)
+                    SWITCHES["moe_decode_op"] = "alt"
+                    fused.forward(x, ids, w)
+                    for key in alt_env:
+                        _os.environ.pop(key, None)
+                    _os.environ.update(env)
         finally:
             SWITCHES["moe_decode_op"] = before
         torch.cuda.synchronize(device)
