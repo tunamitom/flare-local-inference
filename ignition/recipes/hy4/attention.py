@@ -322,6 +322,7 @@ class Hy4LayerAttention:
                 return full[:, first:last].contiguous()
 
             q_a_raw, kv_raw, gate_raw = cols("q_a_proj"), cols("kv_a_proj"), cols("linear_gate")
+            self._wk_raw = (x, cols("indexer_wk")) if "indexer_wk" in packed.slices else None
         else:
             q_a_raw = x @ packed.rows("q_a_proj").T
             kv_raw = x @ packed.rows("kv_a_proj").T
@@ -563,9 +564,15 @@ class Hy4LayerAttention:
             raise ValueError("shared layers prepare no index keys")
         # The packed same-input weight supplies `wk` when present (same rows,
         # bitwise the same GEMM); the loose tensor otherwise.
-        packed = self.weights.packed_input
-        wk = iw.wk if packed is None else packed.rows("indexer_wk")
-        k = (x @ wk.T).float()
+        stash = getattr(self, "_wk_raw", None)
+        if stash is not None and stash[0] is x:
+            # consult18 P6: the decode-scope INT8 pack GEMM already projected wk
+            k = stash[1].float()
+            self._wk_raw = None
+        else:
+            packed = self.weights.packed_input
+            wk = iw.wk if packed is None else packed.rows("indexer_wk")
+            k = (x @ wk.T).float()
         k = layer_norm(k, iw.k_norm_weight, iw.k_norm_bias, self.config.text["rms_norm_eps"])
         return apply_interleaved_rope(k, positions, rope_dim=self.config.text["qk_rope_head_dim"],
                                      theta=self.rope_theta)
