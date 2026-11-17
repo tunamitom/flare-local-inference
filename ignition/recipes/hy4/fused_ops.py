@@ -332,6 +332,53 @@ def _ihc_pp_norm_kernel(part_ptr, scale_ptr, base_ptr, out_ptr, y_ptr, sqy_ptr, 
     tl.store(y_ptr + t * H + offs, (yb * rmsy * tl.load(norm_weight_ptr + offs)).to(tl.bfloat16))
 
 
+
+@triton.jit
+def _ihc_pp_y_block(out_ptr, t, K, H, offs, pre0, pre1, pre2, pre3):
+    o0 = tl.load(out_ptr + t * K + 0 * H + offs).to(tl.float32)
+    o1 = tl.load(out_ptr + t * K + 1 * H + offs).to(tl.float32)
+    o2 = tl.load(out_ptr + t * K + 2 * H + offs).to(tl.float32)
+    o3 = tl.load(out_ptr + t * K + 3 * H + offs).to(tl.float32)
+    y = pre0 * o0 + pre1 * o1 + pre2 * o2 + pre3 * o3
+    return y.to(tl.bfloat16).to(tl.float32)
+
+
+@triton.jit
+def _ihc_pp_collapse_norm_kernel(part_ptr, scale_ptr, base_ptr, out_ptr, post_ptr, y_ptr,
+                                 norm_weight_ptr, H, K, NC, magnitude, hc_eps, norm_eps,
+                                 layernorm_eps, ND: tl.constexpr, BLOCK_D: tl.constexpr):
+    """Round 14: `_ihc_pp_collapse_kernel` (FUSE_NORM) + `_ihc_pp_norm_kernel` in
+    one program per row. The pair recomputes the gates in each of its 2 x ND
+    programs per row and reads the four streams twice; here the gates run once,
+    pass 1 reads the streams once, stores the BF16 collapse and sums each
+    block's squares (the collapse kernel's expression and `tl.sum`, the norm
+    kernel's sequential order from 0.0), pass 2 rereads the BF16 collapse (the
+    same value the pair recomputes) and stores the norm kernel's expression.
+    Bit-identical by construction at the same BLOCK_D / num_warps."""
+    t = tl.program_id(0).to(tl.int64)
+    pre0, pre1, pre2, pre3, post0, post1, post2, post3 = _ihc_pp_gates(
+        part_ptr, scale_ptr, base_ptr, t, K, NC, magnitude, hc_eps, norm_eps)
+    tl.store(post_ptr + t * 4 + 0, post0)
+    tl.store(post_ptr + t * 4 + 1, post1)
+    tl.store(post_ptr + t * 4 + 2, post2)
+    tl.store(post_ptr + t * 4 + 3, post3)
+    sqy = 0.0
+    for j in tl.static_range(ND):
+        offs = j * BLOCK_D + tl.arange(0, BLOCK_D)
+        yb = _ihc_pp_y_block(out_ptr, t, K, H, offs, pre0, pre1, pre2, pre3)
+        tl.store(y_ptr + t * H + offs, yb.to(tl.bfloat16))
+        sqy += tl.sum(yb * yb)
+    rmsy = tl.rsqrt(sqy / H + layernorm_eps)
+    tl.debug_barrier()
+    for j in tl.static_range(ND):
+        offs = j * BLOCK_D + tl.arange(0, BLOCK_D)
+        yb = tl.load(y_ptr + t * H + offs).to(tl.float32)
+        tl.store(y_ptr + t * H + offs, (yb * rmsy * tl.load(norm_weight_ptr + offs)).to(tl.bfloat16))
+
+
+IHC_FUSE_MIN_ROWS = 512
+
+
 def ihc_post_pre_split(x, residual, prev_post, fn, hc_scale, hc_base, *, magnitude, hc_eps,
                        norm_eps, norm_weight=None, layernorm_eps, block_k, block_d, num_warps):
     """`run_post_pre` (b12x iHC) over (row, chunk) grids: `(out_streams, post, y)`,
@@ -347,7 +394,6 @@ def ihc_post_pre_split(x, residual, prev_post, fn, hc_scale, hc_base, *, magnitu
         prev_post = prev_post.squeeze(-1)
     nc, nd = k_all // block_k, hidden // block_d
     parts = torch.empty((rows, nc, 9), dtype=torch.float32, device=residual.device)
-    sqy = torch.empty((rows, nd), dtype=torch.float32, device=residual.device)
     from .runtime import SWITCHES
 
     per = 8 if rows >= 512 and SWITCHES.get("ihc_rows") == "8" else 1
@@ -359,6 +405,15 @@ def ihc_post_pre_split(x, residual, prev_post, fn, hc_scale, hc_base, *, magnitu
     else:
         _ihc_pp_chunks_kernel[(rows, nc)](x, residual, prev_post, fn, out, parts, hidden, k_all, nc,
                                           BLOCK_K=block_k, num_warps=num_warps)
+    if norm_weight is not None and rows >= IHC_FUSE_MIN_ROWS and SWITCHES.get("ihc_fuse") == "on":
+        # round 14: collapse + norm in one program per row (bit-identical;
+        # 99 -> 29 us at 2,048 rows; slower below a few hundred rows)
+        _ihc_pp_collapse_norm_kernel[(rows,)](parts, hc_scale, hc_base, out, post, y, norm_weight,
+                                              hidden, k_all, nc, float(magnitude), float(hc_eps),
+                                              float(norm_eps), float(layernorm_eps), ND=nd,
+                                              BLOCK_D=block_d, num_warps=num_warps)
+        return out, post, y
+    sqy = torch.empty((rows, nd), dtype=torch.float32, device=residual.device)
     _ihc_pp_collapse_kernel[(rows, nd)](parts, hc_scale, hc_base, out, post, y, sqy, hidden, k_all,
                                         nc, nd, float(magnitude), float(hc_eps), float(norm_eps),
                                         BLOCK_D=block_d, FUSE_NORM=norm_weight is not None,

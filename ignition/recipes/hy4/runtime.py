@@ -85,6 +85,9 @@ ALLOWED = {
     "ihc_rows": ("1", "8"),
     # consult18 P11: the CE exchanges' streams at the device's highest priority
     "ce_priority": ("normal", "high"),
+    # round 14: iHC post_pre collapse + input RMSNorm in one program per row at
+    # >= 512 rows (fused_ops._ihc_pp_collapse_norm_kernel; bit-identical)
+    "ihc_fuse": ("off", "on"),
 }
 DEFAULTS = {"index_scores": "fp32",
             "ihc": os.environ.get("HY4_IHC") or "default",
@@ -111,7 +114,8 @@ DEFAULTS = {"index_scores": "fp32",
             "absorb_out": os.environ.get("HY4_ABSORB_OUT") or "cat",
             "router_mm": os.environ.get("HY4_ROUTER_MM") or "f32",
             "ihc_rows": os.environ.get("HY4_IHC_ROWS") or "1",
-            "ce_priority": os.environ.get("HY4_CE_PRIORITY") or "normal"}
+            "ce_priority": os.environ.get("HY4_CE_PRIORITY") or "normal",
+            "ihc_fuse": os.environ.get("HY4_IHC_FUSE") or "off"}
 for _key, _value in DEFAULTS.items():
     if _value not in ALLOWED[_key]:
         raise ValueError(f"runtime default {_key}={_value!r} must be one of {ALLOWED[_key]}")
