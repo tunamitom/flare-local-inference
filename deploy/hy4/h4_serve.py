@@ -9,7 +9,8 @@ PcieDcpCollectives), the fused 656-byte FP8 record cache (M2), and the
 post-capture `Allocate cache` line (the P5 gate). MTP off.
 
 Rank 0 owns the OpenAI-style HTTP surface (/health, /v1/models,
-/v1/chat/completions, streaming SSE or one JSON body) and the sampler; ranks 1..7 run the same
+/v1/chat/completions, streaming SSE or one JSON body, reasoning split into
+reasoning_content) and the sampler; ranks 1..7 run the same
 decode loop off a broadcast command stream. Logits are gathered to full vocab
 on every rank (collectives.gather_logits), but only rank 0 samples and
 broadcasts the next token, so all ranks advance in lockstep.
@@ -449,6 +450,81 @@ def normalize_tool_history(messages):
     return out
 
 
+THINK_OPEN = "<think:opensource>"
+THINK_CLOSE = "</think:opensource>"
+
+
+class OutputSplitter:
+    """Splits a generation into `reasoning_content` and `content` on the token
+    stream, identically for streamed and whole responses.
+
+    The chat template's thinking mode ends the prompt with THINK_OPEN, so the
+    model's output starts inside its reasoning; the first THINK_CLOSE token ends
+    it. An output that itself starts with THINK_OPEN is handled the same way.
+    Before the first THINK_CLOSE everything is reasoning (a reply cut off while
+    thinking is all reasoning); after it everything is content. Otherwise (the
+    no_think mode, raw prompts) everything is content. Marker tokens appear in
+    neither field. With `tool_id`, content stops at the tool-call block's token
+    and the block is held for tool-call parsing.
+
+    `feed` / `finish` return `(kind, text)` deltas, kind "reasoning" or
+    "content"; `reasoning_ids`, `content_ids` and `held` are the partition."""
+
+    def __init__(self, ctx, think_open, tool_id=None):
+        self.open_id, self.close_id, self.tool_id = ctx.think_open_token, ctx.think_close_token, tool_id
+        self.phase = "reasoning" if think_open else "content"
+        self.first = True
+        self.r, self.c = IncrementalDetokenizer(ctx.tok), IncrementalDetokenizer(ctx.tok)
+        self.held = None
+
+    @property
+    def reasoning_ids(self):
+        return self.r.ids
+
+    @property
+    def content_ids(self):
+        return self.c.ids
+
+    def feed(self, ids):
+        events = []
+        for t in ids:
+            first, self.first = self.first, False
+            if first and self.phase == "content" and t == self.open_id:
+                self.phase = "reasoning"
+                continue
+            if self.phase == "reasoning":
+                if t == self.close_id:
+                    rest = self.r.finish()
+                    if rest:
+                        events.append(("reasoning", rest))
+                    self.phase = "content"
+                    continue
+                piece = self.r.add([t])
+                if piece:
+                    events.append(("reasoning", piece))
+                continue
+            if self.held is not None:
+                self.held.append(t)
+                continue
+            if t == self.close_id:
+                continue
+            if self.tool_id is not None and t == self.tool_id:
+                self.held = [t]
+                continue
+            piece = self.c.add([t])
+            if piece:
+                events.append(("content", piece))
+        return events
+
+    def finish(self):
+        events = []
+        for kind, detok in (("reasoning", self.r), ("content", self.c)):
+            rest = detok.finish()
+            if rest:
+                events.append((kind, rest))
+        return events
+
+
 def run_generate(ctx, cmd):
     """One generation; every rank runs the full loop in lockstep."""
     import torch
@@ -752,7 +828,7 @@ def serve_http(ctx):
             self.end_headers()
             self.wfile.write(data)
 
-        def _stream_events(self, item, ids, include_usage, tools=None):
+        def _stream_events(self, item, ids, include_usage, tools=None, think_open=False):
             """OpenAI `chat.completion.chunk` SSE over chunked HTTP/1.1: a role
             chunk, `delta.content` per decoded piece, a finish chunk, the usage
             chunk when `stream_options.include_usage`, then `[DONE]`. A client
@@ -774,8 +850,9 @@ def serve_http(ctx):
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     alive[0] = False
 
-            def delta(content):
-                write({**base, "choices": [{"index": 0, "delta": {"content": content},
+            def delta(content, kind="content"):
+                field = "reasoning_content" if kind == "reasoning" else "content"
+                write({**base, "choices": [{"index": 0, "delta": {field: content},
                                             "finish_reason": None}]})
 
             self.send_response(200)
@@ -785,12 +862,9 @@ def serve_http(ctx):
             self.end_headers()
             write({**base, "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""},
                                         "finish_reason": None}]})
-            detok = IncrementalDetokenizer(ctx.tok)
+            # reasoning / content / held tool-call block, as OutputSplitter decides
+            split = OutputSplitter(ctx, think_open, ctx.toolcalls_token if tools else None)
             q = item["stream_q"]
-            # with `tools`, content deltas stop at the model's tool-call block
-            # (one token); the block is parsed into `delta.tool_calls` at the end
-            marker = ctx.toolcalls_token if tools else None
-            held = None
             deadline = time.monotonic() + 7200
             while True:
                 try:
@@ -799,16 +873,8 @@ def serve_http(ctx):
                     item.setdefault("error", "the serve loop did not answer in 7200 s")
                     break
                 if kind == "tokens":
-                    if held is not None:
-                        held.extend(payload)
-                        continue
-                    if marker is not None and marker in payload:
-                        cut = payload.index(marker)
-                        held = list(payload[cut:])
-                        payload = payload[:cut]
-                    text = detok.add(payload)
-                    if text:
-                        delta(text)
+                    for part, text in split.feed(payload):
+                        delta(text, part)
                 else:
                     break
             if item.get("error"):
@@ -816,11 +882,10 @@ def serve_http(ctx):
                 write({"error": {"message": item["error"][:400], "type": "server_error"}})
             else:
                 out, finish = item["result"]
-                rest = detok.finish()
-                if rest:
-                    delta(rest)
-                if held is not None:
-                    block = ctx.tok.decode(held, skip_special_tokens=True)
+                for part, text in split.finish():
+                    delta(text, part)
+                if split.held is not None:
+                    block = ctx.tok.decode(split.held, skip_special_tokens=True)
                     _, calls = parse_tool_calls(block, tools)
                     if calls:
                         for index, call in enumerate(calls):
@@ -833,7 +898,8 @@ def serve_http(ctx):
                 if include_usage:
                     write({**base, "choices": [], "usage": {
                         "prompt_tokens": len(ids), "completion_tokens": len(out),
-                        "total_tokens": len(ids) + len(out)}})
+                        "total_tokens": len(ids) + len(out),
+                        "completion_tokens_details": {"reasoning_tokens": len(split.reasoning_ids)}}})
             write(b"[DONE]")
             if alive[0]:
                 try:
@@ -906,6 +972,8 @@ def serve_http(ctx):
                     text = str(body["prompt"])
                 else:
                     raise ValueError("the body needs `messages` or `prompt`")
+                # the prompt leaves a think block open (the template's thinking mode)
+                think_open = text.endswith(THINK_OPEN)
                 ids = ctx.tok.encode(text, add_special_tokens=False)
                 if not ids:
                     raise ValueError("empty prompt")
@@ -945,7 +1013,7 @@ def serve_http(ctx):
             try:
                 ctx.q.put(item)
                 if stream:
-                    self._stream_events(item, ids, include_usage, tools)
+                    self._stream_events(item, ids, include_usage, tools, think_open)
                     return
                 if not item["ev"].wait(timeout=7200):
                     raise TimeoutError("the serve loop did not answer in 7200 s")
@@ -958,13 +1026,24 @@ def serve_http(ctx):
                 return
             out, finish = item["result"]
             nll = item.get("nll")
-            content = ctx.tok.decode(out, skip_special_tokens=True)
+            split = OutputSplitter(ctx, think_open, ctx.toolcalls_token if tools else None)
+            split.feed(out)
+            split.finish()
+            reasoning = ctx.tok.decode(split.reasoning_ids, skip_special_tokens=True)
+            content = ctx.tok.decode(split.content_ids, skip_special_tokens=True)
+            calls = []
+            if split.held is not None:
+                block = ctx.tok.decode(split.held, skip_special_tokens=True)
+                _, calls = parse_tool_calls(block, tools)
+                if not calls:
+                    content += block              # not a well-formed block: it was content
             message = {"role": "assistant", "content": content}
-            if tools:
-                content, calls = parse_tool_calls(content, tools)
-                if calls:
-                    message = {"role": "assistant", "content": content or None, "tool_calls": calls}
-                    finish = "tool_calls"
+            if reasoning:
+                message["reasoning_content"] = reasoning
+            if calls:
+                message["content"] = content or None
+                message["tool_calls"] = calls
+                finish = "tool_calls"
             created = int(time.time())
             self._send(200, {
                 "id": f"chatcmpl-h4-{created}", "object": "chat.completion", "created": created,
@@ -973,6 +1052,7 @@ def serve_http(ctx):
                              "finish_reason": finish or "stop"}],
                 "usage": {"prompt_tokens": len(ids), "completion_tokens": len(out),
                           "total_tokens": len(ids) + len(out),
+                          "completion_tokens_details": {"reasoning_tokens": len(split.reasoning_ids)},
                           **({} if nll is None else {"nll_sum": nll[0], "nll_tokens": nll[1],
                                                      "nll_mean": nll[0] / max(nll[1], 1)})},
             })
@@ -1496,6 +1576,11 @@ def main():
             ctx.tok = tok
             _tc = tok.encode(TOOLCALLS_BEGIN, add_special_tokens=False)
             ctx.toolcalls_token = _tc[0] if len(_tc) == 1 else None
+            _to = tok.encode(THINK_OPEN, add_special_tokens=False)
+            _tcl = tok.encode(THINK_CLOSE, add_special_tokens=False)
+            if len(_to) != 1 or len(_tcl) != 1:
+                raise RuntimeError("the think markers must be single tokens for the reasoning split")
+            ctx.think_open_token, ctx.think_close_token = _to[0], _tcl[0]
             eos_id = tok.eos_token_id if tok.eos_token_id is not None else 120025
             ctx.sampler = Sampler(tok, eos_id, seed=int(time.time()) & 0xFFFFFFFF, device=ctx.device)
             serve_http(ctx)
