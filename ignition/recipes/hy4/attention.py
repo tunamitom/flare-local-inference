@@ -387,7 +387,16 @@ class Hy4LayerAttention:
         else:
             q = apply_interleaved_rope(q, positions, rope_dim=self.qk_rope, theta=self.rope_theta)
         kv_pass, k_rot = kv_raw[:, :self.kv_lora], kv_raw[:, self.kv_lora:]
-        if glue:
+        latent = None
+        if glue and diet("diet3") and diet("rms_tree"):
+            # round 15: the latent row (tree RMSNorm + rope) in one launch
+            from .fused_ops import latent_prep
+
+            latent = latent_prep(kv_raw, w.kv_a_norm, self.config.text["rms_norm_eps"], positions,
+                                 lora=self.kv_lora, rope_dim=self.qk_rope, theta=self.rope_theta)
+        if latent is not None:
+            pass
+        elif glue:
             # round 15: k_pass and k_rot written straight into the latent row (no cat)
             from .fused_ops import rms_norm as fused_rms_norm, rope_interleaved
 
@@ -682,12 +691,24 @@ class Hy4LayerAttention:
         stash = getattr(self, "_wk_raw", None)
         if stash is not None and stash[0] is x:
             # consult18 P6: the decode-scope INT8 pack GEMM already projected wk
-            k = stash[1].float()
+            k_raw = stash[1]
             self._wk_raw = None
         else:
             packed = self.weights.packed_input
             wk = iw.wk if packed is None else packed.rows("indexer_wk")
-            k = (x @ wk.T).float()
+            k_raw = x @ wk.T
+        if k_raw.is_cuda and diet("diet3") and _fused_norm_rope():
+            # round 15: .float(), the LayerNorm (ATen's own mean / Welford trees)
+            # and the rope in one launch for the decode family's few rows
+            from .fused_ops import index_key_prep
+
+            keys = index_key_prep(k_raw, iw.k_norm_weight, iw.k_norm_bias,
+                                  self.config.text["rms_norm_eps"], positions,
+                                  rope_dim=self.config.text["qk_rope_head_dim"],
+                                  theta=self.rope_theta)
+            if keys is not None:
+                return keys
+        k = k_raw.float()
         k = layer_norm(k, iw.k_norm_weight, iw.k_norm_bias, self.config.text["rms_norm_eps"])
         return apply_interleaved_rope(k, positions, rope_dim=self.config.text["qk_rope_head_dim"],
                                      theta=self.rope_theta)

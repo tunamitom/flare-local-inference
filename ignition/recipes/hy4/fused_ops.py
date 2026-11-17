@@ -20,7 +20,7 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-__all__ = ["dequant_rows_int8", "dequant_slots_int8", "ihc_post_pre_split", "quant_rows_int8", "moe_route", "scores_only_select", "merge_head_major", "rms_norm", "rope_interleaved", "sigmoid_gate", "swiglu_f32", "store_owned_rows", "candidate_pick", "rms_norm_tree"]
+__all__ = ["dequant_rows_int8", "dequant_slots_int8", "ihc_post_pre_split", "quant_rows_int8", "moe_route", "scores_only_select", "merge_head_major", "rms_norm", "rope_interleaved", "sigmoid_gate", "swiglu_f32", "store_owned_rows", "candidate_pick", "rms_norm_tree", "index_key_prep", "latent_prep"]
 
 _INV_FREQ = {}
 
@@ -130,11 +130,9 @@ def _halve(v, OFF: tl.constexpr):
 
 
 @triton.jit
-def _rms_tree_kernel(x_ptr, w_ptr, out_ptr, N, eps, inv_n, x_stride, out_stride, ms_ptr,
-                     BW: tl.constexpr, K: tl.constexpr, STORE_MS: tl.constexpr):
-    row = tl.program_id(0).to(tl.int64)
+def _tree_mean_sq(base, inv_n, BW: tl.constexpr, K: tl.constexpr):
+    """ATen's mean of x^2 over 4 * BW * K contiguous values at `base`."""
     t = tl.arange(0, BW)
-    base = x_ptr + row * x_stride
     a0 = tl.zeros([BW], dtype=tl.float32)
     a1 = tl.zeros([BW], dtype=tl.float32)
     a2 = tl.zeros([BW], dtype=tl.float32)
@@ -163,7 +161,15 @@ def _rms_tree_kernel(x_ptr, w_ptr, out_ptr, N, eps, inv_n, x_stride, out_stride,
     v = _halve(v, 4)
     v = _halve(v, 2)
     v = _halve(v, 1)
-    ms = tl.sum(v, axis=0) * inv_n     # one element: the sum is the value itself
+    return tl.sum(v, axis=0) * inv_n     # one element: the sum is the value itself
+
+
+@triton.jit
+def _rms_tree_kernel(x_ptr, w_ptr, out_ptr, N, eps, inv_n, x_stride, out_stride, ms_ptr,
+                     BW: tl.constexpr, K: tl.constexpr, STORE_MS: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64)
+    base = x_ptr + row * x_stride
+    ms = _tree_mean_sq(base, inv_n, BW, K)
     if STORE_MS:
         tl.store(ms_ptr + row, ms)
     r = libdevice.rsqrt(libdevice.add_rn(ms, eps))
@@ -201,6 +207,55 @@ def _torch_mean_block_width(rows, n):
     return bw
 
 
+@triton.jit
+def _latent_prep_kernel(kv_ptr, w_ptr, pos_ptr, inv_ptr, out_ptr, kv_stride, eps, inv_n,
+                        BW: tl.constexpr, K: tl.constexpr, ROPE: tl.constexpr):
+    """Round 15: the MLA latent row in one launch — `rms_norm(kv[:, :N])` (the
+    tree kernel's expressions) and the rope of `kv[:, N:N + ROPE]` (the rope
+    kernel's expressions) written side by side."""
+    row = tl.program_id(0).to(tl.int64)
+    base = kv_ptr + row * kv_stride
+    N: tl.constexpr = 4 * BW * K
+    ms = _tree_mean_sq(base, inv_n, BW, K)
+    r = libdevice.rsqrt(libdevice.add_rn(ms, eps))
+    offs = tl.arange(0, N)
+    x = tl.load(base + offs).to(tl.float32)
+    w = tl.load(w_ptr + offs).to(tl.float32)
+    y = libdevice.mul_rn(w, libdevice.mul_rn(x, r))
+    tl.store(out_ptr + row * (N + ROPE) + offs, y.to(out_ptr.dtype.element_ty))
+    j = tl.arange(0, ROPE)
+    xr = tl.load(base + N + j)
+    xf = xr.to(tl.float32)
+    ev, od = tl.split(tl.reshape(xf, [ROPE // 2, 2]))
+    swapped = tl.reshape(tl.join(od, ev), [ROPE])
+    even = (j % 2) == 0
+    pos = tl.load(pos_ptr + row).to(tl.float32)
+    inv = tl.load(inv_ptr + j // 2)
+    angle = libdevice.mul_rn(pos, inv)
+    other = tl.where(even, -swapped, swapped)
+    rr = libdevice.add_rn(libdevice.mul_rn(xf, libdevice.cos(angle)),
+                          libdevice.mul_rn(other, libdevice.sin(angle)))
+    tl.store(out_ptr + row * (N + ROPE) + N + j, rr.to(xr.dtype).to(out_ptr.dtype.element_ty))
+
+
+def latent_prep(kv_raw, weight, eps, positions, *, lora, rope_dim, theta):
+    """`cat(rms_norm(kv_raw[:, :lora]), rope(kv_raw[:, lora:lora + rope_dim]))` for the
+    decode family's few rows in one launch, or None when not that shape."""
+    rows = int(kv_raw.shape[0]) if kv_raw.dim() == 2 else -1
+    if rows < 1 or rows > 4 or kv_raw.stride(-1) != 1 or int(kv_raw.shape[1]) != lora + rope_dim:
+        return None
+    bw = _torch_mean_block_width(rows, int(lora))
+    if bw is None or rope_dim & (rope_dim - 1) or int(positions.numel()) != rows:
+        return None
+    out = torch.empty((rows, lora + rope_dim), dtype=kv_raw.dtype, device=kv_raw.device)
+    _latent_prep_kernel[(rows,)](kv_raw, weight.contiguous(), positions.reshape(-1),
+                                 _inv_freq(int(rope_dim), theta, kv_raw.device), out, kv_raw.stride(0),
+                                 float(eps), _mean_factor(rows, int(lora)), BW=bw,
+                                 K=int(lora) // (4 * bw), ROPE=int(rope_dim), num_warps=4,
+                                 enable_fp_fusion=False)
+    return out
+
+
 _MEAN_FACTORS = {}
 
 
@@ -236,6 +291,99 @@ def rms_norm_tree(x, weight, eps, out=None):
                               target, BW=bw, K=N // (4 * bw), STORE_MS=False, num_warps=4,
                               enable_fp_fusion=False)
     return target if out is not None else target.view(x.shape)
+
+
+# --------------------------------------------------------------------------
+# Round 15: the indexer key prep `rope(layer_norm(k.float()))` for the decode
+# family's few rows in ONE launch (128-wide keys). Every statistic is ATen's
+# own reduction tree: the mean (MeanOps, 4-wide vectors over 32 lanes, the
+# shuffle fold 16..1, `* 1/128`) and the biased variance (WelfordOps, 2-wide
+# vectors over 64 lanes: each lane combines its pair, then the shared fold 32
+# and the shuffle fold 16..1). Every Welford combine joins equal counts, so
+# its `nb / n` is exactly 0.5 and nvcc's FMA contraction cannot change a bit.
+# The normalization, affine and rope are the torch ops' / rope kernel's own
+# expressions (no contraction: launched with enable_fp_fusion=False).
+# --------------------------------------------------------------------------
+@triton.jit
+def _welford_fold(mu, m2, nf, OFF: tl.constexpr):
+    mu_lo, mu_hi = tl.split(tl.permute(tl.reshape(mu, [2, OFF]), [1, 0]))
+    m2_lo, m2_hi = tl.split(tl.permute(tl.reshape(m2, [2, OFF]), [1, 0]))
+    delta = mu_hi - mu_lo
+    new_count = nf + nf
+    nb = libdevice.div_rn(nf, new_count)
+    return mu_lo + delta * nb, (m2_lo + m2_hi) + ((delta * delta) * nf) * nb, new_count
+
+
+@triton.jit
+def _index_key_prep_kernel(k_ptr, w_ptr, b_ptr, pos_ptr, inv_ptr, out_ptr, k_stride, eps, inv_n,
+                           ROPE: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64)
+    base = k_ptr + row * k_stride
+    # mean: MeanOps over 4-wide vectors, 32 lanes
+    t = tl.arange(0, 32)
+    x0 = tl.load(base + 4 * t + 0).to(tl.float32)
+    x1 = tl.load(base + 4 * t + 1).to(tl.float32)
+    x2 = tl.load(base + 4 * t + 2).to(tl.float32)
+    x3 = tl.load(base + 4 * t + 3).to(tl.float32)
+    v = ((x0 + x1) + x2) + x3
+    v = _halve(v, 16)
+    v = _halve(v, 8)
+    v = _halve(v, 4)
+    v = _halve(v, 2)
+    v = _halve(v, 1)
+    mean = tl.sum(v, axis=0) * inv_n
+    # biased variance: WelfordOps over 2-wide vectors, 64 lanes
+    u = tl.arange(0, 64)
+    e0 = tl.load(base + 2 * u + 0).to(tl.float32)
+    e1 = tl.load(base + 2 * u + 1).to(tl.float32)
+    d = e1 - e0
+    mu = e0 + d * 0.5
+    m2 = 0.0 + ((d * d) * 1.0) * 0.5          # (+0 + +0) + delta^2 * 1 * 0.5
+    mu, m2, nf = _welford_fold(mu, m2, 2.0, 32)
+    mu, m2, nf = _welford_fold(mu, m2, nf, 16)
+    mu, m2, nf = _welford_fold(mu, m2, nf, 8)
+    mu, m2, nf = _welford_fold(mu, m2, nf, 4)
+    mu, m2, nf = _welford_fold(mu, m2, nf, 2)
+    mu, m2, nf = _welford_fold(mu, m2, nf, 1)
+    var = libdevice.div_rn(tl.sum(m2, axis=0), nf)
+    # (xf - mean) * rsqrt(var + eps) * weight + bias
+    c = tl.arange(0, 128)
+    x = tl.load(base + c).to(tl.float32)
+    r = libdevice.rsqrt(var + eps)
+    y = (x - mean) * r
+    y = y * tl.load(w_ptr + c) + tl.load(b_ptr + c)
+    # interleaved rope on the last ROPE columns (the rope kernel's expressions)
+    ev, od = tl.split(tl.reshape(y, [64, 2]))
+    swapped = tl.reshape(tl.join(od, ev), [128])
+    start = 128 - ROPE
+    rot = c >= start
+    jj = tl.where(rot, c - start, 0)
+    even = (jj % 2) == 0
+    p = tl.load(pos_ptr + row).to(tl.float32)
+    inv = tl.load(inv_ptr + jj // 2, mask=rot, other=0.0)
+    angle = libdevice.mul_rn(p, inv)
+    cs = libdevice.cos(angle)
+    sn = libdevice.sin(angle)
+    other = tl.where(even, -swapped, swapped)
+    rr = libdevice.add_rn(libdevice.mul_rn(y, cs), libdevice.mul_rn(other, sn))
+    tl.store(out_ptr + row * 128 + c, tl.where(rot, rr, y))
+
+
+def index_key_prep(k_raw, weight, bias, eps, positions, *, rope_dim, theta):
+    """`rope_interleaved(layer_norm(k_raw.float(), weight, bias, eps), positions)`
+    for <= 8 rows of 128-wide keys (FP32 out), or None when not that shape."""
+    rows = int(k_raw.shape[0]) if k_raw.dim() == 2 else -1
+    if (rows < 1 or rows > 8 or int(k_raw.shape[1]) != 128 or k_raw.stride(-1) != 1
+            or int(rope_dim) != 64 or weight.dtype != torch.float32 or bias.dtype != torch.float32
+            or int(positions.numel()) != rows):
+        return None
+    out = torch.empty((rows, 128), dtype=torch.float32, device=k_raw.device)
+    inv = _inv_freq(int(rope_dim), theta, k_raw.device)
+    _index_key_prep_kernel[(rows,)](k_raw, weight.contiguous(), bias.contiguous(),
+                                    positions.reshape(-1), inv, out, k_raw.stride(0), float(eps),
+                                    _mean_factor(rows, 128), ROPE=int(rope_dim), num_warps=1,
+                                    enable_fp_fusion=False)
+    return out
 
 
 @triton.jit
