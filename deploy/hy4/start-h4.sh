@@ -26,8 +26,8 @@ set -euo pipefail
 NAME="${NAME:-h4}"
 PORT="${LLM_PORT:-8001}"
 TP=8
-IMAGE="${IMAGE:-local/flare:rt-h4-cp8-dg62}"
-IMAGE_SHA="${IMAGE_SHA:-sha256:24a5fbe58a72284fd02e709af86924961d4555808ca5ece8049f109f9eecd9d3}"
+IMAGE="${IMAGE:-local/flare:rt-h4-cp8-dg67}"
+IMAGE_SHA="${IMAGE_SHA:-sha256:6942931089f8b36d262dfc5685c162802f1be205b8cf2ed2f2d6c5035534060d}"
 PKG_LINK="${PKG_DIR:-/opt/models/Hy4-nvfp4-w4a16-mse-gpu}"
 SERVED_NAME="${SERVED_NAME:-smart}"
 MAX_CONCURRENCY="${MAX_CONCURRENCY:-1}"
@@ -198,6 +198,7 @@ docker run -d --name "$NAME" --network host --init --cap-add SYS_PTRACE \
   -e HY4_HOST_TRIM="${HY4_HOST_TRIM:-on}" \
   -e HY4_BATCHED_WAITS="${HY4_BATCHED_WAITS:-}" \
   -e HY4_GRAPH_MOE="${HY4_GRAPH_MOE:-on}" \
+  -e HY4_CE_PRIORITY="${HY4_CE_PRIORITY:-high}" \
   -e HY4_COMM_TOKEN="${HY4_COMM_TOKEN:-}" \
   -e HY4_PLAIN_SYNC_CENSUS="${HY4_PLAIN_SYNC_CENSUS:-}" \
   -e HY4_SYNC_FREE="${HY4_SYNC_FREE:-decode}" \
