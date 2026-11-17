@@ -26,8 +26,8 @@ set -euo pipefail
 NAME="${NAME:-h4}"
 PORT="${LLM_PORT:-8001}"
 TP=8
-IMAGE="${IMAGE:-local/flare:rt-h4-cp8-dg77}"
-IMAGE_SHA="${IMAGE_SHA:-sha256:1b08fb1cee4101535a0f693867c827b4519fb3d2a2467c9e0c79e25de5005e32}"
+IMAGE="${IMAGE:-local/flare:rt-h4-cp8-dg78}"
+IMAGE_SHA="${IMAGE_SHA:-sha256:702ad9c1eb0332cd178405e388585aae8c59b2a730e9e57d0c9458a6bf20d65f}"
 PKG_LINK="${PKG_DIR:-/opt/models/Hy4-nvfp4-w4a16-mse-gpu}"
 SERVED_NAME="${SERVED_NAME:-smart}"
 MAX_CONCURRENCY="${MAX_CONCURRENCY:-1}"
@@ -257,7 +257,7 @@ docker run -d --name "$NAME" --network host --init --cap-add SYS_PTRACE \
       --snapshot /model \
       --host 0.0.0.0 --port "$PORT" --served-model-name "$SERVED_NAME" \
       --max-concurrency "$MAX_CONCURRENCY" \
-      --max-context "${H4_MAX_CONTEXT:-999424}" \
+      --max-context "${H4_MAX_CONTEXT:-1048576}" \
       --headroom "${H4_HEADROOM:-4563402752}" \
       --all-reduce-arm "${H4_AR_ARMS:-1:oneshot,2-4:rsag,8-512:twoshot,1024-:dma}" \
       --all-reduce-kernel-rows 512 \
