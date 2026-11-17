@@ -113,6 +113,9 @@ ALLOWED = {
     # round 15 (bit-identical): the indexer key prep (cast, LayerNorm with
     # ATen's mean / Welford trees, rope) in one launch for <= 8 rows
     "diet3": ("off", "on"),
+    # round 15 (numerics class): decode W_UV expansion + sigmoid gate in one
+    # launch (fused_ops.expand_gate; FP32 accumulation in Triton's order)
+    "expand_gate": ("off", "on"),
 }
 DEFAULTS = {"index_scores": "fp32",
             "ihc": os.environ.get("HY4_IHC") or "default",
@@ -147,7 +150,8 @@ DEFAULTS = {"index_scores": "fp32",
             "rms_tree": os.environ.get("HY4_RMS_TREE") or "off",
             "expand_bf16": os.environ.get("HY4_EXPAND_BF16") or "off",
             "diet2": os.environ.get("HY4_DIET2") or "off",
-            "diet3": os.environ.get("HY4_DIET3") or "off"}
+            "diet3": os.environ.get("HY4_DIET3") or "off",
+            "expand_gate": os.environ.get("HY4_EXPAND_GATE") or "off"}
 for _key, _value in DEFAULTS.items():
     if _value not in ALLOWED[_key]:
         raise ValueError(f"runtime default {_key}={_value!r} must be one of {ALLOWED[_key]}")

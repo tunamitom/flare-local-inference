@@ -1720,6 +1720,10 @@ class Hy4Decoder:
         WATCH.check("comm.lse_reduce", layer.index, merged=out, merged_lse=lse)
         with TIMER.phase("attn.fold_expand_gate"):
             out, lse = attn.fold_sink(out, lse)   # the ONE sink fold, after the merge
+            if not expanded:
+                fused = attn.expand_gate_project(out, y)   # round 15 (switch expand_gate)
+                if fused is not None:
+                    return fused
             # `W_UV` expansion over this rank's head shard (a per (row, head) scale
             # commutes with the fold; the latent-space partials cannot expand on a
             # foreign head — `kv_b_proj` is head-sharded for the decode wiring).

@@ -20,7 +20,7 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-__all__ = ["dequant_rows_int8", "dequant_slots_int8", "ihc_post_pre_split", "quant_rows_int8", "moe_route", "scores_only_select", "merge_head_major", "rms_norm", "rope_interleaved", "sigmoid_gate", "swiglu_f32", "store_owned_rows", "candidate_pick", "rms_norm_tree", "index_key_prep", "latent_prep"]
+__all__ = ["dequant_rows_int8", "dequant_slots_int8", "ihc_post_pre_split", "quant_rows_int8", "moe_route", "scores_only_select", "merge_head_major", "rms_norm", "rope_interleaved", "sigmoid_gate", "swiglu_f32", "store_owned_rows", "candidate_pick", "rms_norm_tree", "index_key_prep", "latent_prep", "expand_gate"]
 
 _INV_FREQ = {}
 
@@ -254,6 +254,56 @@ def latent_prep(kv_raw, weight, eps, positions, *, lora, rope_dim, theta):
                                  K=int(lora) // (4 * bw), ROPE=int(rope_dim), num_warps=4,
                                  enable_fp_fusion=False)
     return out
+
+
+# --------------------------------------------------------------------------
+# Round 15 (numerics class): the W_UV expansion of the folded attention output
+# and the sigmoid gate in ONE launch for the decode family: per (row, head,
+# 32 value columns) the BF16 output row and W_UV rows are widened (exact),
+# their products (exact in FP32) summed in FP32 (Triton's order, not cuBLAS
+# SGEMM's), rounded once to BF16 (= the einsum's `.to(bf16)`), then gated with
+# torch's sigmoid / product rounding (exact; libdevice without FTZ). Replaces
+# out.float(), the per-step FP32 copy of the W_UV shard, the GEMM, the cast
+# and the gate kernel.
+# --------------------------------------------------------------------------
+@triton.jit
+def _expand_gate_kernel(o_ptr, w_ptr, g_ptr, out_ptr, HEADS, V, D, o_sr, o_sh, w_sh, w_sv, g_stride,
+                        BLOCK_V: tl.constexpr, BLOCK_D: tl.constexpr):
+    rh = tl.program_id(0)
+    vb = tl.program_id(1)
+    r = (rh // HEADS).to(tl.int64)
+    h = rh % HEADS
+    d = tl.arange(0, BLOCK_D)
+    v = vb * BLOCK_V + tl.arange(0, BLOCK_V)
+    o = tl.load(o_ptr + r * o_sr + h * o_sh + d, mask=d < D, other=0.0).to(tl.float32)
+    w = tl.load(w_ptr + h.to(tl.int64) * w_sh + v[:, None].to(tl.int64) * w_sv + d[None, :],
+                mask=(v[:, None] < V) & (d[None, :] < D), other=0.0).to(tl.float32)
+    e = tl.sum(w * o[None, :], axis=1).to(tl.bfloat16).to(tl.float32)
+    col = h * V + v
+    g = tl.load(g_ptr + r * g_stride + col, mask=v < V, other=0.0).to(tl.float32)
+    s = libdevice.div_rn(1.0, 1.0 + libdevice.exp(-g)).to(tl.bfloat16).to(tl.float32)
+    tl.store(out_ptr + r * (HEADS * V) + col, libdevice.mul_rn(e, s).to(tl.bfloat16), mask=v < V)
+
+
+def expand_gate(out, wuv, gate_raw, *, block_v=32):
+    """`(einsum("rhd,hvd->rhv", out.float(), wuv.float()).to(bf16) * sigmoid(gate)).reshape(rows, -1)`
+    up to the expansion's FP32 summation order, for BF16 operands; None if not that shape."""
+    if out.dim() != 3 or wuv.dim() != 3 or out.dtype != torch.bfloat16 or wuv.dtype != torch.bfloat16:
+        return None
+    rows, heads, D = (int(v) for v in out.shape)
+    V = int(wuv.shape[1])
+    if (int(wuv.shape[0]) != heads or int(wuv.shape[2]) != D or wuv.stride(2) != 1
+            or out.stride(2) != 1 or D & (D - 1) or rows < 1 or rows > 16):
+        return None
+    g = gate_raw.reshape(rows, -1)
+    if int(g.shape[1]) != heads * V or g.stride(-1) != 1 or g.dtype != torch.bfloat16:
+        return None
+    flat = torch.empty((rows, heads * V), dtype=torch.bfloat16, device=out.device)
+    _expand_gate_kernel[(rows * heads, triton.cdiv(V, block_v))](
+        out, wuv, g, flat, heads, V, D, out.stride(0), out.stride(1), wuv.stride(0), wuv.stride(1),
+        g.stride(0),
+        BLOCK_V=block_v, BLOCK_D=D, num_warps=4, enable_reflect_ftz=False)
+    return flat
 
 
 _MEAN_FACTORS = {}

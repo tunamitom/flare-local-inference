@@ -1117,6 +1117,48 @@ class Hy4LayerAttention:
             self._packed_gates = {}
         self._packed_gates[lane()] = (x.data_ptr(), gate_raw)
 
+    def _take_gate(self, x):
+        """The stashed packed gate projection for `x` (consumed), else None."""
+        from .lanes import lane
+
+        stashes = getattr(self, "_packed_gates", None) or {}
+        stashed = stashes.get(lane())
+        if stashed is not None and stashed[0] == x.data_ptr():
+            stashes[lane()] = None
+            return stashed[1]
+        return None
+
+    def expand_gate_project(self, out, x):
+        """round 15 (`expand_gate`, numerics class): `gate_and_project(
+        expand_output(out).to(x.dtype), x)` with the expansion and the gate in one
+        launch (fused_ops.expand_gate); None when the fused form does not apply
+        (the caller then runs the unfused chain — nothing was consumed)."""
+        if not (out.is_cuda and x.dtype == torch.bfloat16 and diet("expand_gate")):
+            return None
+        from .lanes import lane
+
+        stashes = getattr(self, "_packed_gates", None) or {}
+        stashed = stashes.get(lane())
+        if stashed is None or stashed[0] != x.data_ptr():
+            return None
+        from .fused_ops import expand_gate
+
+        first, last = self.sharding.head_range
+        flat = expand_gate(out, self.expand_wuv[first:last], stashed[1])
+        if flat is None:
+            return None
+        stashes[lane()] = None
+        return self._project_out(flat)
+
+    def _project_out(self, flat):
+        o_proj = self.weights.o_proj
+        if self.weights.w8_o_proj is not None:
+            from .w8 import in_decode_scope
+
+            if in_decode_scope(flat):
+                o_proj = self.weights.w8_o_proj
+        return flat @ o_proj.T
+
     def gate_and_project(self, attn_output, x):
         """Elementwise per-head gate (`gated_mla`, `gating_type=elementwise`) then `o_proj`.
 
