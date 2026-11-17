@@ -26,8 +26,8 @@ set -euo pipefail
 NAME="${NAME:-h4}"
 PORT="${LLM_PORT:-8001}"
 TP=8
-IMAGE="${IMAGE:-local/flare:rt-h4-cp8-dg78}"
-IMAGE_SHA="${IMAGE_SHA:-sha256:702ad9c1eb0332cd178405e388585aae8c59b2a730e9e57d0c9458a6bf20d65f}"
+IMAGE="${IMAGE:-local/flare:rt-h4-cp8-dg79}"
+IMAGE_SHA="${IMAGE_SHA:-sha256:69f88fcdbcc98ba558cfc1041c13c782eb080ee31b2e3a2eb5b40e6a7d3b3220}"
 PKG_LINK="${PKG_DIR:-/opt/models/Hy4-nvfp4-w4a16-mse-gpu}"
 SERVED_NAME="${SERVED_NAME:-smart}"
 MAX_CONCURRENCY="${MAX_CONCURRENCY:-1}"
@@ -220,6 +220,7 @@ docker run -d --name "$NAME" --network host --init --cap-add SYS_PTRACE \
   -e HY4_SPEC_FILTER="${HY4_SPEC_FILTER:-on}" \
   -e HY4_ABSORB_OUT="${HY4_ABSORB_OUT:-direct}" \
   -e HY4_IHC_ROWS="${HY4_IHC_ROWS:-8}" \
+  -e HY4_IHC_FUSE="${HY4_IHC_FUSE:-on}" \
   -e HY4_ROUTER_MM="${HY4_ROUTER_MM:-bf16}" \
   -e HY4_HEAD_FP32_DROP="${HY4_HEAD_FP32_DROP:-1}" \
   -e HY4_ABSORB_ROWS="${HY4_ABSORB_ROWS:-1024}" \
