@@ -20,7 +20,7 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-__all__ = ["dequant_rows_int8", "dequant_slots_int8", "ihc_post_pre_split", "quant_rows_int8", "moe_route", "scores_only_select", "merge_head_major", "rms_norm", "rope_interleaved", "sigmoid_gate", "swiglu_f32", "store_owned_rows"]
+__all__ = ["dequant_rows_int8", "dequant_slots_int8", "ihc_post_pre_split", "quant_rows_int8", "moe_route", "scores_only_select", "merge_head_major", "rms_norm", "rope_interleaved", "sigmoid_gate", "swiglu_f32", "store_owned_rows", "candidate_pick", "rms_norm_tree"]
 
 _INV_FREQ = {}
 
@@ -60,7 +60,10 @@ def _rope_kernel(x_ptr, out_ptr, pos_ptr, inv_ptr, stride_n, stride_d, D, HEADS,
     xf = x.to(tl.float32)
     other = tl.where(even, -xp, xp)
     r = libdevice.add_rn(libdevice.mul_rn(xf, c), libdevice.mul_rn(other, s))
-    y = tl.where(rot, r.to(out_ptr.dtype.element_ty), x)
+    # rounded to the INPUT dtype, then widened (bitwise the old store when the dtypes match;
+    # round 15: BF16 in, FP32 out = rope then .float())
+    y = tl.where(rot, r.to(x_ptr.dtype.element_ty).to(out_ptr.dtype.element_ty),
+                 x.to(out_ptr.dtype.element_ty))
     tl.store(out_ptr + n * out_stride_n + offs, y, mask=live)
 
 
@@ -82,7 +85,9 @@ def rope_interleaved(x, positions, *, rope_dim, theta, out=None):
         out = torch.empty(lead + (D,), dtype=x.dtype, device=x.device)
         out_stride = D
     else:
-        out_stride = _even_row_stride(out, lead + (D,), x.dtype)
+        out_stride = _even_row_stride(out, lead + (D,), out.dtype)
+        if out.dtype != x.dtype and not (x.dtype == torch.bfloat16 and out.dtype == torch.float32):
+            raise ValueError("rope out dtype: the input's, or FP32 from BF16")
     if n == 0:
         return out
     inv = _inv_freq(rope_dim, theta, x.device)
@@ -104,6 +109,133 @@ def _even_row_stride(out, shape, dtype):
         if int(out.stride(d - 1)) != int(out.shape[d]) * int(out.stride(d)):
             raise ValueError("out rows must be evenly strided")
     return stride
+
+
+# --------------------------------------------------------------------------
+# Round 15: `rms_norm` (square -> torch mean -> tail) in ONE launch for the
+# decode family's few rows. The mean is torch's own reduction tree for a
+# contiguous FP32 last-dim mean (ATen Reduce.cuh, vectorized input): block
+# width BW from `set_block_dimension`, each thread t keeps 4 accumulators
+# acc_i = sum_k x[4 (t + k BW) + i] (sequential in k), combines
+# ((acc0 + acc1) + acc2) + acc3, then halves: a shared-memory fold down to 32
+# lanes and the shuffle fold with DECREASING offsets 16..1 (this ATen's CUDA
+# block_x_reduce), and `* (1 / N)`. The square and the tail are the two
+# kernels' own expressions.
+# --------------------------------------------------------------------------
+@triton.jit
+def _halve(v, OFF: tl.constexpr):
+    # v[t] + v[t + OFF] for t < OFF  (v has 2 * OFF entries)
+    lo, hi = tl.split(tl.permute(tl.reshape(v, [2, OFF]), [1, 0]))
+    return lo + hi
+
+
+@triton.jit
+def _rms_tree_kernel(x_ptr, w_ptr, out_ptr, N, eps, inv_n, x_stride, out_stride, ms_ptr,
+                     BW: tl.constexpr, K: tl.constexpr, STORE_MS: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64)
+    t = tl.arange(0, BW)
+    base = x_ptr + row * x_stride
+    a0 = tl.zeros([BW], dtype=tl.float32)
+    a1 = tl.zeros([BW], dtype=tl.float32)
+    a2 = tl.zeros([BW], dtype=tl.float32)
+    a3 = tl.zeros([BW], dtype=tl.float32)
+    for k in tl.static_range(K):
+        e = 4 * (t + k * BW)
+        v0 = tl.load(base + e + 0).to(tl.float32)
+        v1 = tl.load(base + e + 1).to(tl.float32)
+        v2 = tl.load(base + e + 2).to(tl.float32)
+        v3 = tl.load(base + e + 3).to(tl.float32)
+        a0 = a0 + v0 * v0
+        a1 = a1 + v1 * v1
+        a2 = a2 + v2 * v2
+        a3 = a3 + v3 * v3
+    v = ((a0 + a1) + a2) + a3
+    if BW >= 512:
+        v = _halve(v, 256)
+    if BW >= 256:
+        v = _halve(v, 128)
+    if BW >= 128:
+        v = _halve(v, 64)
+    if BW >= 64:
+        v = _halve(v, 32)
+    v = _halve(v, 16)
+    v = _halve(v, 8)
+    v = _halve(v, 4)
+    v = _halve(v, 2)
+    v = _halve(v, 1)
+    ms = tl.sum(v, axis=0) * inv_n     # one element: the sum is the value itself
+    if STORE_MS:
+        tl.store(ms_ptr + row, ms)
+    r = libdevice.rsqrt(libdevice.add_rn(ms, eps))
+    offs = tl.arange(0, BW * 4 * K)
+    x = tl.load(base + offs).to(tl.float32)
+    w = tl.load(w_ptr + offs).to(tl.float32)
+    y = libdevice.mul_rn(w, libdevice.mul_rn(x, r))
+    tl.store(out_ptr + row * out_stride + offs, y.to(out_ptr.dtype.element_ty))
+
+
+def _torch_mean_block_width(rows, n):
+    """ATen's block width for a contiguous FP32 [rows, n] last-dim mean, or None
+    when that reduction is not the single-block vectorized form emulated here."""
+    if n % 4 or n < 128:
+        return None                      # ATen vectorizes the input from dim0 >= 128
+    dim0, dim1 = n // 4, rows
+    mnt = 512
+
+    def last_pow2(v):
+        return 1 << (int(v).bit_length() - 1)
+
+    d0 = last_pow2(dim0) if dim0 < mnt else mnt
+    d1 = last_pow2(dim1) if dim1 < mnt else mnt
+    bw = min(d0, 32)
+    bh = min(d1, mnt // bw)
+    bw = min(d0, mnt // bh)
+    per_thread = -(-n // bw)
+    if per_thread >= bh * 16 or per_thread >= 256:
+        return None                      # inter-warp / multi-block split: not emulated
+    if bw < 32 or n % (4 * bw):
+        return None
+    k = n // (4 * bw)
+    if k & (k - 1):
+        return None                      # the tail's arange needs a power-of-two width
+    return bw
+
+
+_MEAN_FACTORS = {}
+
+
+def _mean_factor(rows, n):
+    """ATen's mean factor: static_cast<float>(num_outputs) / numel, an FP32 division."""
+    key = (rows, n)
+    value = _MEAN_FACTORS.get(key)
+    if value is None:
+        value = _MEAN_FACTORS[key] = float(torch.tensor(float(rows), dtype=torch.float32)
+                                           / torch.tensor(float(rows * n), dtype=torch.float32))
+    return value
+
+
+def rms_norm_tree(x, weight, eps, out=None):
+    """`rms_norm` in one launch when the decode-family shape's torch mean is the
+    emulated tree; None otherwise (the caller falls back)."""
+    N = int(x.shape[-1])
+    flat = x.reshape(-1, N)
+    rows = int(flat.shape[0])
+    if not (1 <= rows <= 4) or flat.stride(-1) != 1 or not x.is_cuda:
+        return None
+    bw = _torch_mean_block_width(rows, N)
+    if bw is None or not weight.is_contiguous():
+        return None
+    if out is None:
+        target, out_stride = torch.empty((rows, N), dtype=x.dtype, device=x.device), N
+    else:
+        target, out_stride = out, _even_row_stride(out, tuple(x.shape), x.dtype)
+    factor = _mean_factor(rows, N)
+    # no FMA contraction: the square is rounded on its own (the square kernel's
+    # store), then added (torch's reduce)
+    _rms_tree_kernel[(rows,)](flat, weight, target, N, float(eps), factor, flat.stride(0), out_stride,
+                              target, BW=bw, K=N // (4 * bw), STORE_MS=False, num_warps=4,
+                              enable_fp_fusion=False)
+    return target if out is not None else target.view(x.shape)
 
 
 @triton.jit
@@ -173,6 +305,14 @@ def rms_norm(x, weight, eps, out=None):
     `(w * (x * rsqrt(ms + eps))).to(x.dtype)` runs fused. `out` (round 15): a
     caller's evenly row-strided view of x's shape to write into."""
     N = int(x.shape[-1])
+    if x.is_cuda and 1 <= x.numel() // max(N, 1) <= 4:
+        from .runtime import SWITCHES
+
+        if SWITCHES.get("rms_tree") == "on":
+            done = rms_norm_tree(x if x.reshape(-1, N).stride(-1) == 1 else x.contiguous(),
+                                 weight, eps, out=out)
+            if done is not None:
+                return done
     flat = x.reshape(-1, N)
     if not flat.is_contiguous():
         flat = flat.contiguous()
@@ -650,30 +790,35 @@ def moe_route(logits, bias, *, top_k, scale, norm, ids_dtype=torch.int64):
 # silu of subnormal inputs).
 # --------------------------------------------------------------------------
 @triton.jit
-def _sigmoid_gate_kernel(a_ptr, g_ptr, out_ptr, N, a_stride, g_stride, BLOCK: tl.constexpr):
+def _sigmoid_gate_kernel(a_ptr, g_ptr, out_ptr, N, V, a_sr, a_sh, a_sv, g_stride,
+                         BLOCK: tl.constexpr):
     r = tl.program_id(0).to(tl.int64)
     offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     live = offs < N
     g = tl.load(g_ptr + r * g_stride + offs, mask=live, other=0.0).to(tl.float32)
     s = libdevice.div_rn(1.0, 1.0 + libdevice.exp(-g)).to(tl.bfloat16).to(tl.float32)
-    a = tl.load(a_ptr + r * a_stride + offs, mask=live, other=0.0).to(tl.float32)
+    h = offs // V
+    a = tl.load(a_ptr + r * a_sr + h * a_sh + (offs - h * V) * a_sv, mask=live,
+                other=0.0).to(tl.float32)
     tl.store(out_ptr + r * N + offs, libdevice.mul_rn(a, s).to(tl.bfloat16), mask=live)
 
 
 def sigmoid_gate(attn_output, gate_raw):
     """`(attn_output * sigmoid(gate_raw).view_as(attn_output)).reshape(rows, -1)`
-    for BF16 operands, contiguous [rows, N] out (bitwise the same)."""
-    rows = int(attn_output.shape[0])
-    a = attn_output.reshape(rows, -1)
+    for BF16 operands, contiguous [rows, heads * v] out (bitwise the same);
+    `attn_output` [rows, heads, v] at any strides (the expansion's permuted view)."""
+    rows, heads, V = (int(v) for v in attn_output.shape)
+    N = heads * V
     g = gate_raw.reshape(rows, -1)
-    N = int(a.shape[1])
-    if int(g.shape[1]) != N or a.stride(-1) != 1 or g.stride(-1) != 1:
-        raise ValueError("sigmoid_gate needs [rows, N] views with unit column stride")
-    out = torch.empty((rows, N), dtype=torch.bfloat16, device=a.device)
+    if int(g.shape[1]) != N or g.stride(-1) != 1:
+        raise ValueError("sigmoid_gate needs a [rows, heads * v] gate with unit column stride")
+    out = torch.empty((rows, N), dtype=torch.bfloat16, device=attn_output.device)
     if rows and N:
         block = min(4096, triton.next_power_of_2(N))
-        _sigmoid_gate_kernel[(rows, triton.cdiv(N, block))](a, g, out, N, a.stride(0), g.stride(0),
-                                                            BLOCK=block, enable_reflect_ftz=False)
+        sr, sh, sv = (int(v) for v in attn_output.stride())
+        _sigmoid_gate_kernel[(rows, triton.cdiv(N, block))](attn_output, g, out, N, V, sr, sh, sv,
+                                                            g.stride(0), BLOCK=block,
+                                                            enable_reflect_ftz=False)
     return out
 
 
@@ -700,6 +845,31 @@ def swiglu_f32(gate32, up32):
         _swiglu_f32_kernel[(rows, triton.cdiv(N, block))](gate32, up32, out, N, gate32.stride(0),
                                                           up32.stride(0), BLOCK=block,
                                                           enable_reflect_ftz=False)
+    return out
+
+
+@triton.jit
+def _candidate_pick_kernel(v_ptr, i_ptr, out_ptr, n, world, rank, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    live = offs < n
+    v = tl.load(v_ptr + offs, mask=live, other=0.0)
+    idx = tl.load(i_ptr + offs, mask=live, other=0)
+    finite = (v == v) & (tl.abs(v) != float("inf"))
+    tl.store(out_ptr + offs, tl.where(finite, idx * world + rank, -1).to(tl.int32), mask=live)
+
+
+def candidate_pick(values, indices, *, world, rank):
+    """`where(isfinite(values), columns[indices], -1).to(int32)` with
+    columns[j] = j * world + rank (j < width) — the padded columns past the
+    width only ever carry -inf scores, so the gather is the affine map."""
+    v = values.contiguous()
+    i = indices.contiguous()
+    out = torch.empty(v.shape, dtype=torch.int32, device=v.device)
+    n = int(v.numel())
+    if n:
+        block = 1024
+        _candidate_pick_kernel[(triton.cdiv(n, block),)](v, i, out, n, int(world), int(rank),
+                                                         BLOCK=block)
     return out
 
 

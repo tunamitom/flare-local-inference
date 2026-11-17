@@ -45,6 +45,12 @@ from .state import Hy4ModelWeights
 from .wiring import DECODE_ONE_ROW, SCHEDULE, chunk_plan, prefill_shape, verify_shape
 
 
+def _diet2():
+    from .runtime import SWITCHES
+
+    return SWITCHES.get("diet2") == "on"
+
+
 @dataclass
 class Hy4Cache:
     """Per-rank latent and index-key records for `rows` request rows.
@@ -98,6 +104,7 @@ class Hy4Cache:
     # (`begin_forward`): every layer writes the same rows, so the bounds check
     # and the ownership mask are computed once, not per layer per table.
     _forward_memo: dict = field(default_factory=dict, repr=False, compare=False)
+    _kept_identity: dict = field(default_factory=dict, repr=False, compare=False)
 
     def __post_init__(self):
         if type(self.world) is not int or self.world < 1:
@@ -196,7 +203,11 @@ class Hy4Cache:
         if layer in self.records:
             kept, slots = self._owned_slots(tokens, positions)
             if int(kept.numel()):
-                self._write_records(layer, latent.index_select(0, kept), slots)
+                rows_in = latent
+                if not (self._kept_identity.get(id(tokens)) is tokens and int(latent.shape[0]) == 1
+                        and latent.is_cuda and _diet2()):
+                    rows_in = latent.index_select(0, kept)
+                self._write_records(layer, rows_in, slots)
             return
         self._store(self.latent[layer], tokens, positions, latent)
 
@@ -298,10 +309,15 @@ class Hy4Cache:
         consult18 P4: `kept` [n] (default [0]) are the forward's token indices
         behind `slot`/`safe` [n] — a T-token forward on a rank owning fewer
         than n of them carries -1 slots (distinct `safe` slots) for the rest."""
+        identity = kept is None and int(tokens.numel()) == 1
         if kept is None:
             kept = torch.zeros((1,), dtype=torch.long, device=self.device)
         self._forward_memo.pop(id(tokens), None)
         self._forward_memo[id(tokens)] = (tokens, positions, kept, slot, safe)
+        self._kept_identity.pop(id(tokens), None)
+        if identity:
+            # round 15: one token, kept = [0] — its index_select is the row itself
+            self._kept_identity[id(tokens)] = tokens
 
     def begin_forward_device(self, tokens, positions, kept, slots):
         """consult18 P2 tail graphs: `begin_forward_host`'s `(kept, slots)` already
@@ -311,6 +327,7 @@ class Hy4Cache:
 
     def end_forward(self):
         self._forward_memo.clear()
+        self._kept_identity.clear()
 
     def _owned_slots(self, tokens, positions):
         """`(kept, slots)`: the row indices this rank owns and their physical slots.

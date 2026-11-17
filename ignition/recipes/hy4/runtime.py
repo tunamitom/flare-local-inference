@@ -99,6 +99,17 @@ ALLOWED = {
     # round 15: the absorbed decode query written in place (W_UK GEMM into the
     # latent columns, rope into the last ones; no cat)
     "diet_absorb": ("off", "on"),
+    # round 15: decode-family RMSNorm (<= 4 rows) in one launch, torch's own
+    # mean tree emulated (fused_ops.rms_norm_tree; bit-identical)
+    "rms_tree": ("off", "on"),
+    # round 15 (numerics class): decode W_UV expansion with BF16 operands and FP32
+    # accumulation (attention.expand_output), no FP32 copies per step
+    "expand_bf16": ("off", "on"),
+    # round 15 (bit-identical): strided packed-projection slices, the fused gate
+    # over strided expansions, the fused candidate pick, the identity latent
+    # write, the indexer query's rope stored as FP32, the decode MoE output
+    # left uninitialized (fully written by the op)
+    "diet2": ("off", "on"),
 }
 DEFAULTS = {"index_scores": "fp32",
             "ihc": os.environ.get("HY4_IHC") or "default",
@@ -129,7 +140,10 @@ DEFAULTS = {"index_scores": "fp32",
             "ihc_fuse": os.environ.get("HY4_IHC_FUSE") or "off",
             "diet_index": os.environ.get("HY4_DIET_INDEX") or "off",
             "diet_glue": os.environ.get("HY4_DIET_GLUE") or "off",
-            "diet_absorb": os.environ.get("HY4_DIET_ABSORB") or "off"}
+            "diet_absorb": os.environ.get("HY4_DIET_ABSORB") or "off",
+            "rms_tree": os.environ.get("HY4_RMS_TREE") or "off",
+            "expand_bf16": os.environ.get("HY4_EXPAND_BF16") or "off",
+            "diet2": os.environ.get("HY4_DIET2") or "off"}
 for _key, _value in DEFAULTS.items():
     if _value not in ALLOWED[_key]:
         raise ValueError(f"runtime default {_key}={_value!r} must be one of {ALLOWED[_key]}")

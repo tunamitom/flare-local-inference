@@ -362,9 +362,13 @@ class Hy4LayerAttention:
             # bitwise-per-slice contract is moot once quantized), then split.
             full = w8.linear(x)
 
+            views = x.is_cuda and diet("diet2")
+
             def cols(name):
                 first, last = packed.slices[name]
-                return full[:, first:last].contiguous()
+                # round 15 (`diet2`): every consumer takes row-strided views
+                # (norm tail / tree, rope, the fused gate, wk's .float())
+                return full[:, first:last] if views else full[:, first:last].contiguous()
 
             q_a_raw, kv_raw, gate_raw = cols("q_a_proj"), cols("kv_a_proj"), cols("linear_gate")
             self._wk_raw = (x, cols("indexer_wk")) if "indexer_wk" in packed.slices else None
@@ -475,6 +479,14 @@ class Hy4LayerAttention:
         """
         first, last = self.sharding.head_range
         wuv = self.expand_wuv[first:last] if local else self.expand_wuv
+        if (out.is_cuda and out.dtype == torch.bfloat16 and wuv.dtype == torch.bfloat16
+                and diet("expand_bf16")):
+            # round 15 (numerics class): BF16 operands, FP32 accumulation inside
+            # the GEMM, one BF16 rounding — the same products as the FP32 form
+            # (BF16 x BF16 is exact in FP32), summation order aside; no per-step
+            # FP32 copies of the output and the W_UV shard (the prefill wire's
+            # `expand_partials` form)
+            return torch.einsum("rhd,hvd->rhv", out, wuv)
         # fp32 accumulation whatever the partial's dtype: the real sparse-MLA
         # wire carries BF16 partials (the DCP merge returns a BF16 head shard),
         # while the CPU reference partials are fp32.
@@ -757,9 +769,15 @@ class Hy4LayerAttention:
                               torch.full((max(topk - width, 0),), -1, device=self.device,
                                          dtype=torch.int64)))
 
-        columns = (forward_memo(visible, ("columns", width, topk, world, rank), columns_of)
+        columns = (None if trim and diet("diet2") else
+                   forward_memo(visible, ("columns", width, topk, world, rank), columns_of)
                    if trim else columns_of())
         values, indices = scores.topk(topk, dim=-1)
+        if trim and diet("diet2"):
+            # round 15: one launch — the affine column map, the finite mask, the int32 cast
+            from .fused_ops import candidate_pick
+
+            return values.to(torch.float32), candidate_pick(values, indices, world=world, rank=rank)
         if trim:
             picked = torch.where(torch.isfinite(values), columns[indices], -1)
         else:
@@ -796,7 +814,15 @@ class Hy4LayerAttention:
         c = self.config.text
         n_heads, head_dim = iw.heads, iw.head_dim
         q = (q_resid @ iw.wq_b.T).view(-1, n_heads, head_dim)
-        q = apply_interleaved_rope(q, positions, rope_dim=c["qk_rope_head_dim"], theta=self.rope_theta)
+        if q.is_cuda and q.dtype == torch.bfloat16 and diet("diet2") and _fused_norm_rope():
+            # round 15: the rope stores its BF16-rounded result as FP32 (= rope, then .float())
+            from .fused_ops import rope_interleaved
+
+            q = rope_interleaved(q, positions, rope_dim=c["qk_rope_head_dim"], theta=self.rope_theta,
+                                 out=torch.empty(q.shape, dtype=torch.float32, device=q.device))
+        else:
+            q = apply_interleaved_rope(q, positions, rope_dim=c["qk_rope_head_dim"],
+                                       theta=self.rope_theta)
         # Owned live keys per query token (world 1: every position is owned).
         def owned_of():
             return torch.div((visible.long() - rank).clamp_min(0) + world - 1, world,
@@ -1090,7 +1116,8 @@ class Hy4LayerAttention:
         if gate_raw is None:
             gate_raw = x @ self.weights.gate_proj.T.to(x.dtype)
         if (attn_output.is_cuda and attn_output.dtype == torch.bfloat16
-                and gate_raw.dtype == torch.bfloat16 and attn_output.is_contiguous()
+                and gate_raw.dtype == torch.bfloat16 and attn_output.dim() == 3
+                and (attn_output.is_contiguous() or diet("diet2"))
                 and diet("diet_glue")):
             # round 15: sigmoid, the gate product and the flatten in one launch
             from .fused_ops import sigmoid_gate

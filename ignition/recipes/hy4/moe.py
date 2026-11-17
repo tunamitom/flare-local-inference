@@ -532,7 +532,7 @@ class FusedRoutedExperts:
             raise ValueError(f"{self.name}: routed input must be BF16 [rows, {self.hidden}]")
         ids = topk_indices.to(torch.int32).contiguous()
         weights = topk_weights.float().contiguous()
-        output = torch.zeros((rows, self.hidden), dtype=x.dtype, device=x.device)
+        output = None
         from .lanes import lane
 
         current = lane()
@@ -563,6 +563,14 @@ class FusedRoutedExperts:
                 op, workspace, storage = (self.decode_op_alt, self._decode_workspace,
                                           self._decode_storage)
                 a4 = False
+        if output is None:
+            uses_decode_op = op is not self.op and op is not self.small_op
+            from .attention import diet
+
+            # round 15 (`diet2`): the decode op writes every output element
+            # (checked with NaN-filled buffers: harness moe_out_probe.py)
+            output = (torch.empty if uses_decode_op and diet("diet2") else torch.zeros)(
+                (rows, self.hidden), dtype=x.dtype, device=x.device)
         amax, layer = (self.amax, 0) if self.amax is not None else (None, None)
         prepared_moe_out(x, weights, ids, output, workspace, op.scale_inputs,
                          storage, op.plan.handle, True, None, amax, layer,
