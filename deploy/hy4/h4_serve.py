@@ -1034,7 +1034,9 @@ def main():
         # consult15 §2 lever 1: one b12x PCIe all-reduce plan per body row
         # shape (decode 1 row + every prepared prefill width) — oneshot at 1
         # row, rsag above (c1-unit-costs.md §1's arm choice).
-        for w in (1, *PREFILL_WIDTHS):
+        # round 16: spec verify rows outside the prefill widths (k = 4 -> 5 rows)
+        EXTRA_ROWS = tuple(w for w in SPEC_ROWS if w not in PREFILL_WIDTHS)
+        for w in (1, *PREFILL_WIDTHS, *EXTRA_ROWS):
             transport.prepare_all_reduce(dsession if w == 1 else session, w)
         if uses_dma and args.dma_replay:
             graphs = transport.prepare_dma_replay()
@@ -1044,7 +1046,7 @@ def main():
             trace(rank, f"overlap: lane 1 ring + CE exchange prepared for {CHUNK} rows")
         if score_offer is not None:
             # consult17: the offer gather at every row count the body runs.
-            for w in (1, *PREFILL_WIDTHS):
+            for w in (1, *PREFILL_WIDTHS, *EXTRA_ROWS):
                 transport.prepare_score_gather(dsession if w == 1 else session, w)
         trace(rank, "transport plans prepared")
 
