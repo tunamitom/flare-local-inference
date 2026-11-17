@@ -26,8 +26,8 @@ set -euo pipefail
 NAME="${NAME:-h4}"
 PORT="${LLM_PORT:-8001}"
 TP=8
-IMAGE="${IMAGE:-local/flare:rt-h4-cp8-dg67}"
-IMAGE_SHA="${IMAGE_SHA:-sha256:6942931089f8b36d262dfc5685c162802f1be205b8cf2ed2f2d6c5035534060d}"
+IMAGE="${IMAGE:-local/flare:rt-h4-cp8-dg69}"
+IMAGE_SHA="${IMAGE_SHA:-sha256:514ffcdc84fb89243bf30808c84c8391215e2633e06f981dd07caba4245e9c23}"
 PKG_LINK="${PKG_DIR:-/opt/models/Hy4-nvfp4-w4a16-mse-gpu}"
 SERVED_NAME="${SERVED_NAME:-smart}"
 MAX_CONCURRENCY="${MAX_CONCURRENCY:-1}"
@@ -221,8 +221,8 @@ docker run -d --name "$NAME" --network host --init --cap-add SYS_PTRACE \
   -e HY4_ABSORB_OUT="${HY4_ABSORB_OUT:-direct}" \
   -e HY4_IHC_ROWS="${HY4_IHC_ROWS:-8}" \
   -e HY4_ROUTER_MM="${HY4_ROUTER_MM:-bf16}" \
-  -e HY4_HEAD_FP32_DROP="${HY4_HEAD_FP32_DROP:-}" \
-  -e HY4_ABSORB_ROWS="${HY4_ABSORB_ROWS:-}" \
+  -e HY4_HEAD_FP32_DROP="${HY4_HEAD_FP32_DROP:-1}" \
+  -e HY4_ABSORB_ROWS="${HY4_ABSORB_ROWS:-1024}" \
   -e HY4_GPU_SAMPLER="${HY4_GPU_SAMPLER:-1}" \
   -e HY4_AB_MLP_GRAPHS="${HY4_AB_MLP_GRAPHS:-1}" \
   -e HY4_DECODE_AUTOTUNE="${HY4_DECODE_AUTOTUNE:-0}" \
@@ -257,13 +257,14 @@ docker run -d --name "$NAME" --network host --init --cap-add SYS_PTRACE \
       --snapshot /model \
       --host 0.0.0.0 --port "$PORT" --served-model-name "$SERVED_NAME" \
       --max-concurrency "$MAX_CONCURRENCY" \
-      --headroom "${H4_HEADROOM:-3489660928}" \
+      --max-context "${H4_MAX_CONTEXT:-999424}" \
+      --headroom "${H4_HEADROOM:-4563402752}" \
       --all-reduce-arm "${H4_AR_ARMS:-1:oneshot,2-4:rsag,8-512:twoshot,1024-:dma}" \
       --all-reduce-kernel-rows 512 \
       --lse-transport ce-relay --gather-transport ce-relay \
       --selection-wire dcp \
       --partial-wire expanded \
-      --overlap 1 --profile-phases 0 --chunk "${H4_CHUNK:-1024}" --dma-replay "${H4_DMA_REPLAY:-1}" \
+      --overlap 1 --profile-phases 0 --chunk "${H4_CHUNK:-2048}" --dma-replay "${H4_DMA_REPLAY:-1}" \
       --profile-steps 64
 # Keep the container log (lost with the container otherwise). Background only
 # the follower: backgrounding the whole list forks a subshell that keeps the
