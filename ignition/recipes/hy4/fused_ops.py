@@ -15,12 +15,14 @@ serve's numerics hash must not move when a switch flips).
 """
 from __future__ import annotations
 
+import math
+
 import torch
 import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-__all__ = ["dequant_rows_int8", "dequant_slots_int8", "ihc_post_pre_split", "quant_rows_int8", "moe_route", "scores_only_select", "merge_head_major", "rms_norm", "rope_interleaved", "sigmoid_gate", "swiglu_f32", "store_owned_rows", "candidate_pick", "rms_norm_tree", "index_key_prep", "latent_prep", "expand_gate"]
+__all__ = ["dequant_rows_int8", "dequant_slots_int8", "ihc_post_pre_split", "quant_rows_int8", "moe_route", "scores_only_select", "merge_head_major", "rms_norm", "rope_interleaved", "sigmoid_gate", "swiglu_f32", "store_owned_rows", "candidate_pick", "rms_norm_tree", "index_key_prep", "latent_prep", "expand_gate", "index_scores_fused"]
 
 _INV_FREQ = {}
 
@@ -304,6 +306,81 @@ def expand_gate(out, wuv, gate_raw, *, block_v=32):
         g.stride(0),
         BLOCK_V=block_v, BLOCK_D=D, num_warps=4, enable_reflect_ftz=False)
     return flat
+
+
+# --------------------------------------------------------------------------
+# Round 16 (numerics class): the lightning indexer's scores for the decode
+# family in two launches. (1) index weights `((x @ Wp^T) * a) * b` with FP32
+# sums; (2) per (row, key block): keys widened in registers, the 32-head query
+# against them as a BF16 tensor-core dot (the query is BF16-exact: exact
+# products, FP32 accumulation), relu, the head-weighted sum, the causal mask. Replaces the x / key casts, the weights GEMV, two scalings, the score
+# SGEMM + its split-K reduce, relu, the head-sum GEMV and the mask. The
+# products are FP32 as before; only summation orders differ (cuBLAS -> Triton).
+# --------------------------------------------------------------------------
+@triton.jit
+def _index_weights_kernel(x_ptr, w_ptr, out_ptr, K, x_stride, a, b, H, BLOCK_K: tl.constexpr):
+    r = tl.program_id(0).to(tl.int64)
+    h = tl.program_id(1)
+    acc = tl.zeros([BLOCK_K], dtype=tl.float32)
+    for k0 in range(0, K, BLOCK_K):
+        kk = k0 + tl.arange(0, BLOCK_K)
+        kin = kk < K
+        xv = tl.load(x_ptr + r * x_stride + kk, mask=kin, other=0.0).to(tl.float32)
+        wv = tl.load(w_ptr + h.to(tl.int64) * K + kk, mask=kin, other=0.0)
+        acc += wv * xv
+    tl.store(out_ptr + r * H + h, (tl.sum(acc, axis=0) * a) * b)
+
+
+@triton.jit
+def _index_scores_kernel(q_ptr, wt_ptr, key_ptr, owned_ptr, out_ptr, width, out_stride,
+                         H: tl.constexpr, D: tl.constexpr, BLOCK_W: tl.constexpr):
+    # The rotated query is BF16-exact (the BF16 rope output widened) and the keys
+    # are BF16, so the BF16 tensor-core dot forms exactly the FP32 GEMM's products;
+    # its FP32 accumulation is the MMA's (logits within ~8e-7 of FP64 vs cuBLAS's
+    # ~3.5e-7; 0 of 2,520 top-2048 selections changed at 16k / 64k). Rejected
+    # forms: an IEEE-FP32 tl.dot spilled ~1 KB per thread (a spilling kernel grows
+    # the driver's GPU-wide local-memory reservation: 0.93 GB less KV pool), a
+    # per-head loop and CUDA-core rank-1 updates were latency-bound (22-37 us).
+    r = tl.program_id(0).to(tl.int64)
+    wb = tl.program_id(1)
+    h = tl.arange(0, H)
+    d = tl.arange(0, D)
+    w = wb * BLOCK_W + tl.arange(0, BLOCK_W)
+    q = tl.load(q_ptr + r * (H * D) + h[:, None] * D + d[None, :]).to(tl.bfloat16)
+    keys = tl.load(key_ptr + w[:, None].to(tl.int64) * D + d[None, :], mask=w[:, None] < width,
+                   other=0.0)
+    prod = tl.maximum(tl.dot(q, tl.trans(keys)), 0.0)
+    wt = tl.load(wt_ptr + r * H + h)
+    logit = tl.sum(wt[:, None] * prod, axis=0)
+    owned = tl.load(owned_ptr + r)
+    logit = tl.where(w < owned, logit, float("-inf"))
+    tl.store(out_ptr + r * out_stride + w, logit, mask=w < width)
+
+
+def index_scores_fused(q, x, weights_proj, key_rows, owned, *, width, scale_a, scale_b,
+                       block_w=64):
+    """The masked indexer logits [rows, width] FP32 from the FP32 rotated query
+    [rows, H, D], the layer input x [rows, K] (BF16), the FP32 weights_proj
+    [H, K], the row's key segment key_rows [>= width, D] (BF16, contiguous) and
+    the owned key counts [rows] (int64); None when not that shape."""
+    if q.dim() != 3 or q.dtype != torch.float32 or not q.is_contiguous():
+        return None
+    rows, H, D = (int(v) for v in q.shape)
+    if (rows < 1 or rows > 8 or H & (H - 1) or D & (D - 1) or H < 16 or D < 16
+            or weights_proj.dtype != torch.float32 or not weights_proj.is_contiguous()
+            or int(weights_proj.shape[0]) != H or key_rows.stride(-1) != 1 or key_rows.dtype != torch.bfloat16
+            or int(key_rows.stride(0)) != D or int(owned.numel()) != rows or x.stride(-1) != 1):
+        return None
+    K = int(weights_proj.shape[1])
+    wt = torch.empty((rows, H), dtype=torch.float32, device=q.device)
+    _index_weights_kernel[(rows, H)](x, weights_proj, wt, K, x.stride(0), float(scale_a), float(scale_b),
+                                     H, BLOCK_K=1024, num_warps=4)
+    out = torch.empty((rows, width), dtype=torch.float32, device=q.device)
+    if width:
+        _index_scores_kernel[(rows, triton.cdiv(width, block_w))](
+            q, wt, key_rows, owned.reshape(-1), out, width, width, H=H, D=D, BLOCK_W=block_w,
+            num_warps=4)
+    return out
 
 
 _MEAN_FACTORS = {}

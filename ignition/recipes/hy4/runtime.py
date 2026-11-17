@@ -116,6 +116,9 @@ ALLOWED = {
     # round 15 (numerics class): decode W_UV expansion + sigmoid gate in one
     # launch (fused_ops.expand_gate; FP32 accumulation in Triton's order)
     "expand_gate": ("off", "on"),
+    # round 16 (numerics class): the decode-family indexer scores in two launches
+    # (fused_ops.index_scores_fused: FP32 products, Triton summation order)
+    "index_fuse": ("off", "on"),
 }
 DEFAULTS = {"index_scores": "fp32",
             "ihc": os.environ.get("HY4_IHC") or "default",
@@ -151,7 +154,8 @@ DEFAULTS = {"index_scores": "fp32",
             "expand_bf16": os.environ.get("HY4_EXPAND_BF16") or "off",
             "diet2": os.environ.get("HY4_DIET2") or "off",
             "diet3": os.environ.get("HY4_DIET3") or "off",
-            "expand_gate": os.environ.get("HY4_EXPAND_GATE") or "off"}
+            "expand_gate": os.environ.get("HY4_EXPAND_GATE") or "off",
+            "index_fuse": os.environ.get("HY4_INDEX_FUSE") or "off"}
 for _key, _value in DEFAULTS.items():
     if _value not in ALLOWED[_key]:
         raise ValueError(f"runtime default {_key}={_value!r} must be one of {ALLOWED[_key]}")
