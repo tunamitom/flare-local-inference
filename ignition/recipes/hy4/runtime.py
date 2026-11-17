@@ -83,6 +83,8 @@ ALLOWED = {
     # consult18 P9: iHC post_pre chunk kernel with 8 rows per program at >= 512
     # rows (the chunk's fn vectors loaded once per 8 rows; bit-identical)
     "ihc_rows": ("1", "8"),
+    # consult18 P11: the CE exchanges' streams at the device's highest priority
+    "ce_priority": ("normal", "high"),
 }
 DEFAULTS = {"index_scores": "fp32",
             "ihc": os.environ.get("HY4_IHC") or "default",
@@ -108,7 +110,8 @@ DEFAULTS = {"index_scores": "fp32",
             "spec_filter": os.environ.get("HY4_SPEC_FILTER") or "off",
             "absorb_out": os.environ.get("HY4_ABSORB_OUT") or "cat",
             "router_mm": os.environ.get("HY4_ROUTER_MM") or "f32",
-            "ihc_rows": os.environ.get("HY4_IHC_ROWS") or "1"}
+            "ihc_rows": os.environ.get("HY4_IHC_ROWS") or "1",
+            "ce_priority": os.environ.get("HY4_CE_PRIORITY") or "normal"}
 for _key, _value in DEFAULTS.items():
     if _value not in ALLOWED[_key]:
         raise ValueError(f"runtime default {_key}={_value!r} must be one of {ALLOWED[_key]}")

@@ -825,6 +825,23 @@ class CeExchange:
     FLAG_STRIDE = 128
     _OPS = ("lse", "gather", "scores")
 
+    def _streams(self):
+        from .runtime import SWITCHES
+
+        return self._stream_sets["high" if SWITCHES.get("ce_priority") == "high" else "normal"]
+
+    @property
+    def _cross_stream(self):
+        return self._streams()[0]
+
+    @property
+    def _local_stream(self):
+        return self._streams()[1]
+
+    @property
+    def _flag_stream(self):
+        return self._streams()[2]
+
     def __init__(self, *, group, ring, rank, world_size, device, max_rows, heads_per_rank,
                  lse_width, gather_width, island_size=4, score_offer=512):
         from b12x.comm.pcie.pcie_oneshot import PCIeOneshotAllReduce
@@ -863,9 +880,16 @@ class CeExchange:
         self.local = [peer for peer in peers if island[peer] == island[self.rank]]
         self.partner = (relay_partner(self.rank, self.world, island_size)
                         if self.world == 2 * island_size else None)
-        self._cross_stream = torch.cuda.Stream(device=self.device)
-        self._local_stream = torch.cuda.Stream(device=self.device)
-        self._flag_stream = torch.cuda.Stream(device=self.device)
+        # consult18 P11: two stream sets — default priority, and the device's
+        # highest priority (runtime switch `ce_priority`). The exchanges' copy,
+        # flag and relay launches are small and latency-bound; at high priority
+        # their pending blocks dispatch ahead of the lanes' compute blocks as SMs
+        # free up (the chain of collectives is what paces the overlapped pair).
+        _, high = torch.cuda.Stream.priority_range()
+        self._stream_sets = {
+            "normal": tuple(torch.cuda.Stream(device=self.device) for _ in range(3)),
+            "high": tuple(torch.cuda.Stream(device=self.device, priority=high) for _ in range(3)),
+        }
         self._ready = torch.cuda.Event()
         self._events = {}
         self.calls = {op: 0 for op in self._OPS}
