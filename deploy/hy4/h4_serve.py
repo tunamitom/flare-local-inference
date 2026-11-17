@@ -10,7 +10,8 @@ post-capture `Allocate cache` line (the P5 gate). MTP off.
 
 Rank 0 owns the OpenAI-style HTTP surface (/health, /v1/models,
 /v1/chat/completions, streaming SSE or one JSON body, reasoning split into
-reasoning_content) and the sampler; ranks 1..7 run the same
+reasoning_content; concurrent requests wait in one FIFO queue and run one at a
+time) and the sampler; ranks 1..7 run the same
 decode loop off a broadcast command stream. Logits are gathered to full vocab
 on every rank (collectives.gather_logits), but only rank 0 samples and
 broadcasts the next token, so all ranks advance in lockstep.
@@ -31,8 +32,10 @@ Both, plus the per-rank facts, land in the boot report.
 """
 import argparse
 import json
+import math
 import os
 import queue
+import select
 import sys
 import threading
 import time
@@ -165,9 +168,11 @@ class Sampler:
         self.gen_cuda = None
 
     def step(self, logits_row, params, produced, max_new):
-        """Sample one token from [V] FP32 logits. Returns (token, done, finish)."""
+        """Sample one token from one row of FP32 logits ([V] or [1, V]).
+        Returns (token, done, finish)."""
         import torch
         temperature = float(params.get("temperature", 0.9) or 0.0)
+        logits_row = logits_row.reshape(-1)      # the top-k / top-p math is over [V]
         if temperature > 0.0 and self.device is not None:
             # consult18 P6: the sampling math (softmax / top-k / top-p sort /
             # multinomial over the full vocabulary) on rank 0's GPU — 1.6 ms of
@@ -453,6 +458,19 @@ def normalize_tool_history(messages):
 THINK_OPEN = "<think:opensource>"
 THINK_CLOSE = "</think:opensource>"
 
+# A request whose client has left stops at the next check: every sampled token on
+# the plain decode path (it rides the existing token broadcast), every
+# CANCEL_EVERY tokens on the speculative path (one small broadcast from rank 0).
+CANCEL_EVERY = 64
+# An SSE comment line goes out after HEARTBEAT_S seconds without a write (queued
+# or in prefill): it feeds client read timeouts. A waiting request checks its
+# client's socket every POLL_S seconds, so a client that leaves is dropped before
+# its turn.
+HEARTBEAT_S = 15.0
+POLL_S = 1.0
+# A started generation that produces nothing for this long is reported failed.
+SERVE_LOOP_TIMEOUT_S = 7200
+
 
 class OutputSplitter:
     """Splits a generation into `reasoning_content` and `content` on the token
@@ -684,10 +702,13 @@ def run_generate(ctx, cmd):
         decoder.embed_sink = None
         ctx.last_nll = (nll_sum, nll_count) if params.get("nll") and ctx.rank == 0 else None
     out = []
+    cancel = getattr(ctx, "cancel", None)      # rank 0: set when the client has left
 
     def sample(logits):
         if ctx.rank == 0:
             nxt, done, finish = ctx.sampler.step(logits[:, -1, :], params, len(out), max_new)
+            if not done and cancel is not None and cancel.is_set():
+                done, finish = True, "cancelled"
         else:
             nxt = done = finish = None
         obj = [nxt, done, finish]
@@ -712,6 +733,12 @@ def run_generate(ctx, cmd):
                 return "stop"
             if produced + 1 >= max_new:
                 return "length"
+            if produced % CANCEL_EVERY == CANCEL_EVERY - 1:
+                # every rank reaches this check at the same token count
+                box = [cancel is not None and cancel.is_set()] if ctx.rank == 0 else [None]
+                dist.broadcast_object_list(box, src=0)
+                if box[0]:
+                    return "cancelled"
             return None
 
         finish, rest = spec.generate(start=n, bonus=nxt, hidden=last_hidden, emit=emit,
@@ -820,6 +847,12 @@ def serve_http(ctx):
         def log_message(self, *args):
             pass
 
+        def handle(self):
+            try:
+                super().handle()
+            except (ConnectionResetError, BrokenPipeError):
+                pass                     # the client dropped its connection
+
         def _send(self, status, payload, content_type="application/json"):
             data = payload if isinstance(payload, bytes) else json.dumps(payload).encode()
             self.send_response(status)
@@ -828,22 +861,54 @@ def serve_http(ctx):
             self.end_headers()
             self.wfile.write(data)
 
+        def _client_gone(self):
+            """True when the client has closed its connection (EOF on the socket)."""
+            try:
+                readable, _, _ = select.select([self.connection], [], [], 0)
+                return bool(readable) and self.connection.recv(1, socket.MSG_PEEK) == b""
+            except (OSError, ValueError):
+                return True
+
+        def _enqueue(self, item):
+            """Appends `item` to the main loop's FIFO queue (no request is refused)."""
+            item["cancel"] = threading.Event()
+            item["admitted"] = time.monotonic()
+            with ctx.lock:
+                ctx.waiting += 1
+            ctx.q.put(item)
+
+        def _wait(self, item, limit):
+            """Waits for the main loop to finish `item`: "done", "gone" (the client
+            left: the item is cancelled) or "timeout" (`limit` seconds after the
+            generation started; the item is cancelled)."""
+            while not item["ev"].wait(timeout=POLL_S):
+                if self._client_gone():
+                    item["cancel"].set()
+                    self.close_connection = True
+                    return "gone"
+                started = item.get("started")
+                if started is not None and time.monotonic() - started > limit:
+                    item["cancel"].set()
+                    return "timeout"
+            return "done"
+
         def _stream_events(self, item, ids, include_usage, tools=None, think_open=False):
             """OpenAI `chat.completion.chunk` SSE over chunked HTTP/1.1: a role
-            chunk, `delta.content` per decoded piece, a finish chunk, the usage
-            chunk when `stream_options.include_usage`, then `[DONE]`. A client
-            that goes away stops the writes only: generation runs to its end
-            (the busy flag is released after it, by the caller)."""
+            chunk, `delta.reasoning_content` / `delta.content` per decoded piece,
+            a finish chunk, the usage chunk when `stream_options.include_usage`,
+            then `[DONE]`. While the request waits in the queue or in prefill, an
+            SSE comment goes out every HEARTBEAT_S seconds. A client that goes
+            away cancels the request (dropped if queued, stopped if running)."""
             created = int(time.time())
             base = {"id": f"chatcmpl-h4-{created}", "object": "chat.completion.chunk",
                     "created": created, "model": ctx.served_names[0]}
             alive = [True]
 
-            def write(payload):
+            def write(payload, comment=False):
                 if not alive[0]:
                     return
-                data = b"data: " + (payload if isinstance(payload, bytes)
-                                    else json.dumps(payload).encode()) + b"\n\n"
+                data = b": " + payload + b"\n\n" if comment else b"data: " + (
+                    payload if isinstance(payload, bytes) else json.dumps(payload).encode()) + b"\n\n"
                 try:
                     self.wfile.write(b"%X\r\n%s\r\n" % (len(data), data))
                     self.wfile.flush()
@@ -865,16 +930,34 @@ def serve_http(ctx):
             # reasoning / content / held tool-call block, as OutputSplitter decides
             split = OutputSplitter(ctx, think_open, ctx.toolcalls_token if tools else None)
             q = item["stream_q"]
-            deadline = time.monotonic() + 7200
+            last = beat = time.monotonic()   # last serve-loop event, last write
             while True:
                 try:
-                    kind, payload = q.get(timeout=max(1.0, deadline - time.monotonic()))
+                    kind, payload = q.get(timeout=POLL_S)
                 except queue.Empty:
-                    item.setdefault("error", "the serve loop did not answer in 7200 s")
-                    break
+                    started, now = item.get("started"), time.monotonic()
+                    if self._client_gone():
+                        alive[0] = False
+                    elif now - beat >= HEARTBEAT_S:
+                        write(b"generating" if started is not None else b"queued", comment=True)
+                        beat = now
+                    if started is not None and now - max(started, last) > SERVE_LOOP_TIMEOUT_S:
+                        item.setdefault("error", f"the serve loop did not answer in {SERVE_LOOP_TIMEOUT_S} s")
+                        item["cancel"].set()
+                        break
+                    if not alive[0]:
+                        item["cancel"].set()
+                        self.close_connection = True
+                        return
+                    continue
+                last = beat = time.monotonic()
                 if kind == "tokens":
                     for part, text in split.feed(payload):
                         delta(text, part)
+                    if not alive[0]:
+                        item["cancel"].set()
+                        self.close_connection = True
+                        return
                 else:
                     break
             if item.get("error"):
@@ -937,19 +1020,12 @@ def serve_http(ctx):
                     self._send(400, {"error": str(error)})
                     return
                 item = {"op": "exec", "path": path, "ev": threading.Event()}
-                with ctx.lock:
-                    if ctx.busy:
-                        self._send(429, {"error": "busy"})
-                        return
-                    ctx.busy = True
-                try:
-                    ctx.q.put(item)
-                    if not item["ev"].wait(timeout=3600):
-                        self._send(504, {"error": "exec did not finish in 3600 s"})
-                        return
-                finally:
-                    with ctx.lock:
-                        ctx.busy = False
+                self._enqueue(item)
+                state = self._wait(item, 3600)
+                if state == "timeout":
+                    self._send(504, {"error": "exec did not finish in 3600 s"})
+                if state != "done":
+                    return
                 self._send(200, {"results": item.get("result")})
                 return
             if self.path != "/v1/chat/completions":
@@ -964,17 +1040,18 @@ def serve_http(ctx):
                 if body.get("n", 1) != 1:
                     raise ValueError("h4 direct serving returns one choice")
                 tools = body.get("tools") or None
-                if "messages" in body:
-                    text = ctx.tok.apply_chat_template(
-                        normalize_tool_history(body["messages"]), tokenize=False,
-                        add_generation_prompt=True, tools=tools)
-                elif "prompt" in body:
-                    text = str(body["prompt"])
-                else:
-                    raise ValueError("the body needs `messages` or `prompt`")
+                with ctx.tok_lock:              # one tokenizer, many request threads
+                    if "messages" in body:
+                        text = ctx.tok.apply_chat_template(
+                            normalize_tool_history(body["messages"]), tokenize=False,
+                            add_generation_prompt=True, tools=tools)
+                    elif "prompt" in body:
+                        text = str(body["prompt"])
+                    else:
+                        raise ValueError("the body needs `messages` or `prompt`")
+                    ids = ctx.tok.encode(text, add_special_tokens=False)
                 # the prompt leaves a think block open (the template's thinking mode)
                 think_open = text.endswith(THINK_OPEN)
-                ids = ctx.tok.encode(text, add_special_tokens=False)
                 if not ids:
                     raise ValueError("empty prompt")
                 limit = body.get("max_completion_tokens", body.get("max_tokens"))
@@ -990,6 +1067,12 @@ def serve_http(ctx):
                     limit = ctx.max_context - len(ids)
                     if limit < 1:
                         raise ValueError(f"prompt exceeds the served context ({ctx.max_context})")
+                for name in ("temperature", "top_p", "top_k"):
+                    # every rank converts these: a bad value must fail here, not in the loop
+                    value = body.get(name)
+                    if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))
+                                              or not math.isfinite(value)):
+                        raise ValueError(f"`{name}` must be a finite number")
                 params = {
                     "temperature": body.get("temperature", 0.9),
                     "top_p": body.get("top_p", 1.0),
@@ -1005,21 +1088,17 @@ def serve_http(ctx):
             item = {"tokens": ids, "max_new": limit, "params": params, "ev": threading.Event()}
             if stream:
                 item["stream_q"] = queue.Queue()
-            with ctx.lock:
-                if ctx.busy:
-                    self._send(429, {"error": {"message": "h4 serves one request at a time", "type": "busy"}})
-                    return
-                ctx.busy = True
-            try:
-                ctx.q.put(item)
-                if stream:
-                    self._stream_events(item, ids, include_usage, tools, think_open)
-                    return
-                if not item["ev"].wait(timeout=7200):
-                    raise TimeoutError("the serve loop did not answer in 7200 s")
-            finally:
-                with ctx.lock:
-                    ctx.busy = False
+            self._enqueue(item)
+            if stream:
+                self._stream_events(item, ids, include_usage, tools, think_open)
+                return
+            state = self._wait(item, SERVE_LOOP_TIMEOUT_S)
+            if state == "gone":
+                return
+            if state == "timeout":
+                self._send(504, {"error": {"message": f"the serve loop did not answer in "
+                                                      f"{SERVE_LOOP_TIMEOUT_S} s", "type": "server_error"}})
+                return
             if item.get("error"):
                 ctx.failure = item["error"]
                 self._send(500, {"error": {"message": item["error"][:400], "type": "server_error"}})
@@ -1058,7 +1137,9 @@ def serve_http(ctx):
             })
 
     host, _, port = ctx.bind.rpartition(":")
-    listener = type("Listener", (ThreadingHTTPServer,), {"address_family": socket.AF_INET})
+    # a burst of concurrent clients must not overflow the listen backlog (default 5)
+    listener = type("Listener", (ThreadingHTTPServer,), {"address_family": socket.AF_INET,
+                                                         "request_queue_size": 128})
     server = listener((host, int(port)), Handler)
     server.daemon_threads = True
     ctx.http = server
@@ -1186,7 +1267,9 @@ def main():
     ctx.bind = f"{args.host}:{args.port}"
     ctx.failure = None
     ctx.lock = threading.Lock()
-    ctx.busy = False
+    ctx.tok_lock = threading.Lock()
+    ctx.waiting = 0          # queued requests not yet started (rank 0)
+    ctx.cancel = None        # the running request's cancel event (rank 0)
     ctx.q = queue.Queue()
     ctx.http = None
     ctx.profile_steps = args.profile_steps
@@ -1590,6 +1673,17 @@ def main():
             # ranks 1..7 block here. (Broadcasting rank 0's own placeholder
             # instead of a queued command shuts the world down immediately.)
             item = ctx.q.get() if rank == 0 else None
+            if item is not None:
+                with ctx.lock:
+                    ctx.waiting -= 1
+                waited = time.monotonic() - item["admitted"]
+                if item["cancel"].is_set():
+                    # its client left while it waited: never broadcast, never run
+                    trace(rank, f"dropped a queued request after {waited:.0f} s: the client left")
+                    continue
+                item["started"] = time.monotonic()
+                trace(rank, f"request start: {len(item.get('tokens') or ())} prompt tokens, "
+                            f"{waited:.1f} s queued, {ctx.waiting} waiting")
             if item is not None and item.get("op") == "exec":
                 cmd = {"op": "exec", "path": item["path"]}
             else:
@@ -1619,6 +1713,7 @@ def main():
             if cmd["op"] == "generate":
                 # rank 0: the request's SSE queue (None for non-streaming requests)
                 ctx.stream_q = item.get("stream_q") if rank == 0 else None
+                ctx.cancel = item["cancel"] if rank == 0 else None
                 ctx.stream_sent = 0
                 try:
                     profile_dir = os.environ.get("HY4_TORCH_PROFILE") or ""
@@ -1649,12 +1744,15 @@ def main():
                             ctx.stream_q.put(("end", None))
                     raise
                 if rank == 0:
+                    if finish == "cancelled":
+                        trace(rank, f"request stopped after {len(out)} tokens: the client left")
                     item["result"] = (out, finish)
                     item["nll"] = getattr(ctx, "last_nll", None)
                     item["ev"].set()
                     if ctx.stream_q is not None:
                         ctx.stream_q.put(("end", None))
                 ctx.stream_q = None
+                ctx.cancel = None
         trace(rank, "shutdown")
     finally:
         try:
