@@ -9,7 +9,7 @@ PcieDcpCollectives), the fused 656-byte FP8 record cache (M2), and the
 post-capture `Allocate cache` line (the P5 gate). MTP off.
 
 Rank 0 owns the OpenAI-style HTTP surface (/health, /v1/models,
-/v1/chat/completions, non-streaming) and the sampler; ranks 1..7 run the same
+/v1/chat/completions, streaming SSE or one JSON body) and the sampler; ranks 1..7 run the same
 decode loop off a broadcast command stream. Logits are gathered to full vocab
 on every rank (collectives.gather_logits), but only rank 0 samples and
 broadcasts the next token, so all ranks advance in lockstep.
@@ -317,6 +317,138 @@ def settled_free(device):
     return torch.cuda.mem_get_info(device)
 
 
+def _stream_push(ctx, out):
+    """Rank 0 only: hand the request's new token ids to its SSE writer (the HTTP
+    thread). A no-op for non-streaming requests and on ranks 1..7: streaming
+    never alters the broadcast command, the decode loop or the numerics."""
+    q = getattr(ctx, "stream_q", None)
+    if q is not None:
+        sent = ctx.stream_sent
+        if len(out) > sent:
+            q.put(("tokens", list(out[sent:])))
+            ctx.stream_sent = len(out)
+
+
+class IncrementalDetokenizer:
+    """Streamed text deltas whose concatenation is the non-streaming
+    `decode(out, skip_special_tokens=True)`: decode a short window from the last
+    emitted boundary, hold back an incomplete UTF-8 tail (U+FFFD), and let
+    `finish()` flush whatever remains of the full decode."""
+
+    def __init__(self, tok):
+        self.tok, self.ids, self.prefix, self.read, self.emitted = tok, [], 0, 0, ""
+
+    def add(self, new_ids):
+        self.ids.extend(new_ids)
+        before = self.tok.decode(self.ids[self.prefix:self.read], skip_special_tokens=True)
+        after = self.tok.decode(self.ids[self.prefix:], skip_special_tokens=True)
+        if len(after) <= len(before) or after.endswith("\ufffd") or not after.startswith(before):
+            return ""
+        delta = after[len(before):]
+        self.prefix, self.read = self.read, len(self.ids)
+        self.emitted += delta
+        return delta
+
+    def finish(self):
+        full = self.tok.decode(self.ids, skip_special_tokens=True)
+        if full.startswith(self.emitted):
+            rest = full[len(self.emitted):]
+            self.emitted = full
+            return rest
+        return ""
+
+
+# --------------------------------------------------------------------------
+# Tool calls (OpenAI `tool_calls`) from the model's own markup, the one the
+# chat template renders for assistant tool turns:
+#   <tool_calls:opensource><tool_call:opensource>NAME
+#     <arg_key:opensource>K</arg_key:opensource><arg_value:opensource>V</arg_value:opensource>...
+#   </tool_call:opensource>...</tool_calls:opensource>
+# String parameters stay strings; other schema types are JSON-decoded (the
+# template writes non-string values with `tojson`).
+# --------------------------------------------------------------------------
+TOOLCALLS_BEGIN = "<tool_calls:opensource>"
+_TOOL_CALL_RE = None
+
+
+def _tool_param_types(tools):
+    types = {}
+    for tool in tools or ():
+        fn = (tool or {}).get("function") or tool or {}
+        props = ((fn.get("parameters") or {}).get("properties") or {})
+        types[fn.get("name")] = {k: (v or {}).get("type") for k, v in props.items()}
+    return types
+
+
+def parse_tool_calls(text, tools):
+    """`(content, calls)`: the text before the tool-call block and the OpenAI
+    tool calls in it; `(text, [])` when there is no well-formed block."""
+    import re
+    import uuid
+
+    global _TOOL_CALL_RE
+    at = text.find(TOOLCALLS_BEGIN)
+    if at < 0:
+        return text, []
+    if _TOOL_CALL_RE is None:
+        _TOOL_CALL_RE = (
+            re.compile(r"<tool_call:opensource>(.*?)</tool_call:opensource>", re.S),
+            re.compile(r"<arg_key:opensource>(.*?)</arg_key:opensource>\s*"
+                       r"<arg_value:opensource>(.*?)</arg_value:opensource>", re.S))
+    call_re, arg_re = _TOOL_CALL_RE
+    types = _tool_param_types(tools)
+    calls = []
+    for block in call_re.findall(text[at:]):
+        name = block.split("<arg_key:opensource>", 1)[0].strip()
+        if not name:
+            continue
+        schema = types.get(name, {})
+        args = {}
+        for key, value in arg_re.findall(block):
+            key = key.strip()
+            if schema.get(key) == "string":
+                args[key] = value
+            else:
+                try:
+                    args[key] = json.loads(value)
+                except ValueError:
+                    args[key] = value
+        calls.append({"id": f"call_{uuid.uuid4().hex[:24]}", "type": "function",
+                      "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
+    if not calls:
+        return text, []
+    return text[:at], calls
+
+
+def normalize_tool_history(messages):
+    """The chat template iterates assistant `tool_calls[].function.arguments` as
+    a mapping; OpenAI clients send it back as a JSON string. Decode it (and give
+    tool-call turns an empty string for a null content)."""
+    out = []
+    for message in messages:
+        if isinstance(message, dict) and message.get("role") == "assistant" and message.get("tool_calls"):
+            message = dict(message)
+            calls = []
+            for call in message["tool_calls"]:
+                call = dict(call)
+                fn = dict(call.get("function") or {})
+                args = fn.get("arguments")
+                if isinstance(args, str):
+                    try:
+                        fn["arguments"] = json.loads(args) if args.strip() else {}
+                    except ValueError:
+                        fn["arguments"] = {"arguments": args}
+                elif args is None:
+                    fn["arguments"] = {}
+                call["function"] = fn
+                calls.append(call)
+            message["tool_calls"] = calls
+            if message.get("content") is None:
+                message["content"] = ""
+        out.append(message)
+    return out
+
+
 def run_generate(ctx, cmd):
     """One generation; every rank runs the full loop in lockstep."""
     import torch
@@ -488,6 +620,7 @@ def run_generate(ctx, cmd):
 
     nxt, done, finish = sample(logits)
     out.append(nxt)
+    _stream_push(ctx, out)
     if not done and use_spec and last_hidden is not None:
         if not hasattr(ctx, "eos_all"):
             box = [ctx.sampler.eos if ctx.rank == 0 else None]
@@ -498,6 +631,7 @@ def run_generate(ctx, cmd):
             # the sampler's stop rules, decided identically on every rank
             produced = len(out)
             out.append(int(tok))
+            _stream_push(ctx, out)
             if tok == ctx.eos_all and not params.get("ignore_eos"):
                 return "stop"
             if produced + 1 >= max_new:
@@ -517,6 +651,7 @@ def run_generate(ctx, cmd):
             WATCH.finding["generated_tokens"] = len(out)   # decode steps completed before it
         nxt, done, finish = sample(logits)
         out.append(nxt)
+        _stream_push(ctx, out)
     finding = WATCH.take()
     if finding is not None:
         finding.setdefault("generated_tokens", 0)          # 0 = during the prompt
@@ -617,6 +752,96 @@ def serve_http(ctx):
             self.end_headers()
             self.wfile.write(data)
 
+        def _stream_events(self, item, ids, include_usage, tools=None):
+            """OpenAI `chat.completion.chunk` SSE over chunked HTTP/1.1: a role
+            chunk, `delta.content` per decoded piece, a finish chunk, the usage
+            chunk when `stream_options.include_usage`, then `[DONE]`. A client
+            that goes away stops the writes only: generation runs to its end
+            (the busy flag is released after it, by the caller)."""
+            created = int(time.time())
+            base = {"id": f"chatcmpl-h4-{created}", "object": "chat.completion.chunk",
+                    "created": created, "model": ctx.served_names[0]}
+            alive = [True]
+
+            def write(payload):
+                if not alive[0]:
+                    return
+                data = b"data: " + (payload if isinstance(payload, bytes)
+                                    else json.dumps(payload).encode()) + b"\n\n"
+                try:
+                    self.wfile.write(b"%X\r\n%s\r\n" % (len(data), data))
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    alive[0] = False
+
+            def delta(content):
+                write({**base, "choices": [{"index": 0, "delta": {"content": content},
+                                            "finish_reason": None}]})
+
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            write({**base, "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""},
+                                        "finish_reason": None}]})
+            detok = IncrementalDetokenizer(ctx.tok)
+            q = item["stream_q"]
+            # with `tools`, content deltas stop at the model's tool-call block
+            # (one token); the block is parsed into `delta.tool_calls` at the end
+            marker = ctx.toolcalls_token if tools else None
+            held = None
+            deadline = time.monotonic() + 7200
+            while True:
+                try:
+                    kind, payload = q.get(timeout=max(1.0, deadline - time.monotonic()))
+                except queue.Empty:
+                    item.setdefault("error", "the serve loop did not answer in 7200 s")
+                    break
+                if kind == "tokens":
+                    if held is not None:
+                        held.extend(payload)
+                        continue
+                    if marker is not None and marker in payload:
+                        cut = payload.index(marker)
+                        held = list(payload[cut:])
+                        payload = payload[:cut]
+                    text = detok.add(payload)
+                    if text:
+                        delta(text)
+                else:
+                    break
+            if item.get("error"):
+                ctx.failure = item["error"]
+                write({"error": {"message": item["error"][:400], "type": "server_error"}})
+            else:
+                out, finish = item["result"]
+                rest = detok.finish()
+                if rest:
+                    delta(rest)
+                if held is not None:
+                    block = ctx.tok.decode(held, skip_special_tokens=True)
+                    _, calls = parse_tool_calls(block, tools)
+                    if calls:
+                        for index, call in enumerate(calls):
+                            write({**base, "choices": [{"index": 0, "delta": {"tool_calls": [
+                                {"index": index, **call}]}, "finish_reason": None}]})
+                        finish = "tool_calls"
+                    elif block:
+                        delta(block)         # not a well-formed block: it was content
+                write({**base, "choices": [{"index": 0, "delta": {}, "finish_reason": finish or "stop"}]})
+                if include_usage:
+                    write({**base, "choices": [], "usage": {
+                        "prompt_tokens": len(ids), "completion_tokens": len(out),
+                        "total_tokens": len(ids) + len(out)}})
+            write(b"[DONE]")
+            if alive[0]:
+                try:
+                    self.wfile.write(b"0\r\n\r\n")
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+
         def do_GET(self):
             if self.path == "/health":
                 if ctx.failure:
@@ -668,14 +893,15 @@ def serve_http(ctx):
                 body = json.loads(raw)
                 if not isinstance(body, dict):
                     raise ValueError("the request body must be a JSON object")
-                if body.get("stream"):
-                    raise ValueError("h4 direct serving answers non-streaming requests only")
+                stream = bool(body.get("stream", False))
+                include_usage = bool((body.get("stream_options") or {}).get("include_usage", False))
                 if body.get("n", 1) != 1:
                     raise ValueError("h4 direct serving returns one choice")
+                tools = body.get("tools") or None
                 if "messages" in body:
                     text = ctx.tok.apply_chat_template(
-                        body["messages"], tokenize=False, add_generation_prompt=True,
-                        tools=body.get("tools") or None)
+                        normalize_tool_history(body["messages"]), tokenize=False,
+                        add_generation_prompt=True, tools=tools)
                 elif "prompt" in body:
                     text = str(body["prompt"])
                 else:
@@ -684,7 +910,10 @@ def serve_http(ctx):
                 if not ids:
                     raise ValueError("empty prompt")
                 limit = body.get("max_completion_tokens", body.get("max_tokens"))
-                limit = 512 if limit is None else int(limit)
+                # A request without max_tokens decodes up to --default-max-tokens, or
+                # to the context window when that flag is 0 (clamped below).
+                # Explicit client values win.
+                limit = (ctx.default_max_new or ctx.max_context) if limit is None else int(limit)
                 if limit < 1:
                     raise ValueError("the output limit must be positive")
                 if len(ids) > ctx.row_capacity:
@@ -706,6 +935,8 @@ def serve_http(ctx):
                 self._send(400, {"error": {"message": str(error), "type": "invalid_request_error"}})
                 return
             item = {"tokens": ids, "max_new": limit, "params": params, "ev": threading.Event()}
+            if stream:
+                item["stream_q"] = queue.Queue()
             with ctx.lock:
                 if ctx.busy:
                     self._send(429, {"error": {"message": "h4 serves one request at a time", "type": "busy"}})
@@ -713,6 +944,9 @@ def serve_http(ctx):
                 ctx.busy = True
             try:
                 ctx.q.put(item)
+                if stream:
+                    self._stream_events(item, ids, include_usage, tools)
+                    return
                 if not item["ev"].wait(timeout=7200):
                     raise TimeoutError("the serve loop did not answer in 7200 s")
             finally:
@@ -725,12 +959,17 @@ def serve_http(ctx):
             out, finish = item["result"]
             nll = item.get("nll")
             content = ctx.tok.decode(out, skip_special_tokens=True)
+            message = {"role": "assistant", "content": content}
+            if tools:
+                content, calls = parse_tool_calls(content, tools)
+                if calls:
+                    message = {"role": "assistant", "content": content or None, "tool_calls": calls}
+                    finish = "tool_calls"
             created = int(time.time())
             self._send(200, {
                 "id": f"chatcmpl-h4-{created}", "object": "chat.completion", "created": created,
                 "model": ctx.served_names[0],
-                "choices": [{"index": 0,
-                             "message": {"role": "assistant", "content": content},
+                "choices": [{"index": 0, "message": message,
                              "finish_reason": finish or "stop"}],
                 "usage": {"prompt_tokens": len(ids), "completion_tokens": len(out),
                           "total_tokens": len(ids) + len(out),
@@ -756,6 +995,9 @@ def main():
     ap.add_argument("--served-model-name", default="smart")
     ap.add_argument("--max-concurrency", type=int, default=1)
     ap.add_argument("--max-context", type=int, default=DEFAULT_MAX_CONTEXT)
+    ap.add_argument("--default-max-tokens", type=int, default=0,
+                    help="output token budget of a request that omits max_tokens; 0 = the "
+                         "context window left after the prompt")
     ap.add_argument("--rows", type=int, default=2, help="cache request rows (row 0 serves)")
     ap.add_argument("--capacity", type=int, default=0,
                     help="cache capacity in GLOBAL positions per row (0 = size from the measured budget)")
@@ -856,6 +1098,9 @@ def main():
     ctx = Context()
     ctx.rank, ctx.world, ctx.device, ctx.dist = rank, world, device, dist
     ctx.max_context = args.max_context
+    # output budget for requests that omit max_tokens (None: the context window
+    # left after the prompt)
+    ctx.default_max_new = args.default_max_tokens if args.default_max_tokens > 0 else None
     ctx.row_capacity = args.capacity or args.max_context  # replaced by the measured capacity below
     ctx.served_names = (args.served_model_name,)
     ctx.bind = f"{args.host}:{args.port}"
@@ -1249,6 +1494,8 @@ def main():
                 with open(tpl_path) as fh:
                     tok.chat_template = fh.read()
             ctx.tok = tok
+            _tc = tok.encode(TOOLCALLS_BEGIN, add_special_tokens=False)
+            ctx.toolcalls_token = _tc[0] if len(_tc) == 1 else None
             eos_id = tok.eos_token_id if tok.eos_token_id is not None else 120025
             ctx.sampler = Sampler(tok, eos_id, seed=int(time.time()) & 0xFFFFFFFF, device=ctx.device)
             serve_http(ctx)
@@ -1285,6 +1532,9 @@ def main():
                     item["ev"].set()
                 continue
             if cmd["op"] == "generate":
+                # rank 0: the request's SSE queue (None for non-streaming requests)
+                ctx.stream_q = item.get("stream_q") if rank == 0 else None
+                ctx.stream_sent = 0
                 try:
                     profile_dir = os.environ.get("HY4_TORCH_PROFILE") or ""
                     min_new = int(os.environ.get("HY4_TORCH_PROFILE_MIN_NEW") or 0)
@@ -1310,11 +1560,16 @@ def main():
                         item["error"] = f"{type(exc).__name__}: {exc}"
                         traceback.print_exc()
                         item["ev"].set()
+                        if ctx.stream_q is not None:
+                            ctx.stream_q.put(("end", None))
                     raise
                 if rank == 0:
                     item["result"] = (out, finish)
                     item["nll"] = getattr(ctx, "last_nll", None)
                     item["ev"].set()
+                    if ctx.stream_q is not None:
+                        ctx.stream_q.put(("end", None))
+                ctx.stream_q = None
         trace(rank, "shutdown")
     finally:
         try:
