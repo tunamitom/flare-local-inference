@@ -88,6 +88,17 @@ ALLOWED = {
     # round 14: iHC post_pre collapse + input RMSNorm in one program per row at
     # >= 512 rows (fused_ops._ihc_pp_collapse_norm_kernel; bit-identical)
     "ihc_fuse": ("off", "on"),
+    # round 15 (decode kernel diet, bit-identical): per-forward memos of the
+    # indexer geometry and slot bases, direct single-group indexer logits,
+    # in-place causal mask, the fused owned index-key store
+    "diet_index": ("off", "on"),
+    # round 15 (bit-identical): fused sigmoid gate, SwiGLU from the FP32 fold,
+    # in-place route logits + int32 ids, constant cache lengths, the latent
+    # written in place (no cat)
+    "diet_glue": ("off", "on"),
+    # round 15: the absorbed decode query written in place (W_UK GEMM into the
+    # latent columns, rope into the last ones; no cat)
+    "diet_absorb": ("off", "on"),
 }
 DEFAULTS = {"index_scores": "fp32",
             "ihc": os.environ.get("HY4_IHC") or "default",
@@ -115,7 +126,10 @@ DEFAULTS = {"index_scores": "fp32",
             "router_mm": os.environ.get("HY4_ROUTER_MM") or "f32",
             "ihc_rows": os.environ.get("HY4_IHC_ROWS") or "1",
             "ce_priority": os.environ.get("HY4_CE_PRIORITY") or "normal",
-            "ihc_fuse": os.environ.get("HY4_IHC_FUSE") or "off"}
+            "ihc_fuse": os.environ.get("HY4_IHC_FUSE") or "off",
+            "diet_index": os.environ.get("HY4_DIET_INDEX") or "off",
+            "diet_glue": os.environ.get("HY4_DIET_GLUE") or "off",
+            "diet_absorb": os.environ.get("HY4_DIET_ABSORB") or "off"}
 for _key, _value in DEFAULTS.items():
     if _value not in ALLOWED[_key]:
         raise ValueError(f"runtime default {_key}={_value!r} must be one of {ALLOWED[_key]}")

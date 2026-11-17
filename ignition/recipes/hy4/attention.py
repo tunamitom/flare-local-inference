@@ -44,6 +44,51 @@ from .shard import Hy4Sharding
 K_NORM_EPS_SOURCE = "config.rms_norm_eps"
 
 
+# --------------------------------------------------------------------------
+# Round 15 (decode kernel diet). `forward_memo` holds values computed ONCE per
+# forward from tensors the forward itself created (`visible`, `token_rows`):
+# the anchor object is kept referenced, so its id cannot be reused while the
+# entry lives. Inside a CUDA-graph capture the memo only shortens the captured
+# chain (the first layer's kernels produce the value, later layers read it).
+# `step_constant` keeps read-only constants made OUTSIDE any capture (a
+# capture records kernels without running them, so nothing created there may
+# outlive it as a value).
+# --------------------------------------------------------------------------
+import collections as _collections
+
+_FORWARD_MEMO = _collections.OrderedDict()
+_STEP_CONSTANTS = {}
+
+
+def diet(name):
+    from .runtime import SWITCHES
+
+    return SWITCHES.get(name) == "on"
+
+
+def forward_memo(anchor, key, make):
+    entry = _FORWARD_MEMO.get(id(anchor))
+    if entry is None or entry[0] is not anchor:
+        entry = (anchor, {})
+        _FORWARD_MEMO[id(anchor)] = entry
+        while len(_FORWARD_MEMO) > 8:
+            _FORWARD_MEMO.popitem(last=False)
+    value = entry[1].get(key)
+    if value is None:
+        value = entry[1][key] = make()
+    return value
+
+
+def step_constant(key, make):
+    value = _STEP_CONSTANTS.get(key)
+    if value is None:
+        value = make()
+        if not torch.cuda.is_current_stream_capturing():
+            _STEP_CONSTANTS[key] = value
+    return value
+
+
+
 def rotate_half_interleaved(x):
     """Adjacent-pair rotation half (PR #50589), over the last dimension."""
     if x.shape[-1] % 2:
@@ -329,12 +374,32 @@ class Hy4LayerAttention:
             gate_raw = x @ packed.rows("linear_gate").T.to(x.dtype)
         q_resid = rms_norm(q_a_raw, w.q_a_norm, self.config.text["rms_norm_eps"])
         q = (q_resid @ w.q_b_proj.T).view(-1, self.heads, self.qk_nope + self.qk_rope)
-        q = apply_interleaved_rope(q, positions, rope_dim=self.qk_rope, theta=self.rope_theta)
+        glue = x.is_cuda and diet("diet_glue") and _fused_norm_rope()
+        q_out = None
+        if absorb and x.is_cuda and diet("diet_absorb") and _fused_norm_rope():
+            # round 15: W_UK straight into the absorbed query's latent columns,
+            # the rope block rotated straight into its last columns (no cat)
+            q_out = self._absorb_into(q, positions)
+        else:
+            q = apply_interleaved_rope(q, positions, rope_dim=self.qk_rope, theta=self.rope_theta)
         kv_pass, k_rot = kv_raw[:, :self.kv_lora], kv_raw[:, self.kv_lora:]
-        k_pass = rms_norm(kv_pass, w.kv_a_norm, self.config.text["rms_norm_eps"])
-        k_rot = apply_interleaved_rope(k_rot, positions, rope_dim=self.qk_rope, theta=self.rope_theta)
-        latent = torch.cat((k_pass, k_rot), dim=-1)
-        q_out = q if not absorb else self.absorb_queries(q)
+        if glue:
+            # round 15: k_pass and k_rot written straight into the latent row (no cat)
+            from .fused_ops import rms_norm as fused_rms_norm, rope_interleaved
+
+            latent = torch.empty((kv_raw.shape[0], self.kv_lora + self.qk_rope),
+                                 dtype=kv_raw.dtype, device=kv_raw.device)
+            fused_rms_norm(kv_pass, w.kv_a_norm, self.config.text["rms_norm_eps"],
+                           out=latent[:, :self.kv_lora])
+            rope_interleaved(k_rot, positions, rope_dim=self.qk_rope, theta=self.rope_theta,
+                             out=latent[:, self.kv_lora:])
+        else:
+            k_pass = rms_norm(kv_pass, w.kv_a_norm, self.config.text["rms_norm_eps"])
+            k_rot = apply_interleaved_rope(k_rot, positions, rope_dim=self.qk_rope,
+                                           theta=self.rope_theta)
+            latent = torch.cat((k_pass, k_rot), dim=-1)
+        if q_out is None:
+            q_out = q if not absorb else self.absorb_queries(q)
         index_keys = None
         if with_index_keys:
             # Through `prepare_index_keys` — the single key-prep entry point
@@ -342,6 +407,28 @@ class Hy4LayerAttention:
             index_keys = self.prepare_index_keys(x, positions)
         self._stash_gate(x, gate_raw)
         return LayerProjections(q_resid, q_out, latent, index_keys, gate_raw)
+
+    def _absorb_into(self, q_unroped, positions):
+        """round 15 (`diet_absorb`): `absorb_queries(rope(q))` without the cat —
+        the per-head `q_nope @ W_UK` GEMM writes the latent columns of the output
+        (the rope never touches the nope block) and the rope kernel rotates the
+        rope block straight into the last columns."""
+        from .fused_ops import rope_interleaved
+
+        first, last = self.sharding.head_range
+        heads = int(q_unroped.shape[1])
+        if heads != self.heads:
+            raise ValueError("the in-place absorb covers this rank's head shard")
+        wuk = self.absorb_wuk[first:last]
+        rows = int(q_unroped.shape[0])
+        lora = int(wuk.shape[-1])
+        out = torch.empty((rows, heads, lora + self.qk_rope), dtype=q_unroped.dtype,
+                          device=q_unroped.device)
+        torch.bmm(q_unroped[..., :self.qk_nope].transpose(0, 1), wuk,
+                  out=out[..., :lora].transpose(0, 1))
+        rope_interleaved(q_unroped[..., self.qk_nope:], positions, rope_dim=self.qk_rope,
+                         theta=self.rope_theta, out=out[..., lora:])
+        return out
 
     def absorb_queries(self, q_unabsorbed):
         """`q_nope @ W_UK` per head over the query's head axis (the local absorb).
@@ -639,13 +726,18 @@ class Hy4LayerAttention:
         # 20 B per query row per owned key): above the budget, score the rows
         # in blocks. Each block is this same method on a row slice.
         count = int(visible.shape[0])
-        owned = torch.div((visible.long() - rank).clamp_min(0) + world - 1, world,
-                          rounding_mode="floor")
         from .lanes import geometry
 
         known = geometry()      # an overlapped half: sized on the host, no device read
-        widest = max((known["owned_max"] if known is not None
-                      else int(owned.max())) if count else 0, topk)
+        trim = visible.is_cuda and diet("diet_index")
+        if trim and known is not None:
+            # round 15: `owned` only sizes the blocks when the host does not know them
+            widest = max(known["owned_max"] if count else 0, topk)
+        else:
+            owned = torch.div((visible.long() - rank).clamp_min(0) + world - 1, world,
+                              rounding_mode="floor")
+            widest = max((known["owned_max"] if known is not None
+                          else int(owned.max())) if count else 0, topk)
         block = max(1, self.INDEX_CANDIDATE_BLOCK_BYTES // (widest * 20))
         if count > block:
             parts = [self.local_candidates(
@@ -660,12 +752,19 @@ class Hy4LayerAttention:
         rows, width = scores.shape
         if width < topk:
             scores = torch.cat((scores, scores.new_full((rows, topk - width), float("-inf"))), dim=-1)
-        columns = torch.cat((torch.arange(width, device=self.device, dtype=torch.int64) * world + rank,
-                             torch.full((max(topk - width, 0),), -1, device=self.device,
-                                        dtype=torch.int64)))
+        def columns_of():
+            return torch.cat((torch.arange(width, device=self.device, dtype=torch.int64) * world + rank,
+                              torch.full((max(topk - width, 0),), -1, device=self.device,
+                                         dtype=torch.int64)))
+
+        columns = (forward_memo(visible, ("columns", width, topk, world, rank), columns_of)
+                   if trim else columns_of())
         values, indices = scores.topk(topk, dim=-1)
-        picked = torch.where(torch.isfinite(values), columns[indices],
-                             torch.full_like(indices, -1, dtype=torch.int64))
+        if trim:
+            picked = torch.where(torch.isfinite(values), columns[indices], -1)
+        else:
+            picked = torch.where(torch.isfinite(values), columns[indices],
+                                 torch.full_like(indices, -1, dtype=torch.int64))
         return values.to(torch.float32), picked.to(torch.int32)
 
     # Byte budgets of the torch indexer scoring (consult14): one score block
@@ -699,8 +798,12 @@ class Hy4LayerAttention:
         q = (q_resid @ iw.wq_b.T).view(-1, n_heads, head_dim)
         q = apply_interleaved_rope(q, positions, rope_dim=c["qk_rope_head_dim"], theta=self.rope_theta)
         # Owned live keys per query token (world 1: every position is owned).
-        owned = torch.div((visible.long() - rank).clamp_min(0) + world - 1, world,
-                          rounding_mode="floor")
+        def owned_of():
+            return torch.div((visible.long() - rank).clamp_min(0) + world - 1, world,
+                             rounding_mode="floor")
+
+        owned = (forward_memo(visible, ("owned", world, rank), owned_of)
+                 if visible.is_cuda and diet("diet_index") else owned_of())
         from .lanes import geometry
 
         known = geometry()      # an overlapped half: one row, sized on the host
@@ -710,13 +813,14 @@ class Hy4LayerAttention:
             width = int(owned.max()) if owned.numel() else 0
         rows = int(q.shape[0])
         q = q.float()
+        trim = q.is_cuda and diet("diet_index")
         weights = (x.float() @ iw.weights_proj.float().T) * (n_heads ** -0.5) * (head_dim ** -0.5)
         # No `[rows, width, key_dim]` key copy: the tokens of one request row
         # share one `[live, key_dim]` key segment, scored in row blocks of at
         # most `INDEX_SCORE_BLOCK_BYTES` (the copy was 1 KiB per query row per
         # owned key — 4.0 GiB at a 32k context, the consult14 request OOM).
         # Columns past a token's own live keys are masked below, as before.
-        logits = q.new_zeros((rows, width))
+        logits = None
         if known is not None:
             # One request row: every query token shares the row's base slot and
             # the widest token owns `width` live keys (all host-known).
@@ -733,6 +837,12 @@ class Hy4LayerAttention:
         # cores); "fp32" (default) is the FP32 contraction.
         low = SWITCHES.get("index_scores") == "bf16"
         q_low = q.to(torch.bfloat16) if low else None
+        # round 15: one group spanning the full width in one row block — the
+        # einsum's own output IS the logits (no zero fill + slice copy)
+        direct = (trim and known is not None and len(groups) == 1 and groups[0][2] == width
+                  and rows <= max(1, self.INDEX_SCORE_BLOCK_BYTES // (n_heads * width * 4)))
+        if not direct:
+            logits = q.new_zeros((rows, width))
         for base, members, live in groups:
             if not live:
                 continue
@@ -749,9 +859,16 @@ class Hy4LayerAttention:
                 else:
                     product = q[part].reshape(-1, head_dim) @ keys.T
                 scores = torch.relu_(product).view(-1, n_heads, live)
-                logits[part, :live] = torch.einsum("rh,rhw->rw", weights[part], scores)
+                if direct:
+                    logits = torch.einsum("rh,rhw->rw", weights[part], scores)
+                else:
+                    logits[part, :live] = torch.einsum("rh,rhw->rw", weights[part], scores)
         # Causal masking over the token's owned live keys (world 1: `owned` is
         # exactly the visible cache length).
+        if trim:
+            masked = forward_memo(visible, ("masked", world, rank, width), lambda: ~(
+                torch.arange(width, device=self.device).reshape(1, width) < owned.reshape(-1, 1)))
+            return logits.masked_fill_(masked, float("-inf"))
         causal = torch.arange(width, device=self.device).reshape(1, width) < owned.reshape(-1, 1)
         return logits.masked_fill(~causal, float("-inf"))
 
@@ -909,7 +1026,13 @@ class Hy4LayerAttention:
                 "no prepared sparse-MLA scratch for this call shape; prepare_plans "
                 "allocates one per call shape — there is no JIT at run time")
         if cache_lengths is None:
-            cache_lengths = counts.new_full((rows,), selected.shape[1])
+            if counts.is_cuda and diet("diet_glue"):
+                # round 15: a read-only constant per (rows, width), not a fill per layer
+                width_ = int(selected.shape[1])
+                cache_lengths = step_constant(("cache_lengths", rows, width_, counts.dtype, counts.device),
+                                              lambda: counts.new_full((rows,), width_))
+            else:
+                cache_lengths = counts.new_full((rows,), selected.shape[1])
         binding = sparse_mla.bind(plan, scratch=scratch, q=q_absorbed.to(torch.bfloat16),
                                   # The Hy4 cache is the flat physical-slot table
                                   # (`output_index_space="physical"`); the kernel
@@ -966,9 +1089,17 @@ class Hy4LayerAttention:
             stashes[lane()] = None
         if gate_raw is None:
             gate_raw = x @ self.weights.gate_proj.T.to(x.dtype)
-        gate = torch.sigmoid(gate_raw)
-        gated = attn_output * gate.view(attn_output.shape[0], self.heads, self.v_head)
-        flat = gated.reshape(gated.shape[0], -1).contiguous()
+        if (attn_output.is_cuda and attn_output.dtype == torch.bfloat16
+                and gate_raw.dtype == torch.bfloat16 and attn_output.is_contiguous()
+                and diet("diet_glue")):
+            # round 15: sigmoid, the gate product and the flatten in one launch
+            from .fused_ops import sigmoid_gate
+
+            flat = sigmoid_gate(attn_output, gate_raw)
+        else:
+            gate = torch.sigmoid(gate_raw)
+            gated = attn_output * gate.view(attn_output.shape[0], self.heads, self.v_head)
+            flat = gated.reshape(gated.shape[0], -1).contiguous()
         o_proj = self.weights.o_proj
         if self.weights.w8_o_proj is not None:
             from .w8 import in_decode_scope
@@ -978,6 +1109,15 @@ class Hy4LayerAttention:
             if in_decode_scope(flat):
                 o_proj = self.weights.w8_o_proj
         return flat @ o_proj.T
+
+
+def _fused_norm_rope():
+    """The in-place writes go through fused_ops' norm tail and rope: only when
+    those ARE the active implementations (host_trim / fused_rope on), so the
+    bytes stay the ones the other arm writes."""
+    from .runtime import SWITCHES
+
+    return SWITCHES.get("host_trim") == "on" and SWITCHES.get("fused_rope") == "on"
 
 
 def rms_norm(x, weight, eps):

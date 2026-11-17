@@ -177,6 +177,13 @@ class Hy4Cache:
 
     def slots_for(self, row_of):
         """Each token's row slot base (`row_of` maps token -> request row)."""
+        if row_of.is_cuda:
+            from .attention import diet, forward_memo
+
+            if diet("diet_index"):
+                # round 15: once per forward (every layer asks for the same rows)
+                return forward_memo(row_of, ("slots_for", self.local_capacity),
+                                    lambda: row_of.long() * self.local_capacity)
         return (row_of.long() * self.local_capacity)
 
     def write_latent(self, layer, tokens, positions, latent):
@@ -225,6 +232,15 @@ class Hy4Cache:
             # no-op); the owner stores the token's value — the same bytes as
             # the indexed assignment below.
             _, _, kept, slots, safe = memo
+            if table.is_cuda and values.dim() == 2:
+                from .attention import diet
+
+                if diet("diet_index"):
+                    # round 15: one launch — owned rows write, the rest stay untouched
+                    from .fused_ops import store_owned_rows
+
+                    store_owned_rows(table, values, kept, slots, safe)
+                    return
             current = table.index_select(0, safe)
             fresh = values.to(table.dtype).index_select(0, kept)
             own = (slots >= 0).reshape(-1, *([1] * (table.dim() - 1)))

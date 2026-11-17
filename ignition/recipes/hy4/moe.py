@@ -688,7 +688,7 @@ class MoEBlock:
         logits = x.float() @ self.router.gate.float().T
         return self._route_from_logits(logits)
 
-    def _route_from_logits(self, logits):
+    def _route_from_logits(self, logits, ids_dtype=None):
         c = self.config.text
         experts, top_k = self.router.experts, c["num_experts_per_tok"]
         if logits.is_cuda and c["n_group"] == 1 and top_k == 8:
@@ -700,7 +700,8 @@ class MoEBlock:
 
                 weights, ids = moe_route(logits, self._bias_f32(), top_k=top_k,
                                          scale=c["routed_scaling_factor"],
-                                         norm=c["norm_topk_prob"])
+                                         norm=c["norm_topk_prob"],
+                                         ids_dtype=ids_dtype or torch.int64)
                 return logits, weights, ids
         scores = torch.sigmoid(logits)
         choice = scores + self._bias_f32()
@@ -721,6 +722,12 @@ class MoEBlock:
         """The shared expert (unclamped SwiGLU), optionally from packed projections."""
         if shared_gate is None or shared_up is None:
             return self.shared.forward(x)
+        if shared_gate.dtype == torch.float32 and x.dtype == torch.bfloat16:
+            # round 15 (`diet_glue`): the FP32 fold's halves — their BF16 cast,
+            # silu and the product in one launch (bitwise the unfused chain)
+            from .fused_ops import swiglu_f32
+
+            return swiglu_f32(shared_gate, shared_up) @ self.shared.down_proj.T
         return (torch.nn.functional.silu(shared_gate) * shared_up) @ self.shared.down_proj.T
 
     def _routed_forward(self, x, topk_indices, topk_weights):
@@ -753,6 +760,7 @@ class MoEBlock:
             with TIMER.phase("moe.route_shared"):
                 from .w8 import in_decode_scope
 
+                route_ids = None
                 r0, r1 = packed.slices["router"]
                 g0, g1 = packed.slices["shared_gate"]
                 u0, u1 = packed.slices["shared_up"]
@@ -764,9 +772,20 @@ class MoEBlock:
                     # decisions identical, weights within 4.8e-7); 3.84 us vs the
                     # FP32 GEMV's 7.48 + the gate/up GEMM's 3.09 at one row.
                     fold = torch.mm(x, packed.packed[r0:u1].T, out_dtype=torch.float32)
-                    logits = fold[:, :r1 - r0].contiguous()
-                    gate_up = fold[:, r1 - r0:].to(x.dtype)
-                    shared_gate, shared_up = gate_up[:, :g1 - g0], gate_up[:, g1 - g0:]
+                    from .attention import diet
+
+                    if x.is_cuda and diet("diet_glue"):
+                        # round 15: the route reads its logits in place (row stride)
+                        # and emits the routed op's int32 ids; the shared expert
+                        # takes the FP32 halves (cast fused into its SwiGLU)
+                        logits = fold[:, :r1 - r0]
+                        shared_gate = fold[:, r1 - r0:g1 - r0]
+                        shared_up = fold[:, g1 - r0:u1 - r0]
+                        route_ids = torch.int32
+                    else:
+                        logits = fold[:, :r1 - r0].contiguous()
+                        gate_up = fold[:, r1 - r0:].to(x.dtype)
+                        shared_gate, shared_up = gate_up[:, :g1 - g0], gate_up[:, g1 - g0:]
                 elif g1 == u0 and in_decode_scope(x):
                     # consult18 P7: decode-family rows run shared gate + up as ONE
                     # GEMM over the adjacent packed rows (cuBLAS picks a slow
@@ -790,7 +809,7 @@ class MoEBlock:
                         logits = x.float() @ self._router_f32_t(packed)
                     shared_gate = x @ packed.rows("shared_gate").T
                     shared_up = x @ packed.rows("shared_up").T
-                _, topk_weights, topk_indices = self._route_from_logits(logits)
+                _, topk_weights, topk_indices = self._route_from_logits(logits, ids_dtype=route_ids)
         else:
             shared_gate = shared_up = None
             with TIMER.phase("moe.route_shared"):

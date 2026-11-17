@@ -20,7 +20,7 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-__all__ = ["dequant_rows_int8", "dequant_slots_int8", "ihc_post_pre_split", "quant_rows_int8", "moe_route", "scores_only_select", "merge_head_major", "rms_norm", "rope_interleaved"]
+__all__ = ["dequant_rows_int8", "dequant_slots_int8", "ihc_post_pre_split", "quant_rows_int8", "moe_route", "scores_only_select", "merge_head_major", "rms_norm", "rope_interleaved", "sigmoid_gate", "swiglu_f32", "store_owned_rows"]
 
 _INV_FREQ = {}
 
@@ -37,7 +37,7 @@ def _inv_freq(rope_dim, theta, device):
 
 
 @triton.jit
-def _rope_kernel(x_ptr, out_ptr, pos_ptr, inv_ptr, stride_n, stride_d, D, HEADS,
+def _rope_kernel(x_ptr, out_ptr, pos_ptr, inv_ptr, stride_n, stride_d, D, HEADS, out_stride_n,
                  ROPE: tl.constexpr, BLOCK_D: tl.constexpr):
     n = tl.program_id(0)
     row = n // HEADS
@@ -61,11 +61,13 @@ def _rope_kernel(x_ptr, out_ptr, pos_ptr, inv_ptr, stride_n, stride_d, D, HEADS,
     other = tl.where(even, -xp, xp)
     r = libdevice.add_rn(libdevice.mul_rn(xf, c), libdevice.mul_rn(other, s))
     y = tl.where(rot, r.to(out_ptr.dtype.element_ty), x)
-    tl.store(out_ptr + n * D + offs, y, mask=live)
+    tl.store(out_ptr + n * out_stride_n + offs, y, mask=live)
 
 
-def rope_interleaved(x, positions, *, rope_dim, theta):
-    """`attention.apply_interleaved_rope` in one kernel (same output, bitwise)."""
+def rope_interleaved(x, positions, *, rope_dim, theta, out=None):
+    """`attention.apply_interleaved_rope` in one kernel (same output, bitwise).
+    `out` (round 15): write into a caller's view of the same shape whose rows
+    (all leading dims flattened) are evenly strided with unit last stride."""
     D = int(x.shape[-1])
     rows = int(positions.numel())
     lead = x.shape[:-1]
@@ -76,14 +78,32 @@ def rope_interleaved(x, positions, *, rope_dim, theta):
         raise ValueError("rope rows must cover the positions")
     heads = n // rows if rows else 1
     flat = x if x.dim() == 2 else x.reshape(n, D)     # 2-D views keep their strides
-    out = torch.empty(lead + (D,), dtype=x.dtype, device=x.device)
+    if out is None:
+        out = torch.empty(lead + (D,), dtype=x.dtype, device=x.device)
+        out_stride = D
+    else:
+        out_stride = _even_row_stride(out, lead + (D,), x.dtype)
     if n == 0:
         return out
     inv = _inv_freq(rope_dim, theta, x.device)
     pos = positions.reshape(-1)
-    _rope_kernel[(n,)](flat, out, pos, inv, flat.stride(0), flat.stride(1), D, heads,
+    _rope_kernel[(n,)](flat, out, pos, inv, flat.stride(0), flat.stride(1), D, heads, out_stride,
                        ROPE=int(rope_dim), BLOCK_D=triton.next_power_of_2(D))
     return out
+
+
+def _even_row_stride(out, shape, dtype):
+    """The row stride of `out` viewed as [prod(shape[:-1]), shape[-1]] (every
+    leading dim flattened), which must be uniform with a unit last stride."""
+    if tuple(out.shape) != tuple(shape) or out.dtype != dtype or out.stride(-1) != 1:
+        raise ValueError(f"out must be {tuple(shape)} {dtype} with unit last stride")
+    if out.dim() == 1:
+        return int(shape[-1])
+    stride = int(out.stride(-2))
+    for d in range(out.dim() - 2, 0, -1):
+        if int(out.stride(d - 1)) != int(out.shape[d]) * int(out.stride(d)):
+            raise ValueError("out rows must be evenly strided")
+    return stride
 
 
 @triton.jit
@@ -128,7 +148,7 @@ def merge_head_major(partials, lses):
 
 
 @triton.jit
-def _rms_tail_kernel(x_ptr, ms_ptr, w_ptr, out_ptr, N, eps, BLOCK: tl.constexpr):
+def _rms_tail_kernel(x_ptr, ms_ptr, w_ptr, out_ptr, N, eps, out_stride, BLOCK: tl.constexpr):
     row = tl.program_id(0)
     blk = tl.program_id(1)
     offs = blk * BLOCK + tl.arange(0, BLOCK)
@@ -137,7 +157,7 @@ def _rms_tail_kernel(x_ptr, ms_ptr, w_ptr, out_ptr, N, eps, BLOCK: tl.constexpr)
     w = tl.load(w_ptr + offs, mask=live, other=0.0).to(tl.float32)
     r = libdevice.rsqrt(libdevice.add_rn(tl.load(ms_ptr + row), eps))
     y = libdevice.mul_rn(w, libdevice.mul_rn(x, r))
-    tl.store(out_ptr + row * N + offs, y.to(out_ptr.dtype.element_ty), mask=live)
+    tl.store(out_ptr + row * out_stride + offs, y.to(out_ptr.dtype.element_ty), mask=live)
 
 
 @triton.jit
@@ -147,10 +167,11 @@ def _square_f32_kernel(x_ptr, out_ptr, N, BLOCK: tl.constexpr):
     tl.store(out_ptr + i, v * v, mask=i < N)
 
 
-def rms_norm(x, weight, eps):
+def rms_norm(x, weight, eps, out=None):
     """`attention.rms_norm` with the elementwise tail in one kernel (bitwise the
     same): the mean of squares stays torch's own reduction (its order), then
-    `(w * (x * rsqrt(ms + eps))).to(x.dtype)` runs fused."""
+    `(w * (x * rsqrt(ms + eps))).to(x.dtype)` runs fused. `out` (round 15): a
+    caller's evenly row-strided view of x's shape to write into."""
     N = int(x.shape[-1])
     flat = x.reshape(-1, N)
     if not flat.is_contiguous():
@@ -163,13 +184,16 @@ def rms_norm(x, weight, eps):
         ms = sq.mean(-1)
     else:
         ms = flat.float().square().mean(-1)
-    out = torch.empty_like(flat)
     rows = int(flat.shape[0])
+    if out is None:
+        target, out_stride = torch.empty_like(flat), N
+    else:
+        target, out_stride = out, _even_row_stride(out, tuple(x.shape), x.dtype)
     if rows:
         block = min(2048, triton.next_power_of_2(N))
-        _rms_tail_kernel[(rows, triton.cdiv(N, block))](flat, ms, weight.contiguous(), out, N,
-                                                        float(eps), BLOCK=block)
-    return out.view(x.shape)
+        _rms_tail_kernel[(rows, triton.cdiv(N, block))](flat, ms, weight.contiguous(), target, N,
+                                                        float(eps), out_stride, BLOCK=block)
+    return target if out is not None else target.view(x.shape)
 
 
 # --------------------------------------------------------------------------
@@ -560,12 +584,12 @@ def scores_only_select(offers, candidate_scores, candidate_positions, *, topk, w
 # ((a0+a4)+(a2+a6))+((a1+a5)+(a3+a7)). Bit-identical (route_check.py).
 # --------------------------------------------------------------------------
 @triton.jit
-def _moe_route_kernel(logits_ptr, bias_ptr, w_ptr, ids_ptr, E, scale,
+def _moe_route_kernel(logits_ptr, bias_ptr, w_ptr, ids_ptr, E, scale, stride_r,
                       EB: tl.constexpr, K: tl.constexpr, NORM: tl.constexpr):
     r = tl.program_id(0).to(tl.int64)
     e = tl.arange(0, EB)
     inside = e < E
-    x = tl.load(logits_ptr + r * E + e, mask=inside, other=0.0)
+    x = tl.load(logits_ptr + r * stride_r + e, mask=inside, other=0.0)
     score = libdevice.div_rn(1.0, 1.0 + libdevice.exp(-x))
     choice = score + tl.load(bias_ptr + e, mask=inside, other=0.0)
     choice = tl.where(inside, choice, float("-inf"))
@@ -596,19 +620,113 @@ def _moe_route_kernel(logits_ptr, bias_ptr, w_ptr, ids_ptr, E, scale,
     tl.store(ids_ptr + r * K + dest, e.to(tl.int64), mask=take)
 
 
-def moe_route(logits, bias, *, top_k, scale, norm):
-    """`(weights [rows, top_k] FP32, ids [rows, top_k] int64)` — moe._route_from_logits
-    for n_group == 1 and top_k == 8 in one launch (bit-identical)."""
+def moe_route(logits, bias, *, top_k, scale, norm, ids_dtype=torch.int64):
+    """`(weights [rows, top_k] FP32, ids [rows, top_k] ids_dtype)` — moe._route_from_logits
+    for n_group == 1 and top_k == 8 in one launch (bit-identical). Row-strided
+    logits (unit column stride) are read in place (round 15)."""
     rows, experts = (int(v) for v in logits.shape)
     if top_k != 8:
         raise ValueError("moe_route covers the top-8 route (the 8-way sum order is pinned)")
+    if logits.stride(-1) != 1:
+        logits = logits.contiguous()
     w = torch.empty((rows, top_k), dtype=torch.float32, device=logits.device)
-    ids = torch.empty((rows, top_k), dtype=torch.int64, device=logits.device)
-    _moe_route_kernel[(rows,)](logits.contiguous(), bias.contiguous(), w, ids, experts, float(scale),
+    ids = torch.empty((rows, top_k), dtype=ids_dtype, device=logits.device)
+    _moe_route_kernel[(rows,)](logits, bias.contiguous(), w, ids, experts, float(scale),
+                               int(logits.stride(0)) if rows else experts,
                                EB=triton.next_power_of_2(experts), K=top_k, NORM=bool(norm),
                                num_warps=4)
     return w, ids
 
+
+
+# --------------------------------------------------------------------------
+# Round 15 (decode kernel diet): elementwise chains in one launch each, every
+# op in torch's own formula and rounding (exhaustively checked over all BF16
+# inputs in /opt/h4/state/dev/diet_ops.py): sigmoid / silu are
+# `1 / (1 + expf(-x))` and `x / (1 + expf(-x))` in FP32 (libdevice expf, IEEE
+# division) rounded to BF16 once; products are FP32 products rounded once.
+# Launched with `enable_reflect_ftz=False`: torch keeps FP32 subnormals, and
+# Triton's default libdevice flush-to-zero differs there (sigmoid at x <= -87.5,
+# silu of subnormal inputs).
+# --------------------------------------------------------------------------
+@triton.jit
+def _sigmoid_gate_kernel(a_ptr, g_ptr, out_ptr, N, a_stride, g_stride, BLOCK: tl.constexpr):
+    r = tl.program_id(0).to(tl.int64)
+    offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    live = offs < N
+    g = tl.load(g_ptr + r * g_stride + offs, mask=live, other=0.0).to(tl.float32)
+    s = libdevice.div_rn(1.0, 1.0 + libdevice.exp(-g)).to(tl.bfloat16).to(tl.float32)
+    a = tl.load(a_ptr + r * a_stride + offs, mask=live, other=0.0).to(tl.float32)
+    tl.store(out_ptr + r * N + offs, libdevice.mul_rn(a, s).to(tl.bfloat16), mask=live)
+
+
+def sigmoid_gate(attn_output, gate_raw):
+    """`(attn_output * sigmoid(gate_raw).view_as(attn_output)).reshape(rows, -1)`
+    for BF16 operands, contiguous [rows, N] out (bitwise the same)."""
+    rows = int(attn_output.shape[0])
+    a = attn_output.reshape(rows, -1)
+    g = gate_raw.reshape(rows, -1)
+    N = int(a.shape[1])
+    if int(g.shape[1]) != N or a.stride(-1) != 1 or g.stride(-1) != 1:
+        raise ValueError("sigmoid_gate needs [rows, N] views with unit column stride")
+    out = torch.empty((rows, N), dtype=torch.bfloat16, device=a.device)
+    if rows and N:
+        block = min(4096, triton.next_power_of_2(N))
+        _sigmoid_gate_kernel[(rows, triton.cdiv(N, block))](a, g, out, N, a.stride(0), g.stride(0),
+                                                            BLOCK=block, enable_reflect_ftz=False)
+    return out
+
+
+@triton.jit
+def _swiglu_f32_kernel(g_ptr, u_ptr, out_ptr, N, g_stride, u_stride, BLOCK: tl.constexpr):
+    r = tl.program_id(0).to(tl.int64)
+    offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    live = offs < N
+    g = tl.load(g_ptr + r * g_stride + offs, mask=live, other=0.0).to(tl.bfloat16).to(tl.float32)
+    u = tl.load(u_ptr + r * u_stride + offs, mask=live, other=0.0).to(tl.bfloat16).to(tl.float32)
+    act = libdevice.div_rn(g, 1.0 + libdevice.exp(-g)).to(tl.bfloat16).to(tl.float32)
+    tl.store(out_ptr + r * N + offs, libdevice.mul_rn(act, u).to(tl.bfloat16), mask=live)
+
+
+def swiglu_f32(gate32, up32):
+    """`silu(gate32.to(bf16)) * up32.to(bf16)` (BF16 out, contiguous) from FP32
+    row-strided views — the cast, the activation and the product in one launch."""
+    rows, N = (int(v) for v in gate32.shape)
+    if tuple(up32.shape) != (rows, N) or gate32.stride(-1) != 1 or up32.stride(-1) != 1:
+        raise ValueError("swiglu_f32 needs two [rows, N] FP32 views with unit column stride")
+    out = torch.empty((rows, N), dtype=torch.bfloat16, device=gate32.device)
+    if rows and N:
+        block = min(4096, triton.next_power_of_2(N))
+        _swiglu_f32_kernel[(rows, triton.cdiv(N, block))](gate32, up32, out, N, gate32.stride(0),
+                                                          up32.stride(0), BLOCK=block,
+                                                          enable_reflect_ftz=False)
+    return out
+
+
+@triton.jit
+def _store_owned_rows_kernel(table_ptr, values_ptr, kept_ptr, slots_ptr, safe_ptr, D, v_stride,
+                             BLOCK_D: tl.constexpr):
+    j = tl.program_id(0)
+    if tl.load(slots_ptr + j) >= 0:
+        k = tl.load(kept_ptr + j).to(tl.int64)
+        dst = tl.load(safe_ptr + j).to(tl.int64)
+        offs = tl.arange(0, BLOCK_D)
+        live = offs < D
+        v = tl.load(values_ptr + k * v_stride + offs, mask=live, other=0.0)
+        tl.store(table_ptr + dst * D + offs, v.to(table_ptr.dtype.element_ty), mask=live)
+
+
+def store_owned_rows(table, values, kept, slots, safe):
+    """The decode-graph `_store`: rows with `slots >= 0` write
+    `values[kept].to(table.dtype)` at `safe`; the others are left untouched (the
+    original rewrites them with their own bytes) — the same table bytes."""
+    D = int(table.shape[1])
+    n = int(slots.numel())
+    if values.stride(-1) != 1 or not table.is_contiguous():
+        raise ValueError("store_owned_rows needs unit column strides and a contiguous table")
+    if n:
+        _store_owned_rows_kernel[(n,)](table, values, kept, slots, safe, D, values.stride(0),
+                                       BLOCK_D=triton.next_power_of_2(D))
 
 
 # --------------------------------------------------------------------------
