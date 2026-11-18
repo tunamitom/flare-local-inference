@@ -26,8 +26,8 @@ set -euo pipefail
 NAME="${NAME:-h4}"
 PORT="${LLM_PORT:-8001}"
 TP=8
-IMAGE="${IMAGE:-local/flare:rt-h4-cp8-dg88v}"
-IMAGE_SHA="${IMAGE_SHA:-sha256:7cc894c5d8ff5c9a092c5231110cd13a3fd0df75801162e0bf7f8013c2b558b7}"
+IMAGE="${IMAGE:-local/flare:rt-h4-cp8-dg88x}"
+IMAGE_SHA="${IMAGE_SHA:-sha256:e8014d68daa6b189b712162f226f39ac10114c953927841dd948c7848908a66c}"
 PKG_LINK="${PKG_DIR:-/opt/models/Hy4-nvfp4-w4a16-mse-gpu}"
 SERVED_NAME="${SERVED_NAME:-smart}"
 MAX_CONCURRENCY="${MAX_CONCURRENCY:-1}"

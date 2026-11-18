@@ -694,9 +694,13 @@ def run_generate_steps(ctx, cmd, *, row=0, admit_only=False, preempt=None, spec_
             decoder.draft_absorb(torch.tensor([nxt], dtype=torch.int64, device=dev), p_post,
                                  request_rows=[row], logits="none", next_embeds=embeds)
 
+        t_prefill = time.monotonic()
         steps, index = [], 0
         while index < len(plan):
-            pair = (getattr(ctx, "overlap", False) and not params.get("nll") and row == 0
+            # c8 regress-fix: overlapped chunk pairs on any row (the batched loop puts
+            # long prompts on rows 1+; row 0 only lost them — prefill -30%)
+            pair = (getattr(ctx, "overlap", False) and not params.get("nll")
+                    and (row == 0 or getattr(ctx, "overlap_any_row", True))
                     and index + 1 < len(plan)
                     and plan[index] == (full, full) and plan[index + 1] == (full, full))
             steps.append((2 * full, 2 * full, True) if pair else (*plan[index], False))
@@ -741,15 +745,16 @@ def run_generate_steps(ctx, cmd, *, row=0, admit_only=False, preempt=None, spec_
                                    rank=ctx.rank, device_dump=False):
                         logits = decoder.forward_overlapped(
                             t, half_shape=ctx.shapes[full],
-                            logits_rows=real - 1 if last else "none")
+                            logits_rows=real - 1 if last else "none", row=row)
                         torch.cuda.synchronize(dev)
                 elif use_spec:
                     logits, post = decoder.forward_overlapped(
                         t, half_shape=ctx.shapes[full], logits_rows=real - 1 if last else "none",
-                        return_hidden=True)
+                        return_hidden=True, row=row)
                 else:
                     logits = decoder.forward_overlapped(
-                        t, half_shape=ctx.shapes[full], logits_rows=real - 1 if last else "none")
+                        t, half_shape=ctx.shapes[full], logits_rows=real - 1 if last else "none",
+                        row=row)
             elif use_spec:
                 logits, post, _ = decoder.forward(t, request_rows=[row], call_shape=ctx.shapes[w],
                                                   logits_rows=real - 1 if last else "none",
@@ -782,6 +787,14 @@ def run_generate_steps(ctx, cmd, *, row=0, admit_only=False, preempt=None, spec_
             last_emb = pending[3]
             absorb_pending(last_emb[-1:] if last_emb is not None else None, final=True)
         decoder.embed_sink = None
+        if n >= 4096:
+            # the engine's prefill wall (first chunk to the last chunk's enqueue + absorb;
+            # paused intervals included when chunked) — TTFT minus HTTP/template/queue
+            torch.cuda.synchronize(dev)
+            dt = time.monotonic() - t_prefill
+            trace(ctx.rank, f"prefill {n} tokens on row {row}: {dt:.2f} s ({n / max(dt, 1e-9):.0f} tok/s), "
+                            f"{sum(1 for st in steps if st[2])} overlapped pairs of {len(steps)} steps"
+                            + (", chunked" if chunked else ""))
         ctx.last_nll = (nll_sum, nll_count) if params.get("nll") and ctx.rank == 0 else None
     out = []
     cancel = getattr(ctx, "cancel", None)      # rank 0: set when the client has left
@@ -2850,12 +2863,18 @@ def main():
         # serving construction re-pays (weights + plan book + context): that
         # residue is exactly free_a + cache_a. (free_post is nearly the whole
         # card — the phase-A weights left with it — and is NOT the budget.)
-        budget = free_a + cache_a - args.headroom
+        # c8 regress-fix: the captured-graph budget (KEEP graphs x ~10 MiB of graph-exec
+        # memory each, measured) comes out of the pool too — captured AFTER the pool,
+        # it used to eat the headroom the prefill's overlapped pairs need (127
+        # allocator retries per 64k prefill, prefill -30%)
+        graph_reserve = int(float(os.environ.get("HY4_GRAPH_RESERVE_MB") or 2688) * 2**20)
+        budget = free_a + cache_a - args.headroom - graph_reserve
         # cache bytes ~= rows * (capacity / world) * (78*656 + 21*256 real residency)
         per_global = args.rows * ((78 + int(MTP)) * 656 + (21 + int(MTP)) * 256) / world
         capacity = args.capacity if args.capacity > 0 else int(budget // per_global) & ~1023
         trace(rank, f"phase A: fixed(book+ctx+runtime)={fixed_bytes} B, torn-down free={free_post} B, "
-                    f"headroom={args.headroom} B -> capacity {capacity} global/row")
+                    f"headroom={args.headroom} B + graph reserve {graph_reserve} B -> capacity "
+                    f"{capacity} global/row")
         if capacity < 2 * world:
             raise RuntimeError(f"memory budget {budget} B cannot hold a usable KV cache")
 
@@ -3080,12 +3099,37 @@ def main():
                                 for _ in range(2):
                                     graphs.run_bspec("chain", rows_p, [False] * b, end=end,
                                                      call_shape=shape, step=step)
+                if 12 in BATCH_ROWS:
+                    # c8 regress-fix: a lone long request decodes in K=3 rounds of one
+                    # row; its context-parallel width buckets up to HY4_BSPEC_PREWARM
+                    # tokens are captured now (a first-use capture mid-request stalls
+                    # its stream ~1-2 s: the 128k bench cell crossed into a new bucket)
+                    upto_b = int(os.environ.get("HY4_BSPEC_PREWARM") or 262144)
+                    w, seen = graphs.index_width(past + 1), set()
+                    while w * world <= upto_b and w not in seen:
+                        seen.add(w)
+                        P = w * world - 16
+                        graphs.bspec_set(0, P=P, c=P - 1, n=0)
+                        end = P + 6
+                        for _ in range(2):
+                            graphs.run_bspec("draft", [0] * 4, [False] * 4, end=end,
+                                             call_shape=batch_shape(4), per=4)
+                            for step in (1, 2):
+                                graphs.run_bspec("chain", [0, 0], [False, True], end=end,
+                                                 call_shape=batch_shape(2), step=step)
+                            graphs.run_bspec("verify", [0] * 4, [False] * 4, end=end,
+                                             call_shape=batch_shape(4), per=4)
+                        w = graphs.index_width(w * world + 1)
+                    trace(rank, f"batch graphs: one-row K=3 rounds primed at {len(seen)} cp widths "
+                                f"up to {upto_b} tokens")
                 for r in range(args.rows):
                     graphs.bspec_set(r, P=0, c=0, n=0)
             torch.cuda.synchronize(device)
             ctx.decoder.release(list(range(args.rows)))
+            free_g, _ = torch.cuda.mem_get_info(device)
             trace(rank, f"batch graphs: buckets {sorted(BATCH_ROWS) + [1]} primed in "
-                        f"{time.monotonic() - t_cap:.1f} s")
+                        f"{time.monotonic() - t_cap:.1f} s; {len(graphs.graphs)} graphs, free "
+                        f"{free_g / 2**30:.2f} GiB (headroom {args.headroom / 2**30:.2f} GiB)")
         ctx.batch_rows = BATCH_ROWS
         ctx.cache_rows = args.rows
         if getattr(ctx, "dyn_extents", False):

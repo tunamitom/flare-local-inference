@@ -1329,7 +1329,8 @@ class Hy4Decoder:
         self._mlp_graphs = graphs
         return len(graphs)
 
-    def forward_overlapped(self, token_ids, *, half_shape, logits_rows="none", return_hidden=False):
+    def forward_overlapped(self, token_ids, *, half_shape, logits_rows="none", return_hidden=False,
+                           row=0):
         """consult18 stage D: one prefill chunk as two halves on two lanes.
 
         Half A (the first `half_shape.tokens` positions) runs on lane 0's
@@ -1356,7 +1357,8 @@ class Hy4Decoder:
                 "logits_rows must be 'all', 'last', 'none' or a token index inside the forward")
         self.trace.append(("call_shape_overlapped", half_shape))
         TIMER.forward_begin(half_shape.name)
-        rows = self._rows(token_ids, None)
+        # c8 regress-fix: any cache row (the batched loop's long prompts land on rows 1+)
+        rows = self._rows(token_ids, [int(row)])
         positions = self._positions(token_ids.shape, rows)
         token_rows = self._token_rows(token_ids.shape, rows)
         halves = ((token_ids[:, :half], positions[:half], token_rows[:half]),
@@ -1381,7 +1383,7 @@ class Hy4Decoder:
         # other lane's ring needed; the ranks deadlocked). Everything the
         # bookkeeping would read from the device is known on the host here:
         # one request row, a contiguous position range per half.
-        row = 0
+        row = int(row)
         start = int(self._row_lengths.get(row, 0))
         world = int(getattr(self.collectives, "world_size", 1))
         rank = int(getattr(self.collectives, "rank", 0))
