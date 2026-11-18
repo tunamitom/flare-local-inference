@@ -1312,6 +1312,8 @@ class BatchLoop:
         self.bs_rows = {}           # every rank: row -> {"warm": a plain warm-up round first}
         self.bs_la = True           # c8 L5b: enqueue bspec round k+1 before consuming round k
         self.bspec_k2 = True        # c8 L13: two chained drafts per row at <= 4 rows
+        self.bspec_k3 = True        # c8 L13b: three chained drafts per row at <= 3 rows
+        self.solo_bspec = False     # c8 L13b: a lone request on the batched rounds (A/B: no gain at c1)
         self._bs_inv = None         # the staged per-slot 1/T (re-staged when it changes)
         self._bs_rows_t = (None, None)
         self.bspec_rounds = self.bspec_accepted = self.bspec_slots = 0
@@ -1378,7 +1380,7 @@ class BatchLoop:
                 item = self._pop(block=True)
             if item.get("op") == "exec":
                 return {"kind": "exec", "path": item["path"], "release": release}, [item]
-            if ctx.q.empty() or self.max_batch <= 1:
+            if (ctx.q.empty() or self.max_batch <= 1) and not self._solo_batched(item):
                 self._start(item, 0)
                 return ({"kind": "solo", "release": release, "tokens": item["tokens"],
                          "max_new": item["max_new"], "params": item["params"]}, [item])
@@ -1407,6 +1409,15 @@ class BatchLoop:
                 "carry_params": [(float(req.params.get("temperature", 0.9) or 0.0),
                                   _unfiltered(req.params)) for _, req in carry]}
         return plan, admits
+
+    def _solo_batched(self, item):
+        """c8 L13b: a lone request runs the batched speculative rounds (K = 3 at one
+        row, device round state, lookahead) when they can serve it: unfiltered
+        sampling (or greedy), not an NLL probe, batched speculation on."""
+        p = item.get("params") or {}
+        return (self.solo_bspec and self.bspec and self.max_batch > 1 and not p.get("nll")
+                and _unfiltered(p) and getattr(self.ctx, "spec", None) is not None
+                and 12 in set(getattr(self.ctx, "batch_rows", ()) or ()))
 
     def _preempt(self):
         return not self.ctx.q.empty()
@@ -1612,9 +1623,14 @@ class BatchLoop:
         return size is not None and size in set(getattr(ctx, "batch_rows", ()) or ())
 
     def _bs_k(self, B):
-        """Drafts per row in a round: 2 at <= 4 rows (a 12-entry verify), else 1."""
+        """Drafts per row in a round: 3 at <= 3 rows, 2 at 4 (verify <= 12 entries),
+        else 1."""
         rows = set(getattr(self.ctx, "batch_rows", ()) or ())
-        return 2 if self.bspec_k2 and B <= 4 and 12 in rows else 1
+        if 12 not in rows:
+            return 1
+        if self.bspec_k3 and B <= 3:
+            return 3
+        return 2 if self.bspec_k2 and B <= 4 else 1
 
     def _bspec_batch(self, plan, items):
         """Every rank: one batched speculative round. Steady state (c8 L5b, `bs_la`):
@@ -1697,13 +1713,13 @@ class BatchLoop:
         if not rows:
             return
         K = self._bs_k(len(rows))
-        if K == 1:
-            # c8 L13: a row whose last round accepted 2 drafts holds 3 pending entries;
-            # the 2-wide absorb takes its last 2
-            for r in rows:
-                if self.bs_rows.get(r, {}).get("n", 0) >= 2:
-                    g.bspec_shift(r)
-                    self.bs_rows[r]["n"] = 1
+        # c8 L13: a row whose last round accepted n > K drafts holds n + 1 pending
+        # entries; the (K+1)-wide absorb takes its last K + 1
+        for r in rows:
+            n_last = self.bs_rows.get(r, {}).get("n", 0)
+            if n_last > K:
+                g.bspec_shift(r, n_last - K)
+                self.bs_rows[r]["n"] = K
         end = self._bs_end(rows, inflight=0)
         rnd = self._bs_enqueue(rows, temps, end, K)
         if self.bs_la:
@@ -2691,23 +2707,26 @@ def main():
                             graphs.run_bspec("draft", rows_p, [False] * b, end=end, call_shape=shape)
                             graphs.run_bspec("verify", rows_p, [False] * b, end=end, call_shape=shape)
                     if 12 in BATCH_ROWS:
-                        # c8 L13: two chained drafts per row at <= 4 rows — absorb / verify
-                        # of 3 entries per row (4 / 8 / 12) and the chain step (2 / 4)
-                        end = base + 2 * args.rows + 5
-                        for b in (12, 8, 4):
-                            shape = batch_shape(b)
-                            rows_p = [(i // 3) % args.rows for i in range(b)]
-                            for _ in range(2):
-                                graphs.run_bspec("draft", rows_p, [False] * b, end=end, call_shape=shape,
-                                                 per=3)
-                                graphs.run_bspec("verify", rows_p, [False] * b, end=end, call_shape=shape,
-                                                 per=3)
-                        for b in (4, 2):
-                            shape = batch_shape(b)
-                            rows_p = [i % args.rows for i in range(b)]
-                            for _ in range(2):
-                                graphs.run_bspec("chain", rows_p, [False] * b, end=end, call_shape=shape,
-                                                 step=1)
+                        # c8 L13: chains of K = 2 (<= 4 rows) and 3 (<= 3 rows) drafts per
+                        # row — absorb / verify of K+1 entries per row (4 / 8 / 12) and
+                        # the chain steps (2 / 4 entries)
+                        end = base + 2 * args.rows + 6
+                        for per in (3, 4):
+                            for b in (12, 8, 4):
+                                shape = batch_shape(b)
+                                rows_p = [(i // per) % args.rows for i in range(b)]
+                                for _ in range(2):
+                                    graphs.run_bspec("draft", rows_p, [False] * b, end=end,
+                                                     call_shape=shape, per=per)
+                                    graphs.run_bspec("verify", rows_p, [False] * b, end=end,
+                                                     call_shape=shape, per=per)
+                        for step in (1, 2):
+                            for b in (4, 2):
+                                shape = batch_shape(b)
+                                rows_p = [i % args.rows for i in range(b)]
+                                for _ in range(2):
+                                    graphs.run_bspec("chain", rows_p, [False] * b, end=end,
+                                                     call_shape=shape, step=step)
                 for r in range(args.rows):
                     graphs.bspec_set(r, P=0, c=0, n=0)
             torch.cuda.synchronize(device)

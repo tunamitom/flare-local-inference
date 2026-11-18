@@ -740,7 +740,7 @@ class DecodeGraphs:
     # the device round state (c8 L5b): P, c, n, and the pending entries. Slots
     # (one per request row) index the per-round buffers; pad entries go one past
     # the row's writes and scatter into a dummy state row.
-    BSPEC_KMAX = 2
+    BSPEC_KMAX = 3
 
     def bspec_state(self):
         st = getattr(self, "_bspec", None)
@@ -991,15 +991,17 @@ class DecodeGraphs:
         st["c"][row] = int(c)
         st["n"][row] = int(n)
 
-    def bspec_shift(self, row):
-        """A row whose last round accepted 2 drafts joins a K = 1 round (absorb width
-        2): drop its oldest pending entry (that draft position keeps the chain's
-        MTP-hidden record; exactness does not depend on the draft)."""
+    def bspec_shift(self, row, drop):
+        """A row whose last round accepted n drafts joins a round of K < n (absorb
+        width K + 1): drop its `drop` = n - K oldest pending entries (those draft
+        positions keep the chain's MTP-hidden records; exactness does not depend on
+        the draft)."""
         st = self.bspec_state()
-        st["pend_tok"][row, 0:2].copy_(st["pend_tok"][row, 1:3].clone())
-        st["pend_hid"][row, 0:2].copy_(st["pend_hid"][row, 1:3].clone())
-        st["c"][row] += 1
-        st["n"][row] = 1
+        width = int(st["pend_tok"].shape[1])
+        st["pend_tok"][row, 0:width - drop].copy_(st["pend_tok"][row, drop:width].clone())
+        st["pend_hid"][row, 0:width - drop].copy_(st["pend_hid"][row, drop:width].clone())
+        st["c"][row] += drop
+        st["n"][row] -= drop
 
     # -- capture ----------------------------------------------------------
     def _comm_capture_contexts(self, stack):
