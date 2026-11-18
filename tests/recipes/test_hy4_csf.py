@@ -235,3 +235,63 @@ def test_load_experts_passes_scale_compression_and_scratch(monkeypatch):
     assert seen["bf16"]["scale_scratch"] is not None
     assert seen["bf16"]["swiglu_limit"] == loading.SWIGLU_LIMIT
     assert seen["bf16"]["swiglu_clamp_after_silu"] is False
+
+
+def test_load_resident_experts_forwards_csf_on_the_serve_path(monkeypatch):
+    """The h4 CUDA serve call (`state._moe_state` -> `load_resident_experts`).
+
+    The CHECKPOINT form (meta fused views, the rank's real intermediate range)
+    must reach `load_fp4_experts` with the loader's CSF setting and the shared
+    expansion scratch — this is the wiring the h4 serve path runs per routed
+    block, and the one the CSF validation boot then exercises on GPU.
+    """
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).parent))
+    import test_hy4_expert_loading as loading
+
+    count, inter, hidden = loading.COUNT, loading.INTER, loading.HIDDEN
+
+    def meta(shape, dtype):
+        return torch.empty(shape, dtype=dtype, device="meta")
+
+    resident = {
+        f"{loading.PREFIX}.gate_up_proj.weight":
+            meta((count, 2 * inter, hidden // 2), torch.uint8),
+        f"{loading.PREFIX}.gate_up_proj.weight_scale":
+            meta((count, 2 * inter, hidden // 16), torch.float8_e4m3fn),
+        f"{loading.PREFIX}.gate_up_proj.weight_scale_2":
+            torch.rand(count, generator=torch.Generator().manual_seed(1)) * 0.02 + 0.01,
+        f"{loading.PREFIX}.down_proj.weight":
+            meta((count, hidden, inter // 2), torch.uint8),
+        f"{loading.PREFIX}.down_proj.weight_scale":
+            meta((count, hidden, inter // 16), torch.float8_e4m3fn),
+        f"{loading.PREFIX}.down_proj.weight_scale_2":
+            torch.rand(count, generator=torch.Generator().manual_seed(2)) * 0.02 + 0.01,
+    }
+    for compressed in ("csf", None):
+        loader = loading.make_loader({}, expert_scale_compression=compressed)
+        for name, tensor in resident.items():
+            loader._sources[name] = tensor
+        before = set(loader._sources)
+        seen = {}
+        monkeypatch.setattr(loader, "load_fp4_experts",
+                            lambda prefixes, **kwargs: seen.update(kwargs) or ("fp4",))
+        assert loader.load_resident_experts(
+            loading.PREFIX, resident, intermediate_range=(0, inter),
+            swiglu_limit=loading.SWIGLU_LIMIT) == ("fp4",)
+        assert seen["scale_compression"] == compressed
+        assert seen["intermediate_size"] == inter
+        assert tuple(seen["intermediate_range"]) == (0, inter)
+        scratch = seen["scale_scratch"]
+        if compressed is None:
+            assert scratch is None
+        else:
+            assert scratch is not None and len(scratch) == 2
+            assert scratch[0].shape == (count, 2 * inter, hidden // 16)
+            assert scratch[1].shape == (count, hidden, inter // 16)
+            # the views share the loader's two expansion buffers (the scratch arena)
+            for view, buffer in zip(scratch, loader.scale_scratch, strict=True):
+                assert (view.untyped_storage().data_ptr()
+                        == buffer.untyped_storage().data_ptr())
+        assert set(loader._sources) == before   # the per-expert stacks are cleaned up

@@ -168,6 +168,12 @@ DEVICE_ARGS=()
 IFS=',' read -ra _uuids <<<"$GPU_LIST"
 for u in "${_uuids[@]}"; do DEVICE_ARGS+=(--device "nvidia.com/gpu=$u"); done
 
+# ── Optional teacher-spool mounts (served-KL gates; set SPOOL_DIR /
+# SPOOL_CHAT_DIR to host dirs of <lang>_<k>.logp.f32.npy) ─────────────────────
+SPOOL_ARGS=()
+[ -n "${SPOOL_DIR:-}" ] && SPOOL_ARGS+=(-v "$SPOOL_DIR":/spool:ro)
+[ -n "${SPOOL_CHAT_DIR:-}" ] && SPOOL_ARGS+=(-v "$SPOOL_CHAT_DIR":/spool_chat:ro)
+
 docker run -d --name "$NAME" --network host --init --cap-add SYS_PTRACE \
   --user "$(id -u):$(id -g)" \
   --cpuset-cpus "$CPUSET" \
@@ -265,6 +271,7 @@ docker run -d --name "$NAME" --network host --init --cap-add SYS_PTRACE \
   -e B12X_PCIE_DMA_FP8="${B12X_PCIE_DMA_FP8:-}" \
   -e B12X_PCIE_DMA_SINGLE_CTA_WAITS="${B12X_PCIE_DMA_SINGLE_CTA_WAITS:-1}" \
   -e HY4_OVERLAP_ADMISSION_UNSAFE="${HY4_OVERLAP_ADMISSION_UNSAFE:-}" \
+  "${SPOOL_ARGS[@]}" \
   -v "$PKG_DIR":/model:ro \
   -v "$STATE_HOST":/state \
   -v "$PREFIX_CACHE_HOST":/prefix-cache \
@@ -284,6 +291,7 @@ docker run -d --name "$NAME" --network host --init --cap-add SYS_PTRACE \
       --selection-wire dcp \
       --partial-wire expanded \
       --overlap 1 --profile-phases 0 --chunk "${H4_CHUNK:-2048}" --dma-replay "${H4_DMA_REPLAY:-1}" \
+      --expert-scale-compression "${HY4_CSF:-none}" \
       --profile-steps 64
 # Keep the container log (lost with the container otherwise). Background only
 # the follower: backgrounding the whole list forks a subshell that keeps the

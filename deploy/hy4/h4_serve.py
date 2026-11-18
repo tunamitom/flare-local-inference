@@ -2706,6 +2706,12 @@ def main():
                     help="abort the boot when the free bytes after the phase-B warm-up fall "
                          "short of --headroom by more than this (default 1 GiB)")
     ap.add_argument("--report", default="/state/boot-report.json")
+    ap.add_argument("--expert-scale-compression", choices=("none", "csf"), default="none",
+                    help="P3: store the routed experts' block scales in the lossless csf "
+                         "encoding at load (csf_32x2_v1). Resident scale bytes shrink on "
+                         "every rank and the freed memory joins the KV pool; the served "
+                         "outputs stay bit-identical (the decode reproduces the exact scale "
+                         "bytes). 'none' keeps the raw block scales resident.")
     ap.add_argument("--selection-exchange", choices=("scores-only", "candidates"),
                     default="scores-only",
                     help="consult16 lever 2: scores-only moves one [rows, offer] score tensor "
@@ -2845,7 +2851,10 @@ def main():
                             if x.strip() and int(x) not in BATCH_ROWS)
         DECODE_ROWS = tuple(sorted(set(SPEC_ROWS) | set(BATCH_ROWS)))
         settings = PreparationConfig(devices=tuple(range(world)), mtp=MTP,
-                                     prefill_chunk_size=CHUNK)
+                                     prefill_chunk_size=CHUNK,
+                                     expert_scale_compression=(
+                                         "csf" if args.expert_scale_compression == "csf" else None))
+        trace(rank, f"expert scale compression: {args.expert_scale_compression}")
 
         def construct_and_wire(cache_rows, cache_capacity):
             """One construction + operator wiring + the boot's full plan book."""
@@ -3139,6 +3148,7 @@ def main():
                 "selection_wire": args.selection_wire,
                 "partial_wire": args.partial_wire,
                 "prefill_chunk": CHUNK, "pad_remainder": ctx.pad,
+                "expert_scale_compression": args.expert_scale_compression,
                 "forward_cost_rows": ctx.forward_cost_rows,
                 "engine_path": ("ignition/recipes/hy4 construct_rank + PcieDcpTransport "
                                 "(w14 bring-up path); recipe.prepare's native export TODO remains"),
