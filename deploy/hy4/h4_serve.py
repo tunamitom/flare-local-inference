@@ -523,6 +523,22 @@ HEARTBEAT_S = 15.0
 POLL_S = 1.0
 # A started generation that produces nothing for this long is reported failed.
 SERVE_LOOP_TIMEOUT_S = 7200
+# The serve loop's liveness (2026-11-19 idle-wedge fix). Every iteration rank 0
+# broadcasts a plan and the followers wait for it in gloo, whose deadline is
+# GLOO_TIMEOUT_MIN. Rank 0 used to block in queue.get() while idle, so a quiet
+# serve died after 30 minutes. Now rank 0 never blocks in planning: with nothing
+# queued it broadcasts an "idle" plan at least every IDLE_TICK_S. Planning or
+# broadcasting (rank 0) or awaiting the plan (followers) for longer than
+# LIVENESS_S is a wedge: a watchdog thread names it in the log (rank 0 also dumps
+# its thread stacks) and /health turns 503 "stalled" while rank 0 is stuck.
+GLOO_TIMEOUT_MIN = 30
+IDLE_TICK_S = float(os.environ.get("H4_IDLE_TICK_S") or 5.0)
+LIVENESS_S = float(os.environ.get("H4_LIVENESS_S") or 120.0)
+# A request handler's socket: blocking socket operations give up after
+# CLIENT_SOCKET_TIMEOUT_S, and TCP keepalive probes find a peer that vanished
+# without closing (no FIN) in about 30 + 10 * 6 = 90 s.
+CLIENT_SOCKET_TIMEOUT_S = 300.0
+TCP_KEEPALIVE = (("TCP_KEEPIDLE", 30), ("TCP_KEEPINTVL", 10), ("TCP_KEEPCNT", 6))
 
 
 class OutputSplitter:
@@ -958,14 +974,27 @@ def serve_http(ctx):
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+        timeout = CLIENT_SOCKET_TIMEOUT_S        # StreamRequestHandler: socket deadline
 
         def log_message(self, *args):
             pass
 
+        def setup(self):
+            super().setup()
+            # a peer that vanished without closing is found by keepalive probes;
+            # _client_gone() then sees the socket error and cancels its request
+            try:
+                self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                for name, value in TCP_KEEPALIVE:
+                    if hasattr(socket, name):
+                        self.connection.setsockopt(socket.IPPROTO_TCP, getattr(socket, name), value)
+            except OSError:
+                pass
+
         def handle(self):
             try:
                 super().handle()
-            except (ConnectionResetError, BrokenPipeError):
+            except (ConnectionResetError, BrokenPipeError, TimeoutError):
                 pass                     # the client dropped its connection
 
         def _send(self, status, payload, content_type="application/json"):
@@ -1116,8 +1145,14 @@ def serve_http(ctx):
 
         def do_GET(self):
             if self.path == "/health":
+                live = getattr(ctx, "liveness", None)
+                stall = live.stalled() if live is not None else None
                 if ctx.failure:
                     self._send(503, {"status": "failed", "detail": str(ctx.failure)[:200]})
+                elif stall is not None:
+                    self._send(503, {"status": "stalled", "detail": live.describe()})
+                elif live is not None:
+                    self._send(200, {"status": "ok", "plans": live.plans})   # ticks while idle
                 else:
                     self._send(200, {"status": "ok"})
             elif self.path == "/v1/models":
@@ -1300,6 +1335,86 @@ def _stops(sampler, ids, params_list, produced, max_new):
     return out
 
 
+class PlanWaitTimeout(RuntimeError):
+    """The per-iteration round-plan broadcast failed or ran out its gloo deadline;
+    the message names the rank, what it awaited, since when and the last plan."""
+
+
+def _wall(ts):
+    return time.strftime("%H:%M:%S", time.localtime(ts)) if ts else "-"
+
+
+class PlanLiveness:
+    """Every rank: times the per-iteration plan broadcast. Rank 0 times its own
+    planning and the broadcast send, a follower its wait for rank 0's plan. A
+    watchdog thread logs a named LIVENESS line once a phase runs past `limit`
+    seconds and again every `limit` seconds while it lasts; rank 0 then also dumps
+    every thread's stack (so the log names where it is stuck)."""
+
+    def __init__(self, rank, limit=None, *, watch=True):
+        self.rank = rank
+        self.limit = LIVENESS_S if limit is None else float(limit)
+        self.lock = threading.Lock()
+        self.phase = None          # what this rank is doing around the broadcast, or None
+        self.since = None          # time.monotonic() when the phase began
+        self.since_wall = None
+        self.plans = 0             # plans broadcast / received so far
+        self.last_kind = None
+        self.last_wall = None
+        self.warned = 0.0
+        if watch:
+            threading.Thread(target=self._watch, name="h4-liveness", daemon=True).start()
+
+    def enter(self, phase):
+        with self.lock:
+            self.phase, self.since, self.since_wall = phase, time.monotonic(), time.time()
+            self.warned = 0.0
+
+    def leave(self, kind):
+        with self.lock:
+            self.phase = self.since = self.since_wall = None
+            self.plans += 1
+            self.last_kind, self.last_wall = kind, time.time()
+
+    def stalled(self):
+        """(phase, seconds) when the current phase has run past the limit, else None."""
+        with self.lock:
+            if self.phase is None:
+                return None
+            age = time.monotonic() - self.since
+            return (self.phase, age) if age > self.limit else None
+
+    def describe(self):
+        with self.lock:
+            phase, since, since_wall = self.phase, self.since, self.since_wall
+            plans, kind, last = self.plans, self.last_kind, self.last_wall
+        age = time.monotonic() - since if since is not None else 0.0
+        prior = f"last plan '{kind}' at {_wall(last)}" if kind else "no plan yet"
+        return (f"rank {self.rank}: {phase or 'between plans'} for {age:.0f} s "
+                f"(since {_wall(since_wall)}; {plans} plans so far, {prior})")
+
+    def _watch(self):
+        import faulthandler
+
+        while True:
+            time.sleep(max(1.0, min(30.0, self.limit / 4)))
+            with self.lock:
+                if self.phase is None:
+                    continue
+                age = time.monotonic() - self.since
+                due = age > self.limit and age - self.warned >= self.limit
+                if due:
+                    self.warned = age
+            if not due:
+                continue
+            if self.rank == 0:
+                trace(0, f"LIVENESS: {self.describe()}; rank 0's thread stacks follow")
+                faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+            else:
+                trace(self.rank, f"LIVENESS: {self.describe()}; rank 0 has not broadcast "
+                                 "(see its LIVENESS stack dump)")
+
+
 class _Req:
     """Rank 0's record of one request in the batched loop."""
 
@@ -1356,13 +1471,16 @@ class BatchLoop:
         self._bs_inv = None         # the staged per-slot 1/T (re-staged when it changes)
         self._bs_rows_t = (None, None)
         self.bspec_rounds = self.bspec_accepted = self.bspec_slots = 0
+        self.liveness = ctx.liveness = PlanLiveness(self.rank)
 
     # ---- rank 0 --------------------------------------------------------
-    def _pop(self, block):
+    def _pop(self, block, timeout=None):
+        """The next live queued item; None when none arrives (non-blocking, or
+        nothing within `timeout` seconds). Cancelled items are dropped here."""
         ctx = self.ctx
         while True:
             try:
-                item = ctx.q.get() if block else ctx.q.get_nowait()
+                item = ctx.q.get(timeout=timeout) if block else ctx.q.get_nowait()
             except queue.Empty:
                 return None
             with ctx.lock:
@@ -1450,9 +1568,14 @@ class BatchLoop:
             elif self.deferred:
                 item = self.deferred.pop(0)
             else:
-                item = self._pop(block=True)
+                # never block here: the followers wait for this plan in gloo (30 min
+                # deadline), so a quiet serve broadcasts an idle tick instead
+                item = self._pop(block=True, timeout=IDLE_TICK_S)
+                if item is None:
+                    return {"kind": "idle", "release": release, "abort": abort}, []
             if item.get("op") == "exec":
-                return {"kind": "exec", "path": item["path"], "release": release}, [item]
+                return {"kind": "exec", "path": item["path"], "release": release,
+                        "abort": abort}, [item]
             if ((ctx.q.empty() or self.max_batch <= 1) and not self._solo_batched(item)
                     and not self._is_long(item)):
                 extents = None
@@ -1462,7 +1585,7 @@ class BatchLoop:
                 self._start(item, 0)
                 return ({"kind": "solo", "release": release, "tokens": item["tokens"],
                          "max_new": item["max_new"], "params": item["params"],
-                         "extents": extents}, [item])
+                         "extents": extents, "abort": abort}, [item])
             first = item
         free = [r for r in range(self.rows) if r not in self.active and r not in self.prefilling]
         # c8 L6: the widest row (0) is kept for the prompts that need it; a long
@@ -1688,6 +1811,17 @@ class BatchLoop:
         return (self.chunked_admit and self.max_batch > 1 and not p.get("nll")
                 and len(item.get("tokens") or ()) >= self.prefill_long)
 
+    def _drop_aborted(self, rows):
+        """Every rank (c8 L17): drop long admissions whose client left. Every plan
+        kind carries the plan's aborts, so they reach the followers even when the
+        loop goes idle or runs a solo / exec plan next."""
+        for row in rows:
+            st = self.prefilling.pop(row, None)
+            if st is not None:
+                st["gen"].close()
+                self.ctx.decoder.release([row])
+                self.bs_rows.pop(row, None)
+
     def _prefill_tick(self, plan, items):
         """Every rank (c8 L17): start the plan's long admissions as paused prefills,
         drop aborted ones, and (when the plan says so) run one chunk of the first
@@ -1773,11 +1907,24 @@ class BatchLoop:
 
     # ---- every rank ----------------------------------------------------
     def iterate(self):
-        ctx, rank = self.ctx, self.rank
-        plan, items = self._plan() if rank == 0 else (None, None)
+        ctx, rank, live = self.ctx, self.rank, self.liveness
+        if rank == 0:
+            live.enter("planning the next round")
+            plan, items = self._plan()
+            live.enter("broadcasting the round plan")
+        else:
+            plan, items = None, None
+            live.enter("awaiting rank 0's round plan")
         obj = [plan]
-        ctx.dist.broadcast_object_list(obj, src=0)
+        try:
+            ctx.dist.broadcast_object_list(obj, src=0)
+        except RuntimeError as exc:
+            message = (f"{live.describe()}: the round-plan broadcast failed "
+                       f"(gloo deadline {GLOO_TIMEOUT_MIN} min): {exc}")
+            trace(rank, f"FATAL: {message}")
+            raise PlanWaitTimeout(message) from exc
         plan = obj[0]
+        live.leave(None if plan is None else plan.get("kind"))
         if plan is None:
             return False
         if plan["release"]:
@@ -1786,8 +1933,11 @@ class BatchLoop:
                 self.bs_rows.pop(row, None)
         if plan.get("extents"):
             self._apply_extents(plan["extents"])
+        self._drop_aborted(plan.get("abort", ()))
         try:
-            if plan["kind"] == "exec":
+            if plan["kind"] == "idle":
+                pass                             # rank 0 had nothing queued: stay in step
+            elif plan["kind"] == "exec":
                 self._exec(plan, items)
             elif plan["kind"] == "solo":
                 self._solo(plan, items)
@@ -2581,7 +2731,7 @@ def main():
     torch.cuda.set_device(device)
     torch.set_num_threads(1)
     trace(rank, f"init_process_group gloo (world {world})")
-    dist.init_process_group("gloo", timeout=timedelta(minutes=30))
+    dist.init_process_group("gloo", timeout=timedelta(minutes=GLOO_TIMEOUT_MIN))
 
     from ignition.recipes.hy4.bootstrap import (PreparationConfig, capture_kernel_graphs,
                                                 construct_rank)
