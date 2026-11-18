@@ -55,6 +55,7 @@ class DecodeGraphs:
     """Captured one-row decode steps, one per (row, width bucket, logits form)."""
 
     GRANULE = 1024     # owned keys per width bucket
+    GEOM_FROM = 8192   # c8 L18: geometric width buckets past this many owned keys
     # Captured graphs are NEVER destroyed: every boot that destroyed one (the
     # phase-A teardown, dg3; LRU eviction, dg11) then segfaulted in
     # cuGraphLaunch replaying another graph of the shared pool; boots that
@@ -95,6 +96,13 @@ class DecodeGraphs:
         rank 0's owned keys (the widest rank) rounded up to the granule."""
         owned = (int(end) + self.world - 1) // self.world
         width = -(-owned // self.granule) * self.granule
+        if width > self.GEOM_FROM:
+            # c8 L18: past GEOM_FROM owned keys the buckets grow geometrically (four
+            # per octave: <= 25% indexer over-scan) — a long context crosses ~24
+            # buckets up to 1M instead of 128, within the captured-graph budget
+            octave = 1 << (width.bit_length() - 1)
+            step = octave // 4
+            width = -(-width // step) * step
         return min(width, self.local_capacity)
 
     def accepts(self, token_ids, *, row, start, call_shape, state, return_hidden, logits_rows):

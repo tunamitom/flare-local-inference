@@ -2836,7 +2836,11 @@ def main():
                 ctx.spec = SpeculativeGreedy(ctx.decoder, k=spec_k, decode_rows=bool(SPEC_ROWS))
                 if upto > 0:
                     t_cap = time.monotonic()
-                    captured = ctx.spec.prewarm(max_context=upto)
+                    # c8 L18: the captured-graph budget — the solo loop's unfiltered and
+                    # greedy graphs up to HY4_SPEC_PREWARM tokens at boot; filtered
+                    # requests and longer contexts capture on first use
+                    spec_upto = int(os.environ.get("HY4_SPEC_PREWARM") or 16384)
+                    captured = ctx.spec.prewarm(max_context=min(upto, spec_upto), filtered=False)
                     replayed = ctx.decoder.decode_graphs.replay_all()
                     ctx.decoder.release([0])
                     trace(rank, f"spec graphs: k={spec_k} decode_rows={bool(SPEC_ROWS)}, "

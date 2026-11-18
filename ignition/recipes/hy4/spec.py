@@ -229,7 +229,7 @@ class SpeculativeGreedy:
             pend_tokens, pend_hidden = drafts[:n] + [bonus], new_hidden
         return None, (P, bonus)
 
-    def prewarm(self, *, max_context, sample=True):
+    def prewarm(self, *, max_context, sample=True, filtered=True):
         """Capture every spec graph at every indexer width bucket from top-k up to
         `max_context` at boot (collective: every rank runs the same forwards).
         Writes target and draft KV of row `row` at the buckets' first positions;
@@ -243,7 +243,8 @@ class SpeculativeGreedy:
             starts.append(g.topk + 2)
         start = max(g.topk, g.short_cap()) + k + 2
         for short in starts:
-            modes = ((False, False), (True, False), (True, True)) if sample else ((False, False),)
+            modes = (((False, False), (True, False)) + (((True, True),) if filtered else ())
+                     if sample else ((False, False),))
             for mode, filt in modes:
                 for w in (x for x in ABSORB_WIDTHS if x <= k + 1):
                     toks, hid = g.spec_inputs("draft", w)
@@ -262,7 +263,8 @@ class SpeculativeGreedy:
         while start + k + 1 < min(int(max_context), g.capacity):
             if not self.eligible(start, start - k - 1):
                 break
-            modes = ((False, False), (True, False), (True, True)) if sample else ((False, False),)
+            modes = (((False, False), (True, False)) + (((True, True),) if filtered else ())
+                     if sample else ((False, False),))
             for mode, filt in modes:
                 for w in (x for x in ABSORB_WIDTHS if x <= k + 1):
                     toks, hid = g.spec_inputs("draft", w)
