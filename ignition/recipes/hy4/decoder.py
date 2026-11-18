@@ -300,13 +300,31 @@ class Hy4Cache:
     def short_latents(self, layer):
         return self.short[layer]
 
+    def _short_slots(self, tokens, positions, fill):
+        """Each token's short-table slot (row * S + position below S, else `fill`) —
+        the same in every layer of a forward: built once per forward (c8 L20,
+        switch short_memo; bit-identical)."""
+        S = self.short_capacity
+
+        def make():
+            pos = positions.reshape(-1).long()
+            return torch.where(pos < S, tokens.reshape(-1).long() * S + pos,
+                               torch.full_like(pos, int(fill))).contiguous()
+
+        from .runtime import SWITCHES
+
+        if positions.is_cuda and SWITCHES.get("short_memo") == "on":
+            from .attention import forward_memo
+
+            return forward_memo(positions, ("short_slots", S, id(tokens), int(fill)), make)
+        return make()
+
     def _write_short(self, layer, tokens, positions, latent):
         """Every token below the short capacity into this layer's short table."""
         from b12x.attention import sparse_mla
 
-        S = self.short_capacity
-        pos = positions.reshape(-1).long()
-        slots = torch.where(pos < S, tokens.reshape(-1).long() * S + pos, torch.full_like(pos, -1))
+        pos = positions.reshape(-1)
+        slots = self._short_slots(tokens, positions, -1)
         if self.short_writer_plan is None:
             c = self.config.text
             kv_c = torch.zeros((1, c["kv_lora_rank"] + c["qk_rope_head_dim"]),
@@ -363,11 +381,8 @@ class Hy4Cache:
         self._store(self.index[owner], tokens, positions, keys)
         if owner in self.short_index:
             table = self.short_index[owner]
-            S = self.short_capacity
-            pos = positions.reshape(-1).long()
-            slots = torch.where(pos < S, tokens.reshape(-1).long() * S + pos,
-                                torch.full_like(pos, int(table.shape[0]) - 1))
-            table.index_copy_(0, slots, keys.reshape(int(pos.shape[0]), -1).to(table.dtype))
+            slots = self._short_slots(tokens, positions, int(table.shape[0]) - 1)
+            table.index_copy_(0, slots, keys.reshape(int(slots.shape[0]), -1).to(table.dtype))
 
     def short_key_table(self, owner):
         return self.short_index[owner]
