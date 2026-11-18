@@ -99,6 +99,13 @@ class Hy4Cache:
     rank: int = 0
     records: dict = field(default_factory=dict)   # layer -> fused uint8 records
     writer_plan: object = None                    # the prepared `plan_cache_writer`
+    # Replicated short-context records: per layer, EVERY token of a row below
+    # `short_capacity` positions (not only this rank's owned ones), at slot
+    # row * short_capacity + position. In the short-context bypass a rank then
+    # attends its own heads over all keys locally (no head gather, no LSE merge).
+    short: dict = field(default_factory=dict)
+    short_capacity: int = 0
+    short_writer_plan: object = None
     page_size: int = 64                           # fused-record page geometry
     # One forward's validated (tokens, positions) -> owned rows and slots
     # (`begin_forward`): every layer writes the same rows, so the bounds check
@@ -193,6 +200,39 @@ class Hy4Cache:
                                     lambda: row_of.long() * self.local_capacity)
         return (row_of.long() * self.local_capacity)
 
+    def allocate_short(self, rows, capacity):
+        """The replicated short-context record tables (fused records only)."""
+        from .config import LATENT_RECORD_BYTES
+
+        if not self.records or capacity <= 0:
+            return 0
+        self.short_capacity = int(capacity)
+        pages = -(-(int(rows) * self.short_capacity) // self.page_size)
+        for layer in self.records:
+            self.short[layer] = torch.zeros((pages, self.page_size, LATENT_RECORD_BYTES),
+                                            dtype=torch.uint8, device=self.device)
+        return sum(t.numel() for t in self.short.values())
+
+    def short_latents(self, layer):
+        return self.short[layer]
+
+    def _write_short(self, layer, tokens, positions, latent):
+        """Every token below the short capacity into this layer's short table."""
+        from b12x.attention import sparse_mla
+
+        S = self.short_capacity
+        pos = positions.reshape(-1).long()
+        slots = torch.where(pos < S, tokens.reshape(-1).long() * S + pos, torch.full_like(pos, -1))
+        if self.short_writer_plan is None:
+            c = self.config.text
+            kv_c = torch.zeros((1, c["kv_lora_rank"] + c["qk_rope_head_dim"]),
+                               dtype=torch.bfloat16, device=self.device)
+            one = torch.zeros((1,), dtype=torch.int64, device=self.device)
+            self.short_writer_plan = sparse_mla.plan_cache_writer(kv_c, self.short[layer], one)
+        sparse_mla.concat_and_cache_glm_next_mla(
+            latent.reshape(int(pos.shape[0]), -1).to(torch.bfloat16).contiguous(), self.short[layer],
+            slots.contiguous(), plan=self.short_writer_plan)
+
     def write_latent(self, layer, tokens, positions, latent):
         """Store this layer's latent records at the tokens' OWNED physical slots.
 
@@ -201,6 +241,8 @@ class Hy4Cache:
         readers consume (`_GLM_NSA_RECORD_BYTES` per record).
         """
         if layer in self.records:
+            if layer in self.short:
+                self._write_short(layer, tokens, positions, latent)
             kept, slots = self._owned_slots(tokens, positions)
             if int(kept.numel()):
                 rows_in = latent
@@ -1611,6 +1653,33 @@ class Hy4Decoder:
             if visible_max is None:   # a direct call: read the device here
                 visible_max = int(visible.max())
             short = visible_max <= topk
+        from .runtime import SWITCHES as _SW
+
+        if short and layer.index in self.cache.short and _SW.get("short_kv") == "on":
+            # Replicated short-context KV: every rank holds every record below the
+            # short capacity, so it attends ITS OWN heads (the owner-absorbed
+            # q_local) over all visible keys — the sink folded in kernel — and
+            # expands / gates / projects them: no head gather, no LSE merge (the
+            # o_proj all-reduce after this layer sums the head shards as before).
+            S = self.cache.short_capacity
+            n = int(visible.shape[0])
+            with TIMER.phase("attn.handback"):
+                selected, counts = attn.selection.buffers(rows=n)
+                width = int(selected.shape[1])
+                cols = torch.arange(width, device=visible.device, dtype=torch.int64).reshape(1, width)
+                base = token_rows.reshape(-1, 1).long() * S
+                selected[:n].copy_(torch.where(cols < visible.reshape(-1, 1).long(), base + cols,
+                                               torch.full_like(cols, -1)).to(selected.dtype))
+                counts[:n].copy_(visible.to(counts.dtype))
+            with TIMER.phase("attn.sparse_mla"):
+                attended = attn.attend(q_local, self.cache.short_latents(layer.index), selected[:n],
+                                       counts[:n], fold_sink=True, expand=False, call_shape=call_shape)
+            with TIMER.phase("attn.fold_expand_gate"):
+                fused = attn.expand_gate_project(attended.output, y)
+                if fused is not None:
+                    return fused
+                out = attn.expand_output(attended.output).to(y.dtype)
+                return attn.gate_and_project(out, y)
         if short:
             # The short-context bypass: at context <= top-k the global top-k is
             # every visible key — no indexer, no selection exchange.

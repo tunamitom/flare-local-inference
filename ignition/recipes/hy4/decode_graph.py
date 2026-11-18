@@ -560,6 +560,19 @@ class DecodeGraphs:
             }
         return entry
 
+    def batch_sample_state(self, size):
+        """Device sampling inputs/outputs of the sampled batched step: per-row 1/T,
+        U(0,1) noise over this rank's vocabulary shard (refilled outside the
+        graph before each replay), and the sampled ids (outside the graph pool)."""
+        entry = self._batch_state(size)
+        if "noise" not in entry:
+            lo, hi = self.decoder.weights.sharding.vocabulary_range
+            entry["inv_temp"] = torch.ones((size,), dtype=torch.float32, device=self.device)
+            entry["noise"] = torch.zeros((size, hi - lo), dtype=torch.float32, device=self.device)
+            entry["out_tokens"] = torch.zeros((size,), dtype=torch.long, device=self.device)
+            entry["out_flag"] = torch.zeros((), dtype=torch.bool, device=self.device)
+        return entry
+
     def _batch_host(self, n):
         """A pinned staging vector from a ring (a pending H2D is never rewritten)."""
         if self._batch_ring_at >= len(self._batch_ring):
@@ -583,7 +596,7 @@ class DecodeGraphs:
             host[4 * size + i] = local
         entry["args"].copy_(host, non_blocking=True)
 
-    def _body_batch(self, size, call_shape, width):
+    def _body_batch(self, size, call_shape, width, sample=False):
         from .lanes import use_lane
 
         d = self.decoder
@@ -608,14 +621,24 @@ class DecodeGraphs:
             logits = d._layers_and_head(
                 tokens, rows, positions, token_rows, visible, visible_max, state=None,
                 return_hidden=False, call_shape=call_shape, logits_rows="all", gather=False)
+            if sample:
+                # exact sampling of softmax(logits / T) per row over the vocabulary
+                # shards (Gumbel-max + the offer exchange): the same ids on every
+                # rank, no logits gather. A greedy row has 1/T = 1 and noise e^-1
+                # (Gumbel 0): its argmax.
+                from .spec_sample import sample_tokens
+
+                entry = self.batch_sample_state(size)
+                scores = logits.reshape(size, -1).float() * entry["inv_temp"].reshape(-1, 1)
+                picked = sample_tokens(d.collectives, scores, entry["noise"],
+                                       vocabulary_range=d.weights.sharding.vocabulary_range)
+                entry["out_tokens"].copy_(picked.reshape(-1))
+                entry["out_flag"].copy_(self._flag(deferred))
+                return entry["out_tokens"], entry["out_flag"]
         return logits, self._flag(deferred)
 
-    def run_batch(self, tokens, rows, starts, *, call_shape, pad_rows=(), pad=None):
-        """One decode step of `len(rows)` request rows (token i at position
-        starts[i] of rows[i]): `(local-shard logits [bucket, 1, V/w], deferred
-        flag)`; logits rows past len(rows) are padding. `pad` = (row, position)
-        of every pad entry (default: the first of `pad_rows` at 0, else the
-        lowest-position row one past its token)."""
+    def _batch_prep(self, tokens, rows, starts, call_shape, pad_rows, pad, sample):
+        """The padded step's (size, tokens, rows, starts, width, graph key)."""
         count = len(rows)
         size = self.batch_bucket(count)
         if size > count:
@@ -632,21 +655,201 @@ class DecodeGraphs:
             tokens = list(tokens) + [0] * (size - count)
         end = max(int(s) for s in starts) + 1
         width = 0 if (end <= self.topk and self._short_bypass(call_shape)) else self.index_width(end)
-        key = ("batch", size, width, call_shape.name)
+        key = ("batch", size, width, call_shape.name) + (("sample",) if sample else ())
+        return size, tokens, rows, starts, width, key
+
+    def batch_cached(self, rows, starts, *, call_shape, pad=None, sample=False):
+        """Whether this step's graph is captured (no eager first call): an eager
+        collective must not be issued while an earlier replay is still pending."""
+        key = self._batch_prep([0] * len(rows), rows, starts, call_shape, (), pad, sample)[-1]
+        return key in self.graphs
+
+    def run_batch(self, tokens, rows, starts, *, call_shape, pad_rows=(), pad=None, sample=False,
+                  pre=None):
+        """One decode step of `len(rows)` request rows (token i at position
+        starts[i] of rows[i]): `(local-shard logits [bucket, 1, V/w], deferred
+        flag)`; logits rows past len(rows) are padding. `pad` = (row, position)
+        of every pad entry (default: the first of `pad_rows` at 0, else the
+        lowest-position row one past its token)."""
+        size, tokens, rows, starts, width, key = self._batch_prep(
+            tokens, rows, starts, call_shape, pad_rows, pad, sample)
         entry = self._batch_state(size)
         self._stage_batch(entry, size, tokens, rows, starts)
+        if pre is not None:
+            pre(entry["args"][0:size])     # stream-ordered fix-up of the staged token ids
         cached = self.graphs.get(key)
         if cached is None:
-            logits, flag = self._body_batch(size, call_shape, width)
+            logits, flag = self._body_batch(size, call_shape, width, sample)
             self.eager_steps += 1
             logits, flag = logits.clone(), flag.clone()
-            self._capture(key, lambda: self._body_batch(size, call_shape, width))
+            self._capture(key, lambda: self._body_batch(size, call_shape, width, sample))
             return logits, flag
         graph, logits, flag = cached
         self.graphs.move_to_end(key)
         graph.replay()
         self.replays += 1
         return logits, flag
+
+    # -- batched speculative sampling, one draft per row (k = 1) -------------
+    # A round over B request rows is two captured forwards of 2B entries (bucket
+    # 2/4/8/16): the MTP draft absorb (row b: its two pending (token, target
+    # hidden) entries at the draft cursor c and c+n, n = last round's accepted
+    # count; with n = 0 the second entry duplicates the first) whose second
+    # entry's hidden gives the draft scores q_b and the sampled draft d1_b, and
+    # the target verify (row b: the bonus at P, d1_b at P+1) with the batched
+    # acceptance (spec_sample.verify_sample_k1). Pending tokens / hidden live per
+    # CACHE row in static buffers; the host updates them after reading a round.
+    def bspec_state(self):
+        st = getattr(self, "_bspec", None)
+        if st is None:
+            d = self.decoder
+            rows = int(d.cache.rows)
+            hidden = int(d.config.hidden)
+            lo, hi = d.weights.sharding.vocabulary_range
+            S = self.BATCH_BUCKETS[-1]
+            dev = self.device
+            st = self._bspec = {
+                "pend_tok": torch.zeros((rows, 2), dtype=torch.long, device=dev),
+                "pend_hid": torch.zeros((rows, 2, hidden), dtype=d.compute_dtype, device=dev),
+                "spec_on": torch.zeros((rows,), dtype=torch.bool, device=dev),
+                "q": torch.zeros((S, hi - lo), dtype=torch.float32, device=dev),
+                "d1": torch.zeros((S,), dtype=torch.long, device=dev),
+                "inv_temp": torch.ones((S,), dtype=torch.float32, device=dev),
+                "noise_q": torch.zeros((S, hi - lo), dtype=torch.float32, device=dev),
+                "noise_v": torch.zeros((S, 2, hi - lo), dtype=torch.float32, device=dev),
+                "uniform": torch.zeros((S,), dtype=torch.float32, device=dev),
+                "out_accept": torch.zeros((S,), dtype=torch.bool, device=dev),
+                "out_tokens": torch.zeros((S, 2), dtype=torch.long, device=dev),
+                "out_hidden": torch.zeros((S, 2, hidden), dtype=d.compute_dtype, device=dev),
+                "out_dflag": torch.zeros((), dtype=torch.bool, device=dev),
+                "out_vflag": torch.zeros((), dtype=torch.bool, device=dev),
+                "args": {},
+            }
+        return st
+
+    def _bspec_args(self, size):
+        st = self.bspec_state()
+        entry = st["args"].get(size)
+        if entry is None:
+            # positions | kv rows | record slot | safe slot  (+ the static entry maps)
+            entry = st["args"][size] = {
+                "args": torch.zeros((4 * size,), dtype=torch.long, device=self.device),
+                "kept": torch.arange(size, dtype=torch.long, device=self.device),
+                "pick": torch.arange(size, dtype=torch.long, device=self.device) % 2,
+                "slot_of": torch.arange(size, dtype=torch.long, device=self.device) // 2,
+            }
+        return entry
+
+    def _stage_bspec(self, entry, size, rows, positions):
+        host = self._batch_host(4 * size)
+        for i in range(size):
+            row, pos = int(rows[i]), int(positions[i])
+            local = row * self.local_capacity + pos // self.world
+            host[i] = pos
+            host[size + i] = row
+            host[2 * size + i] = local if pos % self.world == self.rank else -1
+            host[3 * size + i] = local
+        entry["args"].copy_(host, non_blocking=True)
+
+    def _bspec_geometry(self, rows, width):
+        return {"owned_max": max(width, 1), "base": None, "bases": rows * self.local_capacity}
+
+    def _body_bdraft(self, size, call_shape, width):
+        from .lanes import use_lane
+        from .spec_sample import sample_tokens
+
+        d = self.decoder
+        st, entry = self.bspec_state(), self._bspec_args(size)
+        args = entry["args"]
+        positions, rows = args[0:size], args[size:2 * size]
+        slot, safe = args[2 * size:3 * size], args[3 * size:4 * size]
+        tokens = st["pend_tok"][rows, entry["pick"]].reshape(size, 1)
+        hidden_in = st["pend_hid"][rows, entry["pick"]]
+        deferred = getattr(d.collectives, "deferred_checks", None)
+        if deferred is not None:
+            deferred.clear()
+        visible_max = self.topk if width == 0 else self.topk + 1
+        with use_lane(0, overlap=False, geometry=self._bspec_geometry(rows, width), sync_free=True), \
+                w8_decode_scope():
+            hidden, _, _ = d._draft_cp(tokens, hidden_in, positions, rows, d.cache,
+                                       call_shape=call_shape, visible_max=visible_max,
+                                       static_slots=(entry["kept"], slot, safe))
+            half = size // 2
+            last = hidden.reshape(half, 2, -1)[:, 1]
+            scores = d.head_logits(last) * st["inv_temp"][:half].reshape(-1, 1)
+            st["q"][:half].copy_(scores)
+            d1 = sample_tokens(d.collectives, scores, st["noise_q"][:half],
+                               vocabulary_range=d.weights.sharding.vocabulary_range)
+            st["d1"][:half].copy_(d1.reshape(-1))
+        st["out_dflag"].copy_(self._flag(deferred))
+        return st["d1"], st["out_dflag"]
+
+    def _body_bverify(self, size, call_shape, width):
+        from .lanes import use_lane
+        from .spec_sample import verify_sample_k1
+
+        d = self.decoder
+        st, entry = self.bspec_state(), self._bspec_args(size)
+        args = entry["args"]
+        positions, rows = args[0:size], args[size:2 * size]
+        slot, safe = args[2 * size:3 * size], args[3 * size:4 * size]
+        half = size // 2
+        bonus = st["pend_tok"][rows, 1]
+        drafts = st["d1"][entry["slot_of"]]
+        tokens = torch.where(entry["pick"] == 0, bonus, drafts).reshape(size, 1)
+        token_rows = rows
+        visible = positions + 1
+        d.cache.begin_forward_static(token_rows, positions, slot=slot, safe=safe, kept=entry["kept"])
+        deferred = getattr(d.collectives, "deferred_checks", None)
+        if deferred is not None:
+            deferred.clear()
+        visible_max = self.topk if width == 0 else self.topk + 1
+        with use_lane(0, overlap=False, geometry=self._bspec_geometry(rows, width), sync_free=True), \
+                w8_decode_scope():
+            logits, normed, _ = d._layers_and_head(
+                tokens, rows, positions, token_rows, visible, visible_max, state=None,
+                return_hidden=True, call_shape=call_shape, logits_rows="all", gather=False)
+            scores = (logits.reshape(half, 2, -1).float()
+                      * st["inv_temp"][:half].reshape(-1, 1, 1))
+            spec_on = st["spec_on"][rows.reshape(half, 2)[:, 0]]
+            accept, toks = verify_sample_k1(
+                d.collectives, scores, st["q"][:half], st["d1"][:half], st["uniform"][:half],
+                st["noise_v"][:half], spec_on, vocabulary_range=d.weights.sharding.vocabulary_range)
+            st["out_accept"][:half].copy_(accept)
+            st["out_tokens"][:half].copy_(toks)
+            st["out_hidden"][:half].copy_(normed.reshape(half, 2, -1))
+        st["out_vflag"].copy_(self._flag(deferred))
+        return st["out_accept"], st["out_vflag"]
+
+    def run_bspec(self, kind, rows, positions, *, call_shape):
+        """One batched speculative forward ("draft" absorb or "verify") of
+        len(rows) entries (2 per request row; a bucket of 2/4/8/16)."""
+        size = len(rows)
+        if size not in self.BATCH_BUCKETS or size % 2:
+            raise ValueError("a batched speculative forward runs 2 entries per row in a bucket")
+        end = max(int(p) for p in positions) + 1
+        width = 0 if (end <= self.topk and self._short_bypass(call_shape)) else self.index_width(end)
+        key = ("bspec", kind, size, width, call_shape.name)
+        entry = self._bspec_args(size)
+        self._stage_bspec(entry, size, rows, positions)
+        body = self._body_bdraft if kind == "draft" else self._body_bverify
+        cached = self.graphs.get(key)
+        if cached is None:
+            out = body(size, call_shape, width)
+            self.eager_steps += 1
+            self._capture(key, lambda: body(size, call_shape, width))
+            return out
+        graph, out, flag = cached
+        self.graphs.move_to_end(key)
+        graph.replay()
+        self.replays += 1
+        return out, flag
+
+    def bspec_cached(self, kind, positions, *, call_shape):
+        size = len(positions)
+        end = max(int(p) for p in positions) + 1
+        width = 0 if (end <= self.topk and self._short_bypass(call_shape)) else self.index_width(end)
+        return ("bspec", kind, size, width, call_shape.name) in self.graphs
 
     # -- capture ----------------------------------------------------------
     def _comm_capture_contexts(self, stack):

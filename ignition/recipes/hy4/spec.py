@@ -121,8 +121,13 @@ class SpeculativeGreedy:
                 tp.fill_(float(top_p if top_p is not None else 1.0))
         P, c = int(start), int(start) - 1
         pend_tokens, pend_hidden = [int(bonus)], hidden.reshape(1, -1)
+        self.yield_state = None
         while self.eligible(P, c):
             if should_yield is not None and should_yield():
+                # the hand-over state: draft rows c .. P-1 still pending absorption
+                # with (pend_tokens, pend_hidden); P-1's token is the bonus
+                self.yield_state = {"P": P, "bonus": bonus, "c": c, "tokens": list(pend_tokens),
+                                    "hidden": pend_hidden}
                 return None, (P, bonus)
             greedy, h, fl, aentry = self._absorb(c, pend_tokens, pend_hidden, sample=sample,
                                                  filtered=filtered)

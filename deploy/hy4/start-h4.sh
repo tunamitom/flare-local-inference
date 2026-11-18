@@ -26,8 +26,8 @@ set -euo pipefail
 NAME="${NAME:-h4}"
 PORT="${LLM_PORT:-8001}"
 TP=8
-IMAGE="${IMAGE:-local/flare:rt-h4-cp8-dg88a}"
-IMAGE_SHA="${IMAGE_SHA:-sha256:39763e05b58929985aaa6e122cd98f194eadefd51daec3641cb49aecb942c73b}"
+IMAGE="${IMAGE:-local/flare:rt-h4-cp8-dg88l}"
+IMAGE_SHA="${IMAGE_SHA:-sha256:d8c9ef861a489071e7b1f37336983832169b9d784b659172cc6aa2ad8a20b226}"
 PKG_LINK="${PKG_DIR:-/opt/models/Hy4-nvfp4-w4a16-mse-gpu}"
 SERVED_NAME="${SERVED_NAME:-smart}"
 MAX_CONCURRENCY="${MAX_CONCURRENCY:-1}"
@@ -236,8 +236,9 @@ docker run -d --name "$NAME" --network host --init --cap-add SYS_PTRACE \
   -e HY4_GPU_SAMPLER="${HY4_GPU_SAMPLER:-1}" \
   -e HY4_AB_MLP_GRAPHS="${HY4_AB_MLP_GRAPHS:-1}" \
   -e HY4_DECODE_AUTOTUNE="${HY4_DECODE_AUTOTUNE:-0}" \
-  -e HY4_MOE_DECODE_OP="${HY4_MOE_DECODE_OP:-1,4,8}" \
-  -e HY4_BATCH_EXTRA="${HY4_BATCH_EXTRA:-}" \
+  -e HY4_MOE_DECODE_OP="${HY4_MOE_DECODE_OP:-1,4,8,16}" \
+  -e HY4_BATCH_EXTRA="${HY4_BATCH_EXTRA:-16}" \
+  -e HY4_SHORT_KV="${HY4_SHORT_KV:-on}" \
   -e HY4_MOE_DECODE_ENV="${HY4_MOE_DECODE_ENV:-}" \
   -e HY4_MOE_DECODE_ENV_ALT="${HY4_MOE_DECODE_ENV_ALT:-}" \
   -e HY4_DECODE_GRAPH_PREWARM="${HY4_DECODE_GRAPH_PREWARM:-}" \
@@ -270,7 +271,7 @@ docker run -d --name "$NAME" --network host --init --cap-add SYS_PTRACE \
       --max-concurrency "$MAX_CONCURRENCY" --rows "${H4_ROWS:-8}" --batch-rows "${H4_BATCH_ROWS:-8}" \
       --max-context "${H4_MAX_CONTEXT:-1048576}" \
       --headroom "${H4_HEADROOM:-4563402752}" \
-      --all-reduce-arm "${H4_AR_ARMS:-1:oneshot,2-8:rsag,16-512:twoshot,1024-:dma}" \
+      --all-reduce-arm "${H4_AR_ARMS:-1:oneshot,2-16:rsag,32-512:twoshot,1024-:dma}" \
       --all-reduce-kernel-rows 512 \
       --lse-transport ce-relay --gather-transport ce-relay \
       --selection-wire dcp \
