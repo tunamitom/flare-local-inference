@@ -108,6 +108,11 @@ class Hy4Cache:
     short_capacity: int = 0
     short_writer_plan: object = None
     page_size: int = 64                           # fused-record page geometry
+    # c8 L6: per-row extents of the flat local-slot space (rows * local_capacity
+    # slots per rank): row r's records live at [row_base[r], row_base[r] + row_cap[r]).
+    # Default: uniform (r * local_capacity, local_capacity) — the static layout.
+    row_base: list = None
+    row_cap: list = None
     # One forward's validated (tokens, positions) -> owned rows and slots
     # (`begin_forward`): every layer writes the same rows, so the bounds check
     # and the ownership mask are computed once, not per layer per table.
@@ -181,14 +186,61 @@ class Hy4Cache:
         on a batch of two without it).
         """
         base = self.slots_for(rows_for).reshape(-1, 1)
-        offsets = torch.arange(self.local_capacity, device=self.device, dtype=torch.long)
+        offsets = torch.arange(self.max_cap(), device=self.device, dtype=torch.long)
         return base + offsets.reshape(1, -1)
+
+    # --- per-row extents (c8 L6) -------------------------------------------
+
+    def _extents(self):
+        if self.row_base is None:
+            self.row_base = [r * self.local_capacity for r in range(self.rows)]
+            self.row_cap = [self.local_capacity] * self.rows
+        if getattr(self, "_extent_dev", None) is None:
+            self._extent_dev = (
+                torch.tensor(self.row_base + [0], dtype=torch.long).to(self.device),
+                torch.tensor(self.row_cap + [0], dtype=torch.long).to(self.device))
+        return self._extent_dev
+
+    def set_extents(self, caps):
+        """Row r gets `caps[r]` local slots, the extents packed in row order
+        (sum <= rows * local_capacity: the allocation). Boot-time only: captured
+        graphs bake host bases."""
+        caps = [int(c) for c in caps]
+        if len(caps) != self.rows or sum(caps) > self.rows * self.local_capacity or min(caps) < 1:
+            raise ValueError(f"row extents {caps} do not fit {self.rows} x {self.local_capacity}")
+        bases, at = [], 0
+        for c in caps:
+            bases.append(at)
+            at += c
+        self.row_base, self.row_cap, self._extent_dev = bases, caps, None
+        self._extents()
+
+    def base_of(self, row):
+        self._extents()
+        return int(self.row_base[int(row)])
+
+    def cap_of(self, row):
+        """Row `row`'s local slots."""
+        self._extents()
+        return int(self.row_cap[int(row)])
+
+    def max_cap(self):
+        self._extents()
+        return max(self.row_cap)
+
+    @property
+    def row_base_dev(self):
+        return self._extents()[0]
+
+    @property
+    def row_cap_dev(self):
+        return self._extents()[1]
 
     # --- slots and writes -------------------------------------------------
 
     @property
     def slot_base(self):
-        return (torch.arange(self.rows, device=self.device, dtype=torch.long) * self.local_capacity)
+        return self.row_base_dev[:self.rows]
 
     def slots_for(self, row_of):
         """Each token's row slot base (`row_of` maps token -> request row)."""
@@ -197,9 +249,9 @@ class Hy4Cache:
 
             if diet("diet_index"):
                 # round 15: once per forward (every layer asks for the same rows)
-                return forward_memo(row_of, ("slots_for", self.local_capacity),
-                                    lambda: row_of.long() * self.local_capacity)
-        return (row_of.long() * self.local_capacity)
+                return forward_memo(row_of, ("slots_for", id(self.row_base_dev)),
+                                    lambda: self.row_base_dev[row_of.long()])
+        return self.row_base_dev.to(row_of.device)[row_of.long()]
 
     def allocate_short(self, rows, capacity):
         """The replicated short-context record tables (fused records only)."""
@@ -342,22 +394,23 @@ class Hy4Cache:
         token indices `i` with `(start + i) % world == rank`, slots are
         `row * local_capacity + (start + i) // world`."""
         width = int(positions.shape[0])
-        if start < 0 or start + width > self.capacity:
-            raise IndexError(f"cache position out of range: a row holds {self.capacity} slots")
         if not 0 <= int(row) < self.rows:
             raise IndexError(f"cache row out of range: {self.rows} request rows")
+        cap = self.cap_of(row)
+        if start < 0 or start + width > cap * self.world:
+            raise IndexError(f"cache position out of range: row {row} holds {cap * self.world} slots")
         last_local = (start + width - 1) // self.world if width else 0
-        if last_local >= self.local_capacity:
+        if last_local >= cap:
             raise IndexError(
-                f"cache local slot out of range: a row holds {self.local_capacity} local "
-                f"slots (capacity {self.capacity}, world {self.world})")
+                f"cache local slot out of range: row {row} holds {cap} local "
+                f"slots (world {self.world})")
         first = (self.rank - start) % self.world
         # No owned token (decode on a non-owning rank): an empty range, not an
         # arange whose start passes its end.
         count = (width - first + self.world - 1) // self.world if first < width else 0
         kept = (first + self.world * torch.arange(count, device=self.device, dtype=torch.long))
         local0 = (start + first) // self.world
-        slots = (int(row) * self.local_capacity + local0
+        slots = (self.base_of(row) + local0
                  + torch.arange(count, device=self.device, dtype=torch.long))
         self._forward_memo.pop(id(tokens), None)
         self._forward_memo[id(tokens)] = (tokens, positions, kept, slots)
@@ -416,17 +469,16 @@ class Hy4Cache:
         request's cache.
         """
         positions = positions.long()
-        if bool((positions < 0).any()) or bool((positions >= self.capacity).any()):
-            raise IndexError(f"cache position out of range: a row holds {self.capacity} slots")
         tokens = tokens.long()
         if bool((tokens < 0).any()) or bool((tokens >= self.rows).any()):
             raise IndexError(f"cache row out of range: {self.rows} request rows")
         local_index = self.local(positions)
-        if bool((local_index < 0).any()) or bool((local_index >= self.local_capacity).any()):
+        cap = self.row_cap_dev.to(tokens.device)[tokens]
+        if bool((positions < 0).any()) or bool((local_index >= cap).any()):
             raise IndexError(
-                f"cache local slot out of range: a row holds {self.local_capacity} local "
-                f"slots (capacity {self.capacity}, world {self.world}) — a mapping that "
-                f"lands past the row would alias another request's records")
+                f"cache local slot out of range: a row holds row_cap local slots (world "
+                f"{self.world}) — a mapping that lands past the row would alias another "
+                f"request's records")
         return self.slots_for(tokens) + local_index
 
     def latents(self, layer):
@@ -948,7 +1000,7 @@ class Hy4Decoder:
                 rank = int(getattr(self.collectives, "rank", 0))
                 end = start + width
                 geometry = {"owned_max": (max(end - rank, 0) + world - 1) // world,
-                            "base": row_id * int(getattr(self.cache, "local_capacity", 0))}
+                            "base": self.cache.base_of(row_id)}
                 S = int(getattr(self.cache, "short_capacity", 0) or 0)
                 if (S and visible_max is not None and self.config.text["index_topk"] < end <= S
                         and SWITCHES.get("short_kv") == "on"):
@@ -1295,7 +1347,7 @@ class Hy4Decoder:
         start = int(self._row_lengths.get(row, 0))
         world = int(getattr(self.collectives, "world_size", 1))
         rank = int(getattr(self.collectives, "rank", 0))
-        base = row * int(getattr(self.cache, "local_capacity", 0))
+        base = self.cache.base_of(row)
         geometries = []
         for index in (0, 1):
             end = start + (index + 1) * half              # the half's widest visible length
@@ -1770,7 +1822,7 @@ class Hy4Decoder:
                             scores, candidates, topk=self.config.text["index_topk"],
                             selected=selected_buf, counts=counts_buf,
                             base=self.cache.slots_for(token_rows),
-                            local_capacity=self.cache.local_capacity)
+                            local_capacity=self.cache.max_cap())
                     yield ("comm", "scores")
                     merged = None
                 else:
@@ -1793,7 +1845,7 @@ class Hy4Decoder:
                         pos = merged
                         base = self.cache.slots_for(token_rows).reshape(-1, 1)
                         local = pos.clamp(min=0) // world
-                        bounded = (pos < 0) | (local < self.cache.local_capacity)
+                        bounded = (pos < 0) | (local < self.cache.max_cap())
                         shifted = torch.where(pos >= 0, pos.to(torch.int64) + world * base,
                                               pos.to(torch.int64))  # `-1` padding stays -1
                         mapped = torch.where(bounded, shifted,

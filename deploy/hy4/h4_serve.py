@@ -656,7 +656,8 @@ def run_generate(ctx, cmd, *, row=0, admit_only=False, preempt=None, spec_absorb
         pos = 0
         logits = None
         nll_sum, nll_count = 0.0, 0
-        plan = prompt_plan(n, ctx.widths, pad=ctx.pad, room=ctx.row_capacity - n,
+        plan = prompt_plan(n, ctx.widths, pad=ctx.pad,
+                           room=ctx.decoder.cache.cap_of(row) * ctx.decoder.cache.world - n,
                            forward_cost_rows=ctx.forward_cost_rows)
         # consult18 stage D: with --overlap, two consecutive full chunks run as
         # one overlapped pair — two CHUNK-row halves on two lanes. (Not for
@@ -1335,7 +1336,23 @@ class BatchLoop:
                 continue
             return item
 
+    def _row_cap(self, row):
+        caps = getattr(self.ctx, "row_caps", None)
+        return int(caps[row]) if caps else int(self.ctx.row_capacity)
+
+    def _needs_big(self, item):
+        """c8 L6: a prompt (+ 16k of room) past the narrowest row's extent needs the
+        widest row (row 0)."""
+        caps = getattr(self.ctx, "row_caps", None)
+        if not caps or min(caps) == max(caps):
+            return False
+        return len(item.get("tokens") or ()) + 16384 > min(caps[1:] or caps)
+
     def _start(self, item, row):
+        # c8 L6: the output limit stops at the row's extent (less the speculative margin)
+        room = self._row_cap(row) - 8 - len(item.get("tokens") or ())
+        if item.get("max_new") is not None and item["max_new"] > room:
+            item["max_new"] = max(1, room)
         item["started"] = time.monotonic()
         trace(0, f"request start: {len(item.get('tokens') or ())} prompt tokens on row {row}, "
                  f"{item['started'] - item['admitted']:.1f} s queued, {self.ctx.waiting} waiting, "
@@ -1373,8 +1390,20 @@ class BatchLoop:
             # consume the last enqueued step before idling
             return {"kind": "batch", "release": release, "admit": [], "carry": [],
                     "carry_params": []}, []
+        waiting = [i for i in getattr(self, "big_waiting", None) or [] if not i["cancel"].is_set()]
+        for i in getattr(self, "big_waiting", None) or []:
+            if i["cancel"].is_set():
+                trace(0, "dropped a queued request: the client left (it waited for the widest row)")
+                i["result"] = ([], "cancelled")
+                i["nll"] = None
+                i["ev"].set()
+                if i.get("stream_q") is not None:
+                    i["stream_q"].put(("end", None))
+        self.big_waiting = waiting
         if not self.active:
-            if self.deferred:
+            if self.big_waiting:
+                item = self.big_waiting.pop(0)        # c8 L6: row 0 is free now
+            elif self.deferred:
                 item = self.deferred.pop(0)
             else:
                 item = self._pop(block=True)
@@ -1386,7 +1415,15 @@ class BatchLoop:
                          "max_new": item["max_new"], "params": item["params"]}, [item])
             first = item
         free = [r for r in range(self.rows) if r not in self.active]
+        # c8 L6: the widest row (0) is kept for the prompts that need it; a long
+        # prompt waits for it (deferred) while shorter ones keep being admitted
+        free.sort(key=lambda r: (r == 0, r))
+        big_waiting = getattr(self, "big_waiting", None)
+        if big_waiting is None:
+            big_waiting = self.big_waiting = []
         admits = [first] if first is not None else []
+        if 0 in free and big_waiting and first is None:
+            admits.append(big_waiting.pop(0))
         while len(admits) < len(free) and len(self.active) + len(admits) < self.max_batch:
             item = self._pop(block=False)
             if item is None:
@@ -1395,7 +1432,21 @@ class BatchLoop:
                 self.deferred.append(item)
                 continue
             admits.append(item)
-        rows = free[:len(admits)]
+        rows, placed = [], []
+        pool = list(free)
+        for item in admits:
+            if self._needs_big(item):
+                if 0 in pool:
+                    pool.remove(0)
+                    rows.append(0)
+                    placed.append(item)
+                else:
+                    big_waiting.append(item)
+                continue
+            if pool:
+                rows.append(pool.pop(0))
+                placed.append(item)
+        admits = placed
         for item, row in zip(admits, rows):
             self._start(item, row)
         carry = sorted(self.active.items())
@@ -2537,9 +2588,23 @@ def main():
         ctx.decode_shape = decode_shape
         ctx.shapes = shapes
         ctx.row_capacity = capacity
+        # c8 L6: per-row extents of the pool. HY4_BIG_ROW (global tokens) gives row 0
+        # an extent that long; the other rows split the rest (uniform otherwise).
+        cache = ctx.decoder.cache
+        big = int(os.environ.get("HY4_BIG_ROW") or 0)
+        local_total = args.rows * cache.local_capacity
+        if big > capacity and args.rows > 1:
+            big_local = min(-(-big // world // 1024) * 1024, local_total - (args.rows - 1) * 4096)
+            small = (local_total - big_local) // (args.rows - 1) // 1024 * 1024
+            cache.set_extents([big_local] + [small] * (args.rows - 1))
+        ctx.row_caps = [cache.cap_of(r) * world for r in range(args.rows)]
+        ctx.row_capacity = max(ctx.row_caps)
+        trace(rank, f"row extents: {sorted(set(ctx.row_caps), reverse=True)} global tokens "
+                    f"(row 0 {ctx.row_caps[0]}, rows 1+ {min(ctx.row_caps)}), pool "
+                    f"{local_total} local slots/rank")
         # one request lives in one cache row: its context cannot pass the row (less a
         # margin: speculative rounds write their pad / draft entries up to P + 4)
-        ctx.max_context = min(int(args.max_context), int(capacity) - 8)
+        ctx.max_context = min(int(args.max_context), int(ctx.row_capacity) - 8)
         warm_free = warm_shortfall = None
         if args.boot_warm:
             # Pay the first-use memory again on the serving construction, then

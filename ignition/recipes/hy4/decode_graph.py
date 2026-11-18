@@ -70,8 +70,10 @@ class DecodeGraphs:
         self.world = int(getattr(decoder.collectives, "world_size", 1))
         self.rank = int(getattr(decoder.collectives, "rank", 0))
         self.topk = int(decoder.config.text["index_topk"])
-        self.local_capacity = int(decoder.cache.local_capacity)
-        self.capacity = int(decoder.cache.capacity)
+        self.cache = decoder.cache
+        # c8 L6: per-row extents — the widest row bounds the indexer width buckets
+        self.local_capacity = int(decoder.cache.max_cap())
+        self.capacity = self.local_capacity * self.world
         self._token = torch.zeros((1, 1), dtype=torch.long, device=self.device)
         self._host = torch.zeros((3,), dtype=torch.long)
         if self.device.type == "cuda":
@@ -100,9 +102,8 @@ class DecodeGraphs:
                 and not return_hidden and logits_rows in ("all", "last")
                 and call_shape.is_decode_graph
                 and (start + 1 > self.topk or self._short_bypass(call_shape))
-                and start + 1 <= self.capacity
-                and (start // self.world) < self.local_capacity
-                and 0 <= row < int(self.decoder.cache.rows))
+                and 0 <= row < int(self.decoder.cache.rows)
+                and (start // self.world) < self.cache.cap_of(row))
 
     def _short_bypass(self, call_shape):
         """Contexts up to top-k take the short-context bypass (every visible
@@ -148,14 +149,16 @@ class DecodeGraphs:
         else:
             owned, vmax, scale = max(width, 1), max(self.topk, S) + 1, self.local_capacity
         if rows is not None:
-            return {"owned_max": owned, "base": None, "bases": rows * scale}, vmax
-        return {"owned_max": owned, "base": row * scale}, vmax
+            bases = rows * scale if regime == "local" else self.cache.row_base_dev[rows]
+            return {"owned_max": owned, "base": None, "bases": bases}, vmax
+        base = row * scale if regime == "local" else self.cache.base_of(row)
+        return {"owned_max": owned, "base": base}, vmax
 
     # -- the step body (eager or under capture) -------------------------
     def _stage(self, token_ids, row, start):
         """Load the step's inputs into the static buffers (no host read)."""
         self._token.copy_(token_ids)
-        local = row * self.local_capacity + start // self.world
+        local = self.cache.base_of(row) + start // self.world
         self._host[0] = start
         self._host[1] = local if start % self.world == self.rank else -1
         self._host[2] = local
@@ -201,9 +204,8 @@ class DecodeGraphs:
         return (token_ids.is_cuda and int(token_ids.shape[0]) == 1 and width > 1
                 and width % self.world == 0 and width <= self.TAIL_MAX
                 and state is None and call_shape.is_prefill_graph
-                and start + width <= self.capacity
-                and (start + width - 1) // self.world < self.local_capacity
-                and 0 <= row < int(self.decoder.cache.rows))
+                and 0 <= row < int(self.decoder.cache.rows)
+                and (start + width - 1) // self.world < self.cache.cap_of(row))
 
     def _stage_tail(self, token_ids, start):
         width = int(token_ids.shape[1])
@@ -232,10 +234,10 @@ class DecodeGraphs:
         first = torch.remainder(self.rank - start, self.world)
         j = torch.arange(per, dtype=torch.long, device=self.device)
         kept = first + self.world * j
-        slots = row * self.local_capacity + torch.div(start + first, self.world,
-                                                      rounding_mode="floor") + j
+        slots = self.cache.base_of(row) + torch.div(start + first, self.world,
+                                                    rounding_mode="floor") + j
         d.cache.begin_forward_device(token_rows, positions, kept, slots)
-        geometry = {"owned_max": max(width, 1), "base": row * self.local_capacity}
+        geometry = {"owned_max": max(width, 1), "base": self.cache.base_of(row)}
         deferred = getattr(d.collectives, "deferred_checks", None)
         if deferred is not None:
             deferred.clear()
@@ -309,9 +311,8 @@ class DecodeGraphs:
         short = start + count <= self.topk
         return (self.device.type == "cuda" and 1 <= count <= self.SPEC_MAX
                 and (not short or self._spec_bypass(count, call_shape))
-                and start >= 0 and start + count <= self.capacity
-                and (start + self.world - 1) // self.world + per - 1 < self.local_capacity
-                and 0 <= row < int(self.decoder.cache.rows)
+                and start >= 0 and 0 <= row < int(self.decoder.cache.rows)
+                and (start + self.world - 1) // self.world + per - 1 < self.cache.cap_of(row)
                 and (call_shape.is_decode_graph == (count == 1)
                      or self._decode_rows(call_shape, count)))
 
@@ -422,7 +423,7 @@ class DecodeGraphs:
     def _stage_spec(self, entry, row, start, count):
         per = entry["per"]
         first = (self.rank - start) % self.world
-        base = row * self.local_capacity + (start + first) // self.world
+        base = self.cache.base_of(row) + (start + first) // self.world
         host = self._spec_host(1 + 3 * per)
         host[0] = start
         for j in range(per):
@@ -583,9 +584,9 @@ class DecodeGraphs:
 
     def accepts_batch(self, rows, starts):
         return (self.device.type == "cuda" and 1 <= len(rows) <= self.BATCH_BUCKETS[-1]
-                and all(start + 1 <= self.capacity and start // self.world < self.local_capacity
-                        for start in starts)
-                and all(0 <= row < int(self.decoder.cache.rows) for row in rows))
+                and all(0 <= row < int(self.decoder.cache.rows) for row in rows)
+                and all(start // self.world < self.cache.cap_of(row)
+                        for row, start in zip(rows, starts)))
 
     def _batch_state(self, size):
         state = getattr(self, "_batch", None)
@@ -630,7 +631,7 @@ class DecodeGraphs:
         host = self._batch_host(5 * size)
         for i in range(size):
             row, start = int(rows[i]), int(starts[i])
-            local = row * self.local_capacity + start // self.world
+            local = self.cache.base_of(row) + start // self.world
             host[i] = int(tokens[i])
             host[size + i] = start
             host[2 * size + i] = row
@@ -810,7 +811,7 @@ class DecodeGraphs:
         else:
             P = st["P"][rows]
             positions = torch.where(pad, P + per, P + pick)
-        local = rows * self.local_capacity + torch.div(positions, self.world, rounding_mode="floor")
+        local = self.cache.row_base_dev[rows] + torch.div(positions, self.world, rounding_mode="floor")
         slot = torch.where(torch.remainder(positions, self.world) == self.rank, local,
                            torch.full_like(local, -1))
         return rows, pad, positions, slot, local
