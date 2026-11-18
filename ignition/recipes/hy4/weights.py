@@ -111,6 +111,43 @@ def checkpoint_names(config, *, mtp=True, packed=False):
 # to 0.0835 — still 0.012 below the RTN census it must refuse.
 EXPORT_MAX_RELATIVE_ERROR = 0.0835
 
+# Origin-keyed evidence (2026-11-18 quality round; consult 10 section 1). A `gptq`
+# package's codes are trained: the solver minimises each routed-expert matrix's
+# OUTPUT error on calibration activations, which deliberately moves individual
+# weights further from BF16 (census ~0.10 against the MSE build's 0.0812), so the
+# census bar can no longer tell searched codes from unsearched ones. A `gptq`
+# package proves itself by its calibration objective instead: every replaced
+# matrix's tr(dW H dW^T) on the calibration Hessian must be strictly below the
+# base MSE package's on the same Hessian, the base report and the calibration
+# set are pinned by hash, and a loose census ceiling still refuses a blown-up
+# solve. A report without an origin is the MSE build (`ptq-mse`).
+EXPORT_ORIGINS = ("ptq-mse", "gptq")
+GPTQ_CENSUS_CEILING = 0.20
+
+
+def _gptq_evidence_problems(evidence, config):
+    """What a `gptq`-origin report fails to prove (empty when the evidence holds)."""
+    if not isinstance(evidence, dict):
+        return ["gptq-origin export_report.json carries no gptq_evidence"]
+    problems = []
+    for key in ("base_report_sha256", "calibration_sha256"):
+        value = evidence.get(key)
+        if not isinstance(value, str) or len(value) != 64:
+            problems.append(f"gptq_evidence.{key} is missing")
+    objective = evidence.get("objective")
+    expected = (config.layers - 1) * config.experts * 2      # fused gate_up + down per routed expert
+    if not isinstance(objective, dict) or len(objective) != expected:
+        count = len(objective) if isinstance(objective, dict) else None
+        problems.append(f"gptq_evidence.objective covers {count} of {expected} routed matrices")
+    else:
+        bad = sum(1 for value in objective.values()
+                  if not (isinstance(value, list) and len(value) == 2
+                          and all(isinstance(x, (int, float)) for x in value) and 0 <= value[0] < value[1]))
+        if bad:
+            problems.append(f"gptq_evidence: {bad} matrices whose calibration objective is not "
+                            "strictly below the base package's")
+    return problems
+
 
 def verify_export_package(snapshot, config):
     """Refuse a packed W4A16 export that cannot prove a complete, verified run.
@@ -122,7 +159,10 @@ def verify_export_package(snapshot, config):
     - ``export_report.json`` exists and shows ``byte_verified``, the full
       78x256x3 matrix census (every block x expert x projection) and
       ``census_max_relative`` <= ``EXPORT_MAX_RELATIVE_ERROR`` (0.0835; the
-      W13 full-model measurement — see the constant's comment);
+      W13 full-model measurement — see the constant's comment) for an MSE
+      build, or, for a ``gptq``-origin build, <= ``GPTQ_CENSUS_CEILING`` plus
+      ``gptq_evidence``: base-report and calibration hashes and a calibration
+      objective strictly below the base package's for every routed matrix;
     - the report counts window-edge scale choices for ALL experts (coverage
       per block and projection, not just the audited expert);
     - ``model.safetensors.index.json`` was written last (mtime at or after the
@@ -150,9 +190,15 @@ def verify_export_package(snapshot, config):
         if report.get("packed_matrices") != expected or not isinstance(census, dict) or len(census) != expected:
             problems.append(f"export_report.json shows "
                             f"{report.get('packed_matrices')} of {expected} packed matrices")
+        origin = (report.get("producer") or {}).get("origin", "ptq-mse")
+        if origin not in EXPORT_ORIGINS:
+            problems.append(f"export_report.json declares unknown origin {origin!r}")
+        bar = GPTQ_CENSUS_CEILING if origin == "gptq" else EXPORT_MAX_RELATIVE_ERROR
         max_error = report.get("census_max_relative")
-        if not isinstance(max_error, (int, float)) or not 0 <= max_error <= EXPORT_MAX_RELATIVE_ERROR:
-            problems.append(f"census_max_relative {max_error!r} exceeds {EXPORT_MAX_RELATIVE_ERROR}")
+        if not isinstance(max_error, (int, float)) or not 0 <= max_error <= bar:
+            problems.append(f"census_max_relative {max_error!r} exceeds {bar}")
+        if origin == "gptq":
+            problems.extend(_gptq_evidence_problems(report.get("gptq_evidence"), config))
         counts = report.get("window_edge_counts")
         if not isinstance(counts, dict):
             problems.append("export_report.json has no window-edge counts")
