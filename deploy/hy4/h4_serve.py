@@ -1240,6 +1240,12 @@ def serve_http(ctx):
     return server
 
 
+def batch_shape_of(size):
+    from ignition.recipes.hy4.wiring import batch_shape
+
+    return batch_shape(size)
+
+
 def _unfiltered(params):
     """Sampling with no top-k / top-p filter (the device-sampled batched step)."""
     top_k = int(params.get("top_k", -1) or -1)
@@ -1303,7 +1309,10 @@ class BatchLoop:
         self._snap_at = 0
         self.rollbacks = 0
         self.bspec = True           # batched speculative sampling (k = 1) when every row can
-        self.bs_rows = {}           # every rank: row -> {"c": draft cursor, "n": last accepted}
+        self.bs_rows = {}           # every rank: row -> {"warm": a plain warm-up round first}
+        self.bs_la = True           # c8 L5b: enqueue bspec round k+1 before consuming round k
+        self._bs_inv = None         # the staged per-slot 1/T (re-staged when it changes)
+        self._bs_rows_t = (None, None)
         self.bspec_rounds = self.bspec_accepted = self.bspec_slots = 0
 
     # ---- rank 0 --------------------------------------------------------
@@ -1524,11 +1533,17 @@ class BatchLoop:
         for row, _ in plan["carry"]:
             self.bs_rows.pop(row, None)         # a plain step: its draft state goes stale
         prev = self.inflight
+        if prev is not None and prev.get("bspec"):
+            # a speculative round in flight: consume it now (a plain step is never
+            # rolled back with it); its snapshot "out" holds the rows' next inputs
+            self._row_reqs = dict(self.active) if rank == 0 else None
+            self._pending = prev
+            self._drain()
         # An eager collective (admission prefill; a new graph's eager first call)
         # must never be issued while a captured step is still pending on the
         # device (the dg88d hang): consume the in-flight step first. Its device
         # snapshot stays valid, so carried rows still read their tokens from it.
-        self._pending = prev
+        self._pending = None if (prev is not None and prev.get("bspec")) else prev
         # rank 0: the request of every row this step may carry (a drain may finish
         # one; its tokens are then skipped)
         self._row_reqs = dict(self.active) if rank == 0 else None
@@ -1587,23 +1602,45 @@ class BatchLoop:
         params = [(t, u) for t, u in plan["carry_params"]]
         params += [(float(p.get("temperature", 0.9) or 0.0), _unfiltered(p))
                    for (_, _, _, p) in plan["admit"]]
-        if not params or not all(t > 0.0 and u for t, u in params):
+        # c8 L5d: greedy rows (T = 0) speculate too (exact argmax acceptance in-graph)
+        if not params or not all(t >= 0.0 and u for t, u in params):
             return False
         graphs = ctx.decoder.decode_graphs
         size = graphs.batch_bucket(2 * len(params)) if 2 * len(params) <= 32 else None
         return size is not None and size in set(getattr(ctx, "batch_rows", ()) or ())
 
     def _bspec_batch(self, plan, items):
+        """Every rank: one batched speculative round. Steady state (c8 L5b, `bs_la`):
+        the same rows as the in-flight round and no admission — round k+1 is
+        enqueued from the device round state, THEN round k is consumed (the host
+        read, streaming and stops overlap round k+1). Otherwise anything in flight
+        is consumed first (admissions are eager collectives: the drain rule)."""
         import torch
 
         ctx, rank = self.ctx, self.rank
         d = ctx.decoder
-        st = d.decode_graphs.bspec_state()
+        g = d.decode_graphs
+        st = g.bspec_state()
         prev = self.inflight
-        self._pending = prev
         self._row_reqs = dict(self.active) if rank == 0 else None
+        rows = [row for row, _ in plan["carry"]]
+        temps = [t for t, _ in plan["carry_params"]]
+        if (self.bs_la and prev is not None and prev.get("bspec") and not plan["admit"]
+                and prev["rows"] == rows and prev["temps"] == temps
+                and all(r in self.bs_rows for r in rows)):
+            end = self._bs_end(rows, inflight=1)
+            size = g.batch_bucket(2 * len(rows))
+            shape = batch_shape_of(size)
+            if (g.bspec_cached("draft", size, end, call_shape=shape)
+                    and g.bspec_cached("verify", size, end, call_shape=shape)):
+                nxt = self._bs_enqueue(rows, temps, end)
+                self.inflight = None
+                rolled = self._bs_consume(prev, nxt)
+                self.inflight = None if rolled else nxt
+                return
         if prev is not None:
-            self._drain()           # rounds are synchronous; carried tokens stay in its snapshot
+            self._pending = prev
+            self._drain()           # carried tokens stay in its snapshot
         prev_rows = prev["rows"] if prev is not None else []
         entering = [(row, tok, prev_rows.index(row) if tok is None else -1)
                     for row, tok in plan["carry"] if row not in self.bs_rows]
@@ -1625,28 +1662,48 @@ class BatchLoop:
                     self.active[row] = req
                     self._row_reqs[row] = req
             self._bind(None)
-        # rows without draft state join as plain rows (never accepted: exact plain samples)
+        # rows without draft state: one warm-up round as a plain row (never accepted:
+        # an exact plain sample; its verify hidden becomes the pending entry), then
+        # they speculate (c8 L5d)
         for row, tok, src in entering:
             if src >= 0:
                 st["pend_tok"][row].copy_(prev["snap"]["out"][src].reshape(1).expand(2))
             else:
                 st["pend_tok"][row].fill_(int(tok))
             st["spec_on"][row] = False
-            self.bs_rows[row] = {"c": int(d._row_lengths.get(row, 0)), "n": 0}
+            L = int(d._row_lengths.get(row, 0))
+            g.bspec_set(row, P=L, c=L, n=0)
+            self.bs_rows[row] = {"warm": True}
         for row, tok, hid, _ in admitted:
             st["pend_tok"][row].fill_(tok)
+            L = int(d._row_lengths[row])
             if hid is not None:
                 st["pend_hid"][row].copy_(hid.reshape(1, -1).expand(2, -1))
                 st["spec_on"][row] = True
                 # the prompt's last draft row is re-absorbed with the real first token
-                self.bs_rows[row] = {"c": int(d._row_lengths[row]) - 1, "n": 0}
+                g.bspec_set(row, P=L, c=L - 1, n=0)
+                self.bs_rows[row] = {}
             else:
                 st["spec_on"][row] = False
-                self.bs_rows[row] = {"c": int(d._row_lengths[row]), "n": 0}
-        rows = [row for row, _ in plan["carry"]] + [row for row, _, _, _ in admitted]
-        temps = [t for t, _ in plan["carry_params"]] + [t for _, _, _, t in admitted]
-        if rows:
-            self._bspec_round(rows, temps)
+                g.bspec_set(row, P=L, c=L, n=0)
+                self.bs_rows[row] = {"warm": True}
+        rows = rows + [row for row, _, _, _ in admitted]
+        temps = temps + [t for _, _, _, t in admitted]
+        if not rows:
+            return
+        end = self._bs_end(rows, inflight=0)
+        rnd = self._bs_enqueue(rows, temps, end)
+        if self.bs_la:
+            self.inflight = rnd
+        else:
+            self._bs_consume(rnd, None)
+
+    def _bs_end(self, rows, *, inflight):
+        """An upper bound on a round's context end from the host-known lengths (each
+        unconsumed round in flight commits <= 2; the pad entries write P + 2). A
+        later regime serves an earlier context exactly, so the bound is safe."""
+        d = self.ctx.decoder
+        return max(int(d._row_lengths.get(r, 0)) for r in rows) + 2 * inflight + 3
 
     def _adopt_solo(self, ys):
         """Every rank: a preempted solo speculation joins the batched rounds with its
@@ -1664,7 +1721,9 @@ class BatchLoop:
         st["pend_tok"][0].fill_(bonus)
         st["pend_hid"][0].copy_(hidden[-1].reshape(1, -1).expand(2, -1))
         st["spec_on"][0] = True
-        self.bs_rows[0] = {"c": P - 1, "n": 0}
+        self.ctx.decoder.decode_graphs.bspec_set(
+            0, P=int(self.ctx.decoder._row_lengths.get(0, P)), c=P - 1, n=0)
+        self.bs_rows[0] = {}
         torch.cuda.synchronize(self.ctx.device)
 
     def _bspec_gen(self, device):
@@ -1675,76 +1734,118 @@ class BatchLoop:
             self._bs_gen.manual_seed(int.from_bytes(os.urandom(8), "little") >> 1)
         return self._bs_gen
 
-    def _bspec_round(self, rows, temps):
-        """Every rank: one batched speculative round over `rows` (draft absorb +
-        verify graphs, one host read); rank 0 emits 1 or 2 tokens per row."""
+    def _bs_enqueue(self, rows, temps, end):
+        """Every rank: stage and launch one round (draft absorb + verify graphs) from
+        the device round state; snapshot its outputs (D2H + event). No host read."""
         import torch
-        from ignition.recipes.hy4.wiring import batch_shape
 
-        ctx, rank = self.ctx, self.rank
+        ctx = self.ctx
         d = ctx.decoder
         g = d.decode_graphs
         st = g.bspec_state()
         B = len(rows)
         size = g.batch_bucket(2 * B)
-        shape = batch_shape(size)
-        starts = [int(d._row_lengths.get(r, 0)) for r in rows]
-        drows, dpos, vrows, vpos = [], [], [], []
-        for r, P in zip(rows, starts):
-            c, n = self.bs_rows[r]["c"], self.bs_rows[r]["n"]
-            drows += [r, r]
-            dpos += [c, c + n]
-            vrows += [r, r]
-            vpos += [P, P + 1]
-        extra = size - 2 * B
-        if extra:
-            # pad entries: the lowest-position row one past this round's writes
-            j = min(range(B), key=lambda i: starts[i])
-            drows += [rows[j]] * extra
-            dpos += [dpos[2 * j + 1] + 1] * extra
-            vrows += [rows[j]] * extra
-            vpos += [starts[j] + 2] * extra
+        shape = batch_shape_of(size)
         half = size // 2
-        inv = [1.0 / t for t in temps] + [1.0] * (half - B)
-        st["inv_temp"][:half].copy_(torch.tensor(inv, dtype=torch.float32))
+        key = tuple(rows)
+        if self._bs_rows_t[0] != key:
+            self._bs_rows_t = (key, torch.tensor(rows, dtype=torch.long).to(ctx.device))
+        rows_t = self._bs_rows_t[1]
+        inv = tuple([1.0 / t if t > 0.0 else 0.0 for t in temps] + [1.0] * (half - B))
+        if self._bs_inv != inv:
+            # inv_temp 0 marks a greedy row (the graphs take its exact argmax)
+            st["inv_temp"][:half].copy_(torch.tensor(inv, dtype=torch.float32).pin_memory(),
+                                        non_blocking=True)
+            self._bs_inv = inv
         gen = self._bspec_gen(st["noise_q"].device)
         st["noise_q"][:half].uniform_(generator=gen)
         st["noise_v"][:half].uniform_(generator=gen)
         st["uniform"][:half].uniform_(generator=gen)
-        g.run_bspec("draft", drows, dpos, call_shape=shape)
-        g.run_bspec("verify", vrows, vpos, call_shape=shape)
-        host = torch.cat([st["out_accept"][:B].long(), st["out_tokens"][:B].reshape(-1),
-                          st["d1"][:B], st["out_vflag"].reshape(1).long()]).tolist()
+        extra = size - 2 * B
+        j = min(range(B), key=lambda i: int(d._row_lengths.get(rows[i], 0)))
+        erows = [r for r in rows for _ in (0, 1)] + [rows[j]] * extra
+        pads = [False] * (2 * B) + [True] * extra
+        bonus = st["pend_tok"][rows_t, 1]                  # the round's inputs (rollback)
+        g.run_bspec("draft", erows, pads, end=end, call_shape=shape)
+        g.run_bspec("verify", erows, pads, end=end, call_shape=shape)
+        snap = self._bs_snap()
+        dev = snap["dev"]
+        dev[0:B].copy_(st["out_accept"][:B])
+        dev[B:3 * B].copy_(st["out_tokens"][:B].reshape(-1))
+        dev[3 * B:4 * B].copy_(st["d1"][:B])
+        dev[4 * B:5 * B].copy_(bonus)
+        dev[5 * B:5 * B + 1].copy_(st["out_vflag"].reshape(1))
+        snap["host"][:5 * B + 1].copy_(dev[:5 * B + 1], non_blocking=True)
+        snap["event"].record()
+        # the rows' next inputs after this round (a plain step after it reads them)
+        snap["out"] = st["pend_tok"][rows_t, 1]
+        return {"bspec": True, "rows": list(rows), "temps": list(temps), "snap": snap}
+
+    def _bs_snap(self):
+        import torch
+
+        if getattr(self, "_bs_snaps", None) is None:
+            dev = self.ctx.device
+            self._bs_snaps = [{"dev": torch.zeros((81,), dtype=torch.long, device=dev),
+                               "host": torch.zeros((81,), dtype=torch.long).pin_memory(),
+                               "event": torch.cuda.Event()} for _ in range(4)]
+            self._bs_snap_at = 0
+        snap = self._bs_snaps[self._bs_snap_at]
+        self._bs_snap_at = (self._bs_snap_at + 1) % len(self._bs_snaps)
+        return snap
+
+    def _bs_consume(self, rnd, nxt):
+        """Every rank: wait for round `rnd`, apply it (rank 0 emits 1 or 2 tokens per
+        row). A flagged verify (a narrow selection may be inexact) discards `nxt`
+        (enqueued after it) and reruns `rnd`'s rows exactly. True when it rolled back."""
+        import torch
+
+        ctx, rank = self.ctx, self.rank
+        d = ctx.decoder
+        g = d.decode_graphs
+        st = g.bspec_state()
+        rows = rnd["rows"]
+        B = len(rows)
+        rnd["snap"]["event"].synchronize()
+        host = rnd["snap"]["host"][:5 * B + 1].tolist()
         acc, toks, d1 = host[:B], host[B:3 * B], host[3 * B:4 * B]
+        bonus, flag = host[4 * B:5 * B], host[5 * B]
+        warm = [r for r in rows if self.bs_rows.get(r, {}).get("warm")]
         self.steps += 1
         if self.steps % 256 == 0:
             d.trace.clear()
-        if host[4 * B]:
-            return self._bspec_exact(rows, starts)
-        rows_t = torch.tensor(rows, dtype=torch.long, device=st["pend_tok"].device)
-        a = st["out_accept"][:B]
-        t0, t1 = st["out_tokens"][:B, 0], st["out_tokens"][:B, 1]
-        new_tok = torch.where(a.unsqueeze(1), torch.stack([st["d1"][:B], t1], 1),
-                              torch.stack([t0, t0], 1))
-        vh = st["out_hidden"][:B]
-        new_hid = torch.where(a.reshape(-1, 1, 1), vh, vh[:, :1].expand(-1, 2, -1))
-        st["pend_tok"].index_copy_(0, rows_t, new_tok)
-        st["pend_hid"].index_copy_(0, rows_t, new_hid)
-        for i, r in enumerate(rows):
-            n = int(acc[i])
-            d.append([r], n + 1)
-            self.bs_rows[r] = {"c": starts[i], "n": n}
+        # rounds are consumed in order: the host lengths are this round's starts; a
+        # row the plan released meanwhile (no length) is skipped
+        live = [i for i, r in enumerate(rows) if r in d._row_lengths]
+        starts = [int(d._row_lengths.get(r, 0)) for r in rows]
+        if flag:
+            torch.cuda.synchronize(ctx.device)          # nxt (if any) finished: discarded
+            if live:
+                self._bspec_exact([rows[i] for i in live], [starts[i] for i in live],
+                                  [bonus[i] for i in live])
+            for r in warm:
+                st["spec_on"][r] = True
+                self.bs_rows[r] = {}
+            rnd["snap"]["out"] = st["pend_tok"][self._bs_rows_t[1], 1] \
+                if self._bs_rows_t[0] == tuple(rows) else rnd["snap"]["out"]
+            return nxt is not None
+        for i in live:
+            d.append([rows[i]], int(acc[i]) + 1)
+        for r in warm:
+            st["spec_on"][r] = True     # warmed: its pending entry is this verify's
+            self.bs_rows[r] = {}
         self.bspec_rounds += 1
         self.bspec_slots += B
         self.bspec_accepted += sum(int(x) for x in acc)
         if rank == 0:
             for i, r in enumerate(rows):
-                req = self._row_reqs.get(r)
+                req = self._row_reqs.get(r) if self._row_reqs is not None else None
                 if req is None or req.done:
                     continue
                 self._emit(req, [d1[i], toks[2 * i + 1]] if acc[i] else [toks[2 * i]])
+        return False
 
-    def _bspec_exact(self, rows, starts):
+    def _bspec_exact(self, rows, starts, bonus):
         """A flagged verify (a narrow selection may be inexact): each row takes one
         exact one-row step at its bonus instead (host-sampled, broadcast)."""
         import torch
@@ -1759,8 +1860,9 @@ class BatchLoop:
         d.logits_root_host = root
         parts, hids = [], []
         try:
-            for r in rows:
-                t = st["pend_tok"][r, 1:2].reshape(1, 1).clone()
+            for i, r in enumerate(rows):
+                # the round's input (its pending state may since be overwritten)
+                t = torch.tensor([[int(bonus[i])]], dtype=torch.long).to(ctx.device)
                 logits, post, _ = d.forward(t, request_rows=[r], call_shape=ctx.decode_shape,
                                             logits_rows="all", return_hidden=True)
                 parts.append(logits)
@@ -1782,7 +1884,7 @@ class BatchLoop:
             st["pend_tok"][r].fill_(ids[0][i])
             st["pend_hid"][r].copy_(hids[i].reshape(1, -1).expand(2, -1))
             d.append([r], 1)
-            self.bs_rows[r] = {"c": starts[i], "n": 0}
+            d.decode_graphs.bspec_set(r, P=starts[i] + 1, c=starts[i], n=0)
         if rank == 0:
             for i, r in enumerate(rows):
                 req = self._row_reqs.get(r)
@@ -1891,6 +1993,8 @@ class BatchLoop:
         Returns True when it rolled back."""
         import torch
 
+        if step.get("bspec"):
+            return self._bs_consume(step, nxt)
         ctx, rank = self.ctx, self.rank
         d = ctx.decoder
         rows, size = step["rows"], step["size"]
@@ -2178,6 +2282,9 @@ def main():
                      if MTP and os.environ.get("HY4_SPEC_DECODE_ROWS") == "1" else ())
         # batched decode: the decode-family rows shapes of the step buckets past one row
         SHORT_KV = os.environ.get("HY4_SHORT_KV") == "on"
+        # the replicated window: records (and indexer keys past top-k) of every
+        # position below it, per serving row
+        SHORT_POSITIONS = max(int(os.environ.get("HY4_SHORT_KV_POSITIONS") or 0), int(cfg_topk))
         BATCH_ROWS = tuple(b for b in (2, 4, 8) if b <= args.batch_rows)
         # dev probes only: wider batch shapes (16 / 32 query rows) for micro-benches
         BATCH_ROWS += tuple(int(x) for x in (os.environ.get("HY4_BATCH_EXTRA") or "").split(",")
@@ -2250,8 +2357,8 @@ def main():
             if SHORT_KV and world > 1:
                 # replicated short-context records for every serving row (both
                 # phases: phase A's fixed term measures them before the pool)
-                nbytes = built.decoder.cache.allocate_short(args.rows, int(cfg_topk))
-                trace(rank, f"short-context KV: {args.rows} rows x {int(cfg_topk)} positions, "
+                nbytes = built.decoder.cache.allocate_short(args.rows, SHORT_POSITIONS)
+                trace(rank, f"short-context KV: {args.rows} rows x {SHORT_POSITIONS} positions, "
                             f"{nbytes / 2**30:.2f} GiB")
             return built, shp, decode_shape, load_s
 
@@ -2507,8 +2614,11 @@ def main():
             # Both regimes prime their own plan variants: the short-context bypass
             # (with replicated short KV: the local-head, sink-bound plans) and the
             # context-parallel path past top-k (the sinkless partial plans).
-            past = int(cfg_topk) + 8
-            for base in (0, past):
+            past = (SHORT_POSITIONS if SHORT_KV else int(cfg_topk)) + 8   # the cp regime
+            # the local regime (replicated short KV past top-k): its one bucket
+            bases = (0, int(cfg_topk) + 8, past) if SHORT_KV and SHORT_POSITIONS > int(cfg_topk) \
+                else (0, past)
+            for base in bases:
                 for b in sorted(BATCH_ROWS, reverse=True) + [1]:
                     shape = ctx.decode_shape if b == 1 else batch_shape(b)
                     # wider than the cache rows: wrap the rows, each wrapped entry
@@ -2520,14 +2630,18 @@ def main():
             if MTP and getattr(ctx, "spec", None) is not None:
                 # batched speculation: the MTP draft attention's batch plan group is
                 # primed by its first call too — widest first, draft and verify
-                for base in (0, past):
+                for base in bases:
                     for b in sorted((x for x in BATCH_ROWS if x >= 2), reverse=True):
                         shape = batch_shape(b)
                         rows_p = [(i // 2) % args.rows for i in range(b)]
-                        pos_p = [base + i for i in range(b)]
+                        for r in range(args.rows):     # the device round state: near `base`
+                            graphs.bspec_set(r, P=base + 2 * r, c=base + 2 * r, n=0)
+                        end = base + 2 * args.rows + 3
                         for _ in range(2):
-                            graphs.run_bspec("draft", rows_p, pos_p, call_shape=shape)
-                            graphs.run_bspec("verify", rows_p, pos_p, call_shape=shape)
+                            graphs.run_bspec("draft", rows_p, [False] * b, end=end, call_shape=shape)
+                            graphs.run_bspec("verify", rows_p, [False] * b, end=end, call_shape=shape)
+                for r in range(args.rows):
+                    graphs.bspec_set(r, P=0, c=0, n=0)
             torch.cuda.synchronize(device)
             ctx.decoder.release(list(range(args.rows)))
             trace(rank, f"batch graphs: buckets {sorted(BATCH_ROWS) + [1]} primed in "

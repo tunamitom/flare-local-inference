@@ -102,6 +102,14 @@ ALLOWED = {
     # round 15: decode-family RMSNorm (<= 4 rows) in one launch, torch's own
     # mean tree emulated (fused_ops.rms_norm_tree; bit-identical)
     "rms_tree": ("off", "on"),
+    # c8 campaign L8: RMSNorm over > 4 rows in one launch (FP32 tree sum in-kernel;
+    # the 3-launch square / torch mean / tail path otherwise)
+    "rms_rows": ("off", "on"),
+    # c8 campaign L8: the short-context bypass selection (identical in every layer
+    # of a forward) built once per forward, not per layer
+    "short_memo": ("off", "on"),
+    # c8 campaign L8: batched steps' record writes skip the identity index_select
+    "kept_rows": ("off", "on"),
     # round 15 (numerics class): decode W_UV expansion with BF16 operands and FP32
     # accumulation (attention.expand_output), no FP32 copies per step
     "expand_bf16": ("off", "on"),
@@ -153,6 +161,9 @@ DEFAULTS = {"index_scores": "fp32",
             "diet_glue": os.environ.get("HY4_DIET_GLUE") or "off",
             "diet_absorb": os.environ.get("HY4_DIET_ABSORB") or "off",
             "rms_tree": os.environ.get("HY4_RMS_TREE") or "off",
+            "rms_rows": os.environ.get("HY4_RMS_ROWS") or "off",
+            "short_memo": os.environ.get("HY4_SHORT_MEMO") or "off",
+            "kept_rows": os.environ.get("HY4_KEPT_ROWS") or "off",
             "expand_bf16": os.environ.get("HY4_EXPAND_BF16") or "off",
             "diet2": os.environ.get("HY4_DIET2") or "off",
             "diet3": os.environ.get("HY4_DIET3") or "off",

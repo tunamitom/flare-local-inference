@@ -237,8 +237,11 @@ class SpeculativeGreedy:
         g, k = self.graphs, self.k
         before = g.captures
         # the short-context bypass bucket first (one start serves all of it)
-        starts = [k + 2] if g.spec_width(k + 2, k + 1, self._shape(k + 1)) == 0 else []
-        start = g.topk + k + 2
+        starts = [k + 2] if g.spec_width(k + 2, k + 1, self._shape(k + 1))[0] == "bypass" else []
+        # the local regime's one bucket (replicated short KV), then cp from S on
+        if g.spec_width(g.topk + 2, k + 1, self._shape(k + 1))[0] == "local":
+            starts.append(g.topk + 2)
+        start = max(g.topk, g.short_cap()) + k + 2
         for short in starts:
             modes = ((False, False), (True, False), (True, True)) if sample else ((False, False),)
             for mode, filt in modes:

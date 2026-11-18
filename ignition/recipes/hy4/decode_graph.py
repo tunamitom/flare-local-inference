@@ -43,6 +43,14 @@ import torch
 from .w8 import decode_scope as w8_decode_scope
 
 
+
+def _kept_rows():
+    """c8 L8: batched steps' kept = arange(rows) skips its identity index_select."""
+    from .runtime import SWITCHES
+
+    return SWITCHES.get("kept_rows") == "on"
+
+
 class DecodeGraphs:
     """Captured one-row decode steps, one per (row, width bucket, logits form)."""
 
@@ -105,6 +113,44 @@ class DecodeGraphs:
         """0 = the short-context bypass, else the indexer width bucket."""
         return 0 if start + 1 <= self.topk else self.index_width(start + 1)
 
+    # -- regimes: bypass (end <= top-k), local (replicated short-context keys
+    #    and records: end <= the short capacity), cp (context parallel) --------
+    def short_cap(self):
+        from .runtime import SWITCHES
+
+        S = int(getattr(self.decoder.cache, "short_capacity", 0) or 0)
+        return S if (S and SWITCHES.get("short_kv") == "on") else 0
+
+    def regime(self, end, call_shape, *, bypass_ok=None):
+        """`(regime, width)` of a decode-family forward whose context ends at `end`."""
+        ok = self._short_bypass(call_shape) if bypass_ok is None else bypass_ok
+        if end <= self.topk and ok:
+            return "bypass", 0
+        S = self.short_cap()
+        if S and end <= S and ok:
+            # one local bucket (the whole short table): the indexer scores S keys
+            # per row (~0.05 ms) and every local context shares one primed graph
+            return "local", S
+        return "cp", self.index_width(end)
+
+    @staticmethod
+    def wkey(regime, width):
+        return ("L", width) if regime == "local" else width
+
+    def _geo(self, regime, width, *, rows=None, row=None):
+        """The captured step's host-known geometry and `visible_max` in its regime
+        (`visible_max` steers the attention: <= top-k bypass, <= S local, else cp)."""
+        S = self.short_cap()
+        if regime == "local":
+            owned, vmax, scale = width, width, S
+        elif regime == "bypass":
+            owned, vmax, scale = 1, self.topk, self.local_capacity
+        else:
+            owned, vmax, scale = max(width, 1), max(self.topk, S) + 1, self.local_capacity
+        if rows is not None:
+            return {"owned_max": owned, "base": None, "bases": rows * scale}, vmax
+        return {"owned_max": owned, "base": row * scale}, vmax
+
     # -- the step body (eager or under capture) -------------------------
     def _stage(self, token_ids, row, start):
         """Load the step's inputs into the static buffers (no host read)."""
@@ -115,7 +161,7 @@ class DecodeGraphs:
         self._host[2] = local
         self._args.copy_(self._host, non_blocking=True)
 
-    def _body(self, row, call_shape, width, logits_rows):
+    def _body(self, row, call_shape, width, logits_rows, regime=None):
         from .lanes import use_lane
 
         d = self.decoder
@@ -125,13 +171,11 @@ class DecodeGraphs:
         visible = positions + 1
         d.cache.begin_forward_static(token_rows, positions, slot=self._args[1:2],
                                      safe=self._args[2:3])
-        geometry = {"owned_max": max(width, 1), "base": row * self.local_capacity}
+        regime = regime or ("bypass" if width == 0 else "cp")
+        geometry, visible_max = self._geo(regime, width, row=row)
         deferred = getattr(d.collectives, "deferred_checks", None)
         if deferred is not None:
             deferred.clear()
-        # The bypass test reads only this bound: width 0 is the short-context
-        # bucket (<= top-k), any other bucket is past top-k (accepts()).
-        visible_max = self.topk if width == 0 else self.topk + 1
         with use_lane(0, overlap=False, geometry=geometry, sync_free=True), w8_decode_scope():
             logits = d._layers_and_head(
                 self._token, rows, positions, token_rows, visible, visible_max, state=None,
@@ -278,10 +322,8 @@ class DecodeGraphs:
                 and (call_shape.is_decode_graph or self._decode_rows(call_shape, count)))
 
     def spec_width(self, start, count, call_shape):
-        """0 (the short-context bypass bucket) or the indexer width bucket."""
-        if start + count <= self.topk and self._spec_bypass(count, call_shape):
-            return 0
-        return self.index_width(start + count)
+        """`(regime, width)` of a spec forward (0 width: the bypass bucket)."""
+        return self.regime(start + count, call_shape, bypass_ok=self._spec_bypass(count, call_shape))
 
     @staticmethod
     def _decode_rows(call_shape, count):
@@ -396,7 +438,7 @@ class DecodeGraphs:
         args = entry["args"]
         return args[1:1 + per], args[1 + per:1 + 2 * per], args[1 + 2 * per:1 + 3 * per]
 
-    def _body_verify(self, row, call_shape, width, count, sample=False, filtered=False):
+    def _body_verify(self, row, call_shape, width, count, sample=False, filtered=False, regime="cp"):
         from .lanes import use_lane
 
         d = self.decoder
@@ -407,11 +449,11 @@ class DecodeGraphs:
         visible = positions + 1
         kept, slot, safe = self._spec_slots(entry)
         d.cache.begin_forward_static(token_rows, positions, slot=slot, safe=safe, kept=kept)
-        geometry = {"owned_max": max(width, 1), "base": row * self.local_capacity}
+        geometry, visible_max = self._geo(regime, width, row=row)
+        visible_max = visible_max if call_shape.is_decode_graph else None
         deferred = getattr(d.collectives, "deferred_checks", None)
         if deferred is not None:
             deferred.clear()
-        visible_max = (self.topk if width == 0 else self.topk + 1) if call_shape.is_decode_graph else None
         with use_lane(0, overlap=False, geometry=geometry, sync_free=True), w8_decode_scope():
             logits, normed, _ = d._layers_and_head(
                 tokens, rows, positions, token_rows, visible, visible_max, state=None,
@@ -434,7 +476,7 @@ class DecodeGraphs:
                 greedy = d.greedy_tokens(logits.reshape(count, -1))
         return self._emit(entry, greedy, normed.reshape(count, -1), self._flag(deferred))
 
-    def _body_draft(self, row, call_shape, width, count, sample=False, filtered=False):
+    def _body_draft(self, row, call_shape, width, count, sample=False, filtered=False, regime="cp"):
         from .lanes import use_lane
 
         d = self.decoder
@@ -442,11 +484,11 @@ class DecodeGraphs:
         tokens, rows = self._spec_rows(entry["tokens"], row, call_shape, count)
         hidden_in = entry["hidden"]
         positions = entry["args"][0:1] + torch.arange(count, dtype=torch.long, device=self.device)
-        geometry = {"owned_max": max(width, 1), "base": row * self.local_capacity}
+        geometry, visible_max = self._geo(regime, width, row=row)
+        visible_max = visible_max if call_shape.is_decode_graph else None
         deferred = getattr(d.collectives, "deferred_checks", None)
         if deferred is not None:
             deferred.clear()
-        visible_max = (self.topk if width == 0 else self.topk + 1) if call_shape.is_decode_graph else None
         with use_lane(0, overlap=False, geometry=geometry, sync_free=True), w8_decode_scope():
             hidden, _, _ = d._draft_cp(tokens, hidden_in, positions, rows, d.cache,
                                        call_shape=call_shape, visible_max=visible_max,
@@ -499,8 +541,8 @@ class DecodeGraphs:
         output buffers, valid until the next forward of the same (kind, T).
         Captured per (kind, T, indexer width bucket); the first call runs
         eagerly through the same body."""
-        width = self.spec_width(start, count, call_shape)
-        key = (kind, int(row), int(count), width, call_shape.name)
+        regime, width = self.spec_width(start, count, call_shape)
+        key = (kind, int(row), int(count), self.wkey(regime, width), call_shape.name)
         filtered = bool(sample and filtered)
         if sample:
             key = key + (("sample", "filtered") if filtered else ("sample",))
@@ -510,9 +552,9 @@ class DecodeGraphs:
         body = self._body_verify if kind == "verify" else self._body_draft
         graph = self.graphs.get(key)
         if graph is None:
-            out = body(row, call_shape, width, count, sample, filtered)
+            out = body(row, call_shape, width, count, sample, filtered, regime)
             self.eager_steps += 1
-            self._capture(key, lambda: body(row, call_shape, width, count, sample, filtered))
+            self._capture(key, lambda: body(row, call_shape, width, count, sample, filtered, regime))
             return out
         graph, outputs, _ = graph
         self.graphs.move_to_end(key)
@@ -596,7 +638,7 @@ class DecodeGraphs:
             host[4 * size + i] = local
         entry["args"].copy_(host, non_blocking=True)
 
-    def _body_batch(self, size, call_shape, width, sample=False):
+    def _body_batch(self, size, call_shape, rw, sample=False):
         from .lanes import use_lane
 
         d = self.decoder
@@ -609,14 +651,11 @@ class DecodeGraphs:
         token_rows = rows                       # one token per query row
         visible = positions + 1
         d.cache.begin_forward_static(token_rows, positions, slot=slot, safe=safe,
-                                     kept=entry["kept"])
-        geometry = {"owned_max": max(width, 1), "base": None,
-                    "bases": rows * self.local_capacity}
+                                     kept=entry["kept"], kept_identity=_kept_rows())
+        geometry, visible_max = self._geo(*rw, rows=rows)
         deferred = getattr(d.collectives, "deferred_checks", None)
         if deferred is not None:
             deferred.clear()
-        # width 0: every row is inside the short-context bypass (<= top-k)
-        visible_max = self.topk if width == 0 else self.topk + 1
         with use_lane(0, overlap=False, geometry=geometry, sync_free=True), w8_decode_scope():
             logits = d._layers_and_head(
                 tokens, rows, positions, token_rows, visible, visible_max, state=None,
@@ -654,9 +693,9 @@ class DecodeGraphs:
             starts = list(starts) + [pad[1]] * (size - count)
             tokens = list(tokens) + [0] * (size - count)
         end = max(int(s) for s in starts) + 1
-        width = 0 if (end <= self.topk and self._short_bypass(call_shape)) else self.index_width(end)
-        key = ("batch", size, width, call_shape.name) + (("sample",) if sample else ())
-        return size, tokens, rows, starts, width, key
+        regime, width = self.regime(end, call_shape)
+        key = ("batch", size, self.wkey(regime, width), call_shape.name) + (("sample",) if sample else ())
+        return size, tokens, rows, starts, (regime, width), key
 
     def batch_cached(self, rows, starts, *, call_shape, pad=None, sample=False):
         """Whether this step's graph is captured (no eager first call): an eager
@@ -671,7 +710,7 @@ class DecodeGraphs:
         flag)`; logits rows past len(rows) are padding. `pad` = (row, position)
         of every pad entry (default: the first of `pad_rows` at 0, else the
         lowest-position row one past its token)."""
-        size, tokens, rows, starts, width, key = self._batch_prep(
+        size, tokens, rows, starts, rw, key = self._batch_prep(
             tokens, rows, starts, call_shape, pad_rows, pad, sample)
         entry = self._batch_state(size)
         self._stage_batch(entry, size, tokens, rows, starts)
@@ -679,10 +718,10 @@ class DecodeGraphs:
             pre(entry["args"][0:size])     # stream-ordered fix-up of the staged token ids
         cached = self.graphs.get(key)
         if cached is None:
-            logits, flag = self._body_batch(size, call_shape, width, sample)
+            logits, flag = self._body_batch(size, call_shape, rw, sample)
             self.eager_steps += 1
             logits, flag = logits.clone(), flag.clone()
-            self._capture(key, lambda: self._body_batch(size, call_shape, width, sample))
+            self._capture(key, lambda: self._body_batch(size, call_shape, rw, sample))
             return logits, flag
         graph, logits, flag = cached
         self.graphs.move_to_end(key)
@@ -708,10 +747,17 @@ class DecodeGraphs:
             lo, hi = d.weights.sharding.vocabulary_range
             S = self.BATCH_BUCKETS[-1]
             dev = self.device
+            # c8 L5b: per cache row (+1 dummy row that absorbs the pad slots' scatters)
+            # the device-resident round state — committed length P (the bonus's
+            # position), draft cursor c, last accepted count n — so a round's
+            # positions never wait on a host read (the verify graph advances them)
             st = self._bspec = {
-                "pend_tok": torch.zeros((rows, 2), dtype=torch.long, device=dev),
-                "pend_hid": torch.zeros((rows, 2, hidden), dtype=d.compute_dtype, device=dev),
-                "spec_on": torch.zeros((rows,), dtype=torch.bool, device=dev),
+                "pend_tok": torch.zeros((rows + 1, 2), dtype=torch.long, device=dev),
+                "pend_hid": torch.zeros((rows + 1, 2, hidden), dtype=d.compute_dtype, device=dev),
+                "spec_on": torch.zeros((rows + 1,), dtype=torch.bool, device=dev),
+                "P": torch.zeros((rows + 1,), dtype=torch.long, device=dev),
+                "c": torch.zeros((rows + 1,), dtype=torch.long, device=dev),
+                "n": torch.zeros((rows + 1,), dtype=torch.long, device=dev),
                 "q": torch.zeros((S, hi - lo), dtype=torch.float32, device=dev),
                 "d1": torch.zeros((S,), dtype=torch.long, device=dev),
                 "inv_temp": torch.ones((S,), dtype=torch.float32, device=dev),
@@ -731,113 +777,156 @@ class DecodeGraphs:
         st = self.bspec_state()
         entry = st["args"].get(size)
         if entry is None:
-            # positions | kv rows | record slot | safe slot  (+ the static entry maps)
+            # kv rows | pad mask (host-staged; positions and slots are device-derived)
             entry = st["args"][size] = {
-                "args": torch.zeros((4 * size,), dtype=torch.long, device=self.device),
+                "args": torch.zeros((2 * size,), dtype=torch.long, device=self.device),
                 "kept": torch.arange(size, dtype=torch.long, device=self.device),
                 "pick": torch.arange(size, dtype=torch.long, device=self.device) % 2,
                 "slot_of": torch.arange(size, dtype=torch.long, device=self.device) // 2,
             }
         return entry
 
-    def _stage_bspec(self, entry, size, rows, positions):
-        host = self._batch_host(4 * size)
+    def _stage_bspec(self, entry, size, rows, pads):
+        host = self._batch_host(2 * size)
         for i in range(size):
-            row, pos = int(rows[i]), int(positions[i])
-            local = row * self.local_capacity + pos // self.world
-            host[i] = pos
-            host[size + i] = row
-            host[2 * size + i] = local if pos % self.world == self.rank else -1
-            host[3 * size + i] = local
+            host[i] = int(rows[i])
+            host[size + i] = 1 if pads[i] else 0
         entry["args"].copy_(host, non_blocking=True)
 
-    def _bspec_geometry(self, rows, width):
-        return {"owned_max": max(width, 1), "base": None, "bases": rows * self.local_capacity}
+    def _bspec_geometry(self, kind, size):
+        """Device positions / record slots of a round's entries from the round state:
+        draft (c, c + n) per row, verify (P, P + 1); pad entries one past the row's
+        writes (draft c + n + 1, verify P + 2)."""
+        st, entry = self.bspec_state(), self._bspec_args(size)
+        args = entry["args"]
+        rows, pad = args[0:size], args[size:2 * size] != 0
+        odd = entry["pick"]
+        if kind == "draft":
+            c, n = st["c"][rows], st["n"][rows]
+            positions = torch.where(pad, c + n + 1, c + odd * n)
+        else:
+            P = st["P"][rows]
+            positions = torch.where(pad, P + 2, P + odd)
+        local = rows * self.local_capacity + torch.div(positions, self.world, rounding_mode="floor")
+        slot = torch.where(torch.remainder(positions, self.world) == self.rank, local,
+                           torch.full_like(local, -1))
+        return rows, pad, positions, slot, local
 
-    def _body_bdraft(self, size, call_shape, width):
+    def _body_bdraft(self, size, call_shape, rw):
         from .lanes import use_lane
         from .spec_sample import sample_tokens
 
         d = self.decoder
         st, entry = self.bspec_state(), self._bspec_args(size)
-        args = entry["args"]
-        positions, rows = args[0:size], args[size:2 * size]
-        slot, safe = args[2 * size:3 * size], args[3 * size:4 * size]
+        rows, _, positions, slot, safe = self._bspec_geometry("draft", size)
         tokens = st["pend_tok"][rows, entry["pick"]].reshape(size, 1)
         hidden_in = st["pend_hid"][rows, entry["pick"]]
         deferred = getattr(d.collectives, "deferred_checks", None)
         if deferred is not None:
             deferred.clear()
-        visible_max = self.topk if width == 0 else self.topk + 1
-        with use_lane(0, overlap=False, geometry=self._bspec_geometry(rows, width), sync_free=True), \
+        geometry, visible_max = self._geo(*rw, rows=rows)
+        with use_lane(0, overlap=False, geometry=geometry, sync_free=True), \
                 w8_decode_scope():
             hidden, _, _ = d._draft_cp(tokens, hidden_in, positions, rows, d.cache,
                                        call_shape=call_shape, visible_max=visible_max,
                                        static_slots=(entry["kept"], slot, safe))
             half = size // 2
             last = hidden.reshape(half, 2, -1)[:, 1]
-            scores = d.head_logits(last) * st["inv_temp"][:half].reshape(-1, 1)
+            # c8 L5d: inv_temp 0 marks a greedy row — unit scale and constant noise
+            # (Gumbel-max is then the exact argmax: its draft is the greedy draft)
+            inv = st["inv_temp"][:half]
+            greedy = inv <= 0
+            scores = d.head_logits(last) * torch.where(greedy, torch.ones_like(inv), inv).reshape(-1, 1)
             st["q"][:half].copy_(scores)
-            d1 = sample_tokens(d.collectives, scores, st["noise_q"][:half],
+            noise = torch.where(greedy.reshape(-1, 1), torch.full_like(st["noise_q"][:half], 0.5),
+                                st["noise_q"][:half])
+            d1 = sample_tokens(d.collectives, scores, noise,
                                vocabulary_range=d.weights.sharding.vocabulary_range)
             st["d1"][:half].copy_(d1.reshape(-1))
         st["out_dflag"].copy_(self._flag(deferred))
         return st["d1"], st["out_dflag"]
 
-    def _body_bverify(self, size, call_shape, width):
+    def _body_bverify(self, size, call_shape, rw):
         from .lanes import use_lane
         from .spec_sample import verify_sample_k1
 
         d = self.decoder
         st, entry = self.bspec_state(), self._bspec_args(size)
-        args = entry["args"]
-        positions, rows = args[0:size], args[size:2 * size]
-        slot, safe = args[2 * size:3 * size], args[3 * size:4 * size]
+        rows, pad, positions, slot, safe = self._bspec_geometry("verify", size)
         half = size // 2
         bonus = st["pend_tok"][rows, 1]
         drafts = st["d1"][entry["slot_of"]]
         tokens = torch.where(entry["pick"] == 0, bonus, drafts).reshape(size, 1)
         token_rows = rows
         visible = positions + 1
-        d.cache.begin_forward_static(token_rows, positions, slot=slot, safe=safe, kept=entry["kept"])
+        d.cache.begin_forward_static(token_rows, positions, slot=slot, safe=safe, kept=entry["kept"],
+                                     kept_identity=_kept_rows())
         deferred = getattr(d.collectives, "deferred_checks", None)
         if deferred is not None:
             deferred.clear()
-        visible_max = self.topk if width == 0 else self.topk + 1
-        with use_lane(0, overlap=False, geometry=self._bspec_geometry(rows, width), sync_free=True), \
+        geometry, visible_max = self._geo(*rw, rows=rows)
+        with use_lane(0, overlap=False, geometry=geometry, sync_free=True), \
                 w8_decode_scope():
             logits, normed, _ = d._layers_and_head(
                 tokens, rows, positions, token_rows, visible, visible_max, state=None,
                 return_hidden=True, call_shape=call_shape, logits_rows="all", gather=False)
+            # c8 L5d: a greedy row (inv_temp 0) samples p0 / p1 by exact argmax (unit
+            # scale, constant noise, no residual) and accepts its greedy draft iff
+            # it IS p0's argmax — greedy speculative decoding, exact
+            inv = st["inv_temp"][:half]
+            greedy = inv <= 0
             scores = (logits.reshape(half, 2, -1).float()
-                      * st["inv_temp"][:half].reshape(-1, 1, 1))
+                      * torch.where(greedy, torch.ones_like(inv), inv).reshape(-1, 1, 1))
             spec_on = st["spec_on"][rows.reshape(half, 2)[:, 0]]
+            noise = torch.where(greedy.reshape(-1, 1, 1), torch.full_like(st["noise_v"][:half], 0.5),
+                                st["noise_v"][:half])
             accept, toks = verify_sample_k1(
                 d.collectives, scores, st["q"][:half], st["d1"][:half], st["uniform"][:half],
-                st["noise_v"][:half], spec_on, vocabulary_range=d.weights.sharding.vocabulary_range)
+                noise, spec_on & ~greedy, vocabulary_range=d.weights.sharding.vocabulary_range)
+            accept = torch.where(greedy, spec_on & (toks[:, 0] == st["d1"][:half]), accept)
             st["out_accept"][:half].copy_(accept)
             st["out_tokens"][:half].copy_(toks)
             st["out_hidden"][:half].copy_(normed.reshape(half, 2, -1))
+            # c8 L5b: advance the round state on device (pad slots scatter into the
+            # dummy row): c = P, n = accepted, P += n + 1, pending = the emitted
+            # tokens with their verify hiddens ([d1, t1] / [t0, t0])
+            srow = rows.reshape(half, 2)[:, 0]
+            target = torch.where(pad.reshape(half, 2)[:, 0],
+                                 torch.full_like(srow, int(st["P"].shape[0]) - 1), srow)
+            a = accept.long()
+            P_old = st["P"][srow]
+            vh = normed.reshape(half, 2, -1).to(st["pend_hid"].dtype)
+            new_tok = torch.where(accept.unsqueeze(1), torch.stack([st["d1"][:half], toks[:, 1]], 1),
+                                  torch.stack([toks[:, 0], toks[:, 0]], 1))
+            new_hid = torch.where(accept.reshape(-1, 1, 1), vh, vh[:, :1].expand(-1, 2, -1))
+            st["c"].index_copy_(0, target, P_old)
+            st["n"].index_copy_(0, target, a)
+            st["P"].index_copy_(0, target, P_old + a + 1)
+            st["pend_tok"].index_copy_(0, target, new_tok)
+            st["pend_hid"].index_copy_(0, target, new_hid)
         st["out_vflag"].copy_(self._flag(deferred))
         return st["out_accept"], st["out_vflag"]
 
-    def run_bspec(self, kind, rows, positions, *, call_shape):
+    def run_bspec(self, kind, rows, pads, *, end, call_shape):
         """One batched speculative forward ("draft" absorb or "verify") of
-        len(rows) entries (2 per request row; a bucket of 2/4/8/16)."""
+        len(rows) entries (2 per request row; a bucket of 2/4/8/16): entry i is
+        a slot of cache row rows[i] (pads[i]: a pad entry); its position comes
+        from the device round state. `end`: the caller's UPPER bound on the
+        round's context end — it picks the regime's graph, and a later regime
+        (or a wider cp bucket) serves an earlier context exactly."""
         size = len(rows)
         if size not in self.BATCH_BUCKETS or size % 2:
             raise ValueError("a batched speculative forward runs 2 entries per row in a bucket")
-        end = max(int(p) for p in positions) + 1
-        width = 0 if (end <= self.topk and self._short_bypass(call_shape)) else self.index_width(end)
-        key = ("bspec", kind, size, width, call_shape.name)
+        rw = self.regime(int(end), call_shape)
+        key = ("bspec", kind, size, self.wkey(*rw), call_shape.name)
         entry = self._bspec_args(size)
-        self._stage_bspec(entry, size, rows, positions)
+        self._stage_bspec(entry, size, rows, pads)
         body = self._body_bdraft if kind == "draft" else self._body_bverify
         cached = self.graphs.get(key)
         if cached is None:
-            out = body(size, call_shape, width)
+            out = body(size, call_shape, rw)
             self.eager_steps += 1
-            self._capture(key, lambda: body(size, call_shape, width))
+            self._capture(key, lambda: body(size, call_shape, rw))
             return out
         graph, out, flag = cached
         self.graphs.move_to_end(key)
@@ -845,11 +934,16 @@ class DecodeGraphs:
         self.replays += 1
         return out, flag
 
-    def bspec_cached(self, kind, positions, *, call_shape):
-        size = len(positions)
-        end = max(int(p) for p in positions) + 1
-        width = 0 if (end <= self.topk and self._short_bypass(call_shape)) else self.index_width(end)
-        return ("bspec", kind, size, width, call_shape.name) in self.graphs
+    def bspec_cached(self, kind, size, end, *, call_shape):
+        return ("bspec", kind, size, self.wkey(*self.regime(int(end), call_shape)),
+                call_shape.name) in self.graphs
+
+    def bspec_set(self, row, *, P, c, n):
+        """Host write of one row's device round state (entry, adoption, an exact rerun)."""
+        st = self.bspec_state()
+        st["P"][row] = int(P)
+        st["c"][row] = int(c)
+        st["n"][row] = int(n)
 
     # -- capture ----------------------------------------------------------
     def _comm_capture_contexts(self, stack):
@@ -899,17 +993,17 @@ class DecodeGraphs:
     # -- the step ---------------------------------------------------------
     def run(self, token_ids, *, row, start, call_shape, logits_rows):
         """One decode step: `(local-shard logits, deferred selection flag)`."""
-        width = self.bucket(start)
-        key = (int(row), width, call_shape.name, logits_rows)
+        regime, width = self.regime(start + 1, call_shape)
+        key = (int(row), self.wkey(regime, width), call_shape.name, logits_rows)
         self._stage(token_ids, row, start)
         entry = self.graphs.get(key)
         if entry is None:
             # The bucket's first step runs eagerly through the same body, then
             # the bucket is captured for the following steps.
-            logits, flag = self._body(row, call_shape, width, logits_rows)
+            logits, flag = self._body(row, call_shape, width, logits_rows, regime)
             self.eager_steps += 1
             logits, flag = logits.clone(), flag.clone()
-            self._capture(key, lambda: self._body(row, call_shape, width, logits_rows))
+            self._capture(key, lambda: self._body(row, call_shape, width, logits_rows, regime))
             return logits, flag
         graph, logits, flag = entry
         self.graphs.move_to_end(key)
@@ -924,7 +1018,10 @@ class DecodeGraphs:
         position; the caller releases the row afterwards. Returns the buckets."""
         d = self.decoder
         starts = [min(64, self.topk - 1)] if self._short_bypass(call_shape) else []
-        start = self.topk
+        S = self.short_cap()
+        if S > self.topk and self._short_bypass(call_shape):
+            starts.append(self.topk)            # the local regime's one bucket
+        start = max(self.topk, S)
         while start < min(int(max_context), self.capacity):
             starts.append(start)
             # the first position of the next bucket

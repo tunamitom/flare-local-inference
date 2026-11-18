@@ -104,6 +104,7 @@ class Hy4Cache:
     # row * short_capacity + position. In the short-context bypass a rank then
     # attends its own heads over all keys locally (no head gather, no LSE merge).
     short: dict = field(default_factory=dict)
+    short_index: dict = field(default_factory=dict)   # owner -> [rows*S + 1, D] (last: scratch)
     short_capacity: int = 0
     short_writer_plan: object = None
     page_size: int = 64                           # fused-record page geometry
@@ -211,7 +212,15 @@ class Hy4Cache:
         for layer in self.records:
             self.short[layer] = torch.zeros((pages, self.page_size, LATENT_RECORD_BYTES),
                                             dtype=torch.uint8, device=self.device)
-        return sum(t.numel() for t in self.short.values())
+        # past top-k the local path selects over every key too: the indexer keys
+        # of every short position, replicated (one trailing scratch slot takes
+        # the writes past the short capacity)
+        for owner, table in self.index.items():
+            self.short_index[owner] = torch.zeros((int(rows) * self.short_capacity + 1,
+                                                   int(table.shape[1])), dtype=table.dtype,
+                                                  device=self.device)
+        return (sum(t.numel() for t in self.short.values())
+                + sum(t.numel() * t.element_size() for t in self.short_index.values()))
 
     def short_latents(self, layer):
         return self.short[layer]
@@ -246,7 +255,8 @@ class Hy4Cache:
             kept, slots = self._owned_slots(tokens, positions)
             if int(kept.numel()):
                 rows_in = latent
-                if not (self._kept_identity.get(id(tokens)) is tokens and int(latent.shape[0]) == 1
+                if not (self._kept_identity.get(id(tokens)) is tokens
+                        and int(latent.shape[0]) == int(kept.numel())
                         and latent.is_cuda and _diet2()):
                     rows_in = latent.index_select(0, kept)
                 self._write_records(layer, rows_in, slots)
@@ -276,6 +286,16 @@ class Hy4Cache:
 
     def write_index_keys(self, owner, tokens, positions, keys):
         self._store(self.index[owner], tokens, positions, keys)
+        if owner in self.short_index:
+            table = self.short_index[owner]
+            S = self.short_capacity
+            pos = positions.reshape(-1).long()
+            slots = torch.where(pos < S, tokens.reshape(-1).long() * S + pos,
+                                torch.full_like(pos, int(table.shape[0]) - 1))
+            table.index_copy_(0, slots, keys.reshape(int(pos.shape[0]), -1).to(table.dtype))
+
+    def short_key_table(self, owner):
+        return self.short_index[owner]
 
     def _store(self, table, tokens, positions, values):
         memo = self._forward_memo.get(id(tokens))
@@ -342,7 +362,7 @@ class Hy4Cache:
         self._forward_memo.pop(id(tokens), None)
         self._forward_memo[id(tokens)] = (tokens, positions, kept, slots)
 
-    def begin_forward_static(self, tokens, positions, *, slot, safe, kept=None):
+    def begin_forward_static(self, tokens, positions, *, slot, safe, kept=None, kept_identity=False):
         """consult18 P2 decode graphs: `begin_forward` for ONE token with
         device-resident slots (fixed shapes, no host value). `slot` [1] is the
         token's physical slot on its owning rank and -1 elsewhere (the fused
@@ -351,7 +371,8 @@ class Hy4Cache:
         consult18 P4: `kept` [n] (default [0]) are the forward's token indices
         behind `slot`/`safe` [n] — a T-token forward on a rank owning fewer
         than n of them carries -1 slots (distinct `safe` slots) for the rest."""
-        identity = kept is None and int(tokens.numel()) == 1
+        # c8 L8: a batched step's kept = arange(rows) is the identity too (the caller says so)
+        identity = (kept is None and int(tokens.numel()) == 1) or bool(kept_identity)
         if kept is None:
             kept = torch.zeros((1,), dtype=torch.long, device=self.device)
         self._forward_memo.pop(id(tokens), None)
@@ -928,6 +949,11 @@ class Hy4Decoder:
                 end = start + width
                 geometry = {"owned_max": (max(end - rank, 0) + world - 1) // world,
                             "base": row_id * int(getattr(self.cache, "local_capacity", 0))}
+                S = int(getattr(self.cache, "short_capacity", 0) or 0)
+                if (S and visible_max is not None and self.config.text["index_topk"] < end <= S
+                        and SWITCHES.get("short_kv") == "on"):
+                    # the local (replicated-key) regime scores this row's short keys
+                    geometry = {"owned_max": end, "base": row_id * S}
                 deferred = getattr(self.collectives, "deferred_checks", None)
                 if deferred is not None:
                     deferred.clear()
@@ -1663,17 +1689,51 @@ class Hy4Decoder:
             # o_proj all-reduce after this layer sums the head shards as before).
             S = self.cache.short_capacity
             n = int(visible.shape[0])
-            with TIMER.phase("attn.handback"):
-                selected, counts = attn.selection.buffers(rows=n)
-                width = int(selected.shape[1])
-                cols = torch.arange(width, device=visible.device, dtype=torch.int64).reshape(1, width)
-                base = token_rows.reshape(-1, 1).long() * S
-                selected[:n].copy_(torch.where(cols < visible.reshape(-1, 1).long(), base + cols,
-                                               torch.full_like(cols, -1)).to(selected.dtype))
-                counts[:n].copy_(visible.to(counts.dtype))
+            memo = getattr(self, "_short_sel", None) if _SW.get("short_memo") == "on" else None
+            if memo is not None and memo[0] is visible and memo[1] is token_rows:
+                # c8 L8: this forward's selection (identical in every layer), built once
+                sel, cnt = memo[2], memo[3]
+            else:
+                with TIMER.phase("attn.handback"):
+                    selected, counts = attn.selection.buffers(rows=n)
+                    width = int(selected.shape[1])
+                    cols = torch.arange(width, device=visible.device, dtype=torch.int64).reshape(1, width)
+                    base = token_rows.reshape(-1, 1).long() * S
+                    fill = torch.where(cols < visible.reshape(-1, 1).long(), base + cols,
+                                       torch.full_like(cols, -1)).to(selected.dtype)
+                    selected[:n].copy_(fill)
+                    counts[:n].copy_(visible.to(counts.dtype))
+                    sel, cnt = selected[:n], counts[:n]
+                    if _SW.get("short_memo") == "on":
+                        # its own tensors (an owner buffer may be rewritten by another path)
+                        sel, cnt = fill, counts[:n].clone()
+                        self._short_sel = (visible, token_rows, sel, cnt)
             with TIMER.phase("attn.sparse_mla"):
-                attended = attn.attend(q_local, self.cache.short_latents(layer.index), selected[:n],
-                                       counts[:n], fold_sink=True, expand=False, call_shape=call_shape)
+                attended = attn.attend(q_local, self.cache.short_latents(layer.index), sel,
+                                       cnt, fold_sink=True, expand=False, call_shape=call_shape)
+            with TIMER.phase("attn.fold_expand_gate"):
+                fused = attn.expand_gate_project(attended.output, y)
+                if fused is not None:
+                    return fused
+                out = attn.expand_output(attended.output).to(y.dtype)
+                return attn.gate_and_project(out, y)
+        S = self.cache.short_capacity
+        if (not short and S and visible_max is not None and visible_max <= S
+                and layer.index in self.cache.short and call_shape.is_decode_graph
+                and _SW.get("short_kv") == "on"):
+            # Replicated keys past top-k (context <= the short capacity): the
+            # world-1 selection over this row's replicated indexer keys (full
+            # layers score, shared layers reuse their owner's picks), then the
+            # local-head attention over the replicated records — no score
+            # exchange, no head gather, no LSE merge.
+            owner = attn.selection.owner_id
+            base = token_rows.reshape(-1).long() * S
+            with TIMER.phase("attn.index_score"):
+                selected, counts = attn.select(y, q_resid, positions, visible,
+                                               self.cache.short_key_table(owner), base)
+            with TIMER.phase("attn.sparse_mla"):
+                attended = attn.attend(q_local, self.cache.short_latents(layer.index), selected,
+                                       counts, fold_sink=True, expand=False, call_shape=call_shape)
             with TIMER.phase("attn.fold_expand_gate"):
                 fused = attn.expand_gate_project(attended.output, y)
                 if fused is not None:

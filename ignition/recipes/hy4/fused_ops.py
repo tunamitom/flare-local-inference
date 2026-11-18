@@ -582,6 +582,42 @@ def _square_f32_kernel(x_ptr, out_ptr, N, BLOCK: tl.constexpr):
     tl.store(out_ptr + i, v * v, mask=i < N)
 
 
+@triton.jit
+def _rms_rows_kernel(x_ptr, w_ptr, out_ptr, N, eps, x_stride, out_stride, BLOCK: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64)
+    offs = tl.arange(0, BLOCK)
+    live = offs < N
+    x = tl.load(x_ptr + row * x_stride + offs, mask=live, other=0.0).to(tl.float32)
+    ms = tl.sum(x * x, axis=0) / N
+    r = libdevice.rsqrt(libdevice.add_rn(ms, eps))
+    w = tl.load(w_ptr + offs, mask=live, other=0.0).to(tl.float32)
+    y = libdevice.mul_rn(w, libdevice.mul_rn(x, r))
+    tl.store(out_ptr + row * out_stride + offs, y.to(out_ptr.dtype.element_ty), mask=live)
+
+
+def rms_norm_rows(x, weight, eps, out=None):
+    """c8 campaign L8: `rms_norm` over any row count in one launch — the mean of
+    squares is an in-kernel FP32 tree sum (not torch's reduction order), the
+    tail the same `(w * (x * rsqrt(ms + eps))).to(dtype)`. None when the row
+    does not fit one block (the caller falls back)."""
+    N = int(x.shape[-1])
+    if N > 8192 or not x.is_cuda or not weight.is_contiguous():
+        return None
+    flat = x.reshape(-1, N)
+    if flat.stride(-1) != 1:
+        flat = flat.contiguous()
+    rows = int(flat.shape[0])
+    if out is None:
+        target, out_stride = torch.empty((rows, N), dtype=x.dtype, device=x.device), N
+    else:
+        target, out_stride = out, _even_row_stride(out, tuple(x.shape), x.dtype)
+    if rows:
+        block = triton.next_power_of_2(N)
+        _rms_rows_kernel[(rows,)](flat, weight, target, N, float(eps), flat.stride(0), out_stride,
+                                  BLOCK=block, num_warps=8 if block >= 4096 else 4)
+    return target if out is not None else target.view(x.shape)
+
+
 def rms_norm(x, weight, eps, out=None):
     """`attention.rms_norm` with the elementwise tail in one kernel (bitwise the
     same): the mean of squares stays torch's own reduction (its order), then
@@ -594,6 +630,13 @@ def rms_norm(x, weight, eps, out=None):
         if SWITCHES.get("rms_tree") == "on":
             done = rms_norm_tree(x if x.reshape(-1, N).stride(-1) == 1 else x.contiguous(),
                                  weight, eps, out=out)
+            if done is not None:
+                return done
+    if x.is_cuda and x.numel() // max(N, 1) > 4:
+        from .runtime import SWITCHES
+
+        if SWITCHES.get("rms_rows") == "on":
+            done = rms_norm_rows(x, weight, eps, out=out)
             if done is not None:
                 return done
     flat = x.reshape(-1, N)
