@@ -201,19 +201,40 @@ class Hy4Cache:
                 torch.tensor(self.row_cap + [0], dtype=torch.long).to(self.device))
         return self._extent_dev
 
-    def set_extents(self, caps):
-        """Row r gets `caps[r]` local slots, the extents packed in row order
-        (sum <= rows * local_capacity: the allocation). Boot-time only: captured
-        graphs bake host bases."""
+    def set_extents(self, caps, bases=None):
+        """Row r gets `caps[r]` local slots at `bases[r]` (default: packed in row
+        order); the extents must fit the allocation (rows * local_capacity) without
+        overlapping. The device copies update IN PLACE (captured graphs hold them)."""
         caps = [int(c) for c in caps]
-        if len(caps) != self.rows or sum(caps) > self.rows * self.local_capacity or min(caps) < 1:
-            raise ValueError(f"row extents {caps} do not fit {self.rows} x {self.local_capacity}")
-        bases, at = [], 0
-        for c in caps:
-            bases.append(at)
-            at += c
-        self.row_base, self.row_cap, self._extent_dev = bases, caps, None
+        if bases is None:
+            bases, at = [], 0
+            for c in caps:
+                bases.append(at)
+                at += c
+        bases = [int(b) for b in bases]
+        total = self.rows * self.local_capacity
+        spans = sorted((b, b + c) for b, c in zip(bases, caps) if c > 0)
+        if (len(caps) != self.rows or len(bases) != self.rows or min(caps) < 0
+                or any(b < 0 or e > total for b, e in spans)
+                or any(spans[i][1] > spans[i + 1][0] for i in range(len(spans) - 1))):
+            raise ValueError(f"row extents {list(zip(bases, caps))} do not fit {total} slots")
         self._extents()
+        self.row_base, self.row_cap = bases, caps
+        dev_base, dev_cap = self._extent_dev
+        dev_base.copy_(torch.tensor(bases + [0], dtype=torch.long))
+        dev_cap.copy_(torch.tensor(caps + [0], dtype=torch.long))
+
+    def relocate(self, row, old_base, new_base, used):
+        """c8 L6b: move `used` local slots of `row`'s records and index keys from
+        `old_base` to `new_base` on this rank (every rank moves its own owned
+        slots; the extents are set afterwards)."""
+        if used <= 0 or old_base == new_base:
+            return
+        for table in self.records.values():
+            flat = table.view(-1, table.shape[-1])
+            flat[new_base:new_base + used].copy_(flat[old_base:old_base + used].clone())
+        for table in (*self.index.values(), *self.latent.values()):
+            table[new_base:new_base + used].copy_(table[old_base:old_base + used].clone())
 
     def base_of(self, row):
         self._extents()
@@ -225,8 +246,10 @@ class Hy4Cache:
         return int(self.row_cap[int(row)])
 
     def max_cap(self):
+        """The widest a row may ever be (local slots): `cap_limit` when extents are
+        dynamic (c8 L6b), else the widest current extent."""
         self._extents()
-        return max(self.row_cap)
+        return max(max(self.row_cap), int(getattr(self, "cap_limit", 0) or 0))
 
     @property
     def row_base_dev(self):

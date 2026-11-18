@@ -72,7 +72,7 @@ class DecodeGraphs:
         self.rank = int(getattr(decoder.collectives, "rank", 0))
         self.topk = int(decoder.config.text["index_topk"])
         self.cache = decoder.cache
-        # c8 L6: per-row extents — the widest row bounds the indexer width buckets
+        # c8 L6: per-row extents — the widest a row may be bounds the width buckets
         self.local_capacity = int(decoder.cache.max_cap())
         self.capacity = self.local_capacity * self.world
         self._token = torch.zeros((1, 1), dtype=torch.long, device=self.device)
@@ -146,7 +146,7 @@ class DecodeGraphs:
     def wkey(regime, width):
         return ("L", width) if regime == "local" else width
 
-    def _geo(self, regime, width, *, rows=None, row=None):
+    def _geo(self, regime, width, *, rows=None, row=None, count=1):
         """The captured step's host-known geometry and `visible_max` in its regime
         (`visible_max` steers the attention: <= top-k bypass, <= S local, else cp)."""
         S = self.short_cap()
@@ -159,8 +159,12 @@ class DecodeGraphs:
         if rows is not None:
             bases = rows * scale if regime == "local" else self.cache.row_base_dev[rows]
             return {"owned_max": owned, "base": None, "bases": bases}, vmax
-        base = row * scale if regime == "local" else self.cache.base_of(row)
-        return {"owned_max": owned, "base": base}, vmax
+        if regime == "local":
+            return {"owned_max": owned, "base": row * scale}, vmax
+        # c8 L6b: the row's extent base read on device (a relocated row's captured
+        # graphs follow it), one per query row
+        bases = self.cache.row_base_dev[row].reshape(1).expand(count).contiguous()
+        return {"owned_max": owned, "base": None, "bases": bases}, vmax
 
     # -- the step body (eager or under capture) -------------------------
     def _stage(self, token_ids, row, start):
@@ -183,7 +187,7 @@ class DecodeGraphs:
         d.cache.begin_forward_static(token_rows, positions, slot=self._args[1:2],
                                      safe=self._args[2:3])
         regime = regime or ("bypass" if width == 0 else "cp")
-        geometry, visible_max = self._geo(regime, width, row=row)
+        geometry, visible_max = self._geo(regime, width, row=row, count=1)
         deferred = getattr(d.collectives, "deferred_checks", None)
         if deferred is not None:
             deferred.clear()
@@ -274,7 +278,10 @@ class DecodeGraphs:
         flag)` (graph-pool tensors: read them before the next replay)."""
         count = int(token_ids.shape[1])
         width = self.index_width(start + count)
-        key = ("tail", int(row), count, width, call_shape.name, bool(need_logits))
+        # c8 L6b: the tail graphs bake the row's base (> 64 query rows: no per-row
+        # base indexer) — a relocated row captures its tails anew
+        key = ("tail", int(row), count, width, call_shape.name, bool(need_logits),
+               self.cache.base_of(row))
         if need_hidden:
             key = key + ("hidden",)
         tokens = self._stage_tail(token_ids, start)
@@ -458,7 +465,7 @@ class DecodeGraphs:
         visible = positions + 1
         kept, slot, safe = self._spec_slots(entry)
         d.cache.begin_forward_static(token_rows, positions, slot=slot, safe=safe, kept=kept)
-        geometry, visible_max = self._geo(regime, width, row=row)
+        geometry, visible_max = self._geo(regime, width, row=row, count=count)
         visible_max = visible_max if call_shape.is_decode_graph else None
         deferred = getattr(d.collectives, "deferred_checks", None)
         if deferred is not None:
@@ -493,7 +500,7 @@ class DecodeGraphs:
         tokens, rows = self._spec_rows(entry["tokens"], row, call_shape, count)
         hidden_in = entry["hidden"]
         positions = entry["args"][0:1] + torch.arange(count, dtype=torch.long, device=self.device)
-        geometry, visible_max = self._geo(regime, width, row=row)
+        geometry, visible_max = self._geo(regime, width, row=row, count=count)
         visible_max = visible_max if call_shape.is_decode_graph else None
         deferred = getattr(d.collectives, "deferred_checks", None)
         if deferred is not None:

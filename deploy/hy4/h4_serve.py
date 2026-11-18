@@ -1442,9 +1442,14 @@ class BatchLoop:
                 return {"kind": "exec", "path": item["path"], "release": release}, [item]
             if ((ctx.q.empty() or self.max_batch <= 1) and not self._solo_batched(item)
                     and not self._is_long(item)):
+                extents = None
+                if self._dyn():
+                    # c8 L6b: a lone request takes the whole pool (shrunk on demand later)
+                    extents = self._dyn_solo(release)
                 self._start(item, 0)
                 return ({"kind": "solo", "release": release, "tokens": item["tokens"],
-                         "max_new": item["max_new"], "params": item["params"]}, [item])
+                         "max_new": item["max_new"], "params": item["params"],
+                         "extents": extents}, [item])
             first = item
         free = [r for r in range(self.rows) if r not in self.active and r not in self.prefilling]
         # c8 L6: the widest row (0) is kept for the prompts that need it; a long
@@ -1456,6 +1461,8 @@ class BatchLoop:
         admits = [first] if first is not None else []
         if 0 in free and big_waiting and first is None:
             admits.append(big_waiting.pop(0))
+        mem_waiting, self.deferred_mem = getattr(self, "deferred_mem", []), []
+        admits = [i for i in mem_waiting if not i["cancel"].is_set()] + admits
         while (len(admits) < len(free)
                and len(self.active) + len(self.prefilling) + len(admits) < self.max_batch):
             item = self._pop(block=False)
@@ -1479,6 +1486,9 @@ class BatchLoop:
             if pool:
                 rows.append(pool.pop(0))
                 placed.append(item)
+        extents = None
+        if self._dyn():
+            placed, rows, extents = self._dyn_place(placed, rows, release)
         for item, row in zip(placed, rows):
             self._start(item, row)
         # c8 L17: long prompts prefill chunk by chunk between the loop's rounds
@@ -1493,6 +1503,7 @@ class BatchLoop:
         carry = sorted(self.active.items())
         inflight = set(self.inflight["rows"]) if self.inflight is not None else set()
         plan = {"kind": "batch", "release": release, "abort": abort, "prefill": prefill,
+                "extents": extents,
                 "admit_long": [(row, item["tokens"], item["max_new"], item["params"])
                                for item, row in longs],
                 "admit": [(row, item["tokens"], item["max_new"], item["params"])
@@ -1503,6 +1514,161 @@ class BatchLoop:
                 "carry_params": [(float(req.params.get("temperature", 0.9) or 0.0),
                                   _unfiltered(req.params)) for _, req in carry]}
         return plan, admits + [item for item, _ in longs]
+
+    # -- c8 L6b: dynamic row extents (rank 0 plans, every rank applies) --------
+    def _dyn(self):
+        return bool(getattr(self.ctx, "dyn_extents", False))
+
+    def _need_local(self, tokens):
+        """Local slots for `tokens` positions plus 8k of room, in 1,024-slot units."""
+        c = self.ctx.decoder.cache
+        n = -(-(int(tokens) + 8192) // c.world)
+        return min(-(-n // 1024) * 1024, int(c.cap_limit))
+
+    def _used_local(self, row):
+        """Local slots a row has written (its length, in-flight rounds and pads included)."""
+        c = self.ctx.decoder.cache
+        L = int(self.ctx.decoder._row_lengths.get(row, 0))
+        return min(-(-(L + 64) // c.world), c.cap_of(row))
+
+    def _first_fit(self, ext, n, exclude=()):
+        c = self.ctx.decoder.cache
+        total = self.rows * c.local_capacity
+        at = 0
+        for b, e in sorted((b, b + cap) for r, (b, cap) in ext.items() if cap > 0 and r not in exclude):
+            if b - at >= n:
+                return at
+            at = max(at, e)
+        return at if total - at >= n else None
+
+    def _compact(self, ext, moves, shrink=False):
+        """Pack the extents left in base order (each keeps its cap, or shrinks to its
+        need with `shrink`); moves get (row, old, new, used)."""
+        at = 0
+        for r, (b, cap) in sorted(ext.items(), key=lambda kv: kv[1][0]):
+            if cap <= 0:
+                continue
+            if shrink:
+                L = int(self.ctx.decoder._row_lengths.get(r, 0))
+                cap = max(self._need_local(L), -(-self._used_local(r) // 1024) * 1024)
+            if b != at:
+                moves.append((r, b, at, self._used_local(r)))
+            ext[r] = (at, cap)
+            at += cap
+
+    def _room(self, ext, moves, n, exclude=()):
+        """A base for n slots: first fit, else after compaction, else after shrinking
+        every extent to its need and compacting; None when the pool cannot hold it."""
+        base = self._first_fit(ext, n, exclude)
+        if base is None:
+            self._compact(ext, moves)
+            base = self._first_fit(ext, n, exclude)
+        if base is None:
+            self._compact(ext, moves, shrink=True)
+            base = self._first_fit(ext, n, exclude)
+        return base
+
+    def _dyn_solo(self, release):
+        c = self.ctx.decoder.cache
+        ext = {r: (0, 0) for r in range(self.rows)}
+        ext[0] = (0, min(int(c.cap_limit), self.rows * c.local_capacity))
+        return {"moves": [], "bases": [ext[r][0] for r in range(self.rows)],
+                "caps": [ext[r][1] for r in range(self.rows)]}
+
+    def _dyn_place(self, placed, rows, release):
+        """Grow the active rows that near their extent's end, then grant each
+        admission its extent; an admission that does not fit waits (front of the
+        queue), an active row that cannot grow finishes ("length")."""
+        c = self.ctx.decoder.cache
+        ext = {r: (c.base_of(r), c.cap_of(r)) for r in range(self.rows)}
+        live = set(self.active) | set(self.prefilling)
+        for r in range(self.rows):
+            if r not in live or r in release:
+                ext[r] = (ext[r][0], 0)
+        moves, changed = [], any(ext[r] != (c.base_of(r), c.cap_of(r)) for r in range(self.rows))
+        for r in sorted(self.active):
+            if r in release:
+                continue
+            b, cap = ext[r]
+            L = int(self.ctx.decoder._row_lengths.get(r, 0))
+            if -(-(L + 512) // c.world) <= cap:
+                continue
+            target = min(max(2 * cap, self._need_local(L)), int(c.cap_limit))
+            if target <= cap:
+                continue
+            changed = True
+            others = sorted((ob, ob + oc) for o, (ob, oc) in ext.items() if o != r and oc > 0)
+            if (b + target <= self.rows * c.local_capacity
+                    and not any(ob < b + target and oe > b for ob, oe in others)):
+                ext[r] = (b, target)                      # grows in place
+                continue
+            ext[r] = (b, 0)
+            nb = self._room(ext, moves, target, exclude={r})
+            if nb is None:
+                ext[r] = (b, cap)
+                req = self.active.pop(r)
+                trace(0, f"request on row {r} reached the pool's end at {L} tokens")
+                self._finish(req, "length")
+                release.append(r)
+                ext[r] = (b, 0)
+                continue
+            moves.append((r, b, nb, self._used_local(r)))
+            ext[r] = (nb, target)
+        force = int(getattr(self, "force_relocate_every", 0) or 0)
+        movable = [r for r in sorted(self.active) if r not in release]
+        if force and movable:
+            # dev gate: move one active row to the LAST free gap every `force` plans
+            # (greedy outputs must not change)
+            self._reloc_tick = getattr(self, "_reloc_tick", 0) + 1
+            if self._reloc_tick % force == 0:
+                r = movable[(self._reloc_tick // force) % len(movable)]
+                b, cap = ext[r]
+                ext[r] = (b, 0)
+                total = self.rows * c.local_capacity
+                spans = sorted((ob, ob + oc) for o, (ob, oc) in ext.items() if oc > 0)
+                gaps, at = [], 0
+                for ob, oe in spans:
+                    if ob - at >= cap:
+                        gaps.append(at)
+                    at = max(at, oe)
+                if total - at >= cap:
+                    gaps.append(total - cap)
+                nb = next((g for g in reversed(gaps) if g != b), None)
+                if nb is None:
+                    ext[r] = (b, cap)
+                else:
+                    moves.append((r, b, nb, self._used_local(r)))
+                    ext[r] = (nb, cap)
+                    changed = True
+                    self.forced_relocations = getattr(self, "forced_relocations", 0) + 1
+        keep_items, keep_rows = [], []
+        for item, row in zip(placed, rows):
+            n = self._need_local(len(item.get("tokens") or ()))
+            base = self._room(ext, moves, n)
+            if base is None:
+                self.deferred_mem = getattr(self, "deferred_mem", [])
+                self.deferred_mem.append(item)
+                continue
+            ext[row] = (base, n)
+            changed = True
+            keep_items.append(item)
+            keep_rows.append(row)
+        if not changed and not moves:
+            return keep_items, keep_rows, None
+        return keep_items, keep_rows, {"moves": moves, "bases": [ext[r][0] for r in range(self.rows)],
+                                       "caps": [ext[r][1] for r in range(self.rows)]}
+
+    def _apply_extents(self, extents):
+        """Every rank: drain, move the relocated rows' slots, set the extents."""
+        ctx, rank = self.ctx, self.rank
+        if self.inflight is not None:
+            self._row_reqs = dict(self.active) if rank == 0 else None
+            self._pending = self.inflight
+            self._drain()
+        cache = ctx.decoder.cache
+        for row, old, new, used in extents["moves"]:
+            cache.relocate(row, old, new, used)
+        cache.set_extents(extents["caps"], extents["bases"])
 
     def _is_long(self, item):
         p = item.get("params") or {}
@@ -1605,6 +1771,8 @@ class BatchLoop:
             ctx.decoder.release(plan["release"])
             for row in plan["release"]:
                 self.bs_rows.pop(row, None)
+        if plan.get("extents"):
+            self._apply_extents(plan["extents"])
         try:
             if plan["kind"] == "exec":
                 self._exec(plan, items)
@@ -2702,11 +2870,18 @@ def main():
         cache = ctx.decoder.cache
         big = int(os.environ.get("HY4_BIG_ROW") or 0)
         local_total = args.rows * cache.local_capacity
+        # c8 L6b: dynamic extents — any row grows (relocating if it must) while the
+        # pool holds; the boot keeps the uniform layout, the serving loop starts empty
+        ctx.dyn_extents = os.environ.get("HY4_DYN_EXTENTS") == "on" and args.rows > 1
+        if ctx.dyn_extents:
+            cache.cap_limit = min(-(-int(args.max_context) // world // 1024) * 1024, local_total)
+            big = 0
         if big > capacity and args.rows > 1:
             big_local = min(-(-big // world // 1024) * 1024, local_total - (args.rows - 1) * 4096)
             small = (local_total - big_local) // (args.rows - 1) // 1024 * 1024
             cache.set_extents([big_local] + [small] * (args.rows - 1))
-        ctx.row_caps = [cache.cap_of(r) * world for r in range(args.rows)]
+        ctx.row_caps = ([cache.cap_limit * world] * args.rows if ctx.dyn_extents
+                        else [cache.cap_of(r) * world for r in range(args.rows)])
         ctx.row_capacity = max(ctx.row_caps)
         trace(rank, f"row extents: {sorted(set(ctx.row_caps), reverse=True)} global tokens "
                     f"(row 0 {ctx.row_caps[0]}, rows 1+ {min(ctx.row_caps)}), pool "
@@ -2913,6 +3088,12 @@ def main():
                         f"{time.monotonic() - t_cap:.1f} s")
         ctx.batch_rows = BATCH_ROWS
         ctx.cache_rows = args.rows
+        if getattr(ctx, "dyn_extents", False):
+            # c8 L6b: every row's extent is granted at admission from here on
+            ctx.decoder.cache.set_extents([0] * args.rows, [0] * args.rows)
+            trace(rank, f"dynamic extents: pool {args.rows * ctx.decoder.cache.local_capacity} local "
+                        f"slots/rank, a row up to {ctx.decoder.cache.cap_limit} "
+                        f"({ctx.decoder.cache.cap_limit * world} tokens)")
 
         # ---- serving loop --------------------------------------------------
         if rank == 0:
