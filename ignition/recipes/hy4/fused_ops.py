@@ -887,6 +887,10 @@ def ihc_post_pre_split(x, residual, prev_post, fn, hc_scale, hc_base, *, magnitu
     from .runtime import SWITCHES
 
     per = 8 if rows >= 512 and SWITCHES.get("ihc_rows") == "8" else 1
+    if per == 1 and 2 <= rows < 512 and SWITCHES.get("ihc_small") == "on":
+        # c8 campaign: 2 rows per program at decode row counts (fn read once per two
+        # rows; bit-identical; 16.77 -> 16.48 ms per 8-row step, 4/8 rows per program lose)
+        per = 2
     if per > 1:
         # consult18 P9: 8 rows per program (bit-identical; 63 -> 50 us at 1,024 rows)
         _ihc_pp_chunks_rows_kernel[(triton.cdiv(rows, per), nc)](

@@ -110,6 +110,8 @@ ALLOWED = {
     "short_memo": ("off", "on"),
     # c8 campaign L8: batched steps' record writes skip the identity index_select
     "kept_rows": ("off", "on"),
+    # c8 campaign: the iHC boundary's chunk kernel with 2 rows per program at 2..511 rows
+    "ihc_small": ("off", "on"),
     # round 15 (numerics class): decode W_UV expansion with BF16 operands and FP32
     # accumulation (attention.expand_output), no FP32 copies per step
     "expand_bf16": ("off", "on"),
@@ -164,6 +166,7 @@ DEFAULTS = {"index_scores": "fp32",
             "rms_rows": os.environ.get("HY4_RMS_ROWS") or "off",
             "short_memo": os.environ.get("HY4_SHORT_MEMO") or "off",
             "kept_rows": os.environ.get("HY4_KEPT_ROWS") or "off",
+            "ihc_small": os.environ.get("HY4_IHC_SMALL") or "off",
             "expand_bf16": os.environ.get("HY4_EXPAND_BF16") or "off",
             "diet2": os.environ.get("HY4_DIET2") or "off",
             "diet3": os.environ.get("HY4_DIET3") or "off",

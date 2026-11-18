@@ -573,7 +573,7 @@ class DecodeGraphs:
     # step writes there — never visible to that token's query, and overwritten
     # by the row's next step before any read. Identical pad entries write
     # identical bytes.
-    BATCH_BUCKETS = (1, 2, 4, 8, 16, 32)
+    BATCH_BUCKETS = (1, 2, 4, 8, 12, 16, 32)
 
     def batch_bucket(self, count):
         for size in self.BATCH_BUCKETS:
@@ -729,15 +729,19 @@ class DecodeGraphs:
         self.replays += 1
         return logits, flag
 
-    # -- batched speculative sampling, one draft per row (k = 1) -------------
-    # A round over B request rows is two captured forwards of 2B entries (bucket
-    # 2/4/8/16): the MTP draft absorb (row b: its two pending (token, target
-    # hidden) entries at the draft cursor c and c+n, n = last round's accepted
-    # count; with n = 0 the second entry duplicates the first) whose second
-    # entry's hidden gives the draft scores q_b and the sampled draft d1_b, and
-    # the target verify (row b: the bonus at P, d1_b at P+1) with the batched
-    # acceptance (spec_sample.verify_sample_k1). Pending tokens / hidden live per
-    # CACHE row in static buffers; the host updates them after reading a round.
+    # -- batched speculative sampling: a chain of K drafts per row (K <= 2) ----
+    # A round over B request rows is captured forwards: the MTP draft ABSORB of
+    # E = K+1 entries per row (its pending (token, target hidden) entries at the
+    # draft cursor c .. c+n, n = last round's accepted count, entries past n
+    # duplicating entry n) whose last entry gives q1 / d1; K-1 one-entry CHAIN
+    # steps (draft j+1 from d_j and the MTP's own hidden at P+j-1); the target
+    # VERIFY of E entries per row (the bonus at P, d1 .. dK at P+1 .. P+K) with the
+    # batched acceptance (spec_sample.verify_sample_batched), which also advances
+    # the device round state (c8 L5b): P, c, n, and the pending entries. Slots
+    # (one per request row) index the per-round buffers; pad entries go one past
+    # the row's writes and scatter into a dummy state row.
+    BSPEC_KMAX = 2
+
     def bspec_state(self):
         st = getattr(self, "_bspec", None)
         if st is None:
@@ -746,43 +750,39 @@ class DecodeGraphs:
             hidden = int(d.config.hidden)
             lo, hi = d.weights.sharding.vocabulary_range
             S = self.BATCH_BUCKETS[-1]
+            K = self.BSPEC_KMAX
             dev = self.device
-            # c8 L5b: per cache row (+1 dummy row that absorbs the pad slots' scatters)
-            # the device-resident round state — committed length P (the bonus's
-            # position), draft cursor c, last accepted count n — so a round's
-            # positions never wait on a host read (the verify graph advances them)
             st = self._bspec = {
-                "pend_tok": torch.zeros((rows + 1, 2), dtype=torch.long, device=dev),
-                "pend_hid": torch.zeros((rows + 1, 2, hidden), dtype=d.compute_dtype, device=dev),
+                "pend_tok": torch.zeros((rows + 1, K + 1), dtype=torch.long, device=dev),
+                "pend_hid": torch.zeros((rows + 1, K + 1, hidden), dtype=d.compute_dtype, device=dev),
                 "spec_on": torch.zeros((rows + 1,), dtype=torch.bool, device=dev),
                 "P": torch.zeros((rows + 1,), dtype=torch.long, device=dev),
                 "c": torch.zeros((rows + 1,), dtype=torch.long, device=dev),
                 "n": torch.zeros((rows + 1,), dtype=torch.long, device=dev),
-                "q": torch.zeros((S, hi - lo), dtype=torch.float32, device=dev),
-                "d1": torch.zeros((S,), dtype=torch.long, device=dev),
+                "q": torch.zeros((S, K, hi - lo), dtype=torch.float32, device=dev),
+                "drafts": torch.zeros((S, K), dtype=torch.long, device=dev),
+                "mtp_hid": torch.zeros((S, hidden), dtype=d.compute_dtype, device=dev),
                 "inv_temp": torch.ones((S,), dtype=torch.float32, device=dev),
-                "noise_q": torch.zeros((S, hi - lo), dtype=torch.float32, device=dev),
-                "noise_v": torch.zeros((S, 2, hi - lo), dtype=torch.float32, device=dev),
-                "uniform": torch.zeros((S,), dtype=torch.float32, device=dev),
-                "out_accept": torch.zeros((S,), dtype=torch.bool, device=dev),
-                "out_tokens": torch.zeros((S, 2), dtype=torch.long, device=dev),
-                "out_hidden": torch.zeros((S, 2, hidden), dtype=d.compute_dtype, device=dev),
+                "noise_q": torch.zeros((S, K, hi - lo), dtype=torch.float32, device=dev),
+                "noise_v": torch.zeros((S, K + 1, hi - lo), dtype=torch.float32, device=dev),
+                "uniform": torch.zeros((S, K), dtype=torch.float32, device=dev),
+                "out_n": torch.zeros((S,), dtype=torch.long, device=dev),
+                "out_tokens": torch.zeros((S, K + 1), dtype=torch.long, device=dev),
                 "out_dflag": torch.zeros((), dtype=torch.bool, device=dev),
                 "out_vflag": torch.zeros((), dtype=torch.bool, device=dev),
                 "args": {},
             }
         return st
 
-    def _bspec_args(self, size):
+    def _bspec_args(self, size, per):
         st = self.bspec_state()
-        entry = st["args"].get(size)
+        entry = st["args"].get((size, per))
         if entry is None:
             # kv rows | pad mask (host-staged; positions and slots are device-derived)
-            entry = st["args"][size] = {
+            idx = torch.arange(size, dtype=torch.long, device=self.device)
+            entry = st["args"][(size, per)] = {
                 "args": torch.zeros((2 * size,), dtype=torch.long, device=self.device),
-                "kept": torch.arange(size, dtype=torch.long, device=self.device),
-                "pick": torch.arange(size, dtype=torch.long, device=self.device) % 2,
-                "slot_of": torch.arange(size, dtype=torch.long, device=self.device) // 2,
+                "kept": idx.clone(), "pick": idx % per, "slot_of": idx // per,
             }
         return entry
 
@@ -793,34 +793,59 @@ class DecodeGraphs:
             host[size + i] = 1 if pads[i] else 0
         entry["args"].copy_(host, non_blocking=True)
 
-    def _bspec_geometry(self, kind, size):
+    def _bspec_geometry(self, kind, size, per, step=0):
         """Device positions / record slots of a round's entries from the round state:
-        draft (c, c + n) per row, verify (P, P + 1); pad entries one past the row's
-        writes (draft c + n + 1, verify P + 2)."""
-        st, entry = self.bspec_state(), self._bspec_args(size)
+        absorb c + min(j, n), chain P + step - 1, verify P + j; pad entries one past
+        the row's writes (absorb c + n + 1, chain P + K + 1, verify P + per)."""
+        st, entry = self.bspec_state(), self._bspec_args(size, per)
         args = entry["args"]
         rows, pad = args[0:size], args[size:2 * size] != 0
-        odd = entry["pick"]
+        pick = entry["pick"]
         if kind == "draft":
             c, n = st["c"][rows], st["n"][rows]
-            positions = torch.where(pad, c + n + 1, c + odd * n)
+            positions = torch.where(pad, c + n + 1, c + torch.minimum(pick, n))
+        elif kind == "chain":
+            P = st["P"][rows]
+            positions = torch.where(pad, P + self.BSPEC_KMAX + 1, P + (step - 1))
         else:
             P = st["P"][rows]
-            positions = torch.where(pad, P + 2, P + odd)
+            positions = torch.where(pad, P + per, P + pick)
         local = rows * self.local_capacity + torch.div(positions, self.world, rounding_mode="floor")
         slot = torch.where(torch.remainder(positions, self.world) == self.rank, local,
                            torch.full_like(local, -1))
         return rows, pad, positions, slot, local
 
-    def _body_bdraft(self, size, call_shape, rw):
-        from .lanes import use_lane
+    def _bspec_greedy(self, slots):
+        """Per slot: (greedy mask, the scale) — inv_temp 0 marks a greedy row (c8 L5d)."""
+        inv = self.bspec_state()["inv_temp"][:slots]
+        greedy = inv <= 0
+        return greedy, torch.where(greedy, torch.ones_like(inv), inv)
+
+    def _bspec_draft_out(self, last, slots, j):
+        """Draft j+1 of every slot from the MTP hidden `last` [slots, H]: its scaled
+        scores (q) and sample (the greedy argmax: unit scale, constant noise)."""
         from .spec_sample import sample_tokens
 
+        d, st = self.decoder, self.bspec_state()
+        greedy, scale = self._bspec_greedy(slots)
+        st["mtp_hid"][:slots].copy_(last)
+        scores = d.head_logits(last) * scale.reshape(-1, 1)
+        st["q"][:slots, j].copy_(scores)
+        noise = torch.where(greedy.reshape(-1, 1), torch.full_like(st["noise_q"][:slots, j], 0.5),
+                            st["noise_q"][:slots, j])
+        dj = sample_tokens(d.collectives, scores, noise,
+                           vocabulary_range=d.weights.sharding.vocabulary_range)
+        st["drafts"][:slots, j].copy_(dj.reshape(-1))
+
+    def _body_bdraft(self, size, call_shape, rw, per):
+        from .lanes import use_lane
+
         d = self.decoder
-        st, entry = self.bspec_state(), self._bspec_args(size)
-        rows, _, positions, slot, safe = self._bspec_geometry("draft", size)
-        tokens = st["pend_tok"][rows, entry["pick"]].reshape(size, 1)
-        hidden_in = st["pend_hid"][rows, entry["pick"]]
+        st, entry = self.bspec_state(), self._bspec_args(size, per)
+        rows, _, positions, slot, safe = self._bspec_geometry("draft", size, per)
+        idx = torch.minimum(entry["pick"], st["n"][rows])
+        tokens = st["pend_tok"][rows, idx].reshape(size, 1)
+        hidden_in = st["pend_hid"][rows, idx]
         deferred = getattr(d.collectives, "deferred_checks", None)
         if deferred is not None:
             deferred.clear()
@@ -830,33 +855,48 @@ class DecodeGraphs:
             hidden, _, _ = d._draft_cp(tokens, hidden_in, positions, rows, d.cache,
                                        call_shape=call_shape, visible_max=visible_max,
                                        static_slots=(entry["kept"], slot, safe))
-            half = size // 2
-            last = hidden.reshape(half, 2, -1)[:, 1]
-            # c8 L5d: inv_temp 0 marks a greedy row — unit scale and constant noise
-            # (Gumbel-max is then the exact argmax: its draft is the greedy draft)
-            inv = st["inv_temp"][:half]
-            greedy = inv <= 0
-            scores = d.head_logits(last) * torch.where(greedy, torch.ones_like(inv), inv).reshape(-1, 1)
-            st["q"][:half].copy_(scores)
-            noise = torch.where(greedy.reshape(-1, 1), torch.full_like(st["noise_q"][:half], 0.5),
-                                st["noise_q"][:half])
-            d1 = sample_tokens(d.collectives, scores, noise,
-                               vocabulary_range=d.weights.sharding.vocabulary_range)
-            st["d1"][:half].copy_(d1.reshape(-1))
+            slots = size // per
+            last = hidden[:slots * per].reshape(slots, per, -1)[:, per - 1]
+            self._bspec_draft_out(last, slots, 0)
         st["out_dflag"].copy_(self._flag(deferred))
-        return st["d1"], st["out_dflag"]
+        return st["drafts"], st["out_dflag"]
 
-    def _body_bverify(self, size, call_shape, rw):
+    def _body_bchain(self, size, call_shape, rw, step):
+        """Chain step `step` (1 .. K-1): draft step+1 from d_step and the MTP hidden."""
         from .lanes import use_lane
-        from .spec_sample import verify_sample_k1
 
         d = self.decoder
-        st, entry = self.bspec_state(), self._bspec_args(size)
-        rows, pad, positions, slot, safe = self._bspec_geometry("verify", size)
-        half = size // 2
-        bonus = st["pend_tok"][rows, 1]
-        drafts = st["d1"][entry["slot_of"]]
-        tokens = torch.where(entry["pick"] == 0, bonus, drafts).reshape(size, 1)
+        st, entry = self.bspec_state(), self._bspec_args(size, 1)
+        rows, _, positions, slot, safe = self._bspec_geometry("chain", size, 1, step)
+        tokens = st["drafts"][:size, step - 1].reshape(size, 1)
+        hidden_in = st["mtp_hid"][:size].clone()
+        deferred = getattr(d.collectives, "deferred_checks", None)
+        if deferred is not None:
+            deferred.clear()
+        geometry, visible_max = self._geo(*rw, rows=rows)
+        with use_lane(0, overlap=False, geometry=geometry, sync_free=True), \
+                w8_decode_scope():
+            hidden, _, _ = d._draft_cp(tokens, hidden_in, positions, rows, d.cache,
+                                       call_shape=call_shape, visible_max=visible_max,
+                                       static_slots=(entry["kept"], slot, safe))
+            self._bspec_draft_out(hidden.reshape(size, -1), size, step)
+        st["out_dflag"].copy_(self._flag(deferred))
+        return st["drafts"], st["out_dflag"]
+
+    def _body_bverify(self, size, call_shape, rw, per):
+        from .lanes import use_lane
+        from .spec_sample import verify_sample_batched
+
+        d = self.decoder
+        st, entry = self.bspec_state(), self._bspec_args(size, per)
+        rows, pad, positions, slot, safe = self._bspec_geometry("verify", size, per)
+        K = per - 1
+        slots = size // per
+        S = int(st["drafts"].shape[0])
+        pick = entry["pick"]
+        bonus = st["pend_tok"][rows, st["n"][rows]]
+        drafts_e = st["drafts"][entry["slot_of"].clamp(max=S - 1), (pick - 1).clamp(min=0)]
+        tokens = torch.where(pick == 0, bonus, drafts_e).reshape(size, 1)
         token_rows = rows
         visible = positions + 1
         d.cache.begin_forward_static(token_rows, positions, slot=slot, safe=safe, kept=entry["kept"],
@@ -870,63 +910,68 @@ class DecodeGraphs:
             logits, normed, _ = d._layers_and_head(
                 tokens, rows, positions, token_rows, visible, visible_max, state=None,
                 return_hidden=True, call_shape=call_shape, logits_rows="all", gather=False)
-            # c8 L5d: a greedy row (inv_temp 0) samples p0 / p1 by exact argmax (unit
-            # scale, constant noise, no residual) and accepts its greedy draft iff
-            # it IS p0's argmax — greedy speculative decoding, exact
-            inv = st["inv_temp"][:half]
-            greedy = inv <= 0
-            scores = (logits.reshape(half, 2, -1).float()
-                      * torch.where(greedy, torch.ones_like(inv), inv).reshape(-1, 1, 1))
-            spec_on = st["spec_on"][rows.reshape(half, 2)[:, 0]]
-            noise = torch.where(greedy.reshape(-1, 1, 1), torch.full_like(st["noise_v"][:half], 0.5),
-                                st["noise_v"][:half])
-            accept, toks = verify_sample_k1(
-                d.collectives, scores, st["q"][:half], st["d1"][:half], st["uniform"][:half],
-                noise, spec_on & ~greedy, vocabulary_range=d.weights.sharding.vocabulary_range)
-            accept = torch.where(greedy, spec_on & (toks[:, 0] == st["d1"][:half]), accept)
-            st["out_accept"][:half].copy_(accept)
-            st["out_tokens"][:half].copy_(toks)
-            st["out_hidden"][:half].copy_(normed.reshape(half, 2, -1))
+            live = slots * per
+            greedy, scale = self._bspec_greedy(slots)
+            scores = (logits[:live].reshape(slots, per, -1).float() * scale.reshape(-1, 1, 1))
+            srow = rows[0:live:per]
+            spec_on = st["spec_on"][srow]
+            noise = torch.where(greedy.reshape(-1, 1, 1),
+                                torch.full_like(st["noise_v"][:slots, :per], 0.5),
+                                st["noise_v"][:slots, :per])
+            drafts = st["drafts"][:slots, :K]
+            n_acc, toks = verify_sample_batched(
+                d.collectives, scores, st["q"][:slots, :K], drafts, st["uniform"][:slots, :K],
+                noise, spec_on, greedy, vocabulary_range=d.weights.sharding.vocabulary_range)
+            st["out_n"][:slots].copy_(n_acc)
+            st["out_tokens"][:slots, :per].copy_(toks)
             # c8 L5b: advance the round state on device (pad slots scatter into the
-            # dummy row): c = P, n = accepted, P += n + 1, pending = the emitted
-            # tokens with their verify hiddens ([d1, t1] / [t0, t0])
-            srow = rows.reshape(half, 2)[:, 0]
-            target = torch.where(pad.reshape(half, 2)[:, 0],
-                                 torch.full_like(srow, int(st["P"].shape[0]) - 1), srow)
-            a = accept.long()
+            # dummy row): c = P, n = accepted, P += n + 1; pending = drafts[:n] + the
+            # emitted sample, each with its verify hidden (entries past n repeat n)
+            target = torch.where(pad[0:live:per], torch.full_like(srow, int(st["P"].shape[0]) - 1),
+                                 srow)
             P_old = st["P"][srow]
-            vh = normed.reshape(half, 2, -1).to(st["pend_hid"].dtype)
-            new_tok = torch.where(accept.unsqueeze(1), torch.stack([st["d1"][:half], toks[:, 1]], 1),
-                                  torch.stack([toks[:, 0], toks[:, 0]], 1))
-            new_hid = torch.where(accept.reshape(-1, 1, 1), vh, vh[:, :1].expand(-1, 2, -1))
+            jj = torch.arange(per, device=n_acc.device).reshape(1, per)
+            last_tok = toks.gather(1, n_acc.reshape(-1, 1))
+            dext = torch.cat([drafts, torch.zeros_like(drafts[:, :1])], dim=1)
+            new_tok = torch.where(jj < n_acc.reshape(-1, 1), dext, last_tok)
+            vh = normed[:live].reshape(slots, per, -1).to(st["pend_hid"].dtype)
+            hidx = torch.minimum(jj, n_acc.reshape(-1, 1)).unsqueeze(-1).expand(-1, -1, vh.shape[-1])
+            new_hid = vh.gather(1, hidx)
             st["c"].index_copy_(0, target, P_old)
-            st["n"].index_copy_(0, target, a)
-            st["P"].index_copy_(0, target, P_old + a + 1)
-            st["pend_tok"].index_copy_(0, target, new_tok)
-            st["pend_hid"].index_copy_(0, target, new_hid)
+            st["n"].index_copy_(0, target, n_acc)
+            st["P"].index_copy_(0, target, P_old + n_acc + 1)
+            st["pend_tok"].narrow(1, 0, per).index_copy_(0, target, new_tok)
+            st["pend_hid"].narrow(1, 0, per).index_copy_(0, target, new_hid)
         st["out_vflag"].copy_(self._flag(deferred))
-        return st["out_accept"], st["out_vflag"]
+        return st["out_n"], st["out_vflag"]
 
-    def run_bspec(self, kind, rows, pads, *, end, call_shape):
-        """One batched speculative forward ("draft" absorb or "verify") of
-        len(rows) entries (2 per request row; a bucket of 2/4/8/16): entry i is
-        a slot of cache row rows[i] (pads[i]: a pad entry); its position comes
-        from the device round state. `end`: the caller's UPPER bound on the
-        round's context end — it picks the regime's graph, and a later regime
-        (or a wider cp bucket) serves an earlier context exactly."""
+    def run_bspec(self, kind, rows, pads, *, end, call_shape, per=2, step=0):
+        """One batched speculative forward: "draft" (the absorb, `per` = K+1 entries
+        per request row), "chain" (one entry per row, chain step `step`) or "verify"
+        (`per` entries per row), in a bucket. Entry i is a slot of cache row rows[i]
+        (pads[i]: a pad entry); its position comes from the device round state.
+        `end`: the caller's UPPER bound on the round's context end — it picks the
+        regime's graph, and a later regime (or a wider cp bucket) serves an earlier
+        context exactly."""
         size = len(rows)
-        if size not in self.BATCH_BUCKETS or size % 2:
-            raise ValueError("a batched speculative forward runs 2 entries per row in a bucket")
+        if size not in self.BATCH_BUCKETS:
+            raise ValueError("a batched speculative forward runs in a bucket")
         rw = self.regime(int(end), call_shape)
-        key = ("bspec", kind, size, self.wkey(*rw), call_shape.name)
-        entry = self._bspec_args(size)
+        sub = step if kind == "chain" else per
+        key = ("bspec", kind, size, sub, self.wkey(*rw), call_shape.name)
+        entry = self._bspec_args(size, 1 if kind == "chain" else per)
         self._stage_bspec(entry, size, rows, pads)
-        body = self._body_bdraft if kind == "draft" else self._body_bverify
+        if kind == "draft":
+            body = lambda: self._body_bdraft(size, call_shape, rw, per)        # noqa: E731
+        elif kind == "chain":
+            body = lambda: self._body_bchain(size, call_shape, rw, step)       # noqa: E731
+        else:
+            body = lambda: self._body_bverify(size, call_shape, rw, per)       # noqa: E731
         cached = self.graphs.get(key)
         if cached is None:
-            out = body(size, call_shape, rw)
+            out = body()
             self.eager_steps += 1
-            self._capture(key, lambda: body(size, call_shape, rw))
+            self._capture(key, body)
             return out
         graph, out, flag = cached
         self.graphs.move_to_end(key)
@@ -934,8 +979,9 @@ class DecodeGraphs:
         self.replays += 1
         return out, flag
 
-    def bspec_cached(self, kind, size, end, *, call_shape):
-        return ("bspec", kind, size, self.wkey(*self.regime(int(end), call_shape)),
+    def bspec_cached(self, kind, size, end, *, call_shape, per=2, step=0):
+        sub = step if kind == "chain" else per
+        return ("bspec", kind, size, sub, self.wkey(*self.regime(int(end), call_shape)),
                 call_shape.name) in self.graphs
 
     def bspec_set(self, row, *, P, c, n):
@@ -944,6 +990,16 @@ class DecodeGraphs:
         st["P"][row] = int(P)
         st["c"][row] = int(c)
         st["n"][row] = int(n)
+
+    def bspec_shift(self, row):
+        """A row whose last round accepted 2 drafts joins a K = 1 round (absorb width
+        2): drop its oldest pending entry (that draft position keeps the chain's
+        MTP-hidden record; exactness does not depend on the draft)."""
+        st = self.bspec_state()
+        st["pend_tok"][row, 0:2].copy_(st["pend_tok"][row, 1:3].clone())
+        st["pend_hid"][row, 0:2].copy_(st["pend_hid"][row, 1:3].clone())
+        st["c"][row] += 1
+        st["n"][row] = 1
 
     # -- capture ----------------------------------------------------------
     def _comm_capture_contexts(self, stack):

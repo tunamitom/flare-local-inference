@@ -149,6 +149,61 @@ def verify_sample_k1(collectives, target_scores, draft_scores, drafts, uniforms,
     return accept, tokens.reshape(rows, 2)
 
 
+def verify_sample_batched(collectives, target_scores, draft_scores, drafts, uniforms, noise, spec_on,
+                          greedy, *, vocabulary_range):
+    """`verify_sample` for B independent requests with a chain of K drafts each (c8 L13).
+
+    `target_scores` [B, K+1, V/w]: temperature-scaled target logits at P .. P+K
+    (inputs: the bonus, d1 .. dK); `draft_scores` [B, K, V/w]: the scaled draft
+    logits each d_j was sampled from; `drafts` [B, K]; `uniforms` [B, K] U(0,1)
+    (rank 0's used); `noise` [B, K+1, V/w] U(0,1); `spec_on` [B] bool (False: never
+    accepted, the residual is p0 itself — a plain sample); `greedy` [B] bool (its
+    scores unscaled and its noise constant: every sample is the argmax; a draft is
+    accepted iff it IS the argmax). Returns `(n [B] int64, tokens [B, K+1])`: the
+    leading accepted drafts' count and the samples — tokens[:, j < K] the residual
+    of position j (emitted when draft j+1 is the first rejection), tokens[:, K] the
+    bonus sample of p_K. A round emits drafts[:n] + [tokens[n]]. Identical on every
+    rank."""
+    rows, K = (int(v) for v in drafts.shape)
+    lo = int(vocabulary_range[0])
+    width = int(target_scores.shape[-1])
+    sp = target_scores.float()
+    sq = draft_scores.float()
+    lse_p = torch.logsumexp(sp, dim=-1)                                   # [B, K+1]
+    lse_q = torch.logsumexp(sq, dim=-1)                                   # [B, K]
+    local = drafts.long() - lo
+    own = (local >= 0) & (local < width)
+    index = local.clamp(0, width - 1).unsqueeze(-1)
+    px = torch.where(own, sp[:, :K].gather(2, index).squeeze(-1), torch.full_like(lse_q, NEG))
+    qx = torch.where(own, sq.gather(2, index).squeeze(-1), torch.full_like(lse_q, NEG))
+    rank = int(getattr(collectives, "rank", 0)) if collectives is not None else 0
+    offer = torch.full((rows, K + 1, 5), NEG, dtype=torch.float32, device=sp.device)
+    offer[:, :, 0] = lse_p
+    offer[:, :K, 1] = lse_q
+    offer[:, :K, 2] = px
+    offer[:, :K, 3] = qx
+    offer[:, :K, 4] = uniforms.float() if rank == 0 else 0.0
+    got = _exchange_rows(collectives, offer.reshape(rows * (K + 1), 5))
+    got = got.reshape(rows, K + 1, got.shape[1], 5)                       # [B, K+1, world, 5]
+    g_lse_p = torch.logsumexp(got[..., 0], dim=2)                         # [B, K+1]
+    g_lse_q = torch.logsumexp(got[:, :K, :, 1], dim=2)                    # [B, K]
+    g_px = got[:, :K, :, 2].max(dim=2).values
+    g_qx = got[:, :K, :, 3].max(dim=2).values
+    u = got[:, :K, 0, 4]
+    log_ratio = (g_px - g_lse_p[:, :K]) - (g_qx - g_lse_q)
+    sampled = spec_on & ~greedy
+    q_part = torch.where(sampled.reshape(-1, 1, 1), torch.exp(sq - g_lse_q.unsqueeze(-1)),
+                         torch.zeros_like(sq))
+    residual = (torch.exp(sp[:, :K] - g_lse_p[:, :K].unsqueeze(-1)) - q_part).clamp_min(0.0)
+    scores = torch.cat([torch.log(residual), sp[:, K:]], dim=1).reshape(rows * (K + 1), width)
+    tokens = sample_tokens(collectives, scores, noise.reshape(rows * (K + 1), width),
+                           vocabulary_range=vocabulary_range).reshape(rows, K + 1)
+    accept = torch.where(greedy.unsqueeze(1), tokens[:, :K] == drafts.long(),
+                         torch.log(u) <= log_ratio) & spec_on.unsqueeze(1)
+    n = torch.cumprod(accept.long(), dim=1).sum(dim=1)
+    return n, tokens
+
+
 # --------------------------------------------------------------------------
 # consult18 P7: top-k / top-p filtering over the vocabulary shards
 # --------------------------------------------------------------------------

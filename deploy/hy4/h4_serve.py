@@ -1311,6 +1311,7 @@ class BatchLoop:
         self.bspec = True           # batched speculative sampling (k = 1) when every row can
         self.bs_rows = {}           # every rank: row -> {"warm": a plain warm-up round first}
         self.bs_la = True           # c8 L5b: enqueue bspec round k+1 before consuming round k
+        self.bspec_k2 = True        # c8 L13: two chained drafts per row at <= 4 rows
         self._bs_inv = None         # the staged per-slot 1/T (re-staged when it changes)
         self._bs_rows_t = (None, None)
         self.bspec_rounds = self.bspec_accepted = self.bspec_slots = 0
@@ -1530,8 +1531,6 @@ class BatchLoop:
         ctx, rank = self.ctx, self.rank
         if self._bspec_ok(plan):
             return self._bspec_batch(plan, items)
-        for row, _ in plan["carry"]:
-            self.bs_rows.pop(row, None)         # a plain step: its draft state goes stale
         prev = self.inflight
         if prev is not None and prev.get("bspec"):
             # a speculative round in flight: consume it now (a plain step is never
@@ -1539,6 +1538,8 @@ class BatchLoop:
             self._row_reqs = dict(self.active) if rank == 0 else None
             self._pending = prev
             self._drain()
+        for row, _ in plan["carry"]:
+            self.bs_rows.pop(row, None)         # a plain step: its draft state goes stale
         # An eager collective (admission prefill; a new graph's eager first call)
         # must never be issued while a captured step is still pending on the
         # device (the dg88d hang): consume the in-flight step first. Its device
@@ -1606,8 +1607,14 @@ class BatchLoop:
         if not params or not all(t >= 0.0 and u for t, u in params):
             return False
         graphs = ctx.decoder.decode_graphs
-        size = graphs.batch_bucket(2 * len(params)) if 2 * len(params) <= 32 else None
+        K = self._bs_k(len(params))
+        size = graphs.batch_bucket((K + 1) * len(params)) if (K + 1) * len(params) <= 32 else None
         return size is not None and size in set(getattr(ctx, "batch_rows", ()) or ())
+
+    def _bs_k(self, B):
+        """Drafts per row in a round: 2 at <= 4 rows (a 12-entry verify), else 1."""
+        rows = set(getattr(self.ctx, "batch_rows", ()) or ())
+        return 2 if self.bspec_k2 and B <= 4 and 12 in rows else 1
 
     def _bspec_batch(self, plan, items):
         """Every rank: one batched speculative round. Steady state (c8 L5b, `bs_la`):
@@ -1625,15 +1632,13 @@ class BatchLoop:
         self._row_reqs = dict(self.active) if rank == 0 else None
         rows = [row for row, _ in plan["carry"]]
         temps = [t for t, _ in plan["carry_params"]]
+        K = self._bs_k(len(rows))
         if (self.bs_la and prev is not None and prev.get("bspec") and not plan["admit"]
-                and prev["rows"] == rows and prev["temps"] == temps
+                and prev["rows"] == rows and prev["temps"] == temps and prev["K"] == K
                 and all(r in self.bs_rows for r in rows)):
             end = self._bs_end(rows, inflight=1)
-            size = g.batch_bucket(2 * len(rows))
-            shape = batch_shape_of(size)
-            if (g.bspec_cached("draft", size, end, call_shape=shape)
-                    and g.bspec_cached("verify", size, end, call_shape=shape)):
-                nxt = self._bs_enqueue(rows, temps, end)
+            if self._bs_cached(len(rows), K, end):
+                nxt = self._bs_enqueue(rows, temps, end, K)
                 self.inflight = None
                 rolled = self._bs_consume(prev, nxt)
                 self.inflight = None if rolled else nxt
@@ -1667,7 +1672,7 @@ class BatchLoop:
         # they speculate (c8 L5d)
         for row, tok, src in entering:
             if src >= 0:
-                st["pend_tok"][row].copy_(prev["snap"]["out"][src].reshape(1).expand(2))
+                st["pend_tok"][row].copy_(prev["snap"]["out"][src].reshape(1).expand(st["pend_tok"].shape[1]))
             else:
                 st["pend_tok"][row].fill_(int(tok))
             st["spec_on"][row] = False
@@ -1678,7 +1683,7 @@ class BatchLoop:
             st["pend_tok"][row].fill_(tok)
             L = int(d._row_lengths[row])
             if hid is not None:
-                st["pend_hid"][row].copy_(hid.reshape(1, -1).expand(2, -1))
+                st["pend_hid"][row].copy_(hid.reshape(1, -1).expand(st["pend_hid"].shape[1], -1))
                 st["spec_on"][row] = True
                 # the prompt's last draft row is re-absorbed with the real first token
                 g.bspec_set(row, P=L, c=L - 1, n=0)
@@ -1691,8 +1696,16 @@ class BatchLoop:
         temps = temps + [t for _, _, _, t in admitted]
         if not rows:
             return
+        K = self._bs_k(len(rows))
+        if K == 1:
+            # c8 L13: a row whose last round accepted 2 drafts holds 3 pending entries;
+            # the 2-wide absorb takes its last 2
+            for r in rows:
+                if self.bs_rows.get(r, {}).get("n", 0) >= 2:
+                    g.bspec_shift(r)
+                    self.bs_rows[r]["n"] = 1
         end = self._bs_end(rows, inflight=0)
-        rnd = self._bs_enqueue(rows, temps, end)
+        rnd = self._bs_enqueue(rows, temps, end, K)
         if self.bs_la:
             self.inflight = rnd
         else:
@@ -1703,7 +1716,25 @@ class BatchLoop:
         unconsumed round in flight commits <= 2; the pad entries write P + 2). A
         later regime serves an earlier context exactly, so the bound is safe."""
         d = self.ctx.decoder
-        return max(int(d._row_lengths.get(r, 0)) for r in rows) + 2 * inflight + 3
+        km = d.decode_graphs.BSPEC_KMAX
+        return max(int(d._row_lengths.get(r, 0)) for r in rows) + (km + 1) * inflight + km + 2
+
+    def _bs_layout(self, B, K):
+        """A round's entry lists: (absorb/verify size, rows, pads), (chain size, rows, pads)."""
+        g = self.ctx.decoder.decode_graphs
+        per = K + 1
+        size = g.batch_bucket(per * B)
+        csize = g.batch_bucket(max(2, B))
+        return per, size, csize
+
+    def _bs_cached(self, B, K, end):
+        g = self.ctx.decoder.decode_graphs
+        per, size, csize = self._bs_layout(B, K)
+        shape, cshape = batch_shape_of(size), batch_shape_of(csize)
+        return (g.bspec_cached("draft", size, end, call_shape=shape, per=per)
+                and g.bspec_cached("verify", size, end, call_shape=shape, per=per)
+                and all(g.bspec_cached("chain", csize, end, call_shape=cshape, step=j)
+                        for j in range(1, K)))
 
     def _adopt_solo(self, ys):
         """Every rank: a preempted solo speculation joins the batched rounds with its
@@ -1719,7 +1750,7 @@ class BatchLoop:
         if len(tokens) > 1:
             spec._absorb(c, tokens[:-1], hidden[:-1], sample=False)
         st["pend_tok"][0].fill_(bonus)
-        st["pend_hid"][0].copy_(hidden[-1].reshape(1, -1).expand(2, -1))
+        st["pend_hid"][0].copy_(hidden[-1].reshape(1, -1).expand(st["pend_hid"].shape[1], -1))
         st["spec_on"][0] = True
         self.ctx.decoder.decode_graphs.bspec_set(
             0, P=int(self.ctx.decoder._row_lengths.get(0, P)), c=P - 1, n=0)
@@ -1734,9 +1765,10 @@ class BatchLoop:
             self._bs_gen.manual_seed(int.from_bytes(os.urandom(8), "little") >> 1)
         return self._bs_gen
 
-    def _bs_enqueue(self, rows, temps, end):
-        """Every rank: stage and launch one round (draft absorb + verify graphs) from
-        the device round state; snapshot its outputs (D2H + event). No host read."""
+    def _bs_enqueue(self, rows, temps, end, K):
+        """Every rank: stage and launch one round (draft absorb, K-1 chain steps,
+        verify) from the device round state; snapshot its outputs (D2H + event).
+        No host read."""
         import torch
 
         ctx = self.ctx
@@ -1744,42 +1776,47 @@ class BatchLoop:
         g = d.decode_graphs
         st = g.bspec_state()
         B = len(rows)
-        size = g.batch_bucket(2 * B)
-        shape = batch_shape_of(size)
-        half = size // 2
+        per, size, csize = self._bs_layout(B, K)
+        shape, cshape = batch_shape_of(size), batch_shape_of(csize)
         key = tuple(rows)
         if self._bs_rows_t[0] != key:
             self._bs_rows_t = (key, torch.tensor(rows, dtype=torch.long).to(ctx.device))
         rows_t = self._bs_rows_t[1]
-        inv = tuple([1.0 / t if t > 0.0 else 0.0 for t in temps] + [1.0] * (half - B))
+        S = int(st["inv_temp"].shape[0])
+        inv = tuple([1.0 / t if t > 0.0 else 0.0 for t in temps] + [1.0] * (S - B))
         if self._bs_inv != inv:
             # inv_temp 0 marks a greedy row (the graphs take its exact argmax)
-            st["inv_temp"][:half].copy_(torch.tensor(inv, dtype=torch.float32).pin_memory(),
-                                        non_blocking=True)
+            st["inv_temp"].copy_(torch.tensor(inv, dtype=torch.float32).pin_memory(), non_blocking=True)
             self._bs_inv = inv
         gen = self._bspec_gen(st["noise_q"].device)
-        st["noise_q"][:half].uniform_(generator=gen)
-        st["noise_v"][:half].uniform_(generator=gen)
-        st["uniform"][:half].uniform_(generator=gen)
-        extra = size - 2 * B
+        slots = max(size // per, csize)
+        st["noise_q"][:slots, :K].uniform_(generator=gen)
+        st["noise_v"][:slots, :per].uniform_(generator=gen)
+        st["uniform"][:slots, :K].uniform_(generator=gen)
         j = min(range(B), key=lambda i: int(d._row_lengths.get(rows[i], 0)))
-        erows = [r for r in rows for _ in (0, 1)] + [rows[j]] * extra
-        pads = [False] * (2 * B) + [True] * extra
-        bonus = st["pend_tok"][rows_t, 1]                  # the round's inputs (rollback)
-        g.run_bspec("draft", erows, pads, end=end, call_shape=shape)
-        g.run_bspec("verify", erows, pads, end=end, call_shape=shape)
+        erows = [r for r in rows for _ in range(per)] + [rows[j]] * (size - per * B)
+        pads = [False] * (per * B) + [True] * (size - per * B)
+        crows = list(rows) + [rows[j]] * (csize - B)
+        cpads = [False] * B + [True] * (csize - B)
+        bonus = st["pend_tok"][rows_t, st["n"][rows_t]]   # the round's inputs (rollback)
+        g.run_bspec("draft", erows, pads, end=end, call_shape=shape, per=per)
+        for step in range(1, K):
+            g.run_bspec("chain", crows, cpads, end=end, call_shape=cshape, step=step)
+        g.run_bspec("verify", erows, pads, end=end, call_shape=shape, per=per)
         snap = self._bs_snap()
         dev = snap["dev"]
-        dev[0:B].copy_(st["out_accept"][:B])
-        dev[B:3 * B].copy_(st["out_tokens"][:B].reshape(-1))
-        dev[3 * B:4 * B].copy_(st["d1"][:B])
-        dev[4 * B:5 * B].copy_(bonus)
-        dev[5 * B:5 * B + 1].copy_(st["out_vflag"].reshape(1))
-        snap["host"][:5 * B + 1].copy_(dev[:5 * B + 1], non_blocking=True)
+        o = 0
+        for part in (st["out_n"][:B], st["drafts"][:B, :K].reshape(-1),
+                     st["out_tokens"][:B, :per].reshape(-1), bonus, st["out_vflag"].reshape(1)):
+            m = int(part.numel())
+            dev[o:o + m].copy_(part)
+            o += m
+        snap["host"][:o].copy_(dev[:o], non_blocking=True)
         snap["event"].record()
         # the rows' next inputs after this round (a plain step after it reads them)
-        snap["out"] = st["pend_tok"][rows_t, 1]
-        return {"bspec": True, "rows": list(rows), "temps": list(temps), "snap": snap}
+        snap["out"] = st["pend_tok"][rows_t, st["n"][rows_t]]
+        return {"bspec": True, "rows": list(rows), "temps": list(temps), "snap": snap, "K": K,
+                "width": o}
 
     def _bs_snap(self):
         import torch
@@ -1805,11 +1842,15 @@ class BatchLoop:
         g = d.decode_graphs
         st = g.bspec_state()
         rows = rnd["rows"]
-        B = len(rows)
+        B, K = len(rows), rnd["K"]
+        per = K + 1
         rnd["snap"]["event"].synchronize()
-        host = rnd["snap"]["host"][:5 * B + 1].tolist()
-        acc, toks, d1 = host[:B], host[B:3 * B], host[3 * B:4 * B]
-        bonus, flag = host[4 * B:5 * B], host[5 * B]
+        host = rnd["snap"]["host"][:rnd["width"]].tolist()
+        acc = host[:B]
+        drafts = host[B:B + B * K]
+        toks = host[B + B * K:B + B * K + B * per]
+        bonus = host[B + B * K + B * per:B + B * K + B * per + B]
+        flag = host[-1]
         warm = [r for r in rows if self.bs_rows.get(r, {}).get("warm")]
         self.steps += 1
         if self.steps % 256 == 0:
@@ -1825,15 +1866,18 @@ class BatchLoop:
                                   [bonus[i] for i in live])
             for r in warm:
                 st["spec_on"][r] = True
-                self.bs_rows[r] = {}
-            rnd["snap"]["out"] = st["pend_tok"][self._bs_rows_t[1], 1] \
-                if self._bs_rows_t[0] == tuple(rows) else rnd["snap"]["out"]
+                self.bs_rows[r] = {"n": 0}
+            if self._bs_rows_t[0] == tuple(rows):
+                rt = self._bs_rows_t[1]
+                rnd["snap"]["out"] = st["pend_tok"][rt, st["n"][rt]]
             return nxt is not None
         for i in live:
             d.append([rows[i]], int(acc[i]) + 1)
+            if rows[i] in self.bs_rows:
+                self.bs_rows[rows[i]]["n"] = int(acc[i])
         for r in warm:
             st["spec_on"][r] = True     # warmed: its pending entry is this verify's
-            self.bs_rows[r] = {}
+            self.bs_rows[r].pop("warm", None)
         self.bspec_rounds += 1
         self.bspec_slots += B
         self.bspec_accepted += sum(int(x) for x in acc)
@@ -1842,7 +1886,8 @@ class BatchLoop:
                 req = self._row_reqs.get(r) if self._row_reqs is not None else None
                 if req is None or req.done:
                     continue
-                self._emit(req, [d1[i], toks[2 * i + 1]] if acc[i] else [toks[2 * i]])
+                n = int(acc[i])
+                self._emit(req, drafts[i * K:i * K + n] + [toks[i * per + n]])
         return False
 
     def _bspec_exact(self, rows, starts, bonus):
@@ -1882,9 +1927,11 @@ class BatchLoop:
         ctx.dist.broadcast_object_list(ids, src=0)
         for i, r in enumerate(rows):
             st["pend_tok"][r].fill_(ids[0][i])
-            st["pend_hid"][r].copy_(hids[i].reshape(1, -1).expand(2, -1))
+            st["pend_hid"][r].copy_(hids[i].reshape(1, -1).expand(st["pend_hid"].shape[1], -1))
             d.append([r], 1)
             d.decode_graphs.bspec_set(r, P=starts[i] + 1, c=starts[i], n=0)
+            if r in self.bs_rows:
+                self.bs_rows[r]["n"] = 0
         if rank == 0:
             for i, r in enumerate(rows):
                 req = self._row_reqs.get(r)
@@ -2409,8 +2456,10 @@ def main():
             transport.prepare_lane_all_reduce(session, 1, CHUNK)
             trace(rank, f"overlap: lane 1 ring + CE exchange prepared for {CHUNK} rows")
         if score_offer is not None:
-            # consult17: the offer gather at every row count the body runs.
-            for w in (1, *PREFILL_WIDTHS, *EXTRA_ROWS):
+            # consult17: the offer gather at every row count the body runs — and the
+            # batched speculative rounds' sampling / acceptance rows (c8 L13: a slot
+            # per request row, (K+1) offers per slot: 6 = 12 entries / 2, 2 slots x 3)
+            for w in sorted({1, *PREFILL_WIDTHS, *EXTRA_ROWS, 6}):
                 transport.prepare_score_gather(dsession if w == 1 else session, w)
         trace(rank, "transport plans prepared")
 
@@ -2472,8 +2521,9 @@ def main():
         ctx.decode_shape = decode_shape
         ctx.shapes = shapes
         ctx.row_capacity = capacity
-        # one request lives in one cache row: its context cannot pass the row
-        ctx.max_context = min(int(args.max_context), int(capacity))
+        # one request lives in one cache row: its context cannot pass the row (less a
+        # margin: speculative rounds write their pad / draft entries up to P + 4)
+        ctx.max_context = min(int(args.max_context), int(capacity) - 8)
         warm_free = warm_shortfall = None
         if args.boot_warm:
             # Pay the first-use memory again on the serving construction, then
@@ -2640,6 +2690,24 @@ def main():
                         for _ in range(2):
                             graphs.run_bspec("draft", rows_p, [False] * b, end=end, call_shape=shape)
                             graphs.run_bspec("verify", rows_p, [False] * b, end=end, call_shape=shape)
+                    if 12 in BATCH_ROWS:
+                        # c8 L13: two chained drafts per row at <= 4 rows — absorb / verify
+                        # of 3 entries per row (4 / 8 / 12) and the chain step (2 / 4)
+                        end = base + 2 * args.rows + 5
+                        for b in (12, 8, 4):
+                            shape = batch_shape(b)
+                            rows_p = [(i // 3) % args.rows for i in range(b)]
+                            for _ in range(2):
+                                graphs.run_bspec("draft", rows_p, [False] * b, end=end, call_shape=shape,
+                                                 per=3)
+                                graphs.run_bspec("verify", rows_p, [False] * b, end=end, call_shape=shape,
+                                                 per=3)
+                        for b in (4, 2):
+                            shape = batch_shape(b)
+                            rows_p = [i % args.rows for i in range(b)]
+                            for _ in range(2):
+                                graphs.run_bspec("chain", rows_p, [False] * b, end=end, call_shape=shape,
+                                                 step=1)
                 for r in range(args.rows):
                     graphs.bspec_set(r, P=0, c=0, n=0)
             torch.cuda.synchronize(device)
