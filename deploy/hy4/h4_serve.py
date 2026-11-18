@@ -596,8 +596,22 @@ class OutputSplitter:
         return events
 
 
-def run_generate(ctx, cmd, *, row=0, admit_only=False, preempt=None, spec_absorb=False):
+def run_generate(ctx, cmd, **kwargs):
+    """`run_generate_steps` driven to the end (no pause between prefill chunks)."""
+    gen = run_generate_steps(ctx, cmd, **kwargs)
+    while True:
+        try:
+            next(gen)
+        except StopIteration as stop:
+            return stop.value
+
+
+def run_generate_steps(ctx, cmd, *, row=0, admit_only=False, preempt=None, spec_absorb=False,
+                       chunked=False):
     """One generation on cache row `row`; every rank runs the full loop in lockstep.
+    A generator: with `chunked` (c8 L17) it pauses after every prefill chunk but the
+    last (the batched loop decodes its other rows meanwhile); its return value is
+    run_generate's.
 
     `admit_only`: prefill and sample the first token, then return `(out,
     finish or None)` with the row kept (the batched decode loop goes on).
@@ -758,6 +772,12 @@ def run_generate(ctx, cmd, *, row=0, admit_only=False, preempt=None, spec_absorb
                 pending = (pos, w, post, emb, real)
                 last_hidden = post[0, real - 1].clone()
             pos += real
+            if chunked and index < len(steps) - 1:
+                # c8 L17: pause between chunks; other forwards (the loop's rounds,
+                # other admissions) run meanwhile and may reset the embedding sink
+                sink, decoder.embed_sink = decoder.embed_sink, None
+                yield pos
+                decoder.embed_sink = sink
         if use_spec and pending is not None:
             last_emb = pending[3]
             absorb_pending(last_emb[-1:] if last_emb is not None else None, final=True)
@@ -1315,6 +1335,11 @@ class BatchLoop:
         self.bspec_k2 = True        # c8 L13: two chained drafts per row at <= 4 rows
         self.bspec_k3 = True        # c8 L13b: three chained drafts per row at <= 3 rows
         self.solo_bspec = False     # c8 L13b: a lone request on the batched rounds (A/B: no gain at c1)
+        self.prefilling = {}        # c8 L17: row -> a long admission's paused prefill (every rank)
+        self.chunked_admit = True   # c8 L17: long prompts prefill between decode rounds
+        self.prefill_long = 8192    # ... from this many prompt tokens
+        self.prefill_every = 24     # ... one chunk per this many decode iterations (rank 0)
+        self._since_chunk = 0
         self._bs_inv = None         # the staged per-slot 1/T (re-staged when it changes)
         self._bs_rows_t = (None, None)
         self.bspec_rounds = self.bspec_accepted = self.bspec_slots = 0
@@ -1386,10 +1411,16 @@ class BatchLoop:
                 self._finish(req, "cancelled")
                 release.append(row)
         first = None
+        # c8 L17: a long admission whose client left stops prefilling
+        abort = [r for r, st in self.prefilling.items()
+                 if st.get("item") is not None and st["item"]["cancel"].is_set()]
+        for r in abort:
+            self._finish(_Req(self.prefilling[r]["item"], r, [], sent=0), "cancelled")
         if not self.active and self.inflight is not None:
             # consume the last enqueued step before idling
             return {"kind": "batch", "release": release, "admit": [], "carry": [],
-                    "carry_params": []}, []
+                    "carry_params": [], "admit_long": [], "abort": abort,
+                    "prefill": False}, []
         waiting = [i for i in getattr(self, "big_waiting", None) or [] if not i["cancel"].is_set()]
         for i in getattr(self, "big_waiting", None) or []:
             if i["cancel"].is_set():
@@ -1400,7 +1431,7 @@ class BatchLoop:
                 if i.get("stream_q") is not None:
                     i["stream_q"].put(("end", None))
         self.big_waiting = waiting
-        if not self.active:
+        if not self.active and not (set(self.prefilling) - set(abort)):
             if self.big_waiting:
                 item = self.big_waiting.pop(0)        # c8 L6: row 0 is free now
             elif self.deferred:
@@ -1409,12 +1440,13 @@ class BatchLoop:
                 item = self._pop(block=True)
             if item.get("op") == "exec":
                 return {"kind": "exec", "path": item["path"], "release": release}, [item]
-            if (ctx.q.empty() or self.max_batch <= 1) and not self._solo_batched(item):
+            if ((ctx.q.empty() or self.max_batch <= 1) and not self._solo_batched(item)
+                    and not self._is_long(item)):
                 self._start(item, 0)
                 return ({"kind": "solo", "release": release, "tokens": item["tokens"],
                          "max_new": item["max_new"], "params": item["params"]}, [item])
             first = item
-        free = [r for r in range(self.rows) if r not in self.active]
+        free = [r for r in range(self.rows) if r not in self.active and r not in self.prefilling]
         # c8 L6: the widest row (0) is kept for the prompts that need it; a long
         # prompt waits for it (deferred) while shorter ones keep being admitted
         free.sort(key=lambda r: (r == 0, r))
@@ -1424,7 +1456,8 @@ class BatchLoop:
         admits = [first] if first is not None else []
         if 0 in free and big_waiting and first is None:
             admits.append(big_waiting.pop(0))
-        while len(admits) < len(free) and len(self.active) + len(admits) < self.max_batch:
+        while (len(admits) < len(free)
+               and len(self.active) + len(self.prefilling) + len(admits) < self.max_batch):
             item = self._pop(block=False)
             if item is None:
                 break
@@ -1446,20 +1479,106 @@ class BatchLoop:
             if pool:
                 rows.append(pool.pop(0))
                 placed.append(item)
-        admits = placed
-        for item, row in zip(admits, rows):
+        for item, row in zip(placed, rows):
             self._start(item, row)
+        # c8 L17: long prompts prefill chunk by chunk between the loop's rounds
+        longs = [(item, row) for item, row in zip(placed, rows) if self._is_long(item)]
+        shorts = [(item, row) for item, row in zip(placed, rows) if not self._is_long(item)]
+        admits = [item for item, _ in shorts]
+        live = [r for r in self.prefilling if r not in abort] or longs
+        self._since_chunk += 1
+        prefill = bool(live) and (not self.active or self._since_chunk >= self.prefill_every)
+        if prefill:
+            self._since_chunk = 0
         carry = sorted(self.active.items())
         inflight = set(self.inflight["rows"]) if self.inflight is not None else set()
-        plan = {"kind": "batch", "release": release,
+        plan = {"kind": "batch", "release": release, "abort": abort, "prefill": prefill,
+                "admit_long": [(row, item["tokens"], item["max_new"], item["params"])
+                               for item, row in longs],
                 "admit": [(row, item["tokens"], item["max_new"], item["params"])
-                          for item, row in zip(admits, rows)],
+                          for item, row in shorts],
                 # an active row's next input: the in-flight step's device output
                 # (None) or its last sampled token (not in the in-flight step)
                 "carry": [(row, None if row in inflight else req.out[-1]) for row, req in carry],
                 "carry_params": [(float(req.params.get("temperature", 0.9) or 0.0),
                                   _unfiltered(req.params)) for _, req in carry]}
-        return plan, admits
+        return plan, admits + [item for item, _ in longs]
+
+    def _is_long(self, item):
+        p = item.get("params") or {}
+        return (self.chunked_admit and self.max_batch > 1 and not p.get("nll")
+                and len(item.get("tokens") or ()) >= self.prefill_long)
+
+    def _prefill_tick(self, plan, items):
+        """Every rank (c8 L17): start the plan's long admissions as paused prefills,
+        drop aborted ones, and (when the plan says so) run one chunk of the first
+        one — draining any in-flight step first (a chunk is an eager collective)."""
+        ctx, rank = self.ctx, self.rank
+        for row in plan.get("abort", []):
+            st = self.prefilling.pop(row, None)
+            if st is not None:
+                st["gen"].close()
+                ctx.decoder.release([row])
+                self.bs_rows.pop(row, None)
+        longs = plan.get("admit_long", [])
+        long_items = items[len(plan["admit"]):] if rank == 0 else [None] * len(longs)
+        for (row, tokens, max_new, params), item in zip(longs, long_items):
+            cmd = {"op": "generate", "tokens": tokens, "max_new": max_new, "params": params}
+            self.prefilling[row] = {
+                "gen": run_generate_steps(ctx, cmd, row=row, admit_only=True, spec_absorb=True,
+                                          chunked=True),
+                "item": item}
+        if not self.prefilling or not plan.get("prefill"):
+            return
+        if self.inflight is not None:
+            self._row_reqs = dict(self.active) if rank == 0 else None
+            self._pending = self.inflight
+            self._drain()
+        row = min(self.prefilling)
+        st = self.prefilling[row]
+        self._bind(st.get("item"))
+        try:
+            next(st["gen"])
+            done = None
+        except StopIteration as stop:
+            done = stop.value
+        sent = getattr(ctx, "stream_sent", 0)
+        self._bind(None)
+        if done is None:
+            return
+        out, finish = done
+        del self.prefilling[row]
+        if finish is None:
+            self._bs_admitted(row, int(out[-1]), getattr(ctx, "admit_hidden", None))
+        if rank == 0:
+            req = _Req(st["item"], row, out, sent=sent)
+            if finish is not None:
+                self._finish(req, finish)
+                self.pending_release.append(row)
+            else:
+                self.active[row] = req
+
+    def _bs_admitted(self, row, tok, hid):
+        """Every rank: an admitted row's batched-speculation entry state (its first
+        token pending, the prompt's last hidden; no hidden: a warm-up round first)."""
+        ctx = self.ctx
+        d = ctx.decoder
+        g = getattr(d, "decode_graphs", None)
+        if g is None or getattr(ctx, "spec", None) is None:
+            return
+        st = g.bspec_state()
+        L = int(d._row_lengths[row])
+        st["pend_tok"][row].fill_(tok)
+        if hid is not None:
+            st["pend_hid"][row].copy_(hid.reshape(1, -1).expand(st["pend_hid"].shape[1], -1))
+            st["spec_on"][row] = True
+            # the prompt's last draft row is re-absorbed with the real first token
+            g.bspec_set(row, P=L, c=L - 1, n=0)
+            self.bs_rows[row] = {}
+        else:
+            st["spec_on"][row] = False
+            g.bspec_set(row, P=L, c=L, n=0)
+            self.bs_rows[row] = {"warm": True}
 
     def _solo_batched(self, item):
         """c8 L13b: a lone request runs the batched speculative rounds (K = 3 at one
@@ -1492,7 +1611,8 @@ class BatchLoop:
             elif plan["kind"] == "solo":
                 self._solo(plan, items)
             else:
-                self._batch(plan, items)
+                self._prefill_tick(plan, items)
+                self._batch(plan, items[:len(plan["admit"])] if rank == 0 else items)
         except Exception as exc:  # noqa: BLE001
             if rank == 0:
                 error = f"{type(exc).__name__}: {exc}"
@@ -1747,18 +1867,7 @@ class BatchLoop:
             g.bspec_set(row, P=L, c=L, n=0)
             self.bs_rows[row] = {"warm": True}
         for row, tok, hid, _ in admitted:
-            st["pend_tok"][row].fill_(tok)
-            L = int(d._row_lengths[row])
-            if hid is not None:
-                st["pend_hid"][row].copy_(hid.reshape(1, -1).expand(st["pend_hid"].shape[1], -1))
-                st["spec_on"][row] = True
-                # the prompt's last draft row is re-absorbed with the real first token
-                g.bspec_set(row, P=L, c=L - 1, n=0)
-                self.bs_rows[row] = {}
-            else:
-                st["spec_on"][row] = False
-                g.bspec_set(row, P=L, c=L, n=0)
-                self.bs_rows[row] = {"warm": True}
+            self._bs_admitted(row, tok, hid)
         rows = rows + [row for row, _, _, _ in admitted]
         temps = temps + [t for _, _, _, t in admitted]
         if not rows:
