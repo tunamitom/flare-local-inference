@@ -332,8 +332,9 @@ def _index_weights_kernel(x_ptr, w_ptr, out_ptr, K, x_stride, a, b, H, BLOCK_K: 
 
 
 @triton.jit
-def _index_scores_kernel(q_ptr, wt_ptr, key_ptr, owned_ptr, out_ptr, width, out_stride,
-                         H: tl.constexpr, D: tl.constexpr, BLOCK_W: tl.constexpr):
+def _index_scores_kernel(q_ptr, wt_ptr, key_ptr, owned_ptr, out_ptr, width, out_stride, base_ptr,
+                         H: tl.constexpr, D: tl.constexpr, BLOCK_W: tl.constexpr,
+                         PER_ROW_BASE: tl.constexpr):
     # The rotated query is BF16-exact (the BF16 rope output widened) and the keys
     # are BF16, so the BF16 tensor-core dot forms exactly the FP32 GEMM's products;
     # its FP32 accumulation is the MMA's (logits within ~8e-7 of FP64 vs cuBLAS's
@@ -347,6 +348,9 @@ def _index_scores_kernel(q_ptr, wt_ptr, key_ptr, owned_ptr, out_ptr, width, out_
     d = tl.arange(0, D)
     w = wb * BLOCK_W + tl.arange(0, BLOCK_W)
     q = tl.load(q_ptr + r * (H * D) + h[:, None] * D + d[None, :]).to(tl.bfloat16)
+    if PER_ROW_BASE:
+        # batched decode: query row r scores its own request row's key segment
+        key_ptr += tl.load(base_ptr + r) * D
     keys = tl.load(key_ptr + w[:, None].to(tl.int64) * D + d[None, :], mask=w[:, None] < width,
                    other=0.0)
     prod = tl.maximum(tl.dot(q, tl.trans(keys)), 0.0)
@@ -358,15 +362,17 @@ def _index_scores_kernel(q_ptr, wt_ptr, key_ptr, owned_ptr, out_ptr, width, out_
 
 
 def index_scores_fused(q, x, weights_proj, key_rows, owned, *, width, scale_a, scale_b,
-                       block_w=64):
+                       block_w=64, bases=None):
     """The masked indexer logits [rows, width] FP32 from the FP32 rotated query
     [rows, H, D], the layer input x [rows, K] (BF16), the FP32 weights_proj
     [H, K], the row's key segment key_rows [>= width, D] (BF16, contiguous) and
-    the owned key counts [rows] (int64); None when not that shape."""
+    the owned key counts [rows] (int64); None when not that shape. `bases`
+    [rows] (int64): each query row's first key slot inside `key_rows` (query
+    rows of different request rows); None: every row reads from slot 0."""
     if q.dim() != 3 or q.dtype != torch.float32 or not q.is_contiguous():
         return None
     rows, H, D = (int(v) for v in q.shape)
-    if (rows < 1 or rows > 8 or H & (H - 1) or D & (D - 1) or H < 16 or D < 16
+    if (rows < 1 or rows > 64 or H & (H - 1) or D & (D - 1) or H < 16 or D < 16
             or weights_proj.dtype != torch.float32 or not weights_proj.is_contiguous()
             or int(weights_proj.shape[0]) != H or key_rows.stride(-1) != 1 or key_rows.dtype != torch.bfloat16
             or int(key_rows.stride(0)) != D or int(owned.numel()) != rows or x.stride(-1) != 1):
@@ -377,9 +383,11 @@ def index_scores_fused(q, x, weights_proj, key_rows, owned, *, width, scale_a, s
                                      H, BLOCK_K=1024, num_warps=4)
     out = torch.empty((rows, width), dtype=torch.float32, device=q.device)
     if width:
+        per_row = bases is not None
         _index_scores_kernel[(rows, triton.cdiv(width, block_w))](
-            q, wt, key_rows, owned.reshape(-1), out, width, width, H=H, D=D, BLOCK_W=block_w,
-            num_warps=4)
+            q, wt, key_rows, owned.reshape(-1), out, width, width,
+            bases.reshape(-1) if per_row else owned, H=H, D=D, BLOCK_W=block_w,
+            PER_ROW_BASE=per_row, num_warps=4)
     return out
 
 

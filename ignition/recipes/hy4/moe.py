@@ -560,8 +560,9 @@ class FusedRoutedExperts:
                 a4 = False
             elif mode == "alt" and getattr(self, "decode_op_alt", None) is not None:
                 # the control arm: same capacity, built under HY4_MOE_DECODE_ENV_ALT
-                op, workspace, storage = (self.decode_op_alt, self._decode_workspace,
-                                          self._decode_storage)
+                alts = getattr(self, "decode_ops_alt", None) or {}
+                op = alts[min(caps)] if min(caps) in alts else self.decode_op_alt
+                workspace, storage = self._decode_workspace, self._decode_storage
                 a4 = False
         if output is None:
             uses_decode_op = op is not self.op and op is not self.small_op
@@ -604,11 +605,14 @@ def wire_decode_ops(routed, *, tokens, env, alt_env=None):
                 _os.environ.pop(key, None)
             _os.environ.update(alt_env)
             for fused in routed:
-                main = fused.decode_op
-                fused.decode_op_alt = fused.plan_decode_op(tokens=tokens)
-                fused.decode_ops[tokens] = main
-                fused.decode_op = main
-            ops += [fused.decode_op_alt for fused in routed]
+                main_op, main_ops = fused.decode_op, dict(fused.decode_ops)
+                # the control arm at EVERY decode capacity (the batched decode
+                # steps' buckets too), selected by row count like the main ops
+                fused.decode_ops_alt = {cap: fused.plan_decode_op(tokens=cap) for cap in capacities}
+                fused.decode_op_alt = fused.decode_ops_alt[tokens]
+                fused.decode_ops = main_ops
+                fused.decode_op = main_op
+                ops += list(fused.decode_ops_alt.values())
             for key in alt_env:
                 _os.environ.pop(key, None)
             _os.environ.update(env)

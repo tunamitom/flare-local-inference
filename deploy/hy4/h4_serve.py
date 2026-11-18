@@ -214,6 +214,59 @@ class Sampler:
         return tok, done, finish
 
 
+def sample_rows(sampler, logits, params_list, produced, max_new):
+    """One token per row of [B, V] logits with each row's own sampling params
+    (the Sampler.step math, one device transfer and one host read for all rows).
+    Returns [(token, done, finish)] per row."""
+    import torch
+    rows = logits.reshape(len(params_list), -1)
+    device = sampler.device
+    if device is not None:
+        rows = rows.to(device, non_blocking=True)
+        if sampler.gen_cuda is None:
+            sampler.gen_cuda = torch.Generator(device=device)
+            sampler.gen_cuda.manual_seed(int(sampler.gen.initial_seed()))
+        gen = sampler.gen_cuda
+    else:
+        gen = sampler.gen
+    rows = rows.float()
+    temps = [float(p.get("temperature", 0.9) or 0.0) for p in params_list]
+    tokens = torch.empty((rows.shape[0],), dtype=torch.long, device=rows.device)
+    greedy = [i for i, t in enumerate(temps) if t <= 0.0]
+    if greedy:
+        idx = torch.tensor(greedy, device=rows.device)
+        tokens[idx] = rows[idx].argmax(dim=-1)
+    sampled = [i for i, t in enumerate(temps) if t > 0.0]
+    if sampled:
+        idx = torch.tensor(sampled, device=rows.device)
+        scale = torch.tensor([1.0 / max(temps[i], 1e-5) for i in sampled], device=rows.device)
+        scaled = rows[idx] * scale.reshape(-1, 1)
+        for j, i in enumerate(sampled):
+            top_k = int(params_list[i].get("top_k", -1) or -1)
+            top_p = float(params_list[i].get("top_p", 1.0) or 1.0)
+            row = scaled[j]
+            if 0 < top_k < row.numel():
+                kth = torch.topk(row, top_k)[0][-1]
+                row.masked_fill_(row < kth, float("-inf"))
+            if 0.0 < top_p < 1.0:
+                sorted_logits, sorted_idx = torch.sort(row, descending=True)
+                probs = torch.softmax(sorted_logits, dim=-1)
+                remove = (torch.cumsum(probs, dim=-1) - probs) >= top_p
+                remove[0] = False
+                row[sorted_idx[remove]] = float("-inf")
+        probs = torch.softmax(scaled, dim=-1)
+        tokens[idx] = torch.multinomial(probs, 1, generator=gen).reshape(-1)
+    out = []
+    for i, tok in enumerate(tokens.tolist()):
+        if tok == sampler.eos and not params_list[i].get("ignore_eos"):
+            out.append((tok, True, "stop"))
+        elif produced[i] + 1 >= max_new[i]:
+            out.append((tok, True, "length"))
+        else:
+            out.append((tok, False, None))
+    return out
+
+
 class Context:
     pass
 
@@ -543,8 +596,14 @@ class OutputSplitter:
         return events
 
 
-def run_generate(ctx, cmd):
-    """One generation; every rank runs the full loop in lockstep."""
+def run_generate(ctx, cmd, *, row=0, admit_only=False, preempt=None):
+    """One generation on cache row `row`; every rank runs the full loop in lockstep.
+
+    `admit_only`: prefill and sample the first token, then return `(out,
+    finish or None)` with the row kept (the batched decode loop goes on).
+    `preempt` (rank 0): a callable that asks a solo request to hand over to the
+    batched loop; the generation then returns `(out, "preempt")` with the row
+    kept, its last token not yet in the cache (the batched loop feeds it)."""
     import torch
     from ignition.recipes.hy4.profile import TIMER, WATCH
     dist = ctx.dist
@@ -568,7 +627,7 @@ def run_generate(ctx, cmd):
     ctx.warm_done = True
 
     WATCH.reset()   # consult17: HY4_FINITE_WATCH=1 names the first non-finite tensor per request
-    decoder.release([0])
+    decoder.release([row])
     n = len(ids)
     # consult18 P4: greedy requests decode by MTP speculation (spec.py); the
     # prefill then also absorbs every prompt row into the draft KV.
@@ -585,13 +644,14 @@ def run_generate(ctx, cmd):
     spec_sampling = (spec_temp > 0.0 and spec_top_k <= 64 and 0.0 < spec_top_p <= 1.0
                      and (not spec_filtered or _rt.SWITCHES.get("spec_filter") == "on"))
     use_spec = (spec is not None and _rt.SWITCHES.get("spec") == "on" and n > 1
+                and row == 0 and not admit_only
                 and max_new > 1 and not params.get("nll")
                 and (spec_temp <= 0.0 or (spec_sampling and _rt.SWITCHES.get("spec_sample") == "on")))
     last_hidden = None
     if n == 1:
         t = torch.tensor([[ids[0]]], dtype=torch.int64, device=dev)
-        logits = decoder.decode_step(t, call_shape=decode_shape)
-        decoder.complete([0], t)
+        logits = decoder.decode_step(t, request_rows=[row], call_shape=decode_shape)
+        decoder.complete([row], t)
     else:
         pos = 0
         logits = None
@@ -621,7 +681,7 @@ def run_generate(ctx, cmd):
 
         steps, index = [], 0
         while index < len(plan):
-            pair = (getattr(ctx, "overlap", False) and not params.get("nll")
+            pair = (getattr(ctx, "overlap", False) and not params.get("nll") and row == 0
                     and index + 1 < len(plan)
                     and plan[index] == (full, full) and plan[index + 1] == (full, full))
             steps.append((2 * full, 2 * full, True) if pair else (*plan[index], False))
@@ -641,7 +701,8 @@ def run_generate(ctx, cmd):
                 # not a serving path), scored against the next prompt token.
                 decoder.logits_root_host = True       # rank 0's host only (see decoder)
                 try:
-                    logits = decoder.forward(t, call_shape=ctx.shapes[w], logits_rows="all")
+                    logits = decoder.forward(t, request_rows=[row], call_shape=ctx.shapes[w],
+                                             logits_rows="all")
                 finally:
                     decoder.logits_root_host = False
                 if ctx.rank == 0:
@@ -675,13 +736,13 @@ def run_generate(ctx, cmd):
                     logits = decoder.forward_overlapped(
                         t, half_shape=ctx.shapes[full], logits_rows=real - 1 if last else "none")
             elif use_spec:
-                logits, post, _ = decoder.forward(t, call_shape=ctx.shapes[w],
+                logits, post, _ = decoder.forward(t, request_rows=[row], call_shape=ctx.shapes[w],
                                                   logits_rows=real - 1 if last else "none",
                                                   return_hidden=True)
             else:
-                logits = decoder.forward(t, call_shape=ctx.shapes[w],
+                logits = decoder.forward(t, request_rows=[row], call_shape=ctx.shapes[w],
                                          logits_rows=real - 1 if last else "none")
-            decoder.append([0], real)
+            decoder.append([row], real)
             if use_spec:
                 # prompt absorption: draft rows pos .. pos+w-1 with the target's
                 # post-norm hidden and each row's next prompt token (the last
@@ -709,6 +770,8 @@ def run_generate(ctx, cmd):
             nxt, done, finish = ctx.sampler.step(logits[:, -1, :], params, len(out), max_new)
             if not done and cancel is not None and cancel.is_set():
                 done, finish = True, "cancelled"
+            elif not done and not admit_only and preempt is not None and preempt():
+                done, finish = True, "preempt"
         else:
             nxt = done = finish = None
         obj = [nxt, done, finish]
@@ -718,6 +781,10 @@ def run_generate(ctx, cmd):
     nxt, done, finish = sample(logits)
     out.append(nxt)
     _stream_push(ctx, out)
+    if admit_only:
+        decoder.trace.clear()          # the wiring trace must not grow per request
+        return out, (finish if done else None)
+    yielding = [False]          # set on every rank by the 64-token check
     if not done and use_spec and last_hidden is not None:
         if not hasattr(ctx, "eos_all"):
             box = [ctx.sampler.eos if ctx.rank == 0 else None]
@@ -735,21 +802,27 @@ def run_generate(ctx, cmd):
                 return "length"
             if produced % CANCEL_EVERY == CANCEL_EVERY - 1:
                 # every rank reaches this check at the same token count
-                box = [cancel is not None and cancel.is_set()] if ctx.rank == 0 else [None]
+                box = ([cancel is not None and cancel.is_set(), preempt is not None and preempt()]
+                       if ctx.rank == 0 else [None, None])
                 dist.broadcast_object_list(box, src=0)
                 if box[0]:
                     return "cancelled"
+                if box[1]:
+                    yielding[0] = True     # hand over at the next round boundary
             return None
 
         finish, rest = spec.generate(start=n, bonus=nxt, hidden=last_hidden, emit=emit,
                                      temperature=spec_temp,
                                      top_k=spec_top_k if 0 < spec_top_k else 0,
-                                     top_p=spec_top_p if spec_top_p < 1.0 else 1.0)
+                                     top_p=spec_top_p if spec_top_p < 1.0 else 1.0,
+                                     should_yield=lambda: yielding[0])
+        if finish is None and yielding[0]:
+            finish = "preempt"
         done = finish is not None
     while not done:
         t = torch.tensor([[out[-1]]], dtype=torch.int64, device=dev)
-        logits = decoder.decode_step(t, call_shape=decode_shape)
-        decoder.complete([0], t)
+        logits = decoder.decode_step(t, request_rows=[row], call_shape=decode_shape)
+        decoder.complete([row], t)
         if WATCH.finding is not None and "generated_tokens" not in WATCH.finding:
             WATCH.finding["generated_tokens"] = len(out)   # decode steps completed before it
         nxt, done, finish = sample(logits)
@@ -760,7 +833,8 @@ def run_generate(ctx, cmd):
         finding.setdefault("generated_tokens", 0)          # 0 = during the prompt
         finding["prompt_tokens"] = len(ids)
         print(f"[h4 r{ctx.rank}] FINITE-WATCH " + json.dumps(finding), flush=True)
-    decoder.release([0])
+    if finish != "preempt":
+        decoder.release([row])
     # consult16 lever 4: the wiring trace is a gate instrument (two entries per
     # layer per forward); a serving process must not grow it without bound.
     decoder.trace.clear()
@@ -892,7 +966,8 @@ def serve_http(ctx):
                     return "timeout"
             return "done"
 
-        def _stream_events(self, item, ids, include_usage, tools=None, think_open=False):
+        def _stream_events(self, item, ids, include_usage, tools=None, think_open=False,
+                           continuous=False):
             """OpenAI `chat.completion.chunk` SSE over chunked HTTP/1.1: a role
             chunk, `delta.reasoning_content` / `delta.content` per decoded piece,
             a finish chunk, the usage chunk when `stream_options.include_usage`,
@@ -915,10 +990,16 @@ def serve_http(ctx):
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     alive[0] = False
 
+            received = [0]          # generated token ids handed over so far
+
             def delta(content, kind="content"):
                 field = "reasoning_content" if kind == "reasoning" else "content"
-                write({**base, "choices": [{"index": 0, "delta": {field: content},
-                                            "finish_reason": None}]})
+                chunk = {**base, "choices": [{"index": 0, "delta": {field: content},
+                                              "finish_reason": None}]}
+                if continuous:
+                    chunk["usage"] = {"prompt_tokens": len(ids), "completion_tokens": received[0],
+                                      "total_tokens": len(ids) + received[0]}
+                write(chunk)
 
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -952,6 +1033,7 @@ def serve_http(ctx):
                     continue
                 last = beat = time.monotonic()
                 if kind == "tokens":
+                    received[0] += len(payload)
                     for part, text in split.feed(payload):
                         delta(text, part)
                     if not alive[0]:
@@ -1037,6 +1119,9 @@ def serve_http(ctx):
                     raise ValueError("the request body must be a JSON object")
                 stream = bool(body.get("stream", False))
                 include_usage = bool((body.get("stream_options") or {}).get("include_usage", False))
+                # vLLM's continuous_usage_stats: cumulative usage on every chunk
+                continuous = include_usage and bool(
+                    (body.get("stream_options") or {}).get("continuous_usage_stats", False))
                 if body.get("n", 1) != 1:
                     raise ValueError("h4 direct serving returns one choice")
                 tools = body.get("tools") or None
@@ -1090,7 +1175,7 @@ def serve_http(ctx):
                 item["stream_q"] = queue.Queue()
             self._enqueue(item)
             if stream:
-                self._stream_events(item, ids, include_usage, tools, think_open)
+                self._stream_events(item, ids, include_usage, tools, think_open, continuous)
                 return
             state = self._wait(item, SERVE_LOOP_TIMEOUT_S)
             if state == "gone":
@@ -1148,6 +1233,274 @@ def serve_http(ctx):
     return server
 
 
+class _Req:
+    """Rank 0's record of one request in the batched loop."""
+
+    def __init__(self, item, row, out=None, sent=0):
+        self.item, self.row = item, row
+        self.out = list(out or [])
+        self.sent = sent
+        self.params, self.max_new = item["params"], item["max_new"]
+
+
+class BatchLoop:
+    """The serving loop, every rank in lockstep (continuous batching).
+
+    Each iteration rank 0 builds one plan and broadcasts it; every rank runs it:
+    - "exec": a dev script (only while no request is active);
+    - "solo": a request that arrived to an idle loop with nothing queued runs
+      the one-row path on row 0 (speculative decoding); when another request
+      queues it hands over at a round boundary ("preempt") and joins the batch;
+    - "batch": release finished / cancelled rows, admit queued requests on free
+      cache rows (prefill + first token), then one batched decode step over
+      every active row with a known next token (DecodeGraphs.run_batch, buckets
+      1/2/4/8, pad rows on free cache rows). Rank 0 samples every row, streams,
+      and finishes requests; their rows are released in the next plan.
+    """
+
+    def __init__(self, ctx):
+        self.ctx = ctx
+        self.rank = ctx.rank
+        self.rows = int(getattr(ctx, "cache_rows", 1) or 1)
+        graphs = getattr(ctx.decoder, "decode_graphs", None)
+        buckets = tuple(getattr(ctx, "batch_rows", ()) or ())
+        self.max_batch = min(max((1, *buckets)), self.rows) if graphs is not None else 1
+        self.active = {}            # rank 0: row -> _Req
+        self.deferred = []          # rank 0: exec items waiting for an idle loop
+        self.pending_release = []   # rank 0: rows finished in the last step
+        self.steps = 0
+
+    # ---- rank 0 --------------------------------------------------------
+    def _pop(self, block):
+        ctx = self.ctx
+        while True:
+            try:
+                item = ctx.q.get() if block else ctx.q.get_nowait()
+            except queue.Empty:
+                return None
+            with ctx.lock:
+                ctx.waiting -= 1
+            waited = time.monotonic() - item["admitted"]
+            if item["cancel"].is_set():
+                # its client left while it waited: never broadcast, never run
+                trace(0, f"dropped a queued request after {waited:.0f} s: the client left")
+                continue
+            return item
+
+    def _start(self, item, row):
+        item["started"] = time.monotonic()
+        trace(0, f"request start: {len(item.get('tokens') or ())} prompt tokens on row {row}, "
+                 f"{item['started'] - item['admitted']:.1f} s queued, {self.ctx.waiting} waiting, "
+                 f"{len(self.active)} active")
+
+    def _finish(self, req, finish):
+        item = req.item
+        if finish == "cancelled":
+            trace(0, f"request stopped after {len(req.out)} tokens: the client left")
+        self._push(req)
+        item["result"] = (req.out, finish)
+        item["nll"] = None
+        item["ev"].set()
+        if item.get("stream_q") is not None:
+            item["stream_q"].put(("end", None))
+
+    @staticmethod
+    def _push(req):
+        q = req.item.get("stream_q")
+        if q is not None and len(req.out) > req.sent:
+            q.put(("tokens", list(req.out[req.sent:])))
+            req.sent = len(req.out)
+
+    def _plan(self):
+        ctx = self.ctx
+        release, self.pending_release = self.pending_release, []
+        for row, req in list(self.active.items()):
+            if req.item["cancel"].is_set():
+                del self.active[row]
+                self._finish(req, "cancelled")
+                release.append(row)
+        first = None
+        if not self.active:
+            if self.deferred:
+                item = self.deferred.pop(0)
+            else:
+                item = self._pop(block=True)
+            if item.get("op") == "exec":
+                return {"kind": "exec", "path": item["path"], "release": release}, [item]
+            if ctx.q.empty() or self.max_batch <= 1:
+                self._start(item, 0)
+                return ({"kind": "solo", "release": release, "tokens": item["tokens"],
+                         "max_new": item["max_new"], "params": item["params"]}, [item])
+            first = item
+        free = [r for r in range(self.rows) if r not in self.active]
+        admits = [first] if first is not None else []
+        while len(admits) < len(free) and len(self.active) + len(admits) < self.max_batch:
+            item = self._pop(block=False)
+            if item is None:
+                break
+            if item.get("op") == "exec":
+                self.deferred.append(item)
+                continue
+            admits.append(item)
+        rows = free[:len(admits)]
+        for item, row in zip(admits, rows):
+            self._start(item, row)
+        plan = {"kind": "batch", "release": release,
+                "admit": [(row, item["tokens"], item["max_new"], item["params"])
+                          for item, row in zip(admits, rows)],
+                "feed": [(row, req.out[-1]) for row, req in sorted(self.active.items())]}
+        return plan, admits
+
+    def _preempt(self):
+        return not self.ctx.q.empty()
+
+    # ---- every rank ----------------------------------------------------
+    def iterate(self):
+        ctx, rank = self.ctx, self.rank
+        plan, items = self._plan() if rank == 0 else (None, None)
+        obj = [plan]
+        ctx.dist.broadcast_object_list(obj, src=0)
+        plan = obj[0]
+        if plan is None:
+            return False
+        if plan["release"]:
+            ctx.decoder.release(plan["release"])
+        try:
+            if plan["kind"] == "exec":
+                self._exec(plan, items)
+            elif plan["kind"] == "solo":
+                self._solo(plan, items)
+            else:
+                self._batch(plan, items)
+        except Exception as exc:  # noqa: BLE001
+            if rank == 0:
+                error = f"{type(exc).__name__}: {exc}"
+                traceback.print_exc()
+                for item in list(items or []) + [req.item for req in self.active.values()]:
+                    item["error"] = error
+                    item["ev"].set()
+                    if item.get("stream_q") is not None:
+                        item["stream_q"].put(("end", None))
+            raise
+        return True
+
+    def _exec(self, plan, items):
+        ctx, rank = self.ctx, self.rank
+        # consult18 P2 dev loop (HY4_DEV_EXEC=1 only, see do_POST).
+        env = {"ctx": ctx, "rank": rank, "result": None, "__name__": "h4_dev_exec"}
+        try:
+            with open(plan["path"]) as fh:
+                exec(compile(fh.read(), plan["path"], "exec"), env)
+            local = {"rank": rank, "ok": True, "result": env.get("result")}
+        except Exception:  # noqa: BLE001
+            local = {"rank": rank, "ok": False, "error": traceback.format_exc()[-6000:]}
+        gathered = [None] * ctx.world
+        ctx.dist.all_gather_object(gathered, local)
+        if rank == 0:
+            items[0]["result"] = gathered
+            items[0]["ev"].set()
+
+    def _bind(self, item):
+        """rank 0: run_generate streams and cancels through ctx (one request at a time)."""
+        ctx = self.ctx
+        ctx.stream_q = item.get("stream_q") if item is not None else None
+        ctx.cancel = item["cancel"] if item is not None else None
+        ctx.stream_sent = 0
+
+    def _solo(self, plan, items):
+        ctx, rank = self.ctx, self.rank
+        item = items[0] if rank == 0 else None
+        self._bind(item)
+        cmd = {"op": "generate", "tokens": plan["tokens"], "max_new": plan["max_new"],
+               "params": plan["params"]}
+        out, finish = run_generate(ctx, cmd, row=0, preempt=self._preempt if rank == 0 else None)
+        if rank == 0:
+            req = _Req(item, 0, out, sent=ctx.stream_sent)
+            if finish == "preempt":
+                self.active[0] = req       # its last token is the next input
+            else:
+                self._finish(req, finish)
+                item["nll"] = getattr(ctx, "last_nll", None)
+        self._bind(None)
+
+    def _batch(self, plan, items):
+        import torch
+
+        ctx, rank = self.ctx, self.rank
+        d = ctx.decoder
+        for index, (row, tokens, max_new, params) in enumerate(plan["admit"]):
+            item = items[index] if rank == 0 else None
+            self._bind(item)
+            cmd = {"op": "generate", "tokens": tokens, "max_new": max_new, "params": params}
+            out, finish = run_generate(ctx, cmd, row=row, admit_only=True)
+            if rank == 0:
+                req = _Req(item, row, out, sent=ctx.stream_sent)
+                if finish is not None:
+                    self._finish(req, finish)
+                    self.pending_release.append(row)
+                else:
+                    self.active[row] = req
+            self._bind(None)
+        feed = plan["feed"]
+        if not feed:
+            return
+        from ignition.recipes.hy4 import runtime as _rt
+        from ignition.recipes.hy4.wiring import batch_shape
+
+        graphs = d.decode_graphs
+        rows = [row for row, _ in feed]
+        tokens = [tok for _, tok in feed]
+        starts = [int(d._row_lengths.get(row, 0)) for row in rows]
+        size = graphs.batch_bucket(len(rows))
+        shape = ctx.decode_shape if size == 1 else batch_shape(size)
+        vr = d.weights.sharding.vocabulary_range
+        root = {"root_host": True} if _rt.SWITCHES.get("root_logits") == "on" else {}
+        pad = None
+        if size > len(rows):
+            # every pad entry: one row one past this step's token (see run_batch)
+            j = min(range(len(rows)), key=lambda i: starts[i])
+            pad = (rows[j], starts[j] + 1)
+        local, flag = graphs.run_batch(tokens, rows, starts, call_shape=shape, pad=pad)
+        logits = d.collectives.gather_logits(local, vocabulary_range=vr, **root)
+        if bool(flag):
+            # a narrow scores-only cut needed the full re-offer: redo every real
+            # row on the exact one-row path (same slots; it rewrites this step's
+            # records); the pad entries' writes stay where no read sees them
+            d._sync_free_allowed = False
+            d.logits_root_host = bool(root)
+            try:
+                parts = []
+                for row, tok in zip(rows, tokens):
+                    t = torch.tensor([[tok]], dtype=torch.long, device=ctx.device)
+                    parts.append(d.forward(t, request_rows=[row], call_shape=ctx.decode_shape,
+                                           logits_rows="all"))
+            finally:
+                d._sync_free_allowed = True
+                d.logits_root_host = False
+            if rank == 0:
+                logits = torch.cat([p.reshape(1, -1) for p in parts]
+                                   + [parts[0].reshape(1, -1)] * (size - len(rows)))
+            d.sync_free_reruns = getattr(d, "sync_free_reruns", 0) + 1
+        d.append(rows, 1)
+        self.steps += 1
+        if self.steps % 256 == 0:
+            d.trace.clear()                # eager first steps of new buckets append to it
+        if rank != 0:
+            return
+        reqs = [self.active[row] for row in rows]
+        picked = sample_rows(ctx.sampler, logits.reshape(size, -1)[:len(rows)],
+                             [req.params for req in reqs], [len(req.out) for req in reqs],
+                             [req.max_new for req in reqs])
+        for req, (tok, done, finish) in zip(reqs, picked):
+            req.out.append(tok)
+            self._push(req)
+            if done:
+                del self.active[req.row]
+                self._finish(req, finish)
+                self.pending_release.append(req.row)
+
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--snapshot", default="/model")
@@ -1159,7 +1512,9 @@ def main():
     ap.add_argument("--default-max-tokens", type=int, default=0,
                     help="output token budget of a request that omits max_tokens; 0 = the "
                          "context window left after the prompt")
-    ap.add_argument("--rows", type=int, default=2, help="cache request rows (row 0 serves)")
+    ap.add_argument("--rows", type=int, default=2, help="cache request rows")
+    ap.add_argument("--batch-rows", type=int, default=8,
+                    help="most request rows one batched decode step serves (buckets 1, 2, 4, 8)")
     ap.add_argument("--capacity", type=int, default=0,
                     help="cache capacity in GLOBAL positions per row (0 = size from the measured budget)")
     ap.add_argument("--headroom", type=int, default=5580050432,
@@ -1317,11 +1672,14 @@ def main():
             # consult17 (lever 9): with expanded partials only the one-row
             # decode still uses the latent pool, so it shrinks to one row.
             extra_value_widths=() if expanded is None else (expanded,),
-            # consult18 P4: the decode-family verify rows merge latents too.
-            value_max_rows=None if expanded is None else (
+            # consult18 P4: the decode-family verify rows merge latents too, and
+            # so do the batched decode step's rows.
+            value_max_rows=None if expanded is None else max(
                 int(os.environ.get("HY4_SPEC_K") or 0) + 1
                 if os.environ.get("HY4_MTP") == "1" and os.environ.get("HY4_SPEC_DECODE_ROWS") == "1"
-                and int(os.environ.get("HY4_SPEC_K") or 0) > 0 else 1),
+                and int(os.environ.get("HY4_SPEC_K") or 0) > 0 else 1,
+                max((b for b in (1, 2, 4, 8) if b <= args.batch_rows), default=1),
+                *(int(x) for x in (os.environ.get("HY4_BATCH_EXTRA") or "").split(",") if x.strip())),
             dma=uses_dma, kernel_rows=args.all_reduce_kernel_rows or None,
             lanes=2 if args.overlap else 1, lane_rows=CHUNK,
             ce_lse_rows=args.ce_rows if args.lse_transport.startswith("ce") else None,
@@ -1349,6 +1707,12 @@ def main():
         MTP = os.environ.get("HY4_MTP") == "1"     # consult18 P4: the MTP draft block
         SPEC_ROWS = (tuple(range(2, int(os.environ.get("HY4_SPEC_K") or 0) + 2))
                      if MTP and os.environ.get("HY4_SPEC_DECODE_ROWS") == "1" else ())
+        # batched decode: the decode-family rows shapes of the step buckets past one row
+        BATCH_ROWS = tuple(b for b in (2, 4, 8) if b <= args.batch_rows)
+        # dev probes only: wider batch shapes (16 / 32 query rows) for micro-benches
+        BATCH_ROWS += tuple(int(x) for x in (os.environ.get("HY4_BATCH_EXTRA") or "").split(",")
+                            if x.strip() and int(x) not in BATCH_ROWS)
+        DECODE_ROWS = tuple(sorted(set(SPEC_ROWS) | set(BATCH_ROWS)))
         settings = PreparationConfig(devices=tuple(range(world)), mtp=MTP,
                                      prefill_chunk_size=CHUNK)
 
@@ -1388,11 +1752,13 @@ def main():
             shp = {w: built.decoder.default_call_shape((1, w)) for w in PREFILL_WIDTHS}
             decode_shape = built.decoder.default_call_shape((1, 1))
             all_shapes = [decode_shape] + [shp[w] for w in PREFILL_WIDTHS]
-            if SPEC_ROWS:
+            if DECODE_ROWS:
                 # consult18 P4: the decode-family verification shapes of the
-                # speculative verify / draft re-absorption (T = 2 .. k + 1)
-                from ignition.recipes.hy4.wiring import verify_shape
+                # speculative verify / draft re-absorption (T = 2 .. k + 1), and
+                # the batched decode step's buckets
+                from ignition.recipes.hy4.wiring import batch_shape, verify_shape
                 all_shapes += [verify_shape(t) for t in SPEC_ROWS]
+                all_shapes += [batch_shape(b) for b in BATCH_ROWS]
             if world > 1:
                 # The CP partial binds the UNBOUND sink at every call shape
                 # (D2/D6); only the graph-capture shapes also need the world-1
@@ -1424,9 +1790,10 @@ def main():
         # the unabsorbed width at `w` query rows; the LSE reduce-scatter is
         # 512-wide latent partials, base 2, at every query-row count.
         transport.prepare_gather(dsession, 1, absorbed)
-        for w in SPEC_ROWS:
-            # consult18 P4: the decode-family verify rows gather absorbed queries
-            # and merge latent partials, like the one-row decode step
+        for w in DECODE_ROWS:
+            # consult18 P4: the decode-family verify rows (and batched decode
+            # rows) gather absorbed queries and merge latent partials, like the
+            # one-row decode step
             transport.prepare_gather(session, w, absorbed)
             transport.prepare_lse(session, w, values, lse_base="base2")
         for w in PREFILL_WIDTHS:
@@ -1443,7 +1810,7 @@ def main():
         # shape (decode 1 row + every prepared prefill width) — oneshot at 1
         # row, rsag above (c1-unit-costs.md §1's arm choice).
         # round 16: spec verify rows outside the prefill widths (k = 4 -> 5 rows)
-        EXTRA_ROWS = tuple(w for w in SPEC_ROWS if w not in PREFILL_WIDTHS)
+        EXTRA_ROWS = tuple(w for w in DECODE_ROWS if w not in PREFILL_WIDTHS)
         for w in (1, *PREFILL_WIDTHS, *EXTRA_ROWS):
             transport.prepare_all_reduce(dsession if w == 1 else session, w)
         if uses_dma and args.dma_replay:
@@ -1516,6 +1883,8 @@ def main():
         ctx.decode_shape = decode_shape
         ctx.shapes = shapes
         ctx.row_capacity = capacity
+        # one request lives in one cache row: its context cannot pass the row
+        ctx.max_context = min(int(args.max_context), int(capacity))
         warm_free = warm_shortfall = None
         if args.boot_warm:
             # Pay the first-use memory again on the serving construction, then
@@ -1646,6 +2015,28 @@ def main():
                                 f"tokens, all graphs replayed ({replayed}) in "
                                 f"{time.monotonic() - t_cap:.1f} s")
 
+        graphs = getattr(ctx.decoder, "decode_graphs", None)
+        if graphs is not None and args.batch_rows > 1:
+            # batched decode: the batch plan group is shared by its buckets and
+            # primed at its first call's rows, so the widest bucket runs first;
+            # every bucket's short-context step is captured now (collective).
+            from ignition.recipes.hy4.wiring import batch_shape
+            t_cap = time.monotonic()
+            for b in sorted(BATCH_ROWS, reverse=True) + [1]:
+                shape = ctx.decode_shape if b == 1 else batch_shape(b)
+                # wider than the cache rows (dev probes): wrap the rows, each
+                # wrapped entry at its own position
+                rows_p = [i % args.rows for i in range(b)]
+                starts_p = [i // args.rows for i in range(b)]
+                for _ in range(2):            # eager + capture, then one replay
+                    graphs.run_batch([0] * b, rows_p, starts_p, call_shape=shape)
+            torch.cuda.synchronize(device)
+            ctx.decoder.release(list(range(args.rows)))
+            trace(rank, f"batch graphs: buckets {sorted(BATCH_ROWS) + [1]} primed in "
+                        f"{time.monotonic() - t_cap:.1f} s")
+        ctx.batch_rows = BATCH_ROWS
+        ctx.cache_rows = args.rows
+
         # ---- serving loop --------------------------------------------------
         if rank == 0:
             from transformers import AutoTokenizer
@@ -1668,91 +2059,9 @@ def main():
             ctx.sampler = Sampler(tok, eos_id, seed=int(time.time()) & 0xFFFFFFFF, device=ctx.device)
             serve_http(ctx)
             trace(rank, f"listening on {ctx.bind} as {ctx.served_names[0]}")
-        while True:
-            # Rank 0 blocks on the request queue, THEN broadcasts the command;
-            # ranks 1..7 block here. (Broadcasting rank 0's own placeholder
-            # instead of a queued command shuts the world down immediately.)
-            item = ctx.q.get() if rank == 0 else None
-            if item is not None:
-                with ctx.lock:
-                    ctx.waiting -= 1
-                waited = time.monotonic() - item["admitted"]
-                if item["cancel"].is_set():
-                    # its client left while it waited: never broadcast, never run
-                    trace(rank, f"dropped a queued request after {waited:.0f} s: the client left")
-                    continue
-                item["started"] = time.monotonic()
-                trace(rank, f"request start: {len(item.get('tokens') or ())} prompt tokens, "
-                            f"{waited:.1f} s queued, {ctx.waiting} waiting")
-            if item is not None and item.get("op") == "exec":
-                cmd = {"op": "exec", "path": item["path"]}
-            else:
-                cmd = None if item is None else {
-                    "op": "generate", "tokens": item["tokens"],
-                    "max_new": item["max_new"], "params": item["params"]}
-            obj = [cmd]
-            dist.broadcast_object_list(obj, src=0)
-            cmd = obj[0]
-            if cmd is None:
-                break
-            if cmd["op"] == "exec":
-                # consult18 P2 dev loop (HY4_DEV_EXEC=1 only, see do_POST).
-                env = {"ctx": ctx, "rank": rank, "result": None, "__name__": "h4_dev_exec"}
-                try:
-                    with open(cmd["path"]) as fh:
-                        exec(compile(fh.read(), cmd["path"], "exec"), env)
-                    local = {"rank": rank, "ok": True, "result": env.get("result")}
-                except Exception:  # noqa: BLE001
-                    local = {"rank": rank, "ok": False, "error": traceback.format_exc()[-6000:]}
-                gathered = [None] * ctx.world
-                dist.all_gather_object(gathered, local)
-                if rank == 0:
-                    item["result"] = gathered
-                    item["ev"].set()
-                continue
-            if cmd["op"] == "generate":
-                # rank 0: the request's SSE queue (None for non-streaming requests)
-                ctx.stream_q = item.get("stream_q") if rank == 0 else None
-                ctx.cancel = item["cancel"] if rank == 0 else None
-                ctx.stream_sent = 0
-                try:
-                    profile_dir = os.environ.get("HY4_TORCH_PROFILE") or ""
-                    min_new = int(os.environ.get("HY4_TORCH_PROFILE_MIN_NEW") or 0)
-                    if (profile_dir and len(cmd.get("tokens") or ()) >= 4096
-                            and int(cmd.get("max_new") or 0) >= min_new
-                            and not getattr(ctx, "profiled", False)):
-                        # consult18 census: CUDA-only kernel trace (CUPTI, no host
-                        # activity tracing) of ONE large request on every rank.
-                        import torch
-                        from torch.profiler import ProfilerActivity, profile
-                        ctx.profiled = True
-                        torch.cuda.synchronize(ctx.device)
-                        with profile(activities=[ProfilerActivity.CUDA]) as prof:
-                            out, finish = run_generate(ctx, cmd)
-                            torch.cuda.synchronize(ctx.device)
-                        os.makedirs(profile_dir, exist_ok=True)
-                        prof.export_chrome_trace(os.path.join(profile_dir, f"trace-r{rank}.json"))
-                        trace(rank, f"torch profile written: {profile_dir}/trace-r{rank}.json")
-                    else:
-                        out, finish = run_generate(ctx, cmd)
-                except Exception as exc:  # noqa: BLE001
-                    if rank == 0:
-                        item["error"] = f"{type(exc).__name__}: {exc}"
-                        traceback.print_exc()
-                        item["ev"].set()
-                        if ctx.stream_q is not None:
-                            ctx.stream_q.put(("end", None))
-                    raise
-                if rank == 0:
-                    if finish == "cancelled":
-                        trace(rank, f"request stopped after {len(out)} tokens: the client left")
-                    item["result"] = (out, finish)
-                    item["nll"] = getattr(ctx, "last_nll", None)
-                    item["ev"].set()
-                    if ctx.stream_q is not None:
-                        ctx.stream_q.put(("end", None))
-                ctx.stream_q = None
-                ctx.cancel = None
+        loop = BatchLoop(ctx)
+        while loop.iterate():
+            pass
         trace(rank, "shutdown")
     finally:
         try:

@@ -95,13 +95,16 @@ class SpeculativeGreedy:
             lo += w
         return out
 
-    def generate(self, *, start, bonus, hidden, emit, temperature=0.0, top_k=0, top_p=1.0):
+    def generate(self, *, start, bonus, hidden, emit, temperature=0.0, top_k=0, top_p=1.0,
+                 should_yield=None):
         """Rounds from committed length `start` with `bonus` emitted at `start`
         and `hidden` [H] the target's post-norm hidden at `start - 1` (the
         prompt's last row: its draft row is re-absorbed with the real token).
         `emit(token)` appends one token and returns a finish reason or None.
         Returns `(finish, None)` when done, or `(None, (P, bonus))` when the
-        next round no longer fits the graphs (the caller decodes on from P)."""
+        next round no longer fits the graphs or `should_yield()` (checked at
+        each round start, identical on every rank) asks the request to hand
+        over: the caller decodes on from P with `bonus` as the next input."""
         d, g, k, row = self.decoder, self.graphs, self.k, self.row
         sample = float(temperature or 0.0) > 0.0
         filtered = sample and (int(top_k or 0) > 0 or float(top_p if top_p is not None else 1.0) < 1.0)
@@ -119,6 +122,8 @@ class SpeculativeGreedy:
         P, c = int(start), int(start) - 1
         pend_tokens, pend_hidden = [int(bonus)], hidden.reshape(1, -1)
         while self.eligible(P, c):
+            if should_yield is not None and should_yield():
+                return None, (P, bonus)
             greedy, h, fl, aentry = self._absorb(c, pend_tokens, pend_hidden, sample=sample,
                                                  filtered=filtered)
             flags = [fl.clone()]
@@ -226,7 +231,26 @@ class SpeculativeGreedy:
         the caller releases the row afterwards. Returns the graph count."""
         g, k = self.graphs, self.k
         before = g.captures
+        # the short-context bypass bucket first (one start serves all of it)
+        starts = [k + 2] if g.spec_width(k + 2, k + 1, self._shape(k + 1)) == 0 else []
         start = g.topk + k + 2
+        for short in starts:
+            modes = ((False, False), (True, False), (True, True)) if sample else ((False, False),)
+            for mode, filt in modes:
+                for w in (x for x in ABSORB_WIDTHS if x <= k + 1):
+                    toks, hid = g.spec_inputs("draft", w)
+                    toks.zero_()
+                    hid.zero_()
+                    if mode:
+                        self._noise("draft", w)
+                    g.run_spec("draft", row=self.row, start=short - w, count=w,
+                               call_shape=self._shape(w), sample=mode, filtered=filt)
+                toks, _ = g.spec_inputs("verify", k + 1)
+                toks.zero_()
+                if mode:
+                    self._noise("verify", k + 1)
+                g.run_spec("verify", row=self.row, start=short, count=k + 1,
+                           call_shape=self._shape(k + 1), sample=mode, filtered=filt)
         while start + k + 1 < min(int(max_context), g.capacity):
             if not self.eligible(start, start - k - 1):
                 break

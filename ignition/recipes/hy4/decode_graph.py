@@ -257,15 +257,31 @@ class DecodeGraphs:
         return -(-int(count) // self.world)
 
     def accepts_spec(self, count, *, row, start, call_shape):
-        """Fixed-shape spec forwards past the short-context bypass, with room
-        for the predicated slots of every rank (a rank-independent bound)."""
+        """Fixed-shape spec forwards, with room for the predicated slots of
+        every rank (a rank-independent bound). Inside the short-context bypass
+        (the whole forward at <= top-k) the decode-family shapes run the bypass
+        bucket; elsewhere the indexer width bucket."""
         per = self.spec_per(count)
+        short = start + count <= self.topk
         return (self.device.type == "cuda" and 1 <= count <= self.SPEC_MAX
-                and start + 1 > self.topk and start + count <= self.capacity
+                and (not short or self._spec_bypass(count, call_shape))
+                and start >= 0 and start + count <= self.capacity
                 and (start + self.world - 1) // self.world + per - 1 < self.local_capacity
                 and 0 <= row < int(self.decoder.cache.rows)
                 and (call_shape.is_decode_graph == (count == 1)
                      or self._decode_rows(call_shape, count)))
+
+    def _spec_bypass(self, count, call_shape):
+        """A spec forward that can take the short-context bypass: a decode-family
+        shape (one token, or the verification rows) under context parallelism."""
+        return (self._short_bypass(call_shape)
+                and (call_shape.is_decode_graph or self._decode_rows(call_shape, count)))
+
+    def spec_width(self, start, count, call_shape):
+        """0 (the short-context bypass bucket) or the indexer width bucket."""
+        if start + count <= self.topk and self._spec_bypass(count, call_shape):
+            return 0
+        return self.index_width(start + count)
 
     @staticmethod
     def _decode_rows(call_shape, count):
@@ -395,7 +411,7 @@ class DecodeGraphs:
         deferred = getattr(d.collectives, "deferred_checks", None)
         if deferred is not None:
             deferred.clear()
-        visible_max = self.topk + 1 if call_shape.is_decode_graph else None
+        visible_max = (self.topk if width == 0 else self.topk + 1) if call_shape.is_decode_graph else None
         with use_lane(0, overlap=False, geometry=geometry, sync_free=True), w8_decode_scope():
             logits, normed, _ = d._layers_and_head(
                 tokens, rows, positions, token_rows, visible, visible_max, state=None,
@@ -430,7 +446,7 @@ class DecodeGraphs:
         deferred = getattr(d.collectives, "deferred_checks", None)
         if deferred is not None:
             deferred.clear()
-        visible_max = self.topk + 1 if call_shape.is_decode_graph else None
+        visible_max = (self.topk if width == 0 else self.topk + 1) if call_shape.is_decode_graph else None
         with use_lane(0, overlap=False, geometry=geometry, sync_free=True), w8_decode_scope():
             hidden, _, _ = d._draft_cp(tokens, hidden_in, positions, rows, d.cache,
                                        call_shape=call_shape, visible_max=visible_max,
@@ -483,7 +499,7 @@ class DecodeGraphs:
         output buffers, valid until the next forward of the same (kind, T).
         Captured per (kind, T, indexer width bucket); the first call runs
         eagerly through the same body."""
-        width = self.index_width(start + count)
+        width = self.spec_width(start, count, call_shape)
         key = (kind, int(row), int(count), width, call_shape.name)
         filtered = bool(sample and filtered)
         if sample:
@@ -503,6 +519,134 @@ class DecodeGraphs:
         graph.replay()
         self.replays += 1
         return outputs
+
+    # -- batched decode: B request rows, one token each ----------------------
+    # A step over B active request rows runs as the decode-family rows shape
+    # of its bucket (1, 2, 4 or 8 query rows; `verify_shape(B)` past one row).
+    # Rows, positions and slots are DEVICE inputs, so one graph per (bucket,
+    # indexer width bucket) serves any set of rows: query row i reads its own
+    # request row's records (`slot_base` per row) and index keys (the fused
+    # indexer's per-row base). Pad entries (bucket > B) all repeat one
+    # (row, position): a free row at 0, or an active row ONE PAST the token this
+    # step writes there — never visible to that token's query, and overwritten
+    # by the row's next step before any read. Identical pad entries write
+    # identical bytes.
+    BATCH_BUCKETS = (1, 2, 4, 8, 16, 32)
+
+    def batch_bucket(self, count):
+        for size in self.BATCH_BUCKETS:
+            if count <= size:
+                return size
+        raise ValueError(f"a batched step holds at most {self.BATCH_BUCKETS[-1]} rows")
+
+    def accepts_batch(self, rows, starts):
+        return (self.device.type == "cuda" and 1 <= len(rows) <= self.BATCH_BUCKETS[-1]
+                and all(start + 1 <= self.capacity and start // self.world < self.local_capacity
+                        for start in starts)
+                and all(0 <= row < int(self.decoder.cache.rows) for row in rows))
+
+    def _batch_state(self, size):
+        state = getattr(self, "_batch", None)
+        if state is None:
+            state = self._batch = {}
+            self._batch_ring = []
+            self._batch_ring_at = 0
+        entry = state.get(size)
+        if entry is None:
+            # args: tokens | positions | rows | record slot (-1 off-owner) | safe slot
+            entry = state[size] = {
+                "args": torch.zeros((5 * size,), dtype=torch.long, device=self.device),
+                "kept": torch.arange(size, dtype=torch.long, device=self.device),
+            }
+        return entry
+
+    def _batch_host(self, n):
+        """A pinned staging vector from a ring (a pending H2D is never rewritten)."""
+        if self._batch_ring_at >= len(self._batch_ring):
+            buf = torch.zeros((5 * self.BATCH_BUCKETS[-1],), dtype=torch.long)
+            if self.device.type == "cuda":
+                buf = buf.pin_memory()
+            self._batch_ring.append(buf)
+        buf = self._batch_ring[self._batch_ring_at]
+        self._batch_ring_at = (self._batch_ring_at + 1) % 64
+        return buf[:n]
+
+    def _stage_batch(self, entry, size, tokens, rows, starts):
+        host = self._batch_host(5 * size)
+        for i in range(size):
+            row, start = int(rows[i]), int(starts[i])
+            local = row * self.local_capacity + start // self.world
+            host[i] = int(tokens[i])
+            host[size + i] = start
+            host[2 * size + i] = row
+            host[3 * size + i] = local if start % self.world == self.rank else -1
+            host[4 * size + i] = local
+        entry["args"].copy_(host, non_blocking=True)
+
+    def _body_batch(self, size, call_shape, width):
+        from .lanes import use_lane
+
+        d = self.decoder
+        entry = self._batch_state(size)
+        args = entry["args"]
+        tokens = args[0:size].reshape(size, 1)
+        positions = args[size:2 * size]
+        rows = args[2 * size:3 * size]
+        slot, safe = args[3 * size:4 * size], args[4 * size:5 * size]
+        token_rows = rows                       # one token per query row
+        visible = positions + 1
+        d.cache.begin_forward_static(token_rows, positions, slot=slot, safe=safe,
+                                     kept=entry["kept"])
+        geometry = {"owned_max": max(width, 1), "base": None,
+                    "bases": rows * self.local_capacity}
+        deferred = getattr(d.collectives, "deferred_checks", None)
+        if deferred is not None:
+            deferred.clear()
+        # width 0: every row is inside the short-context bypass (<= top-k)
+        visible_max = self.topk if width == 0 else self.topk + 1
+        with use_lane(0, overlap=False, geometry=geometry, sync_free=True), w8_decode_scope():
+            logits = d._layers_and_head(
+                tokens, rows, positions, token_rows, visible, visible_max, state=None,
+                return_hidden=False, call_shape=call_shape, logits_rows="all", gather=False)
+        return logits, self._flag(deferred)
+
+    def run_batch(self, tokens, rows, starts, *, call_shape, pad_rows=(), pad=None):
+        """One decode step of `len(rows)` request rows (token i at position
+        starts[i] of rows[i]): `(local-shard logits [bucket, 1, V/w], deferred
+        flag)`; logits rows past len(rows) are padding. `pad` = (row, position)
+        of every pad entry (default: the first of `pad_rows` at 0, else the
+        lowest-position row one past its token)."""
+        count = len(rows)
+        size = self.batch_bucket(count)
+        if size > count:
+            if pad is None:
+                if pad_rows:
+                    pad = (int(pad_rows[0]), 0)
+                else:
+                    j = min(range(count), key=lambda i: starts[i])
+                    pad = (int(rows[j]), int(starts[j]) + 1)
+            if not 0 <= pad[1] < self.capacity:
+                raise ValueError("a batched step's pad position lies outside its row")
+            rows = list(rows) + [pad[0]] * (size - count)
+            starts = list(starts) + [pad[1]] * (size - count)
+            tokens = list(tokens) + [0] * (size - count)
+        end = max(int(s) for s in starts) + 1
+        width = 0 if (end <= self.topk and self._short_bypass(call_shape)) else self.index_width(end)
+        key = ("batch", size, width, call_shape.name)
+        entry = self._batch_state(size)
+        self._stage_batch(entry, size, tokens, rows, starts)
+        cached = self.graphs.get(key)
+        if cached is None:
+            logits, flag = self._body_batch(size, call_shape, width)
+            self.eager_steps += 1
+            logits, flag = logits.clone(), flag.clone()
+            self._capture(key, lambda: self._body_batch(size, call_shape, width))
+            return logits, flag
+        graph, logits, flag = cached
+        self.graphs.move_to_end(key)
+        graph.replay()
+        self.replays += 1
+        return logits, flag
 
     # -- capture ----------------------------------------------------------
     def _comm_capture_contexts(self, stack):

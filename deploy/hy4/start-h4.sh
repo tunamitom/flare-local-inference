@@ -26,8 +26,8 @@ set -euo pipefail
 NAME="${NAME:-h4}"
 PORT="${LLM_PORT:-8001}"
 TP=8
-IMAGE="${IMAGE:-local/flare:rt-h4-cp8-dg86t}"
-IMAGE_SHA="${IMAGE_SHA:-sha256:1959bd3a4102cedbed14042f4807b3891e123b33f5ad1f356def89fdd02b5236}"
+IMAGE="${IMAGE:-local/flare:rt-h4-cp8-dg88a}"
+IMAGE_SHA="${IMAGE_SHA:-sha256:39763e05b58929985aaa6e122cd98f194eadefd51daec3641cb49aecb942c73b}"
 PKG_LINK="${PKG_DIR:-/opt/models/Hy4-nvfp4-w4a16-mse-gpu}"
 SERVED_NAME="${SERVED_NAME:-smart}"
 MAX_CONCURRENCY="${MAX_CONCURRENCY:-1}"
@@ -236,9 +236,10 @@ docker run -d --name "$NAME" --network host --init --cap-add SYS_PTRACE \
   -e HY4_GPU_SAMPLER="${HY4_GPU_SAMPLER:-1}" \
   -e HY4_AB_MLP_GRAPHS="${HY4_AB_MLP_GRAPHS:-1}" \
   -e HY4_DECODE_AUTOTUNE="${HY4_DECODE_AUTOTUNE:-0}" \
-  -e HY4_MOE_DECODE_OP="${HY4_MOE_DECODE_OP:-1,4}" \
+  -e HY4_MOE_DECODE_OP="${HY4_MOE_DECODE_OP:-1,4,8}" \
+  -e HY4_BATCH_EXTRA="${HY4_BATCH_EXTRA:-}" \
   -e HY4_MOE_DECODE_ENV="${HY4_MOE_DECODE_ENV:-}" \
-  -e HY4_MOE_DECODE_ENV_ALT="${HY4_MOE_DECODE_ENV_ALT:-B12X_W4A16_SMALL_M_OCCUPANCY=1}" \
+  -e HY4_MOE_DECODE_ENV_ALT="${HY4_MOE_DECODE_ENV_ALT:-}" \
   -e HY4_DECODE_GRAPH_PREWARM="${HY4_DECODE_GRAPH_PREWARM:-}" \
   -e HY4_DEV_EXEC="${HY4_DEV_EXEC:-1}" \
   -e HY4_TORCH_PROFILE="${HY4_TORCH_PROFILE:-}" \
@@ -266,10 +267,10 @@ docker run -d --name "$NAME" --network host --init --cap-add SYS_PTRACE \
     /opt/h4/h4_serve.py \
       --snapshot /model \
       --host 0.0.0.0 --port "$PORT" --served-model-name "$SERVED_NAME" \
-      --max-concurrency "$MAX_CONCURRENCY" \
+      --max-concurrency "$MAX_CONCURRENCY" --rows "${H4_ROWS:-8}" --batch-rows "${H4_BATCH_ROWS:-8}" \
       --max-context "${H4_MAX_CONTEXT:-1048576}" \
       --headroom "${H4_HEADROOM:-4563402752}" \
-      --all-reduce-arm "${H4_AR_ARMS:-1:oneshot,2-4:rsag,8-512:twoshot,1024-:dma}" \
+      --all-reduce-arm "${H4_AR_ARMS:-1:oneshot,2-8:rsag,16-512:twoshot,1024-:dma}" \
       --all-reduce-kernel-rows 512 \
       --lse-transport ce-relay --gather-transport ce-relay \
       --selection-wire dcp \

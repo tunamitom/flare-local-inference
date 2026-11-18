@@ -88,18 +88,20 @@ class CallShape:
     tokens: int
 
     def __post_init__(self):
-        if self.name not in ("decode", "verify", "prefill"):
+        if self.name not in ("decode", "verify", "batch", "prefill"):
             raise ValueError(f"unknown call shape name {self.name!r}")
         if type(self.rows) is not int or self.rows < 1:
             raise ValueError(f"call shape rows must be a positive int, got {self.rows!r}")
         if type(self.tokens) is not int or self.tokens < 1:
             raise ValueError(f"call shape tokens must be a positive int, got {self.tokens!r}")
-        if self.name in ("decode", "verify") and self.tokens != 1:
+        if self.name in ("decode", "verify", "batch") and self.tokens != 1:
             raise ValueError("decode-family shapes advance one token per row")
         if self.name == "decode" and self.rows != 1:
             raise ValueError("the decode shape is the ONE-ROW shape; use verify_shape(rows)")
         if self.name == "verify" and self.rows < 2:
             raise ValueError("the verification shape is the multi-row shape distinct from decode")
+        if self.name == "batch" and self.rows < 2:
+            raise ValueError("the batched decode shape spans several request rows")
         if self.name == "prefill" and self.tokens < 2:
             raise ValueError("prefill calls carry prompt tokens, not one-token steps")
 
@@ -159,7 +161,8 @@ class CallShape:
         `rows` query rows; b12x's "verify" mode is the multi-group prefill
         kernel (dg26c graph census: 39.5 vs 8.4 us per layer at two rows).
         """
-        return {"decode": "decode", "verify": "decode", "prefill": "extend"}[self.name]
+        return {"decode": "decode", "verify": "decode", "batch": "decode",
+                "prefill": "extend"}[self.name]
 
     @property
     def short_context_bypass(self):
@@ -173,6 +176,13 @@ class CallShape:
 
 
 DECODE_ONE_ROW = CallShape("decode", rows=1, tokens=1)
+
+
+def batch_shape(rows):
+    """The batched decode step's shape: `rows` request rows, one token each. Its
+    own plan group (not `verify`'s): a shared plan is primed at its first call's
+    rows, so the batch plan is primed at its widest bucket at boot."""
+    return CallShape("batch", rows=rows, tokens=1)
 
 
 def verify_shape(rows):

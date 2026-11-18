@@ -867,17 +867,26 @@ class Hy4LayerAttention:
         rows = int(q.shape[0])
         q = q.float()
         trim = q.is_cuda and diet("diet_index")
+        bases = known.get("bases") if known is not None else None
         if (trim and known is not None and width and diet("index_fuse")
                 and SWITCHES_get("index_scores") != "bf16"):
             # round 16 (numerics class): weights + scores + relu + head sum + mask
             # in two launches straight from the BF16 key segment
             from .fused_ops import index_scores_fused
 
-            fused = index_scores_fused(q, x, iw.weights_proj, key_table[int(known["base"]):],
-                                       owned, width=width, scale_a=n_heads ** -0.5,
-                                       scale_b=head_dim ** -0.5)
+            if bases is not None:
+                # batched decode: each query row reads its own request row's keys
+                fused = index_scores_fused(q, x, iw.weights_proj, key_table, owned, width=width,
+                                           scale_a=n_heads ** -0.5, scale_b=head_dim ** -0.5,
+                                           bases=bases)
+            else:
+                fused = index_scores_fused(q, x, iw.weights_proj, key_table[int(known["base"]):],
+                                           owned, width=width, scale_a=n_heads ** -0.5,
+                                           scale_b=head_dim ** -0.5)
             if fused is not None:
                 return fused
+        if bases is not None:
+            raise RuntimeError("batched decode needs the fused indexer (rows <= 8, diet index_fuse)")
         weights = (x.float() @ iw.weights_proj.float().T) * (n_heads ** -0.5) * (head_dim ** -0.5)
         # No `[rows, width, key_dim]` key copy: the tokens of one request row
         # share one `[live, key_dim]` key segment, scored in row blocks of at
