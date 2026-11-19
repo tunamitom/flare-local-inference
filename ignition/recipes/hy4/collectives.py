@@ -1273,16 +1273,29 @@ class CeExchange:
             for dest in self.local:
                 self._send_block(self._local_stream, dest, forward, (partner,), "gather",
                                  ("g-fwd", dest))
-        out = torch.empty((self.world, n, width), dtype=torch.bfloat16, device=self.device)
+        out = torch.empty((self.world * hpr, rows, width), dtype=torch.bfloat16,
+                          device=self.device)
         self._await_all("gather", (*self.cross, *self.local))
-        dequant_slots_int8(slots, self._all_sources, soff, n, width, out, self._all_sources)
-        gathered = out.view(self.world, rows, hpr, width).permute(1, 0, 2, 3) \
-            .reshape(rows, self.world * hpr, width)
+        dequant_slots_int8(slots, self._all_sources, soff, n, width, out, self._all_sources,
+                           head_major=True, hpr=hpr, rows=rows)
         self._drain()
-        return gathered
+        # Option 1 (PERF-PLAN.md Step 3): head-major `[heads, rows, width]`
+        # (rank-major head blocks preserved) — no permute/reshape copy after
+        # the wire, and the absorb GEMM's `q_nope` slice is disjoint-stride.
+        return out
+
+    @property
+    def gather_head_major(self):
+        """Option 1 (PERF-PLAN.md Step 3): the INT8 wire's gather returns
+        head-major `[heads, rows, width]` (the BF16 wire stays row-major)."""
+        return self._wire_int8()
 
     def all_gather_heads(self, local, *, relay=False):
-        """`[rows, heads // world, width]` -> `[rows, heads, width]` (rank-major)."""
+        """`[rows, heads // world, width]` -> rank-major heads.
+
+        INT8 wire (Option 1): contiguous head-major `[heads, rows, width]`;
+        BF16 wire: row-major `[rows, heads, width]`. `gather_head_major` says
+        which one a caller is looking at."""
         if self._wire_int8():
             return self._all_gather_heads_int8(local, relay=relay)
         rows, hpr, width = (int(v) for v in local.shape)
@@ -1929,12 +1942,24 @@ class PcieDcpTransport:
                 and rows >= self.ce_gather_rows and ce.accepts_gather(local_input)):
             _trace(f"all_gather_heads(ce) rows={rows} width={width}")
             gathered = ce.all_gather_heads(local_input, relay=self.ce_gather_relay)
+            # Option 1 layout: the INT8 CE gather is head-major — the audits
+            # compare the row-major map (a view; the same bytes per element).
+            audit_view = gathered.transpose(0, 1) if ce.gather_head_major else gathered
             if self.ce_audit and not self._in_lane():
-                self._audit_gather(local_input, gathered)
+                self._audit_gather(local_input, audit_view)
             if self.lane_audit and self._in_lane():
-                self._lane_audit_gather(local_input, gathered)
+                self._lane_audit_gather(local_input, audit_view)
             return gathered
         return self._kernel_gather(local_input, out)
+
+    def gather_head_major(self, rows, width):
+        """Option 1 (PERF-PLAN.md Step 3): will this gather dispatch to the
+        INT8 CE wire (whose output is head-major `[heads, rows, width]`)?"""
+        ce = self._lane_ce()
+        return bool(ce is not None and ce.gather_head_major
+                    and self.ce_gather_rows is not None
+                    and int(rows) >= self.ce_gather_rows
+                    and int(width) == int(ce.gather_width))
 
     def _kernel_gather(self, local_input, out=None):
         self._lane_check("DCP gather pool")
@@ -2558,9 +2583,16 @@ class PcieDcpCollectives:
         return self.plans.plan_for(shape, kernel)
 
     def all_gather_heads(self, q_local, *, call_shape=None):
-        """`[rows, heads // world, width]` -> `[rows, heads, width]` (rank-major)."""
+        """`[rows, heads // world, width]` -> rank-major heads (INT8 CE wire:
+        head-major `[heads, rows, width]` — see `gather_head_major`)."""
         return self.transport.all_gather_heads(
             q_local.contiguous(), plan=self._plan("all_gather_heads", call_shape))
+
+    def gather_head_major(self, rows, width):
+        """Option 1 (PERF-PLAN.md Step 3): this gather returns head-major
+        `[heads, rows, width]` (the INT8 CE wire dispatch above `ce_gather_rows`).
+        Mock-safe: callers `getattr`-fall back to row-major."""
+        return self.transport.gather_head_major(rows, width)
 
     def lse_reduce(self, out_partial, lse_partial, *, partials_sink_folded, call_shape=None):
         """Base-2 fused reduce-scatter over ALL heads -> this rank's head shard."""

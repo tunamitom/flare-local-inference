@@ -232,3 +232,101 @@ def test_negative_control_detector_flags_raw_overlapping_bmm():
     with pytest.raises(AssertionError):
         with _NoOverlapBmm():
             torch.bmm(a, w)
+
+
+# --------------------------------------------- Option 1 (head-major zero-overlap)
+def _attention_absorb_geom(heads, *, qk_nope=192, qk_rope=64, lora=512,
+                           dtype=torch.bfloat16):
+    """Option 1 geometry (PERF-PLAN.md Step 3): head-major `q_hrd` width
+    `256 = 192 + 64`, absorbed query `576 = 512 + 64` (the `Hy4-nvfp4` wire
+    contract `unabsorbed = qk_nope + qk_rope`, `absorbed = kv_lora + qk_rope`)."""
+    a = Hy4LayerAttention.__new__(Hy4LayerAttention)
+    a.heads = heads
+    a.qk_nope = qk_nope
+    a.qk_rope = qk_rope
+    a.rope_theta = 10000.0
+    a.v_head = 128
+    a.kv_lora = lora
+    gen = torch.Generator().manual_seed(4321)
+    a.absorb_wuk = torch.randn(heads, qk_nope, lora, generator=gen).to(dtype)
+    a.expand_wuv = torch.randn(heads, a.v_head, lora, generator=gen).to(dtype)
+    a.sharding = SimpleNamespace(head_range=(0, heads))
+    return a
+
+
+class _BmmOperandWatch(TorchDispatchMode):
+    """Records every 3-D `aten.bmm` operand (the no-copy proof needs the exact
+    tensor object the GEMM received)."""
+
+    def __init__(self):
+        super().__init__()
+        self.operands = []
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        if ".bmm" in str(func):
+            for t in tuple(args) + tuple(kwargs.values()):
+                if isinstance(t, torch.Tensor) and t.dim() == 3:
+                    self.operands.append(t)
+        return func(*args, **kwargs)
+
+
+def test_absorb_queries_head_major_zero_overlap_no_copy_and_exact():
+    """Option 1 fast path (PERF-PLAN.md Step 3): head-major `q_hrd` keeps
+    `q_nope`'s batch strides DISJOINT — `stride[0] == rows * 256` strictly
+    exceeds `(rows - 1) * 256 + 192` — so the GEMM runs on the SLICE ITSELF
+    (same `data_ptr`: no `contiguous()` copy, the b86a9926 HBM copy tax) and
+    the fused transpose-concat returns the exact `[rows, heads, 576]` query."""
+    for rows in ROWS:
+        attn = _attention_absorb_geom(64)
+        q = torch.randn(rows, 64, attn.qk_nope + attn.qk_rope).to(torch.bfloat16)
+        q_hrd = q.transpose(0, 1).contiguous()      # CeExchange head-major output
+        watch = _BmmOperandWatch()
+        mode = _NoOverlapBmm()
+        with mode, watch:
+            out = attn.absorb_queries(q_hrd, head_major=True)
+        assert mode.bmm_calls >= 1, rows
+        # the GEMM's A operand IS the q_nope slice of the input — no copy:
+        a_ops = [t for t in watch.operands if tuple(t.shape) == (64, rows, attn.qk_nope)]
+        assert a_ops, rows
+        assert a_ops[0].data_ptr() == q_hrd.data_ptr(), rows
+        assert _non_overlapping_batch(a_ops[0]), rows
+        # the plan's disjoint-stride math: batch stride is exactly rows * 256
+        assert a_ops[0].stride()[0] == rows * (attn.qk_nope + attn.qk_rope), rows
+        assert a_ops[0].stride()[2] == 1, rows
+        ref = torch.cat(
+            (torch.einsum("rhi,hio->rho", q[..., :attn.qk_nope], attn.absorb_wuk),
+             q[..., attn.qk_nope:]), dim=-1)
+        assert out.shape == (rows, 64, attn.kv_lora + attn.qk_rope), rows
+        assert torch.equal(out, ref), rows
+
+
+def test_absorb_pack_fused_matches_cat_reference():
+    """The fused transpose-concat is pure movement: bit-identical to the
+    `torch.cat((absorbed_h.transpose(0, 1), q_hrd[..., qk_nope:].transpose(0, 1)))`
+    it replaces (the CPU reference path of `absorb_pack_triton.py`)."""
+    from ignition.recipes.hy4 import absorb_pack_triton
+
+    for rows in (1, 2, 7, 16, 33):
+        attn = _attention_absorb_geom(64)
+        q_hrd = torch.randn(64, rows, attn.qk_nope + attn.qk_rope).to(torch.bfloat16)
+        absorbed_h = torch.randn(64, rows, attn.kv_lora).to(torch.bfloat16)
+        got = absorb_pack_triton.absorb_pack_fused(
+            q_hrd, absorbed_h, qk_nope=attn.qk_nope, lora=attn.kv_lora)
+        ref = torch.cat((absorbed_h.transpose(0, 1),
+                         q_hrd[..., attn.qk_nope:].transpose(0, 1)), dim=-1)
+        assert got.shape == (rows, 64, attn.kv_lora + attn.qk_rope), rows
+        assert torch.equal(got, ref), rows
+
+
+def test_row_major_path_unchanged_by_option1():
+    """The `head_major=False` contract is byte-identical to `b86a9926`: the
+    default call keeps the row-major `[rows, heads, width]` input contract."""
+    attn = _attention_absorb_geom(64)
+    q = torch.randn(12, 64, attn.qk_nope + attn.qk_rope).to(torch.bfloat16)
+    fq = _fc(q)
+    out = attn.absorb_queries(fq)
+    ref = torch.cat(
+        (torch.einsum("rhi,hio->rho", q[..., :attn.qk_nope], attn.absorb_wuk),
+         q[..., attn.qk_nope:]), dim=-1)
+    assert torch.equal(out, ref)

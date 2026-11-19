@@ -1277,8 +1277,8 @@ def dequant_rows_int8(q, s, out):
 
 
 @triton.jit
-def _dequant_slots_kernel(base_ptr, src_ptr, dst_ptr, out_ptr, N, W, SLOT, SOFF,
-                          BLOCK_W: tl.constexpr, ROWS: tl.constexpr):
+def _dequant_slots_kernel(base_ptr, src_ptr, dst_ptr, out_ptr, N, W, SLOT, SOFF, HPR, QROWS,
+                          HEAD_MAJOR: tl.constexpr, BLOCK_W: tl.constexpr, ROWS: tl.constexpr):
     k = tl.program_id(1)
     slot = tl.load(src_ptr + k).to(tl.int64)
     dst = tl.load(dst_ptr + k).to(tl.int64)
@@ -1289,23 +1289,45 @@ def _dequant_slots_kernel(base_ptr, src_ptr, dst_ptr, out_ptr, N, W, SLOT, SOFF,
     q = tl.load(q_base + r[:, None].to(tl.int64) * W + c[None, :], mask=mask, other=0).to(tl.float32)
     s_base = (base_ptr + slot * SLOT + SOFF).to(tl.pointer_type(tl.float32))
     sc = tl.load(s_base + r, mask=r < N, other=0.0)
-    out = out_ptr + dst * N * W
-    tl.store(out + r[:, None].to(tl.int64) * W + c[None, :], (q * sc[:, None]).to(tl.bfloat16),
-             mask=mask)
+    if HEAD_MAJOR:
+        # Option 1 (PERF-PLAN.md Step 3): head-major store — flat `r` is
+        # `row * HPR + head_local` and lands at `[dst * HPR + head_local, row]`
+        # of the contiguous `[world * HPR, QROWS, W]` gather target, so the
+        # gather needs no permute/reshape copy after the wire.
+        off = ((dst * HPR + r % HPR) * QROWS + r // HPR).to(tl.int64) * W
+        tl.store(out_ptr + off[:, None] + c[None, :], (q * sc[:, None]).to(tl.bfloat16),
+                 mask=mask)
+    else:
+        out = out_ptr + dst * N * W
+        tl.store(out + r[:, None].to(tl.int64) * W + c[None, :], (q * sc[:, None]).to(tl.bfloat16),
+                 mask=mask)
 
 
-def dequant_slots_int8(slots, sources, soff, n, width, out, dests=None):
+def dequant_slots_int8(slots, sources, soff, n, width, out, dests=None,
+                       head_major=False, hpr=None, rows=None):
     """`slots` int8 [S, slot] (one inbound slot per source rank: n*width INT8
     values, then n FP32 scales at byte `soff`); `sources` int32 device index of
     the slots to read -> `out` BF16 [*, n, width] at positions `dests` (int32;
-    default 0..k-1) — one launch."""
+    default 0..k-1) — one launch.
+
+    `head_major=True` (Option 1, PERF-PLAN.md Step 3): `out` is the contiguous
+    head-major gather target `[world * hpr, rows, width]` (`hpr * rows == n`)
+    and slot row `r` (`row * hpr + head_local`) stores at
+    `[origin * hpr + head_local, row]` — the gather then needs no
+    permute/reshape copy (and downstream `q_nope` slices keep disjoint batch
+    strides)."""
     k = int(sources.numel())
     if dests is None:
         raise ValueError("dequant_slots_int8 needs its destination index (built outside "
                          "the overlapped loop)")
-    rows = max(1, 4096 // triton.next_power_of_2(width))
-    _dequant_slots_kernel[(triton.cdiv(n, rows), k)](slots.view(torch.int8), sources, dests, out,
-                                                      n, width,
-                                                      int(slots.stride(0)), int(soff),
-                                                      BLOCK_W=triton.next_power_of_2(width),
-                                                      ROWS=rows, num_warps=4)
+    if head_major and (hpr is None or rows is None or int(hpr) * int(rows) != int(n)):
+        raise ValueError("dequant_slots_int8(head_major=True) needs hpr and rows "
+                         "with hpr * rows == n")
+    rows_per_block = max(1, 4096 // triton.next_power_of_2(width))
+    _dequant_slots_kernel[(triton.cdiv(n, rows_per_block), k)](slots.view(torch.int8), sources,
+                                                              dests, out, n, width,
+                                                              int(slots.stride(0)), int(soff),
+                                                              int(hpr or 1), int(rows or 1),
+                                                              HEAD_MAJOR=bool(head_major),
+                                                              BLOCK_W=triton.next_power_of_2(width),
+                                                              ROWS=rows_per_block, num_warps=4)

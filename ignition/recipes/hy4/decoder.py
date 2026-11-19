@@ -1933,8 +1933,15 @@ class Hy4Decoder:
         if local_absorb_after_gather:
             # Prefill wiring: the gathered queries are UNABSORBED; W_UK applies
             # locally over ALL gathered heads (replicated `kv_b_proj`).
+            # Option 1 (PERF-PLAN.md Step 3): flag the INT8 CE gather's
+            # head-major `[heads, rows, width]` layout so `absorb_queries` takes
+            # the zero-overlap fast path (no `contiguous()` copy, fused pack).
+            # Mock-safe `getattr`: mocked collectives stay on the row-major path.
+            head_major = bool(getattr(self.collectives, "gather_head_major",
+                                      lambda rows, width: False)(
+                                          int(q_local.shape[0]), int(q_local.shape[-1])))
             with TIMER.phase("attn.absorb"):
-                q_all = attn.absorb_queries(q_all)
+                q_all = attn.absorb_queries(q_all, head_major=head_major)
         WATCH.check("comm.head_gather", layer.index, q_all=q_all)
         with TIMER.phase("attn.sparse_mla"):
             partial = attn.attend(q_all, self.cache.latents(layer.index), selected, counts,

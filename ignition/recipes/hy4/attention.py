@@ -463,14 +463,22 @@ class Hy4LayerAttention:
                          theta=self.rope_theta, out=out[..., lora:])
         return out
 
-    def absorb_queries(self, q_unabsorbed):
+    def absorb_queries(self, q_unabsorbed, *, head_major=False):
         """`q_nope @ W_UK` per head over the query's head axis (the local absorb).
 
         The prefill wiring gathers UNABSORBED queries and runs this locally
         for ALL gathered heads (with `kv_b_proj` replicated — consult8 §5);
         `project(absorb=True)` runs it owner-side for this rank's head shard.
-        """
-        heads = int(q_unabsorbed.shape[1])
+
+        `head_major=True` (Option 1, PERF-PLAN.md Step 3): `q_unabsorbed` is the
+        INT8 CE gather's contiguous head-major `[heads, rows, qk_nope + qk_rope]`
+        — `q_nope = q_hrd[..., :qk_nope]` then carries DISJOINT batch strides
+        (`stride[0] == rows * W > (rows - 1) * W + qk_nope`), so the GEMM runs
+        on the slice itself (no `contiguous()`: the b86a9926 copy tax is gone)
+        and the fused transpose-concat packs `[rows, heads, kv_lora + qk_rope]`
+        in one launch (no `torch.cat`)."""
+        heads = int(q_unabsorbed.shape[0 if head_major else 1])
+        rows = int(q_unabsorbed.shape[1 if head_major else 0])
         first, last = self.sharding.head_range
         if heads == self.heads:
             wuk = self.absorb_wuk[first:last]
@@ -480,7 +488,18 @@ class Hy4LayerAttention:
             raise ValueError(
                 f"absorb_queries: {heads} heads is neither this rank's shard "
                 f"({self.heads}) nor the full head count ({self.absorb_wuk.shape[0]})")
-        rows = int(q_unabsorbed.shape[0])
+        if head_major:
+            from .absorb_pack_triton import absorb_pack_fused
+
+            if q_unabsorbed.is_cuda and q_unabsorbed.dtype == wuk.dtype and q_unabsorbed.ndim == 3:
+                # Zero-overlap BY LAYOUT (see the docstring): direct bmm on the
+                # disjoint-stride `q_nope` slice + the fused transpose-concat —
+                # safe at EVERY row count (no `rows > 1` carve-out needed).
+                absorbed_h = torch.bmm(q_unabsorbed[..., :self.qk_nope], wuk)
+            else:
+                absorbed_h = torch.einsum("hri,hio->hro", q_unabsorbed[..., :self.qk_nope], wuk)
+            return absorb_pack_fused(q_unabsorbed, absorbed_h,
+                                     qk_nope=self.qk_nope, lora=int(wuk.shape[-1]))
         if (q_unabsorbed.is_cuda and rows > 1 and q_unabsorbed.dtype == wuk.dtype
                 and q_unabsorbed.ndim == 3):
             absorbed = self._bmm_rhi(q_unabsorbed[..., :self.qk_nope], wuk).transpose(0, 1)
