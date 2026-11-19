@@ -465,12 +465,15 @@ class FusedRoutedExperts:
             self._wire_small(preparation, small_scratch)
         return self
 
-    def plan_decode_op(self, *, tokens):
+    def plan_decode_op(self, *, tokens, workspace=None):
         """consult18 P2 (numerics class): plan one more A16 op at a decode
         capacity (`tokens` rows) — call under the b12x env overrides the op
         should compile with (wire_decode_ops sets them). Selected per call by
         runtime switch `moe_decode_op` for calls of at most `tokens` rows on
-        lane 0; its workspace/storage are bound by `bind_decode_scratch`."""
+        lane 0; its workspace/storage are bound by `bind_decode_scratch`.
+        `workspace` (P3): the shared wire ScratchArena — required by CSF
+        experts, whose functional() needs an arena preparation-release
+        boundary; None keeps the pre-CSF plan byte-identical."""
         import torch
         from b12x.preparation import PreparationSession
         from ignition.components.moe import PreparedRoutedExperts
@@ -480,10 +483,11 @@ class FusedRoutedExperts:
         session = PreparationSession(device=self.device, autotune=False, compile_workers=0)
         source = torch.zeros((tokens, self.hidden), dtype=torch.bfloat16, device=self.device)
         ids = torch.zeros((tokens, self.top_k), dtype=torch.int32, device=self.device)
-        weights = torch.full((tokens, self.top_k), 1.0 / self.top_k, dtype=torch.float32,
-                             device=self.device)
+        weights = torch.full((tokens, self.top_k), 1.0 / self.top_k,
+                             dtype=torch.float32, device=self.device)
         op = PreparedRoutedExperts(source, self.experts, ids, weights, torch.zeros_like(source),
-                                   session=session, name=f"{self.name}.decode", a4_prefill=False)
+                                   session=session, name=f"{self.name}.decode", a4_prefill=False,
+                                   **({"workspace": workspace} if workspace is not None else {}))
         op.functional(session=session)
         self._decode_session = session
         self.decode_op = op
@@ -583,10 +587,14 @@ class FusedRoutedExperts:
         return self.forward(x, ids, weights)
 
 
-def wire_decode_ops(routed, *, tokens, env, alt_env=None):
+def wire_decode_ops(routed, *, tokens, env, alt_env=None, arena=None):
     """Plan every layer's decode op under `env` (set only while planning and
     warming: the main ops keep their plans), over ONE shared workspace and
-    scale storage (the layer loop is serial). Returns the workspace bytes."""
+    scale storage (the layer loop is serial). Returns the workspace bytes.
+    `arena` (P3): the shared wire ScratchArena for CSF experts (their
+    functional() requires an arena preparation-release boundary); pass the
+    main scratch's arena — the frozen arena only refuses GROWTH and decode
+    workspaces never exceed the prefill-sized main plan."""
     import os as _os
 
     import torch
@@ -599,7 +607,7 @@ def wire_decode_ops(routed, *, tokens, env, alt_env=None):
                         reverse=True)
     tokens = capacities[-1]            # the smallest: the one-row decode op
     try:
-        ops = [fused.plan_decode_op(tokens=cap) for cap in capacities for fused in routed]
+        ops = [fused.plan_decode_op(tokens=cap, workspace=arena) for cap in capacities for fused in routed]
         if alt_env is not None:
             for key in env:
                 _os.environ.pop(key, None)
@@ -608,7 +616,7 @@ def wire_decode_ops(routed, *, tokens, env, alt_env=None):
                 main_op, main_ops = fused.decode_op, dict(fused.decode_ops)
                 # the control arm at EVERY decode capacity (the batched decode
                 # steps' buckets too), selected by row count like the main ops
-                fused.decode_ops_alt = {cap: fused.plan_decode_op(tokens=cap) for cap in capacities}
+                fused.decode_ops_alt = {cap: fused.plan_decode_op(tokens=cap, workspace=arena) for cap in capacities}
                 fused.decode_op_alt = fused.decode_ops_alt[tokens]
                 fused.decode_ops = main_ops
                 fused.decode_op = main_op

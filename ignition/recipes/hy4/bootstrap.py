@@ -331,7 +331,8 @@ class PreparedHy4Rank:
                 alt = (dict(item.split("=", 1) for item in alt_spec.split(",") if item)
                        if alt_spec else None)
                 wire_decode_ops([layer.mlp.routed for layer in fused_layers],
-                                tokens=decode_tokens, env=env, alt_env=alt)
+                                tokens=decode_tokens, env=env, alt_env=alt,
+                                arena=scratch.arena if first.experts.has_csf_blocks else None)
             self.fused_session, self.fused_scratch = preparation, scratch
             self.fused_small_scratch = small_scratch
         return self
