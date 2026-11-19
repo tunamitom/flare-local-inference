@@ -427,6 +427,16 @@ class Hy4LayerAttention:
         self._stash_gate(x, gate_raw)
         return LayerProjections(q_resid, q_out, latent, index_keys, gate_raw)
 
+    @staticmethod
+    def _bmm_rhi(x_rhi, w_hio):
+        """`[R, H, I] x [H, I, O] -> [H, R, O]` contiguous without overlapping
+        batch strides (cuBLAS 13.1.0..13.6.1 SM120 strided-batched TMA OOB read
+        defect on interleaved `transpose(0, 1)` inputs/outputs when `R > 1`)."""
+        x_hri = x_rhi.transpose(0, 1)
+        if x_hri.is_cuda and int(x_hri.shape[1]) > 1:
+            x_hri = x_hri.contiguous()
+        return torch.bmm(x_hri, w_hio)
+
     def _absorb_into(self, q_unroped, positions):
         """round 15 (`diet_absorb`): `absorb_queries(rope(q))` without the cat —
         the per-head `q_nope @ W_UK` GEMM writes the latent columns of the output
@@ -443,8 +453,12 @@ class Hy4LayerAttention:
         lora = int(wuk.shape[-1])
         out = torch.empty((rows, heads, lora + self.qk_rope), dtype=q_unroped.dtype,
                           device=q_unroped.device)
-        torch.bmm(q_unroped[..., :self.qk_nope].transpose(0, 1), wuk,
-                  out=out[..., :lora].transpose(0, 1))
+        if q_unroped.is_cuda and rows > 1:
+            absorbed = self._bmm_rhi(q_unroped[..., :self.qk_nope], wuk)
+            out[..., :lora].copy_(absorbed.transpose(0, 1))
+        else:
+            torch.bmm(q_unroped[..., :self.qk_nope].transpose(0, 1), wuk,
+                      out=out[..., :lora].transpose(0, 1))
         rope_interleaved(q_unroped[..., self.qk_nope:], positions, rope_dim=self.qk_rope,
                          theta=self.rope_theta, out=out[..., lora:])
         return out
@@ -467,21 +481,10 @@ class Hy4LayerAttention:
                 f"absorb_queries: {heads} heads is neither this rank's shard "
                 f"({self.heads}) nor the full head count ({self.absorb_wuk.shape[0]})")
         rows = int(q_unabsorbed.shape[0])
-        if (q_unabsorbed.is_cuda and rows > 16 and q_unabsorbed.dtype == wuk.dtype
+        if (q_unabsorbed.is_cuda and rows > 1 and q_unabsorbed.dtype == wuk.dtype
                 and q_unabsorbed.ndim == 3):
-            from .runtime import SWITCHES
-
-            if SWITCHES.get("absorb_out") == "direct":
-                # consult18 P9: the per-head GEMM writes straight into the query
-                # (the same cuBLAS batched GEMM, only its output stride differs),
-                # the rope columns are copied beside it — no [rows, heads, 576] cat.
-                lora = int(wuk.shape[-1])
-                out = torch.empty((rows, heads, lora + q_unabsorbed.shape[-1] - self.qk_nope),
-                                  dtype=q_unabsorbed.dtype, device=q_unabsorbed.device)
-                torch.bmm(q_unabsorbed[..., :self.qk_nope].transpose(0, 1), wuk,
-                          out=out[..., :lora].transpose(0, 1))
-                out[..., lora:].copy_(q_unabsorbed[..., self.qk_nope:])
-                return out
+            absorbed = self._bmm_rhi(q_unabsorbed[..., :self.qk_nope], wuk).transpose(0, 1)
+            return torch.cat((absorbed, q_unabsorbed[..., self.qk_nope:]), dim=-1)
         absorbed_nope = torch.einsum("rhi,hio->rho", q_unabsorbed[..., :self.qk_nope], wuk)
         return torch.cat((absorbed_nope, q_unabsorbed[..., self.qk_nope:]), dim=-1)
 
@@ -501,10 +504,12 @@ class Hy4LayerAttention:
             # (BF16 x BF16 is exact in FP32), summation order aside; no per-step
             # FP32 copies of the output and the W_UV shard (the prefill wire's
             # `expand_partials` form)
-            return torch.einsum("rhd,hvd->rhv", out, wuv)
+            return self._bmm_rhi(out, wuv.transpose(1, 2)).transpose(0, 1)
         # fp32 accumulation whatever the partial's dtype: the real sparse-MLA
         # wire carries BF16 partials (the DCP merge returns a BF16 head shard),
         # while the CPU reference partials are fp32.
+        if out.is_cuda and int(out.shape[0]) > 1:
+            return self._bmm_rhi(out.float(), wuv.float().transpose(1, 2)).transpose(0, 1).to(out.dtype)
         return torch.einsum("rhd,hvd->rhv", out.float(), wuv.float()).to(out.dtype)
 
     def expand_partials(self, out):
@@ -521,7 +526,9 @@ class Hy4LayerAttention:
         """
         wuv = self.expand_wuv
         if out.dtype == torch.bfloat16 and wuv.dtype == torch.bfloat16:
-            return torch.einsum("rhd,hvd->rhv", out, wuv)
+            return self._bmm_rhi(out, wuv.transpose(1, 2)).transpose(0, 1)
+        if out.is_cuda and int(out.shape[0]) > 1:
+            return self._bmm_rhi(out.float(), wuv.float().transpose(1, 2)).transpose(0, 1).to(out.dtype)
         return torch.einsum("rhd,hvd->rhv", out.float(), wuv.float()).to(out.dtype)
 
     # --- prepared plans (no JIT at run time) -------------------------------
@@ -984,7 +991,10 @@ class Hy4LayerAttention:
                                                  fold_sink=fold_sink)
             provenance = SparseMLAProvenance(sink_folded=bool(fold_sink and sink is not None))
         if expand:
-            output = torch.einsum("rhd,hvd->rhv", output.float(), self.expand_wuv.float()).to(q_absorbed.dtype)
+            if output.is_cuda and int(output.shape[0]) > 1:
+                output = self._bmm_rhi(output.float(), self.expand_wuv.float().transpose(1, 2)).transpose(0, 1).to(q_absorbed.dtype)
+            else:
+                output = torch.einsum("rhd,hvd->rhv", output.float(), self.expand_wuv.float()).to(q_absorbed.dtype)
         return SparseMLAOutput(output=output, lse=lse if return_lse else None, provenance=provenance)
 
     def fold_sink(self, out, lse, *, call_shape=None):
