@@ -60,13 +60,26 @@ def allocate_line(pool, record, graph_bytes, world, *, label="Allocate cache"):
     """The bootstrap.allocate_cache_report line format, verbatim."""
     tokens = pool // record
     aggregate = tokens * world
-    cap = aggregate // 3
+    # The one-third rule applies only when total KV is less than the max
+    # context supported (owner 2026-11-20). When the pool covers max context
+    # the rule is inapplicable.
+    applies = aggregate < 1_048_576
+    if applies:
+        cap = aggregate // 3
+        holds_1m = cap >= 1_048_576
+        tail = (f"one-third cap {cap}"
+                f"{'>= 1M \u2713' if holds_1m else '< 1M \u2717'}")
+    else:
+        cap = None
+        holds_1m = None
+        tail = "one-third rule n/a (total KV >= max context)"
     return (f"{label}: {pool} B KV pool = {tokens} tokens/rank "
             f"(record {record} B; graph+scratch {graph_bytes} B measured, "
-            f"kernel-chain term only; aggregate {aggregate}; one-third cap {cap}"
-            f"{'>= 1M \u2713' if cap >= 1_048_576 else '< 1M \u2717'})"), {
+            f"kernel-chain term only; aggregate {aggregate}; {tail})"), {
         "pool_bytes": pool, "tokens_per_rank": tokens, "aggregate_tokens": aggregate,
-        "one_third_cap": cap, "one_third_cap_holds_1m": cap >= 1_048_576,
+        "one_third_rule_applies": applies,
+        "one_third_cap": cap,
+        "one_third_cap_holds_1m": holds_1m,
         "record_bytes_contract": record, "graph_scratch_bytes": graph_bytes,
         "graph_term_complete": False, "label": label,
     }
@@ -3102,9 +3115,14 @@ def main():
         local_slots = args.rows * (capacity // world)
         binding_facts["real_record_bytes_per_slot"] = 78 * 656 + 21 * 256
         binding_facts["real_local_slots"] = local_slots
-        binding_facts["real_aggregate_global_tokens"] = args.rows * capacity
-        binding_facts["real_one_third_cap"] = (args.rows * capacity) // 3
-        binding_facts["real_one_third_cap_holds_1m"] = (args.rows * capacity) // 3 >= 1_048_576
+        real_agg = args.rows * capacity
+        binding_facts["real_aggregate_global_tokens"] = real_agg
+        # One-third rule only when total KV < max context (owner 2026-11-20).
+        real_applies = real_agg < 1_048_576
+        binding_facts["real_one_third_rule_applies"] = real_applies
+        binding_facts["real_one_third_cap"] = real_agg // 3 if real_applies else None
+        binding_facts["real_one_third_cap_holds_1m"] = (
+            (real_agg // 3 >= 1_048_576) if real_applies else None)
         binding_facts["plan_book_and_fixed_bytes"] = fixed_bytes
         binding_facts["headroom_bytes_reserved"] = args.headroom
         binding_facts["boot_warm"] = bool(args.boot_warm)

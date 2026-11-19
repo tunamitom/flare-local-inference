@@ -425,7 +425,19 @@ def allocate_cache_report(constructed, *, graph_scratch_bytes, world_size=None,
     tokens = pool // record
     world = world_size if world_size is not None else constructed.sharding.world_size
     aggregate = tokens * world
-    cap = aggregate // 3
+    # The one-third rule applies only when total KV is less than the max
+    # context supported (owner 2026-11-20). When the pool covers max context
+    # the rule is inapplicable.
+    applies = aggregate < 1_048_576
+    if applies:
+        cap = aggregate // 3
+        holds_1m = cap >= 1_048_576
+        tail = (f"one-third cap {cap}"
+                f"{'>= 1M ✓' if holds_1m else '< 1M ✗'}")
+    else:
+        cap = None
+        holds_1m = None
+        tail = "one-third rule n/a (total KV >= max context)"
     # The measured w2 boot facts: 1M aggregate / 3 needs graphs + scratch under
     # (free-after-weights − 3 × 1,048,576 × record) at world 8.
     facts = {
@@ -439,15 +451,15 @@ def allocate_cache_report(constructed, *, graph_scratch_bytes, world_size=None,
         "pool_bytes": pool,
         "tokens_per_rank": tokens,
         "tokens_aggregate": aggregate,
+        "one_third_rule_applies": applies,
         "one_third_cap": cap,
-        "one_third_cap_holds_1m": cap >= 1_048_576,
+        "one_third_cap_holds_1m": holds_1m,
     }
     line = (
         f"Allocate cache: {pool} B KV pool = {tokens} tokens/rank "
         f"(record {record} B; graph+scratch {graph_scratch_bytes} B measured"
         f"{'' if graph_term_complete else ', kernel-chain term only'}; "
-        f"aggregate {aggregate}; one-third cap {cap}"
-        f"{'>= 1M ✓' if cap >= 1_048_576 else '< 1M ✗'})"
+        f"aggregate {aggregate}; {tail})"
     )
     return line, facts
 
