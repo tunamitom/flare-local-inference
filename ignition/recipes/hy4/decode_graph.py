@@ -438,15 +438,28 @@ class DecodeGraphs:
     def _stage_spec(self, entry, row, start, count):
         per = entry["per"]
         first = (self.rank - start) % self.world
-        base = self.cache.base_of(row) + (start + first) // self.world
+        row_base = self.cache.base_of(row)
+        row_end = row_base + self.cache.cap_of(row)
+        base = row_base + (start + first) // self.world
         host = self._spec_host(1 + 3 * per)
         host[0] = start
         for j in range(per):
             i = first + self.world * j
             owned = i < count
+            safe = base + j
+            # Attempt2 (CSF UAF, memcheck-named OOB span): `run_spec` stages
+            # device slots with no `accepts_spec` gate (spec.py's prewarm loop
+            # bounds starts by `g.capacity`, the WIDEST row — not `cap_of(row)`),
+            # and `begin_forward_static` is unchecked (decoder.py:456). A slot
+            # past the row's extent becomes the off-owner form — slot -1 (the
+            # record writer skips it; these out-of-row primes are released
+            # after prewarm and never read) and `safe` = the row's first slot
+            # (a valid in-row slot rewritten with its own bytes). In-extent
+            # staging is unchanged.
+            inside = row_base <= safe < row_end
             host[1 + j] = i if owned else 0
-            host[1 + per + j] = base + j if owned else -1
-            host[1 + 2 * per + j] = base + j
+            host[1 + per + j] = safe if (owned and inside) else -1
+            host[1 + 2 * per + j] = safe if inside else row_base
         entry["args"].copy_(host, non_blocking=True)
 
     def _spec_slots(self, entry):
@@ -650,8 +663,21 @@ class DecodeGraphs:
             host[i] = int(tokens[i])
             host[size + i] = start
             host[2 * size + i] = row
-            host[3 * size + i] = local if start % self.world == self.rank else -1
-            host[4 * size + i] = local
+            # Attempt2 (CSF UAF, memcheck-named OOB span): a staged slot past
+            # the row's extent would write past the row's records — one past the
+            # flat table at a tail row (`_batch_prep` validated pads only
+            # against the widest row's `self.capacity`). The record writer
+            # consumes device slots and `begin_forward_static` is unchecked by
+            # design (decoder.py:456), so the clamp lives here: out-of-extent
+            # entries (pads — their records are never read; real entries are
+            # refused earlier in `_batch_prep`) become the off-owner form, slot
+            # -1 (the fused writer skips it) and `safe` = the row's first slot
+            # (a valid in-row slot rewritten with its own bytes, the
+            # `begin_forward_static` contract). In-extent staging is unchanged.
+            inside = 0 <= start and start // self.world < self.cache.cap_of(row)
+            host[3 * size + i] = (local if start % self.world == self.rank else -1) \
+                if inside else -1
+            host[4 * size + i] = local if inside else self.cache.base_of(row)
         entry["args"].copy_(host, non_blocking=True)
 
     def _body_batch(self, size, call_shape, rw, sample=False):
@@ -696,6 +722,19 @@ class DecodeGraphs:
         """The padded step's (size, tokens, rows, starts, width, graph key)."""
         count = len(rows)
         size = self.batch_bucket(count)
+        # Attempt2 (CSF UAF, memcheck-named OOB span): a REAL entry's slot must
+        # land inside its row's extent — `_stage_batch` stages
+        # `base_of(row) + start // world` and the static cache path is unchecked
+        # by design (decoder.py:456), so a start past the row would alias
+        # another row's records or write past the table. Refuse it (the same
+        # line `begin_forward_host` draws, decoder.py:438) instead of staging
+        # it. Pads are exempt: their records are never read and `_stage_batch`
+        # de-slots any pad that lands outside its row.
+        for row, start in zip(rows, starts):
+            if not (0 <= int(row) < int(self.decoder.cache.rows) and int(start) >= 0
+                    and int(start) // self.world < self.cache.cap_of(int(row))):
+                raise ValueError(
+                    f"a batched step's position {int(start)} lies outside row {int(row)}")
         if size > count:
             if pad is None:
                 if pad_rows:
@@ -703,7 +742,8 @@ class DecodeGraphs:
                 else:
                     j = min(range(count), key=lambda i: starts[i])
                     pad = (int(rows[j]), int(starts[j]) + 1)
-            if not 0 <= pad[1] < self.capacity:
+            if not (0 <= pad[0] < int(self.decoder.cache.rows) and pad[1] >= 0
+                    and pad[1] < self.capacity):
                 raise ValueError("a batched step's pad position lies outside its row")
             rows = list(rows) + [pad[0]] * (size - count)
             starts = list(starts) + [pad[1]] * (size - count)
@@ -826,10 +866,17 @@ class DecodeGraphs:
         else:
             P = st["P"][rows]
             positions = torch.where(pad, P + per, P + pick)
-        local = self.cache.row_base_dev[rows] + torch.div(positions, self.world, rounding_mode="floor")
-        slot = torch.where(torch.remainder(positions, self.world) == self.rank, local,
+        base = self.cache.row_base_dev[rows]
+        local = base + torch.div(positions, self.world, rounding_mode="floor")
+        # Attempt2 (CSF UAF, memcheck-named OOB span): the same clamp as
+        # `_stage_spec` — the round state's positions are device values and
+        # `begin_forward_static` is unchecked, so a slot past the row's extent
+        # de-grades to the off-owner form (slot -1, `safe` = the row's first
+        # slot, rewritten with its own bytes) instead of writing past the row.
+        inside = (local >= base) & (local < base + self.cache.row_cap_dev[rows])
+        slot = torch.where(inside & (torch.remainder(positions, self.world) == self.rank), local,
                            torch.full_like(local, -1))
-        return rows, pad, positions, slot, local
+        return rows, pad, positions, slot, torch.where(inside, local, base)
 
     def _bspec_greedy(self, slots):
         """Per slot: (greedy mask, the scale) — inv_temp 0 marks a greedy row (c8 L5d)."""
