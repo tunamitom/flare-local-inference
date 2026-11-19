@@ -312,8 +312,11 @@ class FusedWireScratch:
         """P3 (CSF): after the seal, run the arena's preparation releases — b12x
         `release_scale_templates` swaps every wired op's expanded CSF scale
         planes for placeholders. Runtime calls expand per call into the shared
-        storage (`scales_expanded=False`), so the per-layer expanded planes are
-        dead weight; freeing them is the KV memory CSF exists to win.
+        storage (`scales_expanded=False`), so those planes are dead weight. At
+        load they are views of the loader's shared expansion scratch (one
+        layer's raw-scale size: 72 MiB/rank on the q4 package, measured on one
+        card); the release drops the last references. The per-layer KV gain is
+        the compression itself, at load (-33 MB/layer/rank, R2).
 
         `ScratchArena.release_preparation` requires completed finalization: the
         recipe's sessions are standalone, so `tuning.register_finalizer` bound
@@ -601,6 +604,10 @@ class FusedRoutedExperts:
             output = (torch.empty if uses_decode_op and diet("diet2") else torch.zeros)(
                 (rows, self.hidden), dtype=x.dtype, device=x.device)
         amax, layer = (self.amax, 0) if self.amax is not None else (None, None)
+        if not op.scale_layouts:
+            # a plan without scale storage (raw scales, or CSF decoded inline)
+            # binds none: shared decode storage belongs to the expanded plans
+            storage = []
         prepared_moe_out(x, weights, ids, output, workspace, op.scale_inputs,
                          storage, op.plan.handle, True, None, amax, layer,
                          None, None, False, a4)
@@ -744,9 +751,16 @@ def wire_decode_ops(routed, *, tokens, env, alt_env=None, arena=None):
                 _os.environ.pop(key, None)
             _os.environ.update(env)
         nbytes = max(op.workspace_nbytes for op in ops)
-        layouts = ops[0].scale_layouts
-        if any(op.scale_layouts != layouts for op in ops):
+        # P3 (CSF): b12x picks inline or expanded scale decoding per plan
+        # (inline at >= 16 tokens and low expert occupancy). An inline plan
+        # declares NO scale storage (`scale_buffers` -> []); every expanded
+        # plan declares the same planes. Size the shared storage by the
+        # expanded ones; `forward` hands inline plans none. Raw scales: all
+        # empty, as before.
+        expanded = {op.scale_layouts for op in ops if op.scale_layouts}
+        if len(expanded) > 1:
             raise ValueError("the decode MoE ops disagree on their scale layouts")
+        layouts = expanded.pop() if expanded else ()
         device = routed[0].device
         workspace = torch.empty(nbytes, dtype=torch.uint8, device=device)
         storage = [torch.empty_strided(shape, stride, dtype=dtype, device=device)

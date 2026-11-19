@@ -35,11 +35,18 @@ HIDDEN, TOP_K, EXPERTS, CAPACITY = 8, 2, 4, 64
 
 
 class FakePlan:
-    """b12x execution plan: one uint8 workspace sized by the call capacity."""
+    """b12x execution plan: one uint8 workspace sized by the call capacity.
 
-    def __init__(self, max_tokens, events):
+    Like b12x (`_tuning`: inline CSF decoding at >= 16 tokens and low expert
+    occupancy), a CSF plan at 16..CAPACITY-1 rows decodes its scales INLINE
+    and declares no scale storage; the others expand into three planes.
+    """
+
+    def __init__(self, max_tokens, events, csf):
         self.nbytes = 256 * max_tokens
         self.handle = f"plan-{max_tokens}"
+        self.csf = csf
+        self.inline = csf and 16 <= max_tokens < CAPACITY
         events.append(("plan", max_tokens))
 
     def scratch_specs(self):
@@ -48,6 +55,14 @@ class FakePlan:
 
     def request(self, *, name, prepare_call, benchmark_call, dependencies=()):
         return SimpleNamespace(name=name)
+
+
+def scale_buffers(binding):
+    """b12x `scale_buffers`: ([], planes) for an expanded CSF plan, else ([], [])."""
+    plan = binding.plan
+    if not plan.csf or plan.inline:
+        return [], []
+    return [], [torch.zeros((EXPERTS, 6)), torch.zeros((EXPERTS, 3)), torch.zeros((2,))]
 
 
 class FakeScalePlan:
@@ -62,12 +77,14 @@ class Boundary:
         self.events = []                  # ("plan", rows) / ("seal",) / ("release", rows)
         self.released = []                # (experts, plan) per release_scale_templates call
         self.calls = 0
+        self.storage = []                 # (plan handle, scale storage planes) per kernel call
 
     def prepared_moe_out(self, a, weights, ids, output, scratch, scale_inputs, storage,
                          handle, input_scales_static, fast_math, activation_amax,
                          layer_idx, route_expert_map, output_expert_map, scales_expanded,
                          a4_prefill):
         self.calls += 1
+        self.storage.append((handle, len(storage)))
         output.zero_()
 
     def release_scale_templates(self, experts, plan):
@@ -90,7 +107,8 @@ def boundary(monkeypatch):
     record = Boundary()
     fused_moe = SimpleNamespace(
         plan_scale_expansion=lambda experts, **kwargs: FakeScalePlan(),
-        plan_execution=lambda *, capacity, **kwargs: FakePlan(capacity.max_tokens, record.events),
+        plan_execution=lambda *, capacity, experts, **kwargs: FakePlan(
+            capacity.max_tokens, record.events, experts.has_csf_blocks),
         ExecutionCapacity=lambda **kwargs: SimpleNamespace(**kwargs),
         RoutingSpec=lambda **kwargs: SimpleNamespace(**kwargs),
         bind=lambda plan, **kwargs: SimpleNamespace(plan=plan),
@@ -98,8 +116,7 @@ def boundary(monkeypatch):
     monkeypatch.setattr(components_moe, "fused_moe", fused_moe)
     monkeypatch.setattr(components_moe, "declare", lambda session, requests, **kwargs: None)
     monkeypatch.setattr(binding_ops, "materialize_scale_templates", lambda experts: None)
-    monkeypatch.setattr(binding_ops, "scale_buffers",
-                        lambda binding: (("scale-inputs",), [torch.zeros((3, 2))]))
+    monkeypatch.setattr(binding_ops, "scale_buffers", scale_buffers)
     monkeypatch.setattr(binding_ops, "release_weight_views", lambda impl: None)
     monkeypatch.setattr(binding_ops, "release_scale_templates", record.release_scale_templates)
     monkeypatch.setattr(binding_ops, "prepared_moe_out", record.prepared_moe_out)
@@ -112,7 +129,7 @@ def boundary(monkeypatch):
         seal(scratch)
 
     monkeypatch.setattr(FusedWireScratch, "seal", recorded_seal)
-    monkeypatch.setenv("HY4_MOE_DECODE_OP", "1,4")           # the c8 decode capacities
+    monkeypatch.setenv("HY4_MOE_DECODE_OP", "1,4,16")        # 16: an inline-CSF plan
     for name in ("HY4_MOE_DECODE_ENV_ALT", "HY4_MOE_A4", "HY4_MOE_CALIBRATE",
                  "HY4_MOE_AUTOTUNE", "HY4_MOE_DETERMINISTIC"):
         monkeypatch.delenv(name, raising=False)
@@ -152,13 +169,36 @@ def test_csf_wiring_constructs_with_the_decode_ops(boundary):
     for layer in layers:
         routed = layer.mlp.routed
         assert layer.mlp._prepared is routed
-        assert sorted(routed.decode_ops) == [1, 4]
-        assert routed._decode_workspace is not None and routed._decode_storage is not None
+        assert sorted(routed.decode_ops) == [1, 4, 16]
+        assert routed._decode_workspace is not None and len(routed._decode_storage) == 3
     # the decode ops planned on the LIVE arena: every plan precedes the seal
     events = boundary.events
     seal = events.index(("seal",))
     plans = [index for index, event in enumerate(events) if event[0] == "plan"]
-    assert len(plans) == 3 * len(layers) and max(plans) < seal
+    assert len(plans) == 4 * len(layers) and max(plans) < seal
+
+
+def test_csf_inline_decode_plans_take_no_scale_storage(boundary):
+    """b12x decodes CSF inline for some plans (no scale storage) and expands
+    for others (GPU R2, 10:03: `the decode MoE ops disagree on their scale
+    layouts`). The shared decode storage serves the expanded plans only."""
+    from ignition.recipes.hy4.runtime import SWITCHES
+
+    layers = _layers(csf=True)
+    _wire(layers)
+    routed = layers[0].mlp.routed
+    assert routed.decode_ops[16].scale_layouts == ()
+    assert routed.decode_ops[4].scale_layouts == routed.decode_ops[1].scale_layouts != ()
+    before = SWITCHES.get("moe_decode_op")
+    SWITCHES["moe_decode_op"] = "on"
+    try:
+        boundary.storage.clear()
+        for rows in (1, 3, 10, 30):
+            routed.forward(torch.zeros((rows, HIDDEN), dtype=torch.bfloat16),
+                           torch.zeros((rows, TOP_K), dtype=torch.int64), torch.ones((rows, TOP_K)))
+    finally:
+        SWITCHES["moe_decode_op"] = before
+    assert boundary.storage == [("plan-1", 3), ("plan-4", 3), ("plan-16", 0), (f"plan-{CAPACITY}", 3)]
 
 
 def test_csf_wiring_releases_the_expanded_scale_templates(boundary):
@@ -169,9 +209,9 @@ def test_csf_wiring_releases_the_expanded_scale_templates(boundary):
     # — the serve sizes its KV pool after wiring returns, so the freed
     # expanded scale planes count toward it
     released = {(id(experts), plan.handle) for experts, plan in boundary.released}
-    assert len(boundary.released) == len(released) == 3 * len(layers)
+    assert len(boundary.released) == len(released) == 4 * len(layers)
     assert released == {(id(layer.mlp.routed.experts), f"plan-{rows}")
-                        for layer in layers for rows in (CAPACITY, 4, 1)}
+                        for layer in layers for rows in (CAPACITY, 16, 4, 1)}
     events = boundary.events
     seal = events.index(("seal",))
     assert all(index > seal for index, event in enumerate(events) if event[0] == "release")
@@ -191,12 +231,13 @@ def test_raw_scale_wiring_keeps_its_order(boundary):
     layers = _layers(csf=False)
     _, scratch, _ = _wire(layers)
     for layer in layers:
-        assert sorted(layer.mlp.routed.decode_ops) == [1, 4]
+        assert sorted(layer.mlp.routed.decode_ops) == [1, 4, 16]
+        assert layer.mlp.routed._decode_storage == []
     # unchanged pre-CSF order: main plans, seal, then the decode plans; no
     # preparation release (nothing to release, the arena keeps its bytes)
     events = boundary.events
     seal = events.index(("seal",))
     assert [event for event in events[:seal] if event[0] == "plan"] == [("plan", CAPACITY)] * 3
-    assert sorted(event[1] for event in events[seal + 1:]) == [1] * 3 + [4] * 3
+    assert sorted(event[1] for event in events[seal + 1:]) == [1] * 3 + [4] * 3 + [16] * 3
     assert boundary.released == []
     assert scratch.arena.frozen and scratch.arena.nbytes > 0
