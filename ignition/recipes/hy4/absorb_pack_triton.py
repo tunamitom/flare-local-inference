@@ -65,6 +65,13 @@ def absorb_pack_fused(q_hrd, absorbed_h, *, qk_nope, lora, out=None):
         raise ValueError("absorb_pack_fused: qk_nope must split q_hrd's width")
     if tuple(absorbed_h.shape) != (h, rows, lora):
         raise ValueError(f"absorb_pack_fused: absorbed_h must be [{h}, {rows}, {lora}]")
+    # Layout guard (zero perf cost): the kernel indexes flat [H*R, W]/[H*R, L]
+    # rows and the out store is flat [R*H, L + rope] — a strided view would
+    # silently mis-index. Fail loudly instead (Neon review, condition 2b).
+    if not (q_hrd.is_contiguous() and absorbed_h.is_contiguous()
+            and (out is None or out.is_contiguous())):
+        raise ValueError("absorb_pack_fused: [H, R, W] / [H, R, L] inputs (and out) "
+                         "must be contiguous — flat-row indexing mis-uses strides")
     fresh = out is None
     if fresh:
         out = torch.empty((rows, h, lora + rope), dtype=q_hrd.dtype, device=q_hrd.device)

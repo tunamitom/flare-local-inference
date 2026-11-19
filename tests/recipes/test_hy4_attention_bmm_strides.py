@@ -319,6 +319,34 @@ def test_absorb_pack_fused_matches_cat_reference():
         assert torch.equal(got, ref), rows
 
 
+def test_absorb_pack_fused_rejects_non_contiguous():
+    """The pack indexes flat [H*R, W]/[H*R, L] rows (and a flat out): a
+    strided view must fail loudly instead of mis-indexing (contiguity guard)."""
+    from ignition.recipes.hy4 import absorb_pack_triton
+
+    attn = _attention_absorb_geom(64)
+    rows = 8
+    w = attn.qk_nope + attn.qk_rope
+    q_hrd = torch.randn(64, rows, w).to(torch.bfloat16)
+    absorbed_h = torch.randn(64, rows, attn.kv_lora).to(torch.bfloat16)
+    q_strided = torch.randn(64, rows * 2, w).to(torch.bfloat16)[:, :rows, :]
+    a_strided = torch.randn(64, rows * 2, attn.kv_lora).to(torch.bfloat16)[:, :rows, :]
+    out_strided = torch.randn(rows, 64, (attn.kv_lora + attn.qk_rope) * 2).to(torch.bfloat16)[
+        ..., :attn.kv_lora + attn.qk_rope]
+    assert not q_strided.is_contiguous() and not a_strided.is_contiguous()
+    assert not out_strided.is_contiguous()
+    for bad_q, bad_a, bad_out in ((q_strided, absorbed_h, None),
+                                 (q_hrd, a_strided, None),
+                                 (q_hrd, absorbed_h, out_strided)):
+        try:
+            absorb_pack_triton.absorb_pack_fused(bad_q, bad_a, qk_nope=attn.qk_nope,
+                                                 lora=attn.kv_lora, out=bad_out)
+        except ValueError as e:
+            assert "contiguous" in str(e)
+        else:
+            raise AssertionError("non-contiguous absorb_pack_fused input accepted")
+
+
 def test_row_major_path_unchanged_by_option1():
     """The `head_major=False` contract is byte-identical to `b86a9926`: the
     default call keeps the row-major `[rows, heads, width]` input contract."""
