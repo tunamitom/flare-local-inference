@@ -72,9 +72,10 @@ class DecodeGraphs:
         self.rank = int(getattr(decoder.collectives, "rank", 0))
         self.topk = int(decoder.config.text["index_topk"])
         self.cache = decoder.cache
-        # c8 L6: per-row extents — the widest a row may be bounds the width buckets
-        self.local_capacity = int(decoder.cache.max_cap())
-        self.capacity = self.local_capacity * self.world
+        # c8 L6: per-row extents — the widest a row may be bounds the width
+        # buckets. CSF bound-fix: `local_capacity` / `capacity` are LIVE
+        # properties below, bound to the rows' real extents (`cap_of(row)`),
+        # never `max_cap()`.
         self._token = torch.zeros((1, 1), dtype=torch.long, device=self.device)
         self._host = torch.zeros((3,), dtype=torch.long)
         if self.device.type == "cuda":
@@ -89,6 +90,27 @@ class DecodeGraphs:
         self.pool = None
         self.captures = self.replays = self.eager_steps = self.uncaptured = 0
         self.capture_s = 0.0
+
+    # -- the bound family (CSF bound-fix) ------------------------------------
+    @property
+    def local_capacity(self):
+        """Local slots any step may address: the widest row's REAL extent
+        (`cap_of`), never `cache.max_cap()` — the dynamic-extents `cap_limit`
+        (131,072 at the gate boots) is 2.93x a row's real 44,672-slot extent
+        (357,376 flat slots / 8 rows), so every `max_cap()`-bounded width
+        bucket, geometry scale or pad could address past the flat slot table
+        (slot 357,376 = one past its end). LIVE: `set_extents` grows/relocates
+        rows at run time (c8 L6b), so the bound follows the extents. Storage
+        sizing never reads this — `Hy4Cache.local_capacity` (the pool
+        arithmetic, decoder.py:151-160) is a different attribute."""
+        return max((self.cache.cap_of(r) for r in range(int(self.cache.rows))), default=0)
+
+    @property
+    def capacity(self):
+        """The family's global bound: the widest row's real extent times the
+        world (`cap_of(row) * world` at uniform extents — 44,672 * 8 = 357,376,
+        vs `max_cap() * world` = 1,048,576)."""
+        return self.local_capacity * self.world
 
     # -- shapes ---------------------------------------------------------
     def index_width(self, end):
@@ -742,8 +764,15 @@ class DecodeGraphs:
                 else:
                     j = min(range(count), key=lambda i: starts[i])
                     pad = (int(rows[j]), int(starts[j]) + 1)
+            # CSF bound-fix: the pad's bound is the PAD ROW's own global extent
+            # (`cap_of(row) * world` — was `self.capacity` = `max_cap() * world`
+            # = 1,048,576 at the gate boots). The caller's pad sits exactly one
+            # past the row's last global position ("one past its token" —
+            # `test_attempt2_staging_fix.py::test_pad_one_past_row_is_deslotted`
+            # pins it), so `<=` admits that one form and `_stage_batch` de-slots
+            # it; anything past it is refused. In-extent pads are unchanged.
             if not (0 <= pad[0] < int(self.decoder.cache.rows) and pad[1] >= 0
-                    and pad[1] < self.capacity):
+                    and pad[1] <= self.cache.cap_of(pad[0]) * self.world):
                 raise ValueError("a batched step's pad position lies outside its row")
             rows = list(rows) + [pad[0]] * (size - count)
             starts = list(starts) + [pad[1]] * (size - count)

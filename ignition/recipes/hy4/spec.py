@@ -260,7 +260,16 @@ class SpeculativeGreedy:
                     self._noise("verify", k + 1)
                 g.run_spec("verify", row=self.row, start=short, count=k + 1,
                            call_shape=self._shape(k + 1), sample=mode, filtered=filt)
-        while start + k + 1 < min(int(max_context), g.capacity):
+        # CSF bound-fix: the loop start bound is the row's own global extent
+        # (`cap_of(row) * world` = 357,376 at the gate boots) — `g.capacity` was
+        # `max_cap() * world` = 1,048,576, so the loop ran starts whose staged
+        # slots leave the row (tail-row start 357,376 stages flat slot 357,376,
+        # one past the flat table; `_stage_spec` de-slots it since 1701defb, but
+        # the loop never needs to leave the extent). In-extent starts and their
+        # captures are unchanged.
+        row_extent = self.graphs.cache.cap_of(self.row) * self.graphs.world \
+            if self.graphs is not None else 0
+        while start + k + 1 < min(int(max_context), row_extent):
             if not self.eligible(start, start - k - 1):
                 break
             modes = (((False, False), (True, False)) + (((True, True),) if filtered else ())

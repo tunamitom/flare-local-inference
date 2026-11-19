@@ -186,8 +186,17 @@ class Hy4Cache:
         on a batch of two without it).
         """
         base = self.slots_for(rows_for).reshape(-1, 1)
-        offsets = torch.arange(self.max_cap(), device=self.device, dtype=torch.long)
-        return base + offsets.reshape(1, -1)
+        rows_t = torch.as_tensor(rows_for, device=self.device).long().reshape(-1, 1)
+        caps = self.row_cap_dev[rows_t]           # cap_of(row) per query row
+        # CSF bound-fix: the offsets run to the row's REAL extent (`cap_of`) —
+        # `arange(max_cap())` (131,072 at the gate boots) carried columns whose
+        # value is past the row's records (column 44,672 of the tail row is
+        # flat slot 357,376, one past the flat table's end). Columns past
+        # `cap_of(row)` are the -1 padding / out-of-range sentinel; the
+        # in-extent columns are byte-identical to the old `base + offsets`.
+        width = max((self.cap_of(r) for r in range(self.rows)), default=0)
+        offsets = torch.arange(width, device=self.device, dtype=torch.long).reshape(1, -1)
+        return torch.where(offsets < caps, base + offsets, torch.full_like(offsets, -1))
 
     # --- per-row extents (c8 L6) -------------------------------------------
 
@@ -1862,7 +1871,21 @@ class Hy4Decoder:
                             scores, candidates, topk=self.config.text["index_topk"],
                             selected=selected_buf, counts=counts_buf,
                             base=self.cache.slots_for(token_rows),
-                            local_capacity=self.cache.max_cap())
+                            # CSF bound-fix: the fused hand-back's `local < LCAP`
+                            # guard (fused_ops.py:987 `local < LCAP`) is this
+                            # path's only out-of-extent guard, and `max_cap()`
+                            # (131,072 — the dynamic-extents cap) admitted local
+                            # slots past every row's real `cap_of` (44,672 at
+                            # the gate boots; tail-row local 44,672 is flat slot
+                            # 357,376, one past the flat table). Bind to the
+                            # row extents: the NARROWEST `cap_of` — a scalar
+                            # kernel argument must be safe for every row of the
+                            # forward, and under the contract's uniform extents
+                            # it IS `cap_of(row)` exactly (in-extent hand-back
+                            # byte-identical); ragged extents conservatively
+                            # derate the fused path, never past any row.
+                            local_capacity=min(self.cache.cap_of(r)
+                                               for r in range(self.cache.rows)))
                     yield ("comm", "scores")
                     merged = None
                 else:
@@ -1885,7 +1908,13 @@ class Hy4Decoder:
                         pos = merged
                         base = self.cache.slots_for(token_rows).reshape(-1, 1)
                         local = pos.clamp(min=0) // world
-                        bounded = (pos < 0) | (local < self.cache.max_cap())
+                        # CSF bound-fix: per-ROW `cap_of(row)` (was
+                        # `self.cache.max_cap()` = 131,072 at the gate boots —
+                        # past every row's real 44,672-slot extent, so a merged
+                        # position at tail-row local 44,672 handed back flat
+                        # slot 357,376, one past the flat table).
+                        caps = self.cache.row_cap_dev[token_rows.long()].reshape(-1, 1)
+                        bounded = (pos < 0) | (local < caps)
                         shifted = torch.where(pos >= 0, pos.to(torch.int64) + world * base,
                                               pos.to(torch.int64))  # `-1` padding stays -1
                         mapped = torch.where(bounded, shifted,
