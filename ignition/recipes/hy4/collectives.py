@@ -1337,6 +1337,47 @@ class CeExchange:
         return gathered
 
 
+def a2a_pool_row_caps(*, absorbed_width, unabsorbed_width, expanded_width,
+                      decode_rows, prefill_widths, ce_rows, audit,
+                      force_caps=False):
+    """PERF-PLAN.md Step 5a — dead `PCIeDCPA2APool` row caps (pure arithmetic).
+
+    The absorbed-query gather (`absorbed_width`, 576) is decode/verify/batch
+    only, so its A2A pool caps at `max(*decode_rows, 1)` UNCONDITIONALLY. When
+    the CE exchange covers `ce_rows` and above, the `unabsorbed_width` (256)
+    gather pool and the `expanded_width` (256) partials pool only serve
+    `w < ce_rows` — they cap at the largest such prepared prefill width, and
+    the caller must skip `prepare_gather`/`prepare_lse` plan binding at
+    `w >= ce_rows` (`skip_prepare_above`; those widths ride the CE exchange).
+
+    `audit` (HY4_CE_AUDIT=1) runs the SM-kernel arm at EVERY CE width, so the
+    full pools and bound plans must stay: the 256 pools keep `CHUNK` rows
+    (absent from `caps`, the caller falls back to `max_rows`). Combining the
+    audit with explicitly forced caps raises loudly — the audit's kernel arm
+    would have neither pool rows nor plans above the cap — mirroring the
+    HY4_AR_AUDIT fail-loud at `h4_serve.py:2810`.
+
+    Returns `{"caps": {(width, kind): rows}, "skip_prepare_above": rows | None}`;
+    missing keys mean "keep `max_rows` (CHUNK)".
+    """
+    caps = {(int(absorbed_width), "gather"): max((int(w) for w in decode_rows), default=1)}
+    ce = None if ce_rows is None else int(ce_rows)
+    if audit and force_caps and ce is not None:
+        raise ValueError(
+            "HY4_CE_AUDIT runs the SM-kernel arm at every CE width: capped dead-A2A "
+            "pools leave that arm with neither pool rows nor bound plans — leave the "
+            "caps off (unset HY4_A2A_CAP)")
+    if ce is None or audit:
+        # Nothing is dead (no CE coverage) or nothing may be dead (audit boot).
+        return {"caps": caps, "skip_prepare_above": None}
+    below = [int(w) for w in prefill_widths if int(w) < ce]
+    cap = max(below) if below else 1
+    caps[(int(unabsorbed_width), "gather")] = cap
+    if expanded_width is not None:
+        caps[(int(expanded_width), "partials")] = cap
+    return {"caps": caps, "skip_prepare_above": ce}
+
+
 class PcieDcpTransport:
     """GPU transport over the real b12x PCIe DCP kernels (W7 gate c / P5).
 
@@ -1470,9 +1511,16 @@ class PcieDcpTransport:
                            score_offer=None, extra_value_widths=(), value_max_rows=None,
                            dma=False, kernel_rows=None, ce_lse_rows=None,
                            ce_gather_rows=None, ce_lse_width=None, ce_gather_width=None,
-                           ce_lse_relay=False, ce_gather_relay=False, lanes=1, lane_rows=None):
+                           ce_lse_relay=False, ce_gather_relay=False, lanes=1, lane_rows=None,
+                           pool_row_caps=None):
         """One channel pool per wire geometry (the query gather's absorbed and
         unabsorbed widths, and the 512-wide latent partials).
+
+        `pool_row_caps` (PERF-PLAN.md Step 5a, `a2a_pool_row_caps`) shrinks
+        individual pools' `max_batch_size` to their dead-A2A row cap — a key
+        absent from the mapping keeps `max_rows`. The scores pools and the
+        all-reduce sizing are untouched (pool-neutrality: no
+        `release_preparation` / `wire_decode_ops` changes).
 
         `reduce_width` (consult15 §2 lever 1) additionally builds the b12x
         PCIe all-reduce pool over the biggest `[rows, reduce_width]` BF16
@@ -1487,11 +1535,13 @@ class PcieDcpTransport:
         rank = dist.get_rank(group=process_group)
         world_size = dist.get_world_size(group=process_group)
         pools = {}
+        caps = dict(pool_row_caps or {})
         for width in sorted(set(query_widths)):
-            _trace(f"PCIeDCPA2APool gather width={width}")
+            capacity = int(caps.get((int(width), "gather"), max_rows))
+            _trace(f"PCIeDCPA2APool gather width={width} rows={capacity}")
             pools[(width, "gather")] = PCIeDCPA2APool.from_process_group(
                 process_group=process_group, device=device,
-                max_batch_size=max_rows, total_heads=total_heads,
+                max_batch_size=capacity, total_heads=total_heads,
                 head_dim=width, query_head_dim=width, single_channel=True)
             _trace(f"PCIeDCPA2APool gather width={width} done")
         # consult17 (lever 9): `extra_value_widths` adds partial pools at other
@@ -1499,7 +1549,8 @@ class PcieDcpTransport:
         # caps the rows of the `value_width` pool when only decode still uses
         # it (pools are sized by their row capacity).
         for width, capacity in ((value_width, value_max_rows or max_rows),
-                                *((extra, max_rows) for extra in extra_value_widths)):
+                                *((extra, caps.get((int(extra), "partials"), max_rows))
+                                  for extra in extra_value_widths)):
             _trace(f"PCIeDCPA2APool partials width={width} rows={capacity}")
             pools[(width, "partials")] = PCIeDCPA2APool.from_process_group(
                 process_group=process_group, device=device,

@@ -2804,12 +2804,46 @@ def main():
                 raise ValueError("--selection-wire dcp needs --selection-exchange scores-only "
                                  "and a non-zero --local-offer")
             score_offer = args.local_offer
+        # (hoisted) the decode-family row shapes — the Step 5a dead-A2A pool
+        # caps need DECODE_ROWS BEFORE the transport builds its pools.
+        MTP = os.environ.get("HY4_MTP") == "1"     # consult18 P4: the MTP draft block
+        SPEC_ROWS = (tuple(range(2, int(os.environ.get("HY4_SPEC_K") or 0) + 2))
+                     if MTP and os.environ.get("HY4_SPEC_DECODE_ROWS") == "1" else ())
+        # batched decode: the decode-family rows shapes of the step buckets past one row
+        SHORT_KV = os.environ.get("HY4_SHORT_KV") == "on"
+        # the replicated window: records (and indexer keys past top-k) of every
+        # position below it, per serving row
+        SHORT_POSITIONS = max(int(os.environ.get("HY4_SHORT_KV_POSITIONS") or 0), int(cfg_topk))
+        BATCH_ROWS = tuple(b for b in (2, 4, 8) if b <= args.batch_rows)
+        # dev probes only: wider batch shapes (16 / 32 query rows) for micro-benches
+        BATCH_ROWS += tuple(int(x) for x in (os.environ.get("HY4_BATCH_EXTRA") or "").split(",")
+                            if x.strip() and int(x) not in BATCH_ROWS)
+        DECODE_ROWS = tuple(sorted(set(SPEC_ROWS) | set(BATCH_ROWS)))
         from ignition.recipes.hy4.collectives import parse_all_reduce_arms
 
         uses_dma = any(rule[2] == "dma" for rule in parse_all_reduce_arms(args.all_reduce_arm))
         if os.environ.get("HY4_AR_AUDIT") and args.all_reduce_kernel_rows:
             raise ValueError("HY4_AR_AUDIT runs the rsag arm at the ring's rows: leave "
                              "--all-reduce-kernel-rows at 0")
+        # Step 5a (PERF-PLAN.md:380-383) — dead-A2A pool caps. The fail-loud
+        # mirror of the HY4_AR_AUDIT check above: HY4_CE_AUDIT=1 runs the
+        # SM-kernel arm at every CE width (it needs the FULL pools + bound
+        # plans), so it must never be combined with the caps.
+        if os.environ.get("HY4_CE_AUDIT") and os.environ.get("HY4_A2A_CAP"):
+            raise ValueError("HY4_CE_AUDIT runs the kernel arm at the CE rows: leave "
+                             "the dead-A2A caps (HY4_A2A_CAP) unset")
+        ce_rows = args.ce_rows if (args.lse_transport.startswith("ce")
+                                   and args.gather_transport.startswith("ce")) else None
+        from ignition.recipes.hy4.collectives import a2a_pool_row_caps
+
+        _caps = a2a_pool_row_caps(
+            absorbed_width=absorbed, unabsorbed_width=unabsorbed, expanded_width=expanded,
+            decode_rows=DECODE_ROWS, prefill_widths=PREFILL_WIDTHS,
+            ce_rows=ce_rows, audit=bool(os.environ.get("HY4_CE_AUDIT")),
+            force_caps=bool(os.environ.get("HY4_A2A_CAP")))
+        _skip_above = _caps["skip_prepare_above"]
+        trace(rank, f"dead-A2A caps {_caps['caps']} (A2A plans skipped at rows "
+                    f">= {_skip_above})")
         transport = PcieDcpTransport.from_process_group(
             dist.group.WORLD, device, total_heads=HEADS_TOTAL,
             query_widths=(unabsorbed, absorbed), value_width=values, max_rows=CHUNK,
@@ -2833,7 +2867,10 @@ def main():
             ce_lse_width=expanded or values, ce_gather_width=unabsorbed,
             # consult18 B2: ce-relay = pairwise relay across the B<->D link.
             ce_lse_relay=args.lse_transport == "ce-relay",
-            ce_gather_relay=args.gather_transport == "ce-relay")
+            ce_gather_relay=args.gather_transport == "ce-relay",
+            # Step 5a (PERF-PLAN.md:380-383): the dead-A2A row caps (576->16
+            # always; 256->512 CE-active/audit-off; 256->CHUNK audit-on).
+            pool_row_caps=_caps["caps"])
         trace(rank, f"dcp exchange: lse {args.lse_transport}, gather {args.gather_transport}"
                     f" (ce from {args.ce_rows} rows)")
         if uses_dma:
@@ -2850,19 +2887,6 @@ def main():
                     f"(local offer {args.local_offer or 'full'})")
         trace(rank, "transport constructed")
 
-        MTP = os.environ.get("HY4_MTP") == "1"     # consult18 P4: the MTP draft block
-        SPEC_ROWS = (tuple(range(2, int(os.environ.get("HY4_SPEC_K") or 0) + 2))
-                     if MTP and os.environ.get("HY4_SPEC_DECODE_ROWS") == "1" else ())
-        # batched decode: the decode-family rows shapes of the step buckets past one row
-        SHORT_KV = os.environ.get("HY4_SHORT_KV") == "on"
-        # the replicated window: records (and indexer keys past top-k) of every
-        # position below it, per serving row
-        SHORT_POSITIONS = max(int(os.environ.get("HY4_SHORT_KV_POSITIONS") or 0), int(cfg_topk))
-        BATCH_ROWS = tuple(b for b in (2, 4, 8) if b <= args.batch_rows)
-        # dev probes only: wider batch shapes (16 / 32 query rows) for micro-benches
-        BATCH_ROWS += tuple(int(x) for x in (os.environ.get("HY4_BATCH_EXTRA") or "").split(",")
-                            if x.strip() and int(x) not in BATCH_ROWS)
-        DECODE_ROWS = tuple(sorted(set(SPEC_ROWS) | set(BATCH_ROWS)))
         settings = PreparationConfig(devices=tuple(range(world)), mtp=MTP,
                                      prefill_chunk_size=CHUNK,
                                      expert_scale_compression=(
@@ -2962,14 +2986,20 @@ def main():
             transport.prepare_gather(session, w, absorbed)
             transport.prepare_lse(session, w, values, lse_base="base2")
         for w in PREFILL_WIDTHS:
+            if _skip_above is not None and w >= _skip_above:
+                continue    # Step 5a: rides the CE exchange — no A2A plan/pool rows
             transport.prepare_gather(session, w, unabsorbed)
         if expanded is None:
             for w in (1, *PREFILL_WIDTHS):
+                if _skip_above is not None and w >= _skip_above:
+                    continue    # Step 5a: rides the CE exchange
                 transport.prepare_lse(dsession if w == 1 else session, w, values, lse_base="base2")
         else:
             # Decode merges latents at one row; prefill merges expanded values.
             transport.prepare_lse(dsession, 1, values, lse_base="base2")
             for w in PREFILL_WIDTHS:
+                if _skip_above is not None and w >= _skip_above:
+                    continue    # Step 5a: rides the CE exchange
                 transport.prepare_lse(session, w, expanded, lse_base="base2")
         # consult15 §2 lever 1: one b12x PCIe all-reduce plan per body row
         # shape (decode 1 row + every prepared prefill width) — oneshot at 1
