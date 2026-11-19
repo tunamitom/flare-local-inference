@@ -308,6 +308,30 @@ class FusedWireScratch:
             raise RuntimeError("no fused op adopted the shared wire scratch")
         self.arena.freeze()
 
+    def release_preparation(self):
+        """P3 (CSF): after the seal, run the arena's preparation releases — b12x
+        `release_scale_templates` swaps every wired op's expanded CSF scale
+        planes for placeholders. Runtime calls expand per call into the shared
+        storage (`scales_expanded=False`), so the per-layer expanded planes are
+        dead weight; freeing them is the KV memory CSF exists to win.
+
+        `ScratchArena.release_preparation` requires completed finalization: the
+        recipe's sessions are standalone, so `tuning.register_finalizer` bound
+        each op when it registered; `finalize()` re-binds them once over the
+        sealed arena (no growth: every plan fits the first, prefill-sized one)
+        and retires the list. The arena's bytes stay alive through the views
+        `adopt` handed out. Every op (decode ops included) must be planned
+        before this: a later `PreparedRoutedExperts` would re-materialize the
+        templates (`materialize_scale_templates`)."""
+        import torch
+
+        if not self.arena.frozen:
+            raise RuntimeError("seal the shared wire scratch before releasing its preparation")
+        self.arena.finalize()
+        if torch.device(self.device).type == "cuda":
+            torch.cuda.synchronize(self.device)
+        self.arena.release_preparation()
+
 
 class FusedRoutedExperts:
     """The fused GPU routed-experts execution (`MoEBlock._prepared` seam).
@@ -587,14 +611,109 @@ class FusedRoutedExperts:
         return self.forward(x, ids, weights)
 
 
+def wire_routed_layers(fused_layers, *, device, capacity, session):
+    """Wire every sparse layer's fused routed-experts op on one rank and, when
+    HY4_MOE_DECODE_OP asks, the decode-capacity ops. Returns
+    (preparation session, wire scratch, small A16 scratch or None).
+
+    Moved from `bootstrap.wire_operators` (the recipe's construct path) so its
+    MoE wiring — the arena lifecycle CSF depends on — is testable on CPU
+    without constructing a model (tests/recipes/test_hy4_csf_wiring.py). Raw
+    scales wire exactly as before; CSF plans its decode ops before the seal
+    and releases the arena's preparation after it (P3).
+    """
+    from b12x.preparation import PreparationSession
+
+    # ONE session and ONE scratch per rank: the layer loop is serial.
+    # consult18 E1: HY4_MOE_AUTOTUNE=1 races b12x's candidate configs for
+    # the routed experts on its realistic routing mix
+    # (statistical_shared_mix_v1: diffuse / lognormal-skewed / correlated +
+    # whole-batch reuse — not the all-zero priming routes) and persists the
+    # selections (HY4_TUNE_CACHE), so only the first boot pays the race.
+    import os as _os
+
+    tune = (_os.environ.get("HY4_MOE_AUTOTUNE") or "") not in ("", "0")
+    if isinstance(session, PreparationSession):
+        preparation = session
+    elif tune:
+        preparation = PreparationSession(
+            device=device, autotune=True,
+            compile_workers=int(_os.environ.get("HY4_TUNE_WORKERS") or 4),
+            cache_dir=_os.environ.get("HY4_TUNE_CACHE") or "/state/b12x-tune")
+    else:
+        preparation = PreparationSession(device=device, autotune=False,
+                                         compile_workers=0)
+    first = fused_layers[0].mlp.routed
+    scratch = FusedWireScratch(device=device, max_tokens=capacity,
+                               hidden=first.hidden, top_k=first.top_k)
+    # consult18 E2: A4-capable experts also wire a small A16 op (decode and
+    # short calls), all of them over a second shared scratch.
+    from .moe import a4_min_rows
+
+    a4_layers = {bool(layer.mlp.routed.a4_prefill) for layer in fused_layers}
+    if len(a4_layers) != 1:
+        raise ValueError("the routed layers disagree on calibrated A4 prefill")
+    small_scratch = (FusedWireScratch(device=device,
+                                      max_tokens=min(a4_min_rows(), capacity),
+                                      hidden=first.hidden, top_k=first.top_k)
+                     if a4_layers.pop() else None)
+    for layer in fused_layers:
+        fused = layer.mlp.routed
+        fused.wire(session=preparation, max_tokens=capacity, scratch=scratch,
+                   small_scratch=small_scratch)
+        fused.warm()
+        layer.mlp._prepared = fused
+    csf = bool(first.experts.has_csf_blocks)
+
+    def decode_ops():
+        # "1" or "1,4": the decode op capacities (consult18 P4: the verify rows)
+        decode_caps = tuple(int(x) for x in (_os.environ.get("HY4_MOE_DECODE_OP") or "0").split(",")
+                            if x.strip() and int(x) > 0)
+        decode_tokens = (decode_caps if len(decode_caps) > 1
+                         else (decode_caps[0] if decode_caps else 0))
+        if decode_caps and small_scratch is None:
+            # consult18 P2 (numerics class): decode-capacity MoE ops compiled
+            # with the b12x small-M split-K schedule, one shared workspace;
+            # runtime switch moe_decode_op selects them.
+            spec = (_os.environ.get("HY4_MOE_DECODE_ENV")
+                    or "B12X_W4A16_SMALL_M_SPLITK=1,B12X_W4A16_SMALL_M_OCCUPANCY=1")
+            env = dict(item.split("=", 1) for item in spec.split(",") if item)
+            alt_spec = _os.environ.get("HY4_MOE_DECODE_ENV_ALT")
+            alt = (dict(item.split("=", 1) for item in alt_spec.split(",") if item)
+                   if alt_spec else None)
+            wire_decode_ops([layer.mlp.routed for layer in fused_layers],
+                            tokens=decode_tokens, env=env, alt_env=alt,
+                            arena=scratch.arena if csf else None)
+
+    # P3 (CSF): the decode ops' functional() needs the wire arena as its
+    # preparation-release boundary, and an op registers its binding on that
+    # arena — so they plan BEFORE the seal (a frozen arena refuses the
+    # registration: boot 9598a030), and the arena's preparation releases run
+    # only after every op is planned. Raw-scale wiring keeps its order.
+    if csf:
+        decode_ops()
+    scratch.seal()
+    if small_scratch is not None:
+        small_scratch.seal()
+    if not csf:
+        decode_ops()
+    else:
+        for wired in (scratch, small_scratch):
+            if wired is not None:
+                wired.release_preparation()
+    return preparation, scratch, small_scratch
+
+
 def wire_decode_ops(routed, *, tokens, env, alt_env=None, arena=None):
     """Plan every layer's decode op under `env` (set only while planning and
     warming: the main ops keep their plans), over ONE shared workspace and
     scale storage (the layer loop is serial). Returns the workspace bytes.
     `arena` (P3): the shared wire ScratchArena for CSF experts (their
-    functional() requires an arena preparation-release boundary); pass the
-    main scratch's arena — the frozen arena only refuses GROWTH and decode
-    workspaces never exceed the prefill-sized main plan."""
+    functional() requires an arena preparation-release boundary). It must
+    still be LIVE (unfrozen): each op registers its binding finalizer on it
+    and a frozen arena refuses that (`scratch binding declarations are
+    frozen`). Decode workspaces never exceed the prefill-sized main plan, so
+    planning them does not grow the arena. `wire_routed_layers` orders this."""
     import os as _os
 
     import torch

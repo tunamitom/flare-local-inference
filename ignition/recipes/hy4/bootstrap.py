@@ -259,7 +259,7 @@ class PreparedHy4Rank:
         # are `prefill_chunk_size` wide; decode/verify feed rows x 1 tokens).
         # `warm` runs the extremes so no plan preparation lands inside a step
         # or a graph capture (KernelPlanBook's no-JIT-at-run-time contract).
-        from .moe import FusedRoutedExperts, FusedWireScratch
+        from .moe import FusedRoutedExperts
 
         capacity = max(self.settings.prefill_chunk_size, self.settings.request_capacity)
         fused_layers = [layer for layer in self.weights.layers
@@ -268,73 +268,11 @@ class PreparedHy4Rank:
         if draft is not None and isinstance(getattr(draft.mlp, "routed", None), FusedRoutedExperts):
             fused_layers.append(draft)   # consult18 P4: the MTP draft's routed experts
         if fused_layers:
-            from b12x.preparation import PreparationSession
+            from .moe import wire_routed_layers
 
-            # ONE session and ONE scratch per rank: the layer loop is serial.
-            # consult18 E1: HY4_MOE_AUTOTUNE=1 races b12x's candidate configs for
-            # the routed experts on its realistic routing mix
-            # (statistical_shared_mix_v1: diffuse / lognormal-skewed / correlated +
-            # whole-batch reuse — not the all-zero priming routes) and persists the
-            # selections (HY4_TUNE_CACHE), so only the first boot pays the race.
-            import os as _os
-
-            tune = (_os.environ.get("HY4_MOE_AUTOTUNE") or "") not in ("", "0")
-            if isinstance(session, PreparationSession):
-                preparation = session
-            elif tune:
-                preparation = PreparationSession(
-                    device=self.device, autotune=True,
-                    compile_workers=int(_os.environ.get("HY4_TUNE_WORKERS") or 4),
-                    cache_dir=_os.environ.get("HY4_TUNE_CACHE") or "/state/b12x-tune")
-            else:
-                preparation = PreparationSession(device=self.device, autotune=False,
-                                                 compile_workers=0)
-            first = fused_layers[0].mlp.routed
-            scratch = FusedWireScratch(device=self.device, max_tokens=capacity,
-                                       hidden=first.hidden, top_k=first.top_k)
-            # consult18 E2: A4-capable experts also wire a small A16 op (decode and
-            # short calls), all of them over a second shared scratch.
-            from .moe import a4_min_rows
-
-            a4_layers = {bool(layer.mlp.routed.a4_prefill) for layer in fused_layers}
-            if len(a4_layers) != 1:
-                raise ValueError("the routed layers disagree on calibrated A4 prefill")
-            small_scratch = (FusedWireScratch(device=self.device,
-                                              max_tokens=min(a4_min_rows(), capacity),
-                                              hidden=first.hidden, top_k=first.top_k)
-                             if a4_layers.pop() else None)
-            for layer in fused_layers:
-                fused = layer.mlp.routed
-                fused.wire(session=preparation, max_tokens=capacity, scratch=scratch,
-                           small_scratch=small_scratch)
-                fused.warm()
-                layer.mlp._prepared = fused
-            scratch.seal()
-            if small_scratch is not None:
-                small_scratch.seal()
-            import os as _os
-
-            # "1" or "1,4": the decode op capacities (consult18 P4: the verify rows)
-            decode_caps = tuple(int(x) for x in (_os.environ.get("HY4_MOE_DECODE_OP") or "0").split(",")
-                                if x.strip() and int(x) > 0)
-            decode_tokens = decode_caps if len(decode_caps) > 1 else (decode_caps[0] if decode_caps else 0)
-            if decode_caps and small_scratch is None:
-                # consult18 P2 (numerics class): decode-capacity MoE ops compiled
-                # with the b12x small-M split-K schedule, one shared workspace;
-                # runtime switch moe_decode_op selects them.
-                from .moe import wire_decode_ops
-
-                spec = (_os.environ.get("HY4_MOE_DECODE_ENV")
-                        or "B12X_W4A16_SMALL_M_SPLITK=1,B12X_W4A16_SMALL_M_OCCUPANCY=1")
-                env = dict(item.split("=", 1) for item in spec.split(",") if item)
-                alt_spec = _os.environ.get("HY4_MOE_DECODE_ENV_ALT")
-                alt = (dict(item.split("=", 1) for item in alt_spec.split(",") if item)
-                       if alt_spec else None)
-                wire_decode_ops([layer.mlp.routed for layer in fused_layers],
-                                tokens=decode_tokens, env=env, alt_env=alt,
-                                arena=scratch.arena if first.experts.has_csf_blocks else None)
-            self.fused_session, self.fused_scratch = preparation, scratch
-            self.fused_small_scratch = small_scratch
+            (self.fused_session, self.fused_scratch,
+             self.fused_small_scratch) = wire_routed_layers(fused_layers, device=self.device,
+                                                            capacity=capacity, session=session)
         return self
 
 
