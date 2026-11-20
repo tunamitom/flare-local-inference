@@ -914,3 +914,202 @@ def test_packed_w4a16_official_export_loads_and_drafts_on_cpu(tmp_path):
     drafts, z = dec.dfly_draft(bonus, hidden[:, -1, :], request_rows=[0], k=3)
     assert drafts.shape == (1, 3) and z.shape == (1, 4, built.model_config.hidden)
     assert torch.isfinite(z).all()
+
+
+# ---------------------------------------------------------------------------
+# 6. First-class spec width k=5 (verify T=6, dfly_block_size=7) across DFly2 + bspec
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("world", (1, 2))
+def test_dfly2_k5_parity_and_bspec_width_generalization(tmp_path, world):
+    """Exercise k=5 (per=6) parity vs SGLang ref and bspec bodies at sizes 6, 8, and 12."""
+    from ignition.recipes.hy4.bootstrap import PreparationConfig, construct_rank
+    from ignition.recipes.hy4.collectives import PcieDcpCollectives, SimulatedDcpTransport, SimulatedGroup
+    from ignition.recipes.hy4.decode_graph import DecodeGraphs
+    from ignition.recipes.hy4.decoder import Hy4Cache, Hy4Decoder
+    from ignition.recipes.hy4.spec import SpeculativeGreedy
+    from ignition.recipes.hy4.wiring import batch_shape
+
+    snap, raw_tensors = _make_tiny_official_snapshot(tmp_path / f"snap_k5_w{world}")
+    cfg_dict = json.loads((snap / "config.json").read_text())
+    settings = PreparationConfig(devices=(0,), mtp=True, prefill_chunk_size=64)
+    cap = 64
+    k = 5
+    prompt1 = torch.tensor([[3 + (i * 5) % 80 for i in range(18)]], dtype=torch.long)
+    prompt3 = torch.tensor([[11 + (i * 7) % 80 for i in range(20)]], dtype=torch.long)
+
+    # Single-rank FP32 ground truth for k=5.
+    built1 = construct_rank(snap, settings, rank=0, pinned=False, mtp=True,
+                            cache_rows=4, cache_capacity=cap, world_size=1)
+    w1 = _to_fp32_dfly_weights(built1.weights)
+    c1 = Hy4Cache.allocate(built1.model_config, rows=4, capacity=cap, device=CPU,
+                           draft=False, dtype=torch.float32, world=1, rank=0)
+    d1 = Hy4Decoder(w1, c1, compute_dtype=torch.float32)
+    lg1, h1, _ = d1.forward(prompt1, request_rows=[1], return_hidden=True)
+    d1.complete([1], prompt1)
+    bonus1 = lg1[:, -1, :].argmax(dim=-1)
+    hid1 = h1[:, -1, :]
+    target_kv_ref = {
+        layer_id: c1.latents(layer_id)[cap:cap + prompt1.shape[1]].clone().unsqueeze(0)
+        for layer_id in cfg_dict["dfly_target_kv_layers"]
+    }
+    target_topk_ref = {
+        layer_id: d1.dfly_state.hist_local[plane, 1].clone().unsqueeze(0)
+        for plane, layer_id in enumerate(d1.weights.dfly.producer_layers)
+    }
+    ref_drafts, ref_z = _sglang_dfly_reference(
+        raw_tensors, cfg_dict,
+        target_kv_by_layer=target_kv_ref,
+        target_topk_by_layer=target_topk_ref,
+        bonus_tokens=bonus1, target_hidden=hid1,
+        anchor=torch.tensor([prompt1.shape[1]], dtype=torch.long), k=k)
+
+    # SpeculativeGreedy accepts k=5 (and k=6) for dfly_block_size=7, rejects k=7.
+    assert SpeculativeGreedy(d1, k=5, decode_rows=True).k == 5
+    assert SpeculativeGreedy(d1, k=6, decode_rows=True).k == 6
+    with pytest.raises(ValueError, match="dfly_block_size"):
+        SpeculativeGreedy(d1, k=7, decode_rows=True)
+
+    # dfly_draft fails loudly on undersized q_out / noise_q rather than mid-loop IndexError.
+    vocab = int(d1.weights.head.shape[0])
+    with pytest.raises(ValueError, match="q_out"):
+        d1.dfly_draft(
+            bonus1, hid1, request_rows=[1], k=5, sample=True,
+            inv_temp=torch.ones((1,), dtype=torch.float32),
+            noise_q=torch.full((1, 5, vocab), 0.5),
+            q_out=torch.zeros((1, 3, vocab)))
+    with pytest.raises(ValueError, match="noise_q"):
+        d1.dfly_draft(
+            bonus1, hid1, request_rows=[1], k=5, sample=True,
+            inv_temp=torch.ones((1,), dtype=torch.float32),
+            noise_q=torch.full((1, 3, vocab), 0.5),
+            q_out=torch.zeros((1, 5, vocab)))
+
+    if world == 1:
+        got_drafts, got_z = d1.dfly_draft(bonus1, hid1, request_rows=[1], k=k)
+        assert torch.allclose(got_z, ref_z, atol=1e-4, rtol=1e-4)
+        assert torch.equal(got_drafts, ref_drafts)
+        g = DecodeGraphs(d1, granule=4)
+        assert g.bspec_kmax == 6
+        assert g.spec_max == 8
+        st = g.bspec_state()
+        assert st["q"].shape[1] == 6 and st["drafts"].shape[1] == 6
+        assert st["pend_tok"].shape[1] == 7 and st["out_tokens"].shape[1] == 7
+        with pytest.raises(ValueError, match="exceeds allocated bspec_kmax"):
+            g.bspec_state(min_k=7)
+        # Exact bucket size=6 (per=6, 0 pads) AND ragged size=8 (per=6, rem=2 pads) match solo k=5.
+        st["pend_tok"][1].fill_(int(bonus1[0]))
+        st["pend_hid"][1].copy_(hid1.expand(st["pend_hid"].shape[1], -1))
+        st["spec_on"][1] = True
+        st["inv_temp"].zero_()
+        g.bspec_set(1, P=int(prompt1.shape[1]), c=int(prompt1.shape[1]) - 1, n=0)
+        for sz in (6, 8):
+            e = g._bspec_args(sz, 6)
+            g._stage_bspec(e, sz, [1] * sz, [False] * 6 + [True] * (sz - 6))
+            bd, df = g._body_bdraft(sz, batch_shape(sz), ("cp", 0), 6)
+            assert not bool(df)
+            assert torch.equal(bd[0, :5], ref_drafts[0])
+        return
+
+    group = SimulatedGroup(world)
+    transport = SimulatedDcpTransport(group)
+    decoders = []
+    for r in range(world):
+        built = construct_rank(snap, settings, rank=r, pinned=False, mtp=True,
+                               cache_rows=4, cache_capacity=cap, world_size=world,
+                               collectives=group.collectives(r))
+        wr = _to_fp32_dfly_weights(built.weights)
+        cr = Hy4Cache.allocate(built.model_config, rows=4, capacity=cap, device=CPU,
+                               draft=False, dtype=torch.float32, world=world, rank=r)
+        cr.set_extents([0, 32, 0, 32], bases=[0, 0, 0, 32])
+        col = PcieDcpCollectives(rank=r, world_size=world, transport=transport)
+        decoders.append(Hy4Decoder(wr, cr, compute_dtype=torch.float32, collectives=col))
+
+    def run_rank(dec):
+        lg_1, h_1, _ = dec.forward(prompt1, request_rows=[1], return_hidden=True)
+        dec.complete([1], prompt1)
+        lg_3, h_3, _ = dec.forward(prompt3, request_rows=[3], return_hidden=True)
+        dec.complete([3], prompt3)
+        g = DecodeGraphs(dec, granule=4)
+        st = g.bspec_state()
+        for r, lg, h, L in ((1, lg_1, h_1, prompt1.shape[1]), (3, lg_3, h_3, prompt3.shape[1])):
+            st["pend_tok"][r].fill_(int(lg[0, -1].argmax()))
+            st["pend_hid"][r].copy_(h[0, -1].reshape(1, -1).expand(st["pend_hid"].shape[1], -1))
+            st["spec_on"][r] = True
+            g.bspec_set(r, P=L, c=L - 1, n=0)
+        st["inv_temp"].zero_()
+        # 2 active rows at per=6 -> exact size=12 sparse draft + short-bypass verify round.
+        rows_12 = [1] * 6 + [3] * 6
+        pads_12 = [False] * 12
+        e12 = g._bspec_args(12, 6)
+        g._stage_bspec(e12, 12, rows_12, pads_12)
+        shape12 = batch_shape(12)
+        d12, df12 = g._body_bdraft(12, shape12, ("cp", 0), 6)
+        assert not bool(df12)
+        d12_out = d12[:2, :5].clone()
+        # On CPU, target batched `_body_bverify` uses bypass regime (fused batched indexer is CUDA-only).
+        p1_s = torch.tensor([[5, 6, 7, 8, 9]], dtype=torch.long)
+        p3_s = torch.tensor([[20, 21, 22, 23, 24, 25]], dtype=torch.long)
+        dec.release([1, 3])
+        slg1, sh1, _ = dec.forward(p1_s, request_rows=[1], return_hidden=True)
+        dec.complete([1], p1_s)
+        slg3, sh3, _ = dec.forward(p3_s, request_rows=[3], return_hidden=True)
+        dec.complete([3], p3_s)
+        for r, lg, h, L in ((1, slg1, sh1, p1_s.shape[1]), (3, slg3, sh3, p3_s.shape[1])):
+            st["pend_tok"][r].fill_(int(lg[0, -1].argmax()))
+            st["pend_hid"][r].copy_(h[0, -1].reshape(1, -1).expand(st["pend_hid"].shape[1], -1))
+            g.bspec_set(r, P=L, c=L - 1, n=0)
+        g._stage_bspec(e12, 12, rows_12, pads_12)
+        sd12, sdf12 = g._body_bdraft(12, shape12, ("bypass", 0), 6)
+        assert not bool(sdf12)
+        n12, vf12 = g._body_bverify(12, shape12, ("bypass", 0), 6)
+        assert not bool(vf12)
+        return d12_out, sd12[:2, :5].clone(), n12[:2].clone(), st["P"][[1, 3]].clone()
+
+    res = group.run([lambda col, d=d: run_rank(d) for d in decoders])
+    assert torch.equal(res[0][0][0], ref_drafts[0])
+    for idx in (0, 1, 2, 3):
+        assert torch.equal(res[0][idx], res[1][idx])
+
+
+def test_bspec_k5_policy_and_snapshot_width():
+    """Verify BatchLoop._bs_k, _bs_layout, and _bs_snap generalize to k=5 while keeping k=3."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "h4_serve_k5_mod", Path(__file__).resolve().parents[2] / "deploy" / "hy4" / "h4_serve.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    from ignition.recipes.hy4.decode_graph import DecodeGraphs
+
+    fake_g = SimpleNamespace(
+        bspec_kmax=6,
+        BSPEC_KMAX=3,
+        BATCH_BUCKETS=DecodeGraphs.BATCH_BUCKETS,
+        batch_bucket=lambda count, *, allowed=None: DecodeGraphs.batch_bucket(
+            SimpleNamespace(BATCH_BUCKETS=DecodeGraphs.BATCH_BUCKETS), count, allowed=allowed),
+    )
+    loop = mod.BatchLoop.__new__(mod.BatchLoop)
+    loop.rows = 8
+    loop.bspec_k3 = True
+    loop.bspec_k2 = True
+
+    # With spec.k=5 and batch_rows=(2, 4, 6, 8, 12, 16): B=1,2 get K=5; B=3 gets K=3; B=4 gets K=2; B>=5 gets K=1.
+    loop.ctx = SimpleNamespace(
+        batch_rows=(2, 4, 6, 8, 12, 16),
+        spec=SimpleNamespace(k=5),
+        decoder=SimpleNamespace(decode_graphs=fake_g),
+    )
+    assert [loop._bs_k(B) for B in range(1, 9)] == [5, 5, 3, 2, 1, 1, 1, 1]
+    assert loop._bs_layout(1, 5) == (6, 6, 2)
+    assert loop._bs_layout(2, 5) == (6, 12, 2)
+
+    # Without bucket 6 prepared (standard 2,4,8,12,16), B=1 still gets K=5 inside bucket 8.
+    loop.ctx.batch_rows = (2, 4, 8, 12, 16)
+    assert [loop._bs_k(B) for B in range(1, 9)] == [5, 5, 3, 2, 1, 1, 1, 1]
+    assert loop._bs_layout(1, 5) == (6, 8, 2)
+    assert loop._bs_layout(2, 5) == (6, 12, 2)
+
+    # Snapshot capacity covers B=8 at K=5 (105 longs > legacy 81).
+    assert 8 * (2 * 5 + 3) + 1 == 105
+    assert max(81, loop.rows * (2 * fake_g.bspec_kmax + 3) + 1) == 121

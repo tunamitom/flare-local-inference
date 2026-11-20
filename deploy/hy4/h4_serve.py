@@ -1946,13 +1946,16 @@ class BatchLoop:
             self.bs_rows[row] = {"warm": True}
 
     def _solo_batched(self, item):
-        """c8 L13b: a lone request runs the batched speculative rounds (K = 3 at one
-        row, device round state, lookahead) when they can serve it: unfiltered
-        sampling (or greedy), not an NLL probe, batched speculation on."""
+        """c8 L13b: a lone request runs the batched speculative rounds (device round
+        state, lookahead) when they can serve it: unfiltered sampling (or greedy),
+        not an NLL probe, batched speculation on."""
         p = item.get("params") or {}
+        spec = getattr(self.ctx, "spec", None)
+        rows = set(getattr(self.ctx, "batch_rows", ()) or ())
+        spec_k = int(getattr(spec, "k", 3) or 3)
+        bucket_ok = any(b >= spec_k + 1 for b in rows) if spec_k > 3 else (12 in rows)
         return (self.solo_bspec and self.bspec and self.max_batch > 1 and not p.get("nll")
-                and _unfiltered(p) and getattr(self.ctx, "spec", None) is not None
-                and 12 in set(getattr(self.ctx, "batch_rows", ()) or ()))
+                and _unfiltered(p) and spec is not None and bucket_ok)
 
     def _preempt(self):
         return not self.ctx.q.empty()
@@ -2172,19 +2175,39 @@ class BatchLoop:
         if not params or not all(t >= 0.0 and u for t, u in params):
             return False
         graphs = ctx.decoder.decode_graphs
+        batch_rows = tuple(getattr(ctx, "batch_rows", ()) or ())
         K = self._bs_k(len(params))
-        size = graphs.batch_bucket((K + 1) * len(params)) if (K + 1) * len(params) <= 32 else None
-        return size is not None and size in set(getattr(ctx, "batch_rows", ()) or ())
+        need = (K + 1) * len(params)
+        max_b = max(batch_rows, default=0)
+        size = graphs.batch_bucket(need, allowed=batch_rows) if need <= max_b else None
+        return size is not None and size in set(batch_rows)
 
     def _bs_k(self, B):
-        """Drafts per row in a round: 3 at <= 3 rows, 2 at 4 (verify <= 12 entries),
-        else 1."""
+        """Drafts per row in a round.
+
+        For `spec.k <= 3` (or absent), keeps the legacy c8 L13 policy (`3` at
+        `B <= 3`, `2` at `B == 4` within bucket 12, else `1`). For `spec.k > 3`
+        (e.g. DFly2 `k = 5`), picks the widest `K <= min(spec.k, bspec_kmax)`
+        whose verify width `(K + 1) * B` fits a prepared bucket up to 12 or an
+        exact prepared bucket (e.g. 18, 24).
+        """
         rows = set(getattr(self.ctx, "batch_rows", ()) or ())
-        if 12 not in rows:
-            return 1
-        if self.bspec_k3 and B <= 3:
-            return 3
-        return 2 if self.bspec_k2 and B <= 4 else 1
+        spec = getattr(self.ctx, "spec", None)
+        spec_k = int(getattr(spec, "k", 3) or 3)
+        if spec_k <= 3:
+            if 12 not in rows:
+                return 1
+            if self.bspec_k3 and B <= 3:
+                return min(3, spec_k)
+            return min(2, spec_k) if self.bspec_k2 and B <= 4 else 1
+        graphs = getattr(getattr(self.ctx, "decoder", None), "decode_graphs", None)
+        kmax = int(getattr(graphs, "bspec_kmax", spec_k)) if graphs is not None else spec_k
+        top_k = min(spec_k, kmax)
+        for K in range(top_k, 1, -1):
+            need = (K + 1) * B
+            if (need <= 12 and any(need <= b <= 12 for b in rows)) or (K == top_k and need in rows):
+                return K
+        return 1
 
     def _bspec_batch(self, plan, items):
         """Every rank: one batched speculative round. Steady state (c8 L5b, `bs_la`):
@@ -2272,18 +2295,21 @@ class BatchLoop:
 
     def _bs_end(self, rows, *, inflight):
         """An upper bound on a round's context end from the host-known lengths (each
-        unconsumed round in flight commits <= 2; the pad entries write P + 2). A
+        unconsumed round in flight commits <= K+1; pad entries write P + K + 1). A
         later regime serves an earlier context exactly, so the bound is safe."""
         d = self.ctx.decoder
-        km = d.decode_graphs.BSPEC_KMAX
+        km = int(getattr(d.decode_graphs, "bspec_kmax", d.decode_graphs.BSPEC_KMAX))
         return max(int(d._row_lengths.get(r, 0)) for r in rows) + (km + 1) * inflight + km + 2
 
     def _bs_layout(self, B, K):
         """A round's entry lists: (absorb/verify size, rows, pads), (chain size, rows, pads)."""
         g = self.ctx.decoder.decode_graphs
+        allowed = tuple(getattr(self.ctx, "batch_rows", ()) or ()) or None
         per = K + 1
-        size = g.batch_bucket(per * B)
-        csize = g.batch_bucket(max(2, B))
+        size = g.batch_bucket(per * B, allowed=allowed)
+        c_need = max(2, B)
+        csize = g.batch_bucket(
+            c_need, allowed=allowed if (allowed and max(allowed) >= c_need) else None)
         return per, size, csize
 
     def _bs_cached(self, B, K, end):
@@ -2365,7 +2391,7 @@ class BatchLoop:
             for step in range(1, K):
                 g.run_bspec("chain", crows, cpads, end=end, call_shape=cshape, step=step)
         g.run_bspec("verify", erows, pads, end=end, call_shape=shape, per=per)
-        snap = self._bs_snap()
+        snap = self._bs_snap(needed=B * (2 * K + 3) + 1)
         dev = snap["dev"]
         o = 0
         for part in (st["out_n"][:B], st["drafts"][:B, :K].reshape(-1),
@@ -2380,13 +2406,17 @@ class BatchLoop:
         return {"bspec": True, "rows": list(rows), "temps": list(temps), "snap": snap, "K": K,
                 "width": o}
 
-    def _bs_snap(self):
+    def _bs_snap(self, *, needed=0):
         import torch
 
-        if getattr(self, "_bs_snaps", None) is None:
+        g = getattr(getattr(self.ctx, "decoder", None), "decode_graphs", None)
+        km = int(getattr(g, "bspec_kmax", getattr(g, "BSPEC_KMAX", 3))) if g is not None else 3
+        cap = max(81, int(self.rows) * (2 * km + 3) + 1, int(needed))
+        snaps = getattr(self, "_bs_snaps", None)
+        if snaps is None or int(snaps[0]["dev"].shape[0]) < cap:
             dev = self.ctx.device
-            self._bs_snaps = [{"dev": torch.zeros((81,), dtype=torch.long, device=dev),
-                               "host": torch.zeros((81,), dtype=torch.long).pin_memory(),
+            self._bs_snaps = [{"dev": torch.zeros((cap,), dtype=torch.long, device=dev),
+                               "host": torch.zeros((cap,), dtype=torch.long).pin_memory(),
                                "event": torch.cuda.Event()} for _ in range(4)]
             self._bs_snap_at = 0
         snap = self._bs_snaps[self._bs_snap_at]
@@ -3057,10 +3087,13 @@ def main():
         # consult15 §2 lever 1: one b12x PCIe all-reduce plan per body row
         # shape (decode 1 row + every prepared prefill width) — oneshot at 1
         # row, rsag above (c1-unit-costs.md §1's arm choice).
-        # round 16: spec verify rows outside the prefill widths (k = 4 -> 5 rows)
+        # round 16: spec verify rows outside the prefill widths (e.g. k=4 -> 5, k=5 -> 6).
         # DFly2 hidden_correction also runs all_reduce on `slots = size // per`
-        # (including 5 and 6 for bspec buckets 12/16 at per=2/3).
-        _dfly_slot_rows = (tuple(sorted({b // per for b in BATCH_ROWS for per in (2, 3, 4) if b >= per}))
+        # across every prepared `per` up to `max(4, spec_k + 1)`.
+        _spec_k_env = int(os.environ.get("HY4_SPEC_K") or 0) if MTP else 0
+        _bspec_pers = tuple(range(2, max(4, _spec_k_env + 1) + 1))
+        _dfly_slot_rows = (tuple(sorted({b // per for b in BATCH_ROWS
+                                         for per in _bspec_pers if b >= per}))
                            if MTP and _has_dfly else ())
         EXTRA_ROWS = tuple(sorted(set(w for w in (*DECODE_ROWS, *_dfly_slot_rows)
                                       if w not in PREFILL_WIDTHS)))
@@ -3074,9 +3107,11 @@ def main():
             trace(rank, f"overlap: lane 1 ring + CE exchange prepared for {CHUNK} rows")
         if score_offer is not None:
             # consult17: the offer gather at every row count the body runs — and the
-            # batched speculative rounds' sampling / acceptance rows (c8 L13: a slot
-            # per request row, (K+1) offers per slot: 6 = 12 entries / 2, 2 slots x 3)
-            for w in sorted({1, *PREFILL_WIDTHS, *EXTRA_ROWS, 6}):
+            # batched speculative rounds' sampling / acceptance rows (`slots * per` and `slots`).
+            _bspec_offer_rows = ({per * (b // per) for b in BATCH_ROWS
+                                  for per in _bspec_pers if b >= per}
+                                 if MTP else set())
+            for w in sorted({1, *PREFILL_WIDTHS, *EXTRA_ROWS, 6, *_bspec_offer_rows}):
                 transport.prepare_score_gather(dsession if w == 1 else session, w)
         trace(rank, "transport plans prepared")
 
@@ -3168,8 +3203,9 @@ def main():
                     f"(row 0 {ctx.row_caps[0]}, rows 1+ {min(ctx.row_caps)}), pool "
                     f"{local_total} local slots/rank")
         # one request lives in one cache row: its context cannot pass the row (less a
-        # margin: speculative rounds write their pad / draft entries up to P + 4)
-        ctx.max_context = min(int(args.max_context), int(ctx.row_capacity) - 8)
+        # margin: speculative rounds with lookahead write pad/draft entries past P)
+        _spec_margin = max(8, 2 * (_spec_k_env + 2))
+        ctx.max_context = min(int(args.max_context), int(ctx.row_capacity) - _spec_margin)
         warm_free = warm_shortfall = None
         if args.boot_warm:
             # Pay the first-use memory again on the serving construction, then
@@ -3346,21 +3382,29 @@ def main():
                         for _ in range(2):
                             graphs.run_bspec("draft", rows_p, [False] * b, end=end, call_shape=shape)
                             graphs.run_bspec("verify", rows_p, [False] * b, end=end, call_shape=shape)
-                    if 12 in BATCH_ROWS:
-                        # c8 L13: chains of K = 2 (<= 4 rows) and 3 (<= 3 rows) drafts per
-                        # row — absorb / verify of K+1 entries per row (4 / 8 / 12) and
-                        # the chain steps (2 / 4 entries)
-                        end = base + 2 * args.rows + 6
-                        for per in (3, 4):
-                            for b in (12, 8, 4):
+                    _has_dfly_dec = bool(getattr(ctx.decoder, "has_dfly", False))
+                    _spec_k_live = int(getattr(ctx.spec, "k", 3) or 3)
+                    _prewarm_pers = (tuple(range(3, max(4, _spec_k_live + 1) + 1))
+                                     if _has_dfly_dec else (3, 4))
+                    if 12 in BATCH_ROWS or (_has_dfly_dec and any(b >= _spec_k_live + 1 for b in BATCH_ROWS)):
+                        # c8 L13: multi-draft bspec rounds (per = K + 1 entries/row).
+                        end = base + 2 * args.rows + max(_prewarm_pers) + 2
+                        for per in _prewarm_pers:
+                            _bs_buckets = [b for b in sorted(BATCH_ROWS, reverse=True)
+                                           if b >= per and (b in (12, 8, 6, 4)
+                                                            or (per == _spec_k_live + 1 and b % per == 0))]
+                            for b in _bs_buckets:
                                 shape = batch_shape(b)
-                                rows_p = [(i // per) % args.rows for i in range(b)]
+                                live = (b // per) * per
+                                rows_p = ([(i // per) % args.rows for i in range(live)]
+                                          + [0] * (b - live))
+                                pads_p = [False] * live + [True] * (b - live)
                                 for _ in range(2):
-                                    graphs.run_bspec("draft", rows_p, [False] * b, end=end,
+                                    graphs.run_bspec("draft", rows_p, pads_p, end=end,
                                                      call_shape=shape, per=per)
-                                    graphs.run_bspec("verify", rows_p, [False] * b, end=end,
+                                    graphs.run_bspec("verify", rows_p, pads_p, end=end,
                                                      call_shape=shape, per=per)
-                        if not getattr(ctx.decoder, "has_dfly", False):
+                        if not _has_dfly_dec and 12 in BATCH_ROWS:
                             for step in (1, 2):
                                 for b in (4, 2):
                                     shape = batch_shape(b)
@@ -3368,30 +3412,38 @@ def main():
                                     for _ in range(2):
                                         graphs.run_bspec("chain", rows_p, [False] * b, end=end,
                                                          call_shape=shape, step=step)
-                if 12 in BATCH_ROWS:
-                    # c8 regress-fix: a lone long request decodes in K=3 rounds of one
+                _has_dfly_dec = bool(getattr(ctx.decoder, "has_dfly", False))
+                _spec_k_live = int(getattr(ctx.spec, "k", 3) or 3)
+                _solo_k = _spec_k_live if (_has_dfly_dec and _spec_k_live > 3) else 3
+                _solo_per = _solo_k + 1
+                _solo_b = (graphs.batch_bucket(_solo_per, allowed=BATCH_ROWS)
+                           if (12 in BATCH_ROWS or (_has_dfly_dec and any(b >= _solo_per for b in BATCH_ROWS)))
+                           and any(b >= _solo_per for b in BATCH_ROWS) else None)
+                if _solo_b is not None:
+                    # c8 regress-fix: a lone long request decodes in K-draft rounds of one
                     # row; its context-parallel width buckets up to HY4_BSPEC_PREWARM
                     # tokens are captured now (a first-use capture mid-request stalls
                     # its stream ~1-2 s: the 128k bench cell crossed into a new bucket)
                     upto_b = int(os.environ.get("HY4_BSPEC_PREWARM") or 262144)
                     w, seen = graphs.index_width(past + 1), set()
+                    solo_pads = [False] * _solo_per + [True] * (_solo_b - _solo_per)
                     while w * world <= upto_b and w not in seen:
                         seen.add(w)
                         P = w * world - 16
                         graphs.bspec_set(0, P=P, c=P - 1, n=0)
-                        end = P + 6
+                        end = P + _solo_per + 2
                         for _ in range(2):
-                            graphs.run_bspec("draft", [0] * 4, [False] * 4, end=end,
-                                             call_shape=batch_shape(4), per=4)
-                            if not getattr(ctx.decoder, "has_dfly", False):
+                            graphs.run_bspec("draft", [0] * _solo_b, solo_pads, end=end,
+                                             call_shape=batch_shape(_solo_b), per=_solo_per)
+                            if not _has_dfly_dec:
                                 for step in (1, 2):
                                     graphs.run_bspec("chain", [0, 0], [False, True], end=end,
                                                      call_shape=batch_shape(2), step=step)
-                            graphs.run_bspec("verify", [0] * 4, [False] * 4, end=end,
-                                             call_shape=batch_shape(4), per=4)
+                            graphs.run_bspec("verify", [0] * _solo_b, solo_pads, end=end,
+                                             call_shape=batch_shape(_solo_b), per=_solo_per)
                         w = graphs.index_width(w * world + 1)
-                    trace(rank, f"batch graphs: one-row K=3 rounds primed at {len(seen)} cp widths "
-                                f"up to {upto_b} tokens")
+                    trace(rank, f"batch graphs: one-row K={_solo_k} rounds (bucket {_solo_b}) primed "
+                                f"at {len(seen)} cp widths up to {upto_b} tokens")
                 for r in range(args.rows):
                     graphs.bspec_set(r, P=0, c=0, n=0)
             torch.cuda.synchronize(device)

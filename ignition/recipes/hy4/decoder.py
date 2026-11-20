@@ -1120,6 +1120,25 @@ class Hy4Decoder:
             self.cache._forward_memo.pop(id(token_rows), None)
             self.cache._kept_identity.pop(id(token_rows), None)
         z = rms_norm(h[:bs * W], dfly.final_norm, eps).view(bs, W, -1)
+        if sample:
+            if noise_q is None:
+                raise ValueError("dfly_draft(sample=True) requires noise_q")
+            if noise_q.ndim == 3:
+                if tuple(noise_q.shape[:2]) != (bs, k):
+                    raise ValueError(
+                        f"dfly_draft noise_q shape {tuple(noise_q.shape)} does not match "
+                        f"(bs={bs}, k={k})")
+            elif noise_q.ndim == 2:
+                if bs != 1 or int(noise_q.shape[0]) != k:
+                    raise ValueError(
+                        f"dfly_draft 2-D noise_q shape {tuple(noise_q.shape)} requires "
+                        f"bs=1 and k={k}")
+            else:
+                raise ValueError(f"dfly_draft noise_q must be 2-D or 3-D, got {noise_q.ndim}-D")
+            if q_out is not None and (q_out.ndim != 3 or tuple(q_out.shape[:2]) != (bs, k)):
+                raise ValueError(
+                    f"dfly_draft q_out shape {tuple(q_out.shape)} does not match "
+                    f"(bs={bs}, k={k})")
         drafts = []
         prev = bonus
         for step in range(k):
