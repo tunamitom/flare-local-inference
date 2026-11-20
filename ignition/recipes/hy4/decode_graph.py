@@ -86,6 +86,8 @@ class DecodeGraphs:
         if self.device.type == "cuda":
             self._tail_host = self._tail_host.pin_memory()
         self._tail_start = torch.zeros((1,), dtype=torch.long, device=self.device)
+        self._spec_ring = []
+        self._spec_ring_at = 0
         self._batch_ring = []
         self._batch_ring_at = 0
         self.graphs = collections.OrderedDict()
@@ -379,8 +381,6 @@ class DecodeGraphs:
         state = getattr(self, "_spec", None)
         if state is None:
             state = self._spec = {}
-            self._spec_ring = []
-            self._spec_ring_at = 0
         entry = state.get(key)
         if entry is None:
             d = self.decoder
