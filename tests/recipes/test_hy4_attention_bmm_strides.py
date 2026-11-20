@@ -114,9 +114,19 @@ def _rope_identity(x, positions, *, rope_dim, theta, out=None):
     return x.clone()
 
 
+def _rope_identity_ref(x, positions, *, rope_dim, theta):
+    """The same stand-in for `absorb_pack_triton._rope_reference` — N3's fused
+    pack+RoPE path owns the rotation now, so its CPU rope gets the identity
+    too and every `_absorb_into` route keeps the unrotated contract."""
+    return x.clone()
+
+
 @pytest.fixture
 def rope_identity(monkeypatch):
     monkeypatch.setattr(fused_ops, "rope_interleaved", _rope_identity)
+    from ignition.recipes.hy4 import absorb_pack_triton
+
+    monkeypatch.setattr(absorb_pack_triton, "_rope_reference", _rope_identity_ref)
 
 
 @pytest.fixture

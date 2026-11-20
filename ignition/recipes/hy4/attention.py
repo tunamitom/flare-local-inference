@@ -455,6 +455,18 @@ class Hy4LayerAttention:
                           device=q_unroped.device)
         if q_unroped.is_cuda and rows > 1:
             absorbed = self._bmm_rhi(q_unroped[..., :self.qk_nope], wuk)
+            if q_unroped.is_contiguous():
+                # N3: ONE fused launch — the transpose-copy of `absorbed` and
+                # the interleaved RoPE of the rope block straight into `out`
+                # (bit-exact: the pack half is a pure move and the kernel's
+                # RoPE mirrors `fused_ops._rope_kernel`'s arithmetic).
+                from .absorb_pack_triton import absorb_pack_rope_fused
+
+                absorb_pack_rope_fused(q_unroped, absorbed, positions,
+                                       qk_nope=self.qk_nope, lora=lora,
+                                       rope_dim=self.qk_rope, theta=self.rope_theta,
+                                       out=out)
+                return out
             out[..., :lora].copy_(absorbed.transpose(0, 1))
         else:
             torch.bmm(q_unroped[..., :self.qk_nope].transpose(0, 1), wuk,
