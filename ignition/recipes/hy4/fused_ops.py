@@ -1563,23 +1563,30 @@ def _lse_final_merge_kernel(mine4_ptr, mine4_lse_ptr, base0, SLOT, SOFF, LOFF,
     tl.store(out_lse_ptr + row * HPR + h, lse)
 
 
-def quant_owner_blocks_int8(x, owners, q_all, s_all, *, rows, hpr, width):
+def quant_owner_blocks_int8(x, owners, q_all, s_all, *, rows, hpr, width,
+                            owner_bounds=None):
     """N4a: `quant_rows_int8` over only the LSE relay's forwarded owner blocks
     (`owners` int32 [K]: the head-block ranks whose quantized rows are put on
     the wire) into the same `q_all` / `s_all` layout the full quant fills —
     the emitted rows are bit-identical to `quant_rows_int8(head_major.view(...))`.
     `x` is `partials` `[rows, heads, width]` (read via strides: no
-    `head_major` permute staging)."""
+    `head_major` permute staging). Pass `owner_bounds=(lo, hi)` from host-known
+    owner indices to validate range without a device-to-host sync."""
     n = int(hpr) * int(rows)
+    k = int(owners.numel())
+    if k == 0:
+        return
     if x.stride(2) != 1:
         x = x.contiguous()
-    if int(owners.numel()) > 0:
+    if owner_bounds is not None:
+        lo, hi = int(owner_bounds[0]), int(owner_bounds[1])
+    else:
         lo, hi = int(owners.min()), int(owners.max())
-        if lo < 0 or (hi + 1) * int(hpr) > int(x.shape[1]):
-            raise ValueError(f"owner blocks [{lo}..{hi}] outside the "
-                             f"{int(x.shape[1]) // int(hpr)} head blocks of x")
+    if lo < 0 or (hi + 1) * int(hpr) > int(x.shape[1]):
+        raise ValueError(f"owner blocks [{lo}..{hi}] outside the "
+                         f"{int(x.shape[1]) // int(hpr)} head blocks of x")
     rows_per = max(1, 4096 // triton.next_power_of_2(width))
-    _lse_quant_owners_kernel[(triton.cdiv(n, rows_per), int(owners.numel()))](
+    _lse_quant_owners_kernel[(triton.cdiv(n, rows_per), k)](
         x, x.stride(0), x.stride(1), owners, q_all, s_all, n, int(rows), int(hpr), int(width),
         BLOCK_W=triton.next_power_of_2(width), ROWS_PER=rows_per, num_warps=4)
 

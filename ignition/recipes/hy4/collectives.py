@@ -926,6 +926,15 @@ class CeExchange:
             torch.tensor([order.index(src) for src in sorted(self.local)], dtype=torch.int32,
                          device=self.device),
             order.index(self.rank), len(order))
+        # N4a: pre-build the forwarded owner-block index and its host bounds
+        # once at init so `_lse_relay_int8_fused` performs zero H2D or D2H
+        # syncs inside `forward_overlapped`'s sync guard.
+        lse_owners = (sorted({*self.local,
+                              *(relay_partner(dest, self.world, len(self.local) + 1)
+                                for dest in self.local)})
+                      if self.partner is not None else [])
+        self._lse_owners = torch.tensor(lse_owners, dtype=torch.int32, device=self.device)
+        self._lse_owners_bounds = ((lse_owners[0], lse_owners[-1]) if lse_owners else None)
 
     # -- flags, counters, events ------------------------------------------
     def _flag_ptr(self, rank, op, source):
@@ -1159,13 +1168,11 @@ class CeExchange:
             raise RuntimeError("the LSE relay needs two islands")
         # only the forwarded owner blocks (dest's own + dest's partner heads)
         # are ever sent: own and partner blocks stay exact and are read from
-        # `p` / `lse_major` directly
-        owners = sorted({*self.local,
-                         *(relay_partner(dest, self.world, len(self.local) + 1)
-                           for dest in self.local)})
-        quant_owner_blocks_int8(p, torch.tensor(owners, dtype=torch.int32,
-                                                device=self.device),
-                                q_all, s_all, rows=rows, hpr=hpr, width=width)
+        # `p` / `lse_major` directly. `self._lse_owners` and its host bounds
+        # are pre-built in `__init__` (sync-free inside `forward_overlapped`).
+        quant_owner_blocks_int8(p, self._lse_owners, q_all, s_all,
+                                rows=rows, hpr=hpr, width=width,
+                                owner_bounds=self._lse_owners_bounds)
 
         def block(owner, offset):
             first = owner * n
