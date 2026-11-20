@@ -136,7 +136,7 @@ if triton is not None:
         xf = x.to(tl.float32)
         other = tl.where(even, -xp, xp)
         rot = libdevice.add_rn(libdevice.mul_rn(xf, cs), libdevice.mul_rn(other, sn))
-        y = tl.where(q_mask, rot.to(x.dtype.element_ty).to(out_ptr.dtype.element_ty),
+        y = tl.where(q_mask, rot.to(x.dtype).to(out_ptr.dtype.element_ty),
                      x.to(out_ptr.dtype.element_ty))
         # Masked store (b725daa7): BLOCK is the next power of two of L + ROPE.
         tl.store(out_ptr + idx * (L + ROPE) + c, tl.where(a_mask, a, y),
