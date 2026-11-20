@@ -812,6 +812,9 @@ def test_bspec_dfly2_batched_bodies_with_pad_and_ragged_extents(tmp_path):
         lg3, h3, _ = dec.forward(p3_short, request_rows=[3], return_hidden=True)
         dec.complete([3], p3_short)
         g = DecodeGraphs(dec, granule=4)
+        # Fresh DecodeGraphs must stage both spec and batch rings before any prior run_spec/run_batch.
+        assert g._spec_host(4).shape == (4,)
+        assert g._batch_host(8).shape == (8,)
         st = g.bspec_state()
         for r, lg, h, L in ((1, lg1, h1, 5), (3, lg3, h3, 6)):
             b = int(lg[0, -1].argmax())
