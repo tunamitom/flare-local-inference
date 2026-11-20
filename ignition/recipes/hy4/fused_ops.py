@@ -22,7 +22,7 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-__all__ = ["dequant_rows_int8", "dequant_slots_int8", "ihc_post_pre_split", "quant_rows_int8", "moe_route", "scores_only_select", "merge_head_major", "rms_norm", "rope_interleaved", "sigmoid_gate", "swiglu_f32", "store_owned_rows", "candidate_pick", "rms_norm_tree", "index_key_prep", "latent_prep", "expand_gate", "index_scores_fused"]
+__all__ = ["dequant_rows_int8", "dequant_slots_int8", "ihc_post_pre_split", "quant_rows_int8", "moe_route", "scores_only_select", "merge_head_major", "rms_norm", "rope_interleaved", "sigmoid_gate", "swiglu_f32", "store_owned_rows", "candidate_pick", "rms_norm_tree", "index_key_prep", "latent_prep", "expand_gate", "index_scores_fused", "quant_owner_blocks_int8", "lse_switch_merge_int8", "lse_final_merge_int8"]
 
 _INV_FREQ = {}
 
@@ -1331,3 +1331,245 @@ def dequant_slots_int8(slots, sources, soff, n, width, out, dests=None,
                                                               HEAD_MAJOR=bool(head_major),
                                                               BLOCK_W=triton.next_power_of_2(width),
                                                               ROWS=rows_per_block, num_warps=4)
+
+
+# --------------------------------------------------------------------------
+# N4a (NEON-LEVERS): the CeExchange LSE relay's fused dequant -> merge ->
+# requant.  Two kernels replace `_lse_relay_int8`'s staging chain (64 MiB
+# `head_major` permute, the 2 x 32 MiB `mine4_in` / `theirs4_in` dequant
+# staging, `out4.to(bf16)` + requant, the `torch.stack` pair merge and the
+# final `.permute(1, 0, 2).contiguous()` copy) with the same per-element
+# arithmetic the eager chain runs:
+# - INT8 dequant is `(q * s)` FP32 then one BF16 round, widened back to FP32
+#   for the merge (the eager chain's `dequant_*_int8` -> BF16 -> `.float()`);
+# - the merge is `_merge_kernel`'s expression ladder verbatim (0-start
+#   `add_rn` / `mul_rn` source accumulation in source order, `exp2` / `log2`
+#   from libdevice, `div_rn`, the `seen` / `-inf` guards);
+# - the requant is `_quant_rows_int8_kernel` verbatim (BF16 round of the FP32
+#   merge output, `amax / 127` scale, `rint`, clamp to +-127).
+# Bit-exactness against `_lse_relay_int8` on identical inputs is the hard
+# gate (gpu/n4a_lse_fuse_verify.py, wire bytes included); `HY4_LSE_FUSE=off`
+# is the untouched legacy chain.
+# --------------------------------------------------------------------------
+
+@triton.jit
+def _lse_merge4_fp32(lv0, lv1, lv2, lv3, pv0, pv1, pv2, pv3, BLOCK_W: tl.constexpr):
+    peak = tl.maximum(tl.maximum(lv0, lv1), tl.maximum(lv2, lv3))
+    finite = (peak == peak) & (peak != float("inf")) & (peak != float("-inf"))
+    peak = tl.where(finite, peak, 0.0)
+    total = 0.0
+    acc = tl.zeros((BLOCK_W,), dtype=tl.float32)
+    w = libdevice.exp2(libdevice.sub_rn(lv0, peak))
+    total = libdevice.add_rn(total, w)
+    acc = libdevice.add_rn(acc, libdevice.mul_rn(pv0, w))
+    w = libdevice.exp2(libdevice.sub_rn(lv1, peak))
+    total = libdevice.add_rn(total, w)
+    acc = libdevice.add_rn(acc, libdevice.mul_rn(pv1, w))
+    w = libdevice.exp2(libdevice.sub_rn(lv2, peak))
+    total = libdevice.add_rn(total, w)
+    acc = libdevice.add_rn(acc, libdevice.mul_rn(pv2, w))
+    w = libdevice.exp2(libdevice.sub_rn(lv3, peak))
+    total = libdevice.add_rn(total, w)
+    acc = libdevice.add_rn(acc, libdevice.mul_rn(pv3, w))
+    seen = total > 0
+    safe = tl.maximum(total, 1e-30)
+    out = tl.where(seen, libdevice.div_rn(acc, safe), 0.0)
+    lse = tl.where(seen, libdevice.add_rn(peak, libdevice.log2(safe)), float("-inf"))
+    return out, lse
+
+
+@triton.jit
+def _lse_merge2_fp32(lv0, lv1, pv0, pv1, BLOCK_W: tl.constexpr):
+    peak = tl.maximum(lv0, lv1)
+    finite = (peak == peak) & (peak != float("inf")) & (peak != float("-inf"))
+    peak = tl.where(finite, peak, 0.0)
+    total = 0.0
+    acc = tl.zeros((BLOCK_W,), dtype=tl.float32)
+    w = libdevice.exp2(libdevice.sub_rn(lv0, peak))
+    total = libdevice.add_rn(total, w)
+    acc = libdevice.add_rn(acc, libdevice.mul_rn(pv0, w))
+    w = libdevice.exp2(libdevice.sub_rn(lv1, peak))
+    total = libdevice.add_rn(total, w)
+    acc = libdevice.add_rn(acc, libdevice.mul_rn(pv1, w))
+    seen = total > 0
+    safe = tl.maximum(total, 1e-30)
+    out = tl.where(seen, libdevice.div_rn(acc, safe), 0.0)
+    lse = tl.where(seen, libdevice.add_rn(peak, libdevice.log2(safe)), float("-inf"))
+    return out, lse
+
+
+@triton.jit
+def _lse_quant_owners_kernel(x_ptr, x_row_stride, x_head_stride, owners_ptr,
+                             q_ptr, s_ptr, N, ROWS, HPR, W,
+                             BLOCK_W: tl.constexpr, ROWS_PER: tl.constexpr):
+    """`_quant_rows_int8_kernel`'s math over only the relay's forwarded owner
+    blocks (`owners` holds their head-block ranks); owner block row `r`
+    (`r = head_local * ROWS + row`) quantizes the same values the full
+    `head_major` quant would: `x[row, owner * HPR + head_local, :]`."""
+    k = tl.program_id(1)
+    owner = tl.load(owners_ptr + k).to(tl.int64)
+    r = tl.program_id(0) * ROWS_PER + tl.arange(0, ROWS_PER)
+    c = tl.arange(0, BLOCK_W)
+    mask = (r[:, None] < N) & (c[None, :] < W)
+    head_local = r // ROWS
+    row = r % ROWS
+    x_base = (x_ptr + row[:, None].to(tl.int64) * x_row_stride
+              + (owner * HPR + head_local)[:, None].to(tl.int64) * x_head_stride)
+    x = tl.load(x_base + c[None, :], mask=mask, other=0.0).to(tl.float32)
+    amax = tl.max(tl.abs(x), axis=1)
+    scale = tl.where(amax > 0, amax / 127.0, 1.0)
+    q = libdevice.rint(x / scale[:, None])
+    q = tl.minimum(tl.maximum(q, -127.0), 127.0)
+    out_row = owner * N + r
+    tl.store(q_ptr + out_row[:, None].to(tl.int64) * W + c[None, :], q.to(tl.int8), mask=mask)
+    tl.store(s_ptr + out_row, scale, mask=r < N)
+
+
+@triton.jit
+def _lse_switch_merge_kernel(p_ptr, p_row_stride, p_head_stride, lse_ptr,
+                             half0, half1, SLOT, SOFF, LOFF,
+                             mine4_ptr, mine4_lse_ptr, q4_ptr, s4_ptr, out4_lse_ptr,
+                             N, ROWS, W,
+                             HPR: tl.constexpr, ME: tl.constexpr, PARTNER: tl.constexpr,
+                             SWITCH: tl.constexpr, BLOCK_W: tl.constexpr):
+    """N4a phase 1: the in-switch 4-source merge for this rank's own heads
+    (FP32 `mine4`) and for the partner's heads, requantized straight to the
+    INT8 wire (`q4` / `s4`) with its merged LSE.  One program per (head, row);
+    sources load in `SWITCH` order (sorted(me, *local) = the eager chain's
+    `torch.stack` source order) — exact BF16 for `ME`, INT8 wire slots
+    otherwise."""
+    hr = tl.program_id(0)
+    h = hr // ROWS
+    row = hr % ROWS
+    c = tl.arange(0, BLOCK_W)
+    mask = c < W
+    block_off = (hr * W + c).to(tl.int64)
+
+    mine_l, mine_p, theirs_l, theirs_p = [], [], [], []
+    for s in range(4):
+        src = SWITCH[s]
+        if src == ME:
+            head = ME * HPR + h
+            lv = tl.load(lse_ptr + head * ROWS + row)
+            pv = tl.load(p_ptr + row * p_row_stride + head * p_head_stride + c,
+                         mask=mask, other=0.0).to(tl.float32)
+        else:
+            slot_q = (half0 + src * SLOT).to(tl.pointer_type(tl.int8))
+            slot_s = (half0 + src * SLOT + SOFF).to(tl.pointer_type(tl.float32))
+            slot_l = (half0 + src * SLOT + LOFF).to(tl.pointer_type(tl.float32))
+            lv = tl.load(slot_l + hr)
+            qv = tl.load(slot_q + hr * W + c, mask=mask, other=0).to(tl.float32)
+            sc = tl.load(slot_s + hr)
+            pv = tl.cast(qv * sc, tl.bfloat16).to(tl.float32)
+        mine_l.append(lv)
+        mine_p.append(pv)
+        if src == ME:
+            head = PARTNER * HPR + h
+            lv = tl.load(lse_ptr + head * ROWS + row)
+            pv = tl.load(p_ptr + row * p_row_stride + head * p_head_stride + c,
+                         mask=mask, other=0.0).to(tl.float32)
+        else:
+            slot_q = (half1 + src * SLOT).to(tl.pointer_type(tl.int8))
+            slot_s = (half1 + src * SLOT + SOFF).to(tl.pointer_type(tl.float32))
+            slot_l = (half1 + src * SLOT + LOFF).to(tl.pointer_type(tl.float32))
+            lv = tl.load(slot_l + hr)
+            qv = tl.load(slot_q + hr * W + c, mask=mask, other=0).to(tl.float32)
+            sc = tl.load(slot_s + hr)
+            pv = tl.cast(qv * sc, tl.bfloat16).to(tl.float32)
+        theirs_l.append(lv)
+        theirs_p.append(pv)
+
+    mine_out, mine_lse = _lse_merge4_fp32(mine_l[0], mine_l[1], mine_l[2], mine_l[3],
+                                         mine_p[0], mine_p[1], mine_p[2], mine_p[3],
+                                         BLOCK_W)
+    tl.store(mine4_ptr + block_off, mine_out, mask=mask)
+    tl.store(mine4_lse_ptr + hr, mine_lse)
+    theirs_out, theirs_lse = _lse_merge4_fp32(theirs_l[0], theirs_l[1], theirs_l[2],
+                                              theirs_l[3], theirs_p[0], theirs_p[1],
+                                              theirs_p[2], theirs_p[3], BLOCK_W)
+    tl.store(out4_lse_ptr + hr, theirs_lse)
+    # the eager chain's `quant_rows_int8(out4.to(torch.bfloat16)...)` math
+    x = tl.cast(theirs_out, tl.bfloat16).to(tl.float32)
+    amax = tl.max(tl.abs(x), axis=0)
+    scale = tl.where(amax > 0, amax / 127.0, 1.0)
+    q = libdevice.rint(x / scale)
+    q = tl.minimum(tl.maximum(q, -127.0), 127.0)
+    tl.store(q4_ptr + block_off, q.to(tl.int8), mask=mask)
+    tl.store(s4_ptr + hr, scale)
+
+
+@triton.jit
+def _lse_final_merge_kernel(mine4_ptr, mine4_lse_ptr, base0, SLOT, SOFF, LOFF,
+                            out_ptr, out_lse_ptr, N, ROWS, W,
+                            HPR: tl.constexpr, PARTNER: tl.constexpr, BLOCK_W: tl.constexpr):
+    """N4a phase 2: the 2-source pair merge (this switch's FP32 result + the
+    partner's INT8 wire payload) straight to the final row-major
+    `[rows, hpr, width]` BF16 + `[rows, hpr]` FP32 LSE (the eager chain's
+    `dequant_rows_int8` -> `torch.stack` -> merge -> `.to(bf16).permute(...)`)."""
+    hr = tl.program_id(0)
+    h = hr // ROWS
+    row = hr % ROWS
+    c = tl.arange(0, BLOCK_W)
+    mask = c < W
+    l0 = tl.load(mine4_lse_ptr + hr)
+    p0 = tl.load(mine4_ptr + hr * W + c, mask=mask, other=0.0)
+    slot_q = (base0 + PARTNER * SLOT).to(tl.pointer_type(tl.int8))
+    slot_s = (base0 + PARTNER * SLOT + SOFF).to(tl.pointer_type(tl.float32))
+    slot_l = (base0 + PARTNER * SLOT + LOFF).to(tl.pointer_type(tl.float32))
+    l1 = tl.load(slot_l + hr)
+    qv = tl.load(slot_q + hr * W + c, mask=mask, other=0).to(tl.float32)
+    sc = tl.load(slot_s + hr)
+    p1 = tl.cast(qv * sc, tl.bfloat16).to(tl.float32)
+    out, lse = _lse_merge2_fp32(l0, l1, p0, p1, BLOCK_W)
+    tl.store(out_ptr + (row * HPR + h).to(tl.int64) * W + c,
+             tl.cast(out, tl.bfloat16), mask=mask)
+    tl.store(out_lse_ptr + row * HPR + h, lse)
+
+
+def quant_owner_blocks_int8(x, owners, q_all, s_all, *, rows, hpr, width):
+    """N4a: `quant_rows_int8` over only the LSE relay's forwarded owner blocks
+    (`owners` int32 [K]: the head-block ranks whose quantized rows are put on
+    the wire) into the same `q_all` / `s_all` layout the full quant fills —
+    the emitted rows are bit-identical to `quant_rows_int8(head_major.view(...))`.
+    `x` is `partials` `[rows, heads, width]` (read via strides: no
+    `head_major` permute staging)."""
+    n = int(hpr) * int(rows)
+    if x.stride(2) != 1:
+        x = x.contiguous()
+    rows_per = max(1, 4096 // triton.next_power_of_2(width))
+    _lse_quant_owners_kernel[(triton.cdiv(n, rows_per), int(owners.numel()))](
+        x, x.stride(0), x.stride(1), owners, q_all, s_all, n, int(rows), int(hpr), int(width),
+        BLOCK_W=triton.next_power_of_2(width), ROWS_PER=rows_per, num_warps=4)
+
+
+def lse_switch_merge_int8(partials, lse_major, half0, half1, *, rows, hpr, width,
+                          soff, lse_part, slot_stride, switch_ranks, me, partner,
+                          mine4, mine4_lse, q4, s4, out4_lse):
+    """N4a fused phase 1 (`_lse_relay_int8`'s step 2 + `out4.to(bf16)` +
+    requant in one launch).  `half0` / `half1` are the int8 wire-slot views
+    `[world, lse_slot]` of the two relay halves; `switch_ranks` is the eager
+    chain's `sorted((me, *local))` source order (its `torch.stack` axis)."""
+    n = int(hpr) * int(rows)
+    if partials.stride(2) != 1:
+        partials = partials.contiguous()
+    block = triton.next_power_of_2(width)
+    _lse_switch_merge_kernel[(n,)](
+        partials, partials.stride(0), partials.stride(1), lse_major,
+        half0, half1, int(slot_stride), int(soff), int(lse_part),
+        mine4, mine4_lse, q4, s4, out4_lse,
+        n, int(rows), int(width),
+        HPR=int(hpr), ME=int(me), PARTNER=int(partner),
+        SWITCH=tuple(int(v) for v in switch_ranks), BLOCK_W=block)
+
+
+def lse_final_merge_int8(mine4, mine4_lse, base0, *, rows, hpr, width,
+                         soff, lse_part, slot_stride, partner, out, out_lse):
+    """N4a fused phase 2: `_lse_relay_int8`'s `dequant_rows_int8` +
+    `torch.stack` + `_merge_head_major` + `.to(bf16).permute(1, 0, 2)` in one
+    launch, writing the final row-major outputs directly."""
+    n = int(hpr) * int(rows)
+    block = triton.next_power_of_2(width)
+    _lse_final_merge_kernel[(n,)](
+        mine4, mine4_lse, base0, int(slot_stride), int(soff), int(lse_part),
+        out, out_lse, n, int(rows), int(width),
+        HPR=int(hpr), PARTNER=int(partner), BLOCK_W=block)

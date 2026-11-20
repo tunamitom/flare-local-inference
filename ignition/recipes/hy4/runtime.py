@@ -131,6 +131,10 @@ ALLOWED = {
     "index_fuse": ("off", "on"),
     # replicated short-context KV: the bypass attends local heads over all keys
     "short_kv": ("off", "on"),
+    # N4a (NEON-LEVERS, bit-exact): the INT8 LSE relay's fused
+    # dequant-merge-requant (fused_ops.lse_switch_merge_int8 /
+    # lse_final_merge_int8) instead of `_lse_relay_int8`'s staging chain
+    "lse_fuse": ("off", "on"),
 }
 DEFAULTS = {"index_scores": "fp32",
             "ihc": os.environ.get("HY4_IHC") or "default",
@@ -172,7 +176,8 @@ DEFAULTS = {"index_scores": "fp32",
             "diet3": os.environ.get("HY4_DIET3") or "off",
             "expand_gate": os.environ.get("HY4_EXPAND_GATE") or "off",
             "index_fuse": os.environ.get("HY4_INDEX_FUSE") or "off",
-            "short_kv": os.environ.get("HY4_SHORT_KV") or "off"}
+            "short_kv": os.environ.get("HY4_SHORT_KV") or "off",
+            "lse_fuse": os.environ.get("HY4_LSE_FUSE") or "off"}
 for _key, _value in DEFAULTS.items():
     if _value not in ALLOWED[_key]:
         raise ValueError(f"runtime default {_key}={_value!r} must be one of {ALLOWED[_key]}")

@@ -803,6 +803,18 @@ def relay_partner(rank, world_size, island_size):
     return (rank + island_size) % world_size
 
 
+def lse_relay_block(offset, *, q_base, s_base, lse_base, n, width, soff,
+                    lse_part, lse_bytes):
+    """The LSE relay's three CE copies for one (owner block, wire offset) —
+    `_lse_relay_int8`'s `block()` closure as a pure function (N4a's fused flow
+    emits byte-identical descriptors; the CPU tests pin these tuples against
+    the legacy construction). `q_base` / `s_base` are the owner block's first
+    rows in `q_all` / `s_all`, `lse_base` the owner's `[hpr, rows]` FP32 LSE."""
+    return ((offset, q_base, n * width),
+            (offset + soff, s_base, n * 4),
+            (offset + lse_part, lse_base, lse_bytes))
+
+
 class CeExchange:
     """consult18 stage B1/B2: the prefill head gather and LSE reduce-scatter on
     copy-engine peer copies instead of SM copy kernels.
@@ -1118,10 +1130,101 @@ class CeExchange:
         self._drain()
         return result
 
+    def _lse_relay_int8_fused(self, partials, lses):
+        """N4a (NEON-LEVERS): `_lse_relay_int8` with its dequant -> merge ->
+        requant staging fused into `fused_ops.lse_switch_merge_int8` /
+        `lse_final_merge_int8` (plus the owner-block-only quant).  The wire
+        protocol, slot layout and bank rotation are byte-identical to
+        `_lse_relay_int8`'s; the arithmetic is the same per-element chain
+        (bit-exact vs `_lse_relay_int8` — `gpu/n4a_lse_fuse_verify.py` is the
+        hard gate).  Per call this removes the `head_major` permute staging,
+        `mine4_in` / `theirs4_in` (2 x 32 MiB), `out4.to(bf16)`, the
+        `torch.stack` pair staging and the final permute copies, and the 25%
+        of quant rows whose blocks are never sent (own + partner heads), and
+        leaves 3 SM launches where the chain runs ~15."""
+        from .fused_ops import (lse_final_merge_int8, lse_switch_merge_int8,
+                                quant_owner_blocks_int8)
+
+        rows, heads, width = (int(v) for v in partials.shape)
+        hpr, me = self.hpr, self.rank
+        n = hpr * rows
+        soff = self._align(n * width)
+        lse_bytes = n * 4
+        p = partials if partials.stride(2) == 1 else partials.contiguous()
+        lse_major = lses.float().t().contiguous()
+        q_all = torch.empty((heads * rows, width), dtype=torch.int8, device=self.device)
+        s_all = torch.empty((heads * rows,), dtype=torch.float32, device=self.device)
+        partner = self.partner
+        if partner is None:
+            raise RuntimeError("the LSE relay needs two islands")
+        # only the forwarded owner blocks (dest's own + dest's partner heads)
+        # are ever sent: own and partner blocks stay exact and are read from
+        # `p` / `lse_major` directly
+        owners = sorted({*self.local,
+                         *(relay_partner(dest, self.world, len(self.local) + 1)
+                           for dest in self.local)})
+        quant_owner_blocks_int8(p, torch.tensor(owners, dtype=torch.int32,
+                                                device=self.device),
+                                q_all, s_all, rows=rows, hpr=hpr, width=width)
+
+        def block(owner, offset):
+            first = owner * n
+            return lse_relay_block(
+                offset, q_base=q_all[first].data_ptr(),
+                s_base=s_all[first:].data_ptr(),
+                lse_base=lse_major[owner * hpr].data_ptr(),
+                n=n, width=width, soff=soff, lse_part=self.lse_part,
+                lse_bytes=lse_bytes)
+
+        bank = self._bank("lse")
+        self._start()
+        for dest in self.local:
+            other = relay_partner(dest, self.world, len(self.local) + 1)
+            copies = (*block(dest, self._lse_offset(bank, 0, me)),
+                      *block(other, self._lse_offset(bank, 1, me)))
+            self._send_block(self._local_stream, dest, copies, (me,), "lse", ("lse1", dest))
+        first0 = self.lse_base + (bank * 2 + 0) * self.world * self.lse_slot
+        first1 = self.lse_base + (bank * 2 + 1) * self.world * self.lse_slot
+        half0 = self._memory[first0:first0 + self.world * self.lse_slot].view(torch.int8)
+        half1 = self._memory[first1:first1 + self.world * self.lse_slot].view(torch.int8)
+        self._await_all("lse", self.local)
+        mine4 = torch.empty((hpr, rows, width), dtype=torch.float32, device=self.device)
+        mine4_lse = torch.empty((hpr, rows), dtype=torch.float32, device=self.device)
+        q4 = torch.empty((n, width), dtype=torch.int8, device=self.device)
+        s4 = torch.empty((n,), dtype=torch.float32, device=self.device)
+        out4_lse = torch.empty((hpr, rows), dtype=torch.float32, device=self.device)
+        lse_switch_merge_int8(p, lse_major, half0, half1,
+                              rows=rows, hpr=hpr, width=width, soff=soff,
+                              lse_part=self.lse_part, slot_stride=self.lse_slot,
+                              switch_ranks=tuple(sorted((me, *self.local))),
+                              me=me, partner=partner, mine4=mine4, mine4_lse=mine4_lse,
+                              q4=q4, s4=s4, out4_lse=out4_lse)
+        # Phase 2, across the link: the merged block for the partner's heads, INT8.
+        main = torch.cuda.current_stream()
+        merged = self._event("lse-merged")
+        merged.record(main)
+        self._cross_stream.wait_event(merged)
+        base = self._lse_offset(bank, 0, me)
+        self._send_block(self._cross_stream, partner,
+                         ((base, q4.data_ptr(), n * width), (base + soff, s4.data_ptr(), n * 4),
+                          (base + self.lse_part, out4_lse.data_ptr(), lse_bytes)),
+                         (me,), "lse", ("lse2", partner))
+        self._await("lse", partner)
+        out = torch.empty((rows, hpr, width), dtype=partials.dtype, device=self.device)
+        out_lse = torch.empty((rows, hpr), dtype=torch.float32, device=self.device)
+        lse_final_merge_int8(mine4, mine4_lse, half0,
+                             rows=rows, hpr=hpr, width=width, soff=soff,
+                             lse_part=self.lse_part, slot_stride=self.lse_slot,
+                             partner=partner, out=out, out_lse=out_lse)
+        self._drain()
+        return out, out_lse
+
     def lse_reduce_scatter(self, partials, lses, *, relay=False):
         """`[rows, heads, width]` partials + `[rows, heads]` base-2 LSE over
         ALL heads -> this rank's merged head shard `(out, lse)`."""
         if relay and self._wire_int8():
+            if self._lse_fuse():
+                return self._lse_relay_int8_fused(partials, lses)
             return self._lse_relay_int8(partials, lses)
         rows, heads, width = (int(v) for v in partials.shape)
         head_major = partials.permute(1, 0, 2)
@@ -1258,6 +1361,14 @@ class CeExchange:
         from .runtime import SWITCHES
 
         return SWITCHES.get("wire") == "int8"
+
+    @staticmethod
+    def _lse_fuse():
+        """N4a: the fused dequant-merge-requant LSE relay (bit-exact vs
+        `_lse_relay_int8`; `HY4_LSE_FUSE=off` is the untouched legacy chain)."""
+        from .runtime import SWITCHES
+
+        return SWITCHES.get("lse_fuse") == "on"
 
     @staticmethod
     def _align(n):
