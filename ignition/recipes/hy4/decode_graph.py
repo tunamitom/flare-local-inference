@@ -63,7 +63,7 @@ class DecodeGraphs:
     # graphs a new key runs eagerly (uncaptured) instead of evicting.
     KEEP = 256
 
-    def __init__(self, decoder, *, granule=None, keep=None):
+    def __init__(self, decoder, *, granule=None, keep=None, bspec_kmax=None):
         self.decoder = decoder
         self.device = decoder.device
         self.granule = int(granule or self.GRANULE)
@@ -72,6 +72,15 @@ class DecodeGraphs:
         self.rank = int(getattr(decoder.collectives, "rank", 0))
         self.topk = int(decoder.config.text["index_topk"])
         self.cache = decoder.cache
+        dfly_block = (int(getattr(decoder.config, "dfly_block_size", 0) or 0)
+                      if getattr(decoder, "has_dfly", False) else 0)
+        self.spec_max = max(self.SPEC_MAX, dfly_block)
+        if bspec_kmax is not None:
+            self.bspec_kmax = max(1, int(bspec_kmax))
+        elif dfly_block > 1:
+            self.bspec_kmax = max(self.BSPEC_KMAX, dfly_block - 1)
+        else:
+            self.bspec_kmax = self.BSPEC_KMAX
         # c8 L6: per-row extents — the widest a row may be bounds the width
         # buckets. CSF bound-fix: `local_capacity` / `capacity` are LIVE
         # properties below, bound to the rows' real extents (`cap_of(row)`),
@@ -86,6 +95,8 @@ class DecodeGraphs:
         if self.device.type == "cuda":
             self._tail_host = self._tail_host.pin_memory()
         self._tail_start = torch.zeros((1,), dtype=torch.long, device=self.device)
+        self._spec_ring = []
+        self._spec_ring_at = 0
         self._batch_ring = []
         self._batch_ring_at = 0
         self.graphs = collections.OrderedDict()
@@ -349,7 +360,7 @@ class DecodeGraphs:
         bucket; elsewhere the indexer width bucket."""
         per = self.spec_per(count)
         short = start + count <= self.topk
-        return (self.device.type == "cuda" and 1 <= count <= self.SPEC_MAX
+        return (self.device.type == "cuda" and 1 <= count <= self.spec_max
                 and (not short or self._spec_bypass(count, call_shape))
                 and start >= 0 and 0 <= row < int(self.decoder.cache.rows)
                 and (start + self.world - 1) // self.world + per - 1 < self.cache.cap_of(row)
@@ -379,8 +390,6 @@ class DecodeGraphs:
         state = getattr(self, "_spec", None)
         if state is None:
             state = self._spec = {}
-            self._spec_ring = []
-            self._spec_ring_at = 0
         entry = state.get(key)
         if entry is None:
             d = self.decoder
@@ -452,7 +461,7 @@ class DecodeGraphs:
         before its one host sync, so a buffer is never rewritten while its
         asynchronous H2D copy may still be pending."""
         if self._spec_ring_at >= len(self._spec_ring):
-            buf = torch.zeros((1 + 3 * self.spec_per(self.SPEC_MAX),), dtype=torch.long)
+            buf = torch.zeros((1 + 3 * self.spec_per(self.spec_max),), dtype=torch.long)
             if self.device.type == "cuda":
                 buf = buf.pin_memory()
             self._spec_ring.append(buf)
@@ -721,11 +730,12 @@ class DecodeGraphs:
     # identical bytes.
     BATCH_BUCKETS = (1, 2, 4, 8, 12, 16, 32)
 
-    def batch_bucket(self, count):
-        for size in self.BATCH_BUCKETS:
+    def batch_bucket(self, count, *, allowed=None):
+        buckets = tuple(sorted(allowed)) if allowed else self.BATCH_BUCKETS
+        for size in buckets:
             if count <= size:
                 return size
-        raise ValueError(f"a batched step holds at most {self.BATCH_BUCKETS[-1]} rows")
+        raise ValueError(f"a batched step holds at most {buckets[-1]} rows")
 
     def accepts_batch(self, rows, starts):
         return (self.device.type == "cuda" and 1 <= len(rows) <= self.BATCH_BUCKETS[-1]
@@ -920,15 +930,17 @@ class DecodeGraphs:
     # the row's writes and scatter into a dummy state row.
     BSPEC_KMAX = 3
 
-    def bspec_state(self):
+    def bspec_state(self, *, min_k=None):
         st = getattr(self, "_bspec", None)
         if st is None:
+            if min_k is not None:
+                self.bspec_kmax = max(self.bspec_kmax, int(min_k))
             d = self.decoder
             rows = int(d.cache.rows)
             hidden = int(d.config.hidden)
             lo, hi = d.weights.sharding.vocabulary_range
             S = self.BATCH_BUCKETS[-1]
-            K = self.BSPEC_KMAX
+            K = self.bspec_kmax
             dev = self.device
             st = self._bspec = {
                 "pend_tok": torch.zeros((rows + 1, K + 1), dtype=torch.long, device=dev),
@@ -950,10 +962,14 @@ class DecodeGraphs:
                 "out_vflag": torch.zeros((), dtype=torch.bool, device=dev),
                 "args": {},
             }
+        elif min_k is not None and int(min_k) > int(st["drafts"].shape[1]):
+            raise ValueError(
+                f"bspec width k={int(min_k)} exceeds allocated bspec_kmax={int(st['drafts'].shape[1])}; "
+                "pass bspec_kmax to DecodeGraphs(...) or request the widest k before first bspec_state()")
         return st
 
     def _bspec_args(self, size, per):
-        st = self.bspec_state()
+        st = self.bspec_state(min_k=max(1, int(per) - 1))
         entry = st["args"].get((size, per))
         if entry is None:
             # kv rows | pad mask (host-staged; positions and slots are device-derived)
@@ -975,7 +991,8 @@ class DecodeGraphs:
         """Device positions / record slots of a round's entries from the round state:
         absorb c + min(j, n), chain P + step - 1, verify P + j; pad entries one past
         the row's writes (absorb c + n + 1, chain P + K + 1, verify P + per)."""
-        st, entry = self.bspec_state(), self._bspec_args(size, per)
+        min_k = step if kind == "chain" else max(1, int(per) - 1)
+        st, entry = self.bspec_state(min_k=min_k), self._bspec_args(size, per)
         args = entry["args"]
         rows, pad = args[0:size], args[size:2 * size] != 0
         pick = entry["pick"]
@@ -984,7 +1001,8 @@ class DecodeGraphs:
             positions = torch.where(pad, c + n + 1, c + torch.minimum(pick, n))
         elif kind == "chain":
             P = st["P"][rows]
-            positions = torch.where(pad, P + self.BSPEC_KMAX + 1, P + (step - 1))
+            kmax = int(st["drafts"].shape[1])
+            positions = torch.where(pad, P + kmax + 1, P + (step - 1))
         else:
             P = st["P"][rows]
             positions = torch.where(pad, P + per, P + pick)
@@ -1026,11 +1044,14 @@ class DecodeGraphs:
         """Batched DFly2 block draft: produces all `K = per - 1` drafts and `q` scores in one pass."""
         from .lanes import use_lane
 
+        if int(per) < 2 or int(size) < int(per):
+            raise ValueError(
+                f"batched DFly2 draft requires size >= per >= 2, got size={size}, per={per}")
         d = self.decoder
-        st, entry = self.bspec_state(), self._bspec_args(size, per)
+        K = int(per) - 1
+        st, entry = self.bspec_state(min_k=K), self._bspec_args(size, per)
         # DFly2 writes into target KV at verify positions `P .. P + K` (pad rows clamped by row_cap_dev).
         rows, _, positions, slot, safe = self._bspec_geometry("verify", size, per)
-        K = per - 1
         slots = size // per
         live = slots * per
         rem = size - live
@@ -1065,7 +1086,7 @@ class DecodeGraphs:
         from .lanes import use_lane
 
         d = self.decoder
-        st, entry = self.bspec_state(), self._bspec_args(size, per)
+        st, entry = self.bspec_state(min_k=max(1, int(per) - 1)), self._bspec_args(size, per)
         rows, _, positions, slot, safe = self._bspec_geometry("draft", size, per)
         idx = torch.minimum(entry["pick"], st["n"][rows])
         tokens = st["pend_tok"][rows, idx].reshape(size, 1)
@@ -1090,7 +1111,7 @@ class DecodeGraphs:
         from .lanes import use_lane
 
         d = self.decoder
-        st, entry = self.bspec_state(), self._bspec_args(size, 1)
+        st, entry = self.bspec_state(min_k=max(1, int(step) + 1)), self._bspec_args(size, 1)
         rows, _, positions, slot, safe = self._bspec_geometry("chain", size, 1, step)
         tokens = st["drafts"][:size, step - 1].reshape(size, 1)
         hidden_in = st["mtp_hid"][:size].clone()
@@ -1112,9 +1133,9 @@ class DecodeGraphs:
         from .spec_sample import verify_sample_batched
 
         d = self.decoder
-        st, entry = self.bspec_state(), self._bspec_args(size, per)
+        K = int(per) - 1
+        st, entry = self.bspec_state(min_k=max(1, K)), self._bspec_args(size, per)
         rows, pad, positions, slot, safe = self._bspec_geometry("verify", size, per)
-        K = per - 1
         slots = size // per
         S = int(st["drafts"].shape[0])
         pick = entry["pick"]
@@ -1192,8 +1213,14 @@ class DecodeGraphs:
         regime's graph, and a later regime (or a wider cp bucket) serves an earlier
         context exactly."""
         size = len(rows)
-        if size not in self.BATCH_BUCKETS:
+        if (size not in self.BATCH_BUCKETS
+                and not (2 <= size <= self.BATCH_BUCKETS[-1] and size == int(call_shape.rows))):
             raise ValueError("a batched speculative forward runs in a bucket")
+        if kind != "chain" and (int(per) < 2 or size < int(per)):
+            raise ValueError(
+                f"batched speculative {kind!r} requires size >= per >= 2, got size={size}, per={per}")
+        min_k = max(1, int(step) + 1) if kind == "chain" else int(per) - 1
+        self.bspec_state(min_k=min_k)
         rw = self._bspec_regime(kind, end, call_shape)
         sub = step if kind == "chain" else per
         key = ("bspec", kind, size, sub, self.wkey(*rw), call_shape.name)

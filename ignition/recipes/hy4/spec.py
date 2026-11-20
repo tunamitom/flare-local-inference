@@ -29,8 +29,6 @@ ABSORB_WIDTHS = (4, 3, 2, 1)
 
 class SpeculativeGreedy:
     def __init__(self, decoder, *, k=3, row=0, decode_rows=False):
-        if not 1 <= int(k) <= 7:
-            raise ValueError("speculation depth k must be in 1..7 (verify T = k + 1 <= 8)")
         self.decoder = decoder
         self.k = int(k)
         self.row = int(row)
@@ -38,10 +36,13 @@ class SpeculativeGreedy:
         # (needs its plans bound at boot: verify_shape(T), T = 2 .. k + 1)
         self.decode_rows = bool(decode_rows)
         self.is_dfly = bool(getattr(decoder, "has_dfly", False))
-        if self.is_dfly and self.k >= int(decoder.config.dfly_block_size):
-            raise ValueError(
-                f"DFly2 speculation depth k={self.k} must be < dfly_block_size "
-                f"({decoder.config.dfly_block_size})")
+        max_k = int(decoder.config.dfly_block_size) - 1 if self.is_dfly else 7
+        if not 1 <= self.k <= max_k:
+            if self.is_dfly:
+                raise ValueError(
+                    f"DFly2 speculation depth k={self.k} must be in 1..{max_k} "
+                    f"(dfly_block_size={decoder.config.dfly_block_size})")
+            raise ValueError("speculation depth k must be in 1..7 (verify T = k + 1 <= 8)")
         self.rounds = self.accepted = self.verify_reruns = self.draft_flags = 0
         self.filter_fallbacks = 0
         self._generator = None
