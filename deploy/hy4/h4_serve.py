@@ -2688,6 +2688,13 @@ def main():
     ap.add_argument("--gather-transport", choices=("kernel", "ce", "ce-relay"), default="kernel",
                     help="consult18 B1: ce runs the prefill head all-gather on copy-engine "
                          "peer copies (byte-exact); kernel keeps the b12x DCP kernel")
+    ap.add_argument("--scores-relay", type=int, choices=(0, 1), default=1,
+                    help="N1: the CE scores exchange runs the two-hop island relay (each "
+                         "rank's offer crosses the B<->D link once via its partner, which "
+                         "forwards it in-switch; cross-RC score bytes drop 4x; byte-identical "
+                         "received scores and top-k). 0 = the old direct broadcast to all 7 "
+                         "peers (rollback; --selection-exchange candidates remains the full "
+                         "selection rollback)")
     ap.add_argument("--ce-rows", type=int, default=1024,
                     help="consult18 B1: narrowest row count the CE exchange serves")
     ap.add_argument("--overlap", type=int, choices=(0, 1), default=0,
@@ -2868,6 +2875,8 @@ def main():
             # consult18 B2: ce-relay = pairwise relay across the B<->D link.
             ce_lse_relay=args.lse_transport == "ce-relay",
             ce_gather_relay=args.gather_transport == "ce-relay",
+            # N1: the scores exchange's two-hop island relay.
+            ce_scores_relay=bool(args.scores_relay),
             # Step 5a (PERF-PLAN.md:380-383): the dead-A2A row caps (576->16
             # always; 256->512 CE-active/audit-off; 256->CHUNK audit-on).
             pool_row_caps=_caps["caps"])

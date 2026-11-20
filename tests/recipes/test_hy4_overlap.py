@@ -206,7 +206,7 @@ class _FakeScoresCe:
         self.score_offer, self.max_rows = unit, 64
         self.offers_by_rank, self.calls, self.unit = offers_by_rank, 0, unit
 
-    def exchange_scores(self, part):
+    def exchange_scores(self, part, *, relay=False):
         assert part.shape[1] == self.unit and part.is_contiguous()
         index = self.calls
         self.calls += 1
@@ -230,7 +230,7 @@ def test_ce_scores_pads_and_trims_bit_exact(width):
     torch.manual_seed(width)
     offers = [torch.randn(3, width).sort(dim=1, descending=True).values for _ in range(world)]
     t = C.PcieDcpTransport.__new__(C.PcieDcpTransport)
-    t.world_size, t.rank = world, 2
+    t.world_size, t.rank, t.ce_scores_relay = world, 2, False
     got = t._ce_scores(_FakeScoresCe(offers), offers[2])
     assert len(got) == world
     for mine, want in zip(got, offers):

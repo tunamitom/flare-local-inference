@@ -288,6 +288,7 @@ docker run -d --name "$NAME" --network host --init --cap-add SYS_PTRACE \
       --all-reduce-arm "${H4_AR_ARMS:-1:oneshot,2-16:rsag,32-512:twoshot,1024-:dma}" \
       --all-reduce-kernel-rows 512 \
       --lse-transport ce-relay --gather-transport ce-relay \
+      --scores-relay "${H4_SCORES_RELAY:-1}" \
       --selection-wire dcp \
       --partial-wire expanded \
       --overlap 1 --profile-phases 0 --chunk "${H4_CHUNK:-2048}" --dma-replay "${H4_DMA_REPLAY:-1}" \

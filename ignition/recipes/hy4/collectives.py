@@ -1202,10 +1202,19 @@ class CeExchange:
         rows, width = (int(v) for v in offers.shape)
         return offers.dtype == torch.float32 and rows <= self.max_rows and width == self.score_offer
 
-    def exchange_scores(self, offers):
+    def exchange_scores(self, offers, *, relay=False):
         """Every rank's `[rows, offer]` FP32 scores in rank order (byte copies).
         The returned views live in this lane's bank: consume them before the
-        lane's next-but-one scores call."""
+        lane's next-but-one scores call.
+
+        N1: `relay=True` runs the two-hop island relay, the exact pattern of
+        `all_gather_heads(relay=True)` (consult18 B2): each rank sends its
+        offer ONCE across the B<->D link (to its cross-island partner) plus
+        to its 3 in-switch peers, awaits the partner on `_local_stream`, then
+        forwards the partner's offer inside the switch. Cross-RC score bytes
+        drop 4x (16 MiB -> 4 MiB egress per rank per call) with zero extra
+        buffer slots (the same `world * score_slot` bank) and byte-identical
+        received scores — pure element movement either way."""
         rows, width = (int(v) for v in offers.shape)
         source = offers.contiguous()
         nbytes = rows * width * 4
@@ -1217,9 +1226,24 @@ class CeExchange:
 
         self._start()
         own = ((offset(me), source.data_ptr(), nbytes),)
-        for dest in (*self.cross, *self.local):
-            stream = self._cross_stream if dest in self.cross else self._local_stream
-            self._send_block(stream, dest, own, (me,), "scores", ("scores", dest))
+        if not relay:
+            for dest in (*self.cross, *self.local):
+                stream = self._cross_stream if dest in self.cross else self._local_stream
+                self._send_block(stream, dest, own, (me,), "scores", ("scores", dest))
+        else:
+            partner = self.partner
+            if partner is None:
+                raise RuntimeError("the scores relay needs two islands")
+            self._send_block(self._cross_stream, partner, own, (me,), "scores", ("s-x", partner))
+            for dest in self.local:
+                self._send_block(self._local_stream, dest, own, (me,), "scores", ("s-own", dest))
+            # Forward the partner's offer inside the switch once it has arrived.
+            with torch.cuda.stream(self._local_stream):
+                self._await("scores", partner, relay=True)
+            forward = ((offset(partner), self.ptrs[me] + offset(partner), nbytes),)
+            for dest in self.local:
+                self._send_block(self._local_stream, dest, forward, (partner,), "scores",
+                                 ("s-fwd", dest))
         slots = self._memory[offset(0):offset(0) + self.world * self.score_slot]
         received = slots.view(self.world, self.score_slot)[:, :nbytes] \
             .view(torch.float32).view(self.world, rows, width)
@@ -1411,7 +1435,7 @@ class PcieDcpTransport:
                  all_reduce=None, reduce_width=None, all_reduce_arms=None, score_offer=None,
                  dma=None, kernel_rows=None, ce=None, ce_lse_rows=None,
                  ce_gather_rows=None, ce_lse_relay=False, ce_gather_relay=False,
-                 lane_rings=(), lane_ces=()):
+                 ce_scores_relay=False, lane_rings=(), lane_ces=()):
         self.group = group
         self.device = torch.device(device)
         self.rank = rank
@@ -1434,6 +1458,8 @@ class PcieDcpTransport:
         self.ce_lse_rows = None if ce_lse_rows is None else int(ce_lse_rows)
         self.ce_gather_rows = None if ce_gather_rows is None else int(ce_gather_rows)
         self.ce_lse_relay, self.ce_gather_relay = bool(ce_lse_relay), bool(ce_gather_relay)
+        # N1: the scores exchange's two-hop island relay (its `relay=True`).
+        self.ce_scores_relay = bool(ce_scores_relay)
         # consult18 stage D: one copy-engine ring and one CE exchange per
         # extra lane (index i -> lane i + 1); every channel is single-stream,
         # so two in-flight halves never share one. Lane plans: (lane, rows).
@@ -1519,7 +1545,8 @@ class PcieDcpTransport:
                            score_offer=None, extra_value_widths=(), value_max_rows=None,
                            dma=False, kernel_rows=None, ce_lse_rows=None,
                            ce_gather_rows=None, ce_lse_width=None, ce_gather_width=None,
-                           ce_lse_relay=False, ce_gather_relay=False, lanes=1, lane_rows=None,
+                           ce_lse_relay=False, ce_gather_relay=False, ce_scores_relay=False,
+                           lanes=1, lane_rows=None,
                            pool_row_caps=None):
         """One channel pool per wire geometry (the query gather's absorbed and
         unabsorbed widths, and the 512-wide latent partials).
@@ -1646,7 +1673,8 @@ class PcieDcpTransport:
                    all_reduce_arms=all_reduce_arms, score_offer=score_offer,
                    dma=ring, kernel_rows=kernel_rows, ce=ce, ce_lse_rows=ce_lse_rows,
                    ce_gather_rows=ce_gather_rows, ce_lse_relay=ce_lse_relay,
-                   ce_gather_relay=ce_gather_relay, lane_rings=lane_rings, lane_ces=lane_ces)
+                   ce_gather_relay=ce_gather_relay, ce_scores_relay=ce_scores_relay,
+                   lane_rings=lane_rings, lane_ces=lane_ces)
 
     def bind(self, rank):
         if rank != self.rank:
@@ -2311,7 +2339,7 @@ class PcieDcpTransport:
         if lane():
             ce = self._lane_ce()
             if ce.accepts_scores(offers):
-                got = ce.exchange_scores(offers)
+                got = ce.exchange_scores(offers, relay=self.ce_scores_relay)
                 if self.lane_audit:
                     self._lane_audit_scores(offers, got)
                 return got
@@ -2450,12 +2478,13 @@ class PcieDcpTransport:
             padded = offers.new_full((rows, units * unit), float("-inf"))
             padded[:, :width] = offers
         if units == 1:
-            got = ce.exchange_scores(padded)
+            got = ce.exchange_scores(padded, relay=self.ce_scores_relay)
             return tuple(part[:, :width] for part in got)
         # A bank is rewritten two calls later: copy each unit out first.
         pieces = [[] for _ in range(self.world_size)]
         for index in range(units):
-            got = ce.exchange_scores(padded[:, index * unit:(index + 1) * unit].contiguous())
+            got = ce.exchange_scores(padded[:, index * unit:(index + 1) * unit].contiguous(),
+                                     relay=self.ce_scores_relay)
             for origin, part in enumerate(got):
                 pieces[origin].append(part.clone())
         return tuple(torch.cat(parts, dim=1)[:, :width] for parts in pieces)
