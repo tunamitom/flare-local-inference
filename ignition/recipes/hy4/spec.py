@@ -37,6 +37,11 @@ class SpeculativeGreedy:
         # consult18 P4: T > 1 forwards as the decode-family verification shape
         # (needs its plans bound at boot: verify_shape(T), T = 2 .. k + 1)
         self.decode_rows = bool(decode_rows)
+        self.is_dfly = bool(getattr(decoder, "has_dfly", False))
+        if self.is_dfly and self.k >= int(decoder.config.dfly_block_size):
+            raise ValueError(
+                f"DFly2 speculation depth k={self.k} must be < dfly_block_size "
+                f"({decoder.config.dfly_block_size})")
         self.rounds = self.accepted = self.verify_reruns = self.draft_flags = 0
         self.filter_fallbacks = 0
         self._generator = None
@@ -58,6 +63,8 @@ class SpeculativeGreedy:
         if g is None:
             return False
         k = self.k
+        if self.is_dfly:
+            return g.accepts_spec(k + 1, row=self.row, start=start, call_shape=self._shape(k + 1))
         return (g.accepts_spec(k + 1, row=self.row, start=start, call_shape=self._shape(k + 1))
                 and g.accepts_spec(1, row=self.row, start=cursor, call_shape=self._shape(1))
                 and g.accepts_spec(1, row=self.row, start=start + k - 1,
@@ -71,6 +78,10 @@ class SpeculativeGreedy:
 
             self._generator = torch.Generator(device=self.graphs.device)
             self._generator.manual_seed(int.from_bytes(os.urandom(8), "little") >> 1)
+        if kind == "dfly_draft":
+            entry = self.graphs.dfly_sample_state(count)
+            entry["noise"].uniform_(generator=self._generator)
+            return entry
         entry = self.graphs.spec_sample_state(kind, count)
         entry["noise"].uniform_(generator=self._generator)
         if kind == "verify":
@@ -129,29 +140,45 @@ class SpeculativeGreedy:
                 self.yield_state = {"P": P, "bonus": bonus, "c": c, "tokens": list(pend_tokens),
                                     "hidden": pend_hidden}
                 return None, (P, bonus)
-            greedy, h, fl, aentry = self._absorb(c, pend_tokens, pend_hidden, sample=sample,
-                                                 filtered=filtered)
-            flags = [fl.clone()]
-            vt, _ = g.spec_inputs("verify", k + 1)
-            vt[:, :1].fill_(int(bonus))
-            vt[0, 1:2].copy_(greedy[:1])
-            if sample:
-                ventry["q_in"][0:1].copy_(aentry["out_q"])
-            for j in range(1, k):
-                st, sh = g.spec_inputs("draft", 1)
-                st.copy_(greedy[:1].reshape(1, 1))
-                sh.copy_(h[-1:].reshape(1, 1, -1))
-                dentry = self._noise("draft", 1) if sample else None
-                greedy, h, fl = g.run_spec("draft", row=row, start=P + j - 1, count=1,
-                                           call_shape=self._shape(1), sample=sample, filtered=filtered)
-                flags.append(fl.clone())
-                vt[0, j + 1:j + 2].copy_(greedy[:1])
+            if self.is_dfly:
+                dbonus, dhid = g.dfly_inputs(k + 1)
+                dbonus.fill_(int(bonus))
+                dhid.copy_(pend_hidden[-1:].reshape(1, -1))
+                dentry = self._noise("dfly_draft", k + 1) if sample else None
+                drafts_t, fl = g.run_dfly_draft(
+                    row=row, start=P, count=k + 1, call_shape=self._shape(k + 1),
+                    sample=sample, filtered=filtered)
+                flags = [fl.clone()]
+                vt, _ = g.spec_inputs("verify", k + 1)
+                vt[:, :1].fill_(int(bonus))
+                vt[0, 1:k + 1].copy_(drafts_t)
                 if sample:
-                    ventry["q_in"][j:j + 1].copy_(dentry["out_q"])
+                    ventry["q_in"].copy_(dentry["out_q"])
+            else:
+                greedy, h, fl, aentry = self._absorb(c, pend_tokens, pend_hidden, sample=sample,
+                                                     filtered=filtered)
+                flags = [fl.clone()]
+                vt, _ = g.spec_inputs("verify", k + 1)
+                vt[:, :1].fill_(int(bonus))
+                vt[0, 1:2].copy_(greedy[:1])
+                if sample:
+                    ventry["q_in"][0:1].copy_(aentry["out_q"])
+                for j in range(1, k):
+                    st, sh = g.spec_inputs("draft", 1)
+                    st.copy_(greedy[:1].reshape(1, 1))
+                    sh.copy_(h[-1:].reshape(1, 1, -1))
+                    dentry = self._noise("draft", 1) if sample else None
+                    greedy, h, fl = g.run_spec("draft", row=row, start=P + j - 1, count=1,
+                                               call_shape=self._shape(1), sample=sample, filtered=filtered)
+                    flags.append(fl.clone())
+                    vt[0, j + 1:j + 2].copy_(greedy[:1])
+                    if sample:
+                        ventry["q_in"][j:j + 1].copy_(dentry["out_q"])
             if sample:
                 self._noise("verify", k + 1)
             vg, vh, vf = g.run_spec("verify", row=row, start=P, count=k + 1,
                                     call_shape=self._shape(k + 1), sample=sample, filtered=filtered)
+            n_flags = len(flags) + 1
             parts = [vt[0], vg, torch.stack(flags + [vf]).to(torch.long)]
             if sample:
                 parts.append(ventry["out_accept"].to(torch.long))
@@ -164,14 +191,21 @@ class SpeculativeGreedy:
                 host = host[:-(k + 1)]
                 usable = next((i for i, ok in enumerate(cov_host) if not ok), k + 1)
             drafts, target = host[1:k + 1], host[k + 1:2 * k + 2]
-            flag_host = host[2 * k + 2:3 * k + 3]
+            flag_end = 2 * k + 2 + n_flags
+            flag_host = host[2 * k + 2:flag_end]
             self.draft_flags += sum(flag_host[:-1])
             if flag_host[-1]:
                 # a narrow selection in the verify may be inexact: the exact
                 # eager forward rewrites the same KV slots and decides instead
                 self.verify_reruns += 1
-                logits, post, _ = d.forward(vt.clone(), call_shape=d.default_call_shape((1, k + 1)),
-                                            logits_rows="all", return_hidden=True)
+                if self.is_dfly:
+                    d.arm_dfly_capture(k + 1)
+                try:
+                    logits, post, _ = d.forward(vt.clone(), call_shape=d.default_call_shape((1, k + 1)),
+                                                logits_rows="all", return_hidden=True)
+                finally:
+                    if self.is_dfly:
+                        d.disarm_dfly_tap()
                 vh = post[0]
                 if sample:
                     from .spec_sample import verify_sample
@@ -189,12 +223,12 @@ class SpeculativeGreedy:
                         ventry["q_in"], vt[0, 1:], ventry["uniform"], ventry["noise"],
                         vocabulary_range=(lo_v, hi_v))
                     target = [int(x) for x in tokens_t.tolist()]
-                    host = host[:3 * k + 3] + [int(x) for x in accept_t.tolist()]
+                    host = host[:flag_end] + [int(x) for x in accept_t.tolist()]
                 else:
                     target = [int(x) for x in logits[0].float().argmax(dim=-1).tolist()]
             n = 0
             if sample:
-                accept = host[3 * k + 3:]
+                accept = host[flag_end:]
                 while n < k and n < usable and accept[n]:
                     n += 1
             else:
@@ -212,6 +246,8 @@ class SpeculativeGreedy:
                 if n == 0:
                     return None, (P, bonus)
                 d.append([row], n)
+                if self.is_dfly:
+                    d.dfly_commit_capture(row, n - 1)
                 for tok in drafts[:n]:
                     finish = emit(tok)
                     if finish is not None:
@@ -219,14 +255,17 @@ class SpeculativeGreedy:
                 return None, (P + n, drafts[n - 1])
             self.rounds += 1
             self.accepted += n
-            new_hidden = vh[:n + 1].clone()
+            new_hidden = vh[n:n + 1].clone() if self.is_dfly else vh[:n + 1].clone()
             d.append([row], n + 1)
+            if self.is_dfly:
+                d.dfly_commit_capture(row, n)
             for tok in drafts[:n] + [target[n]]:
                 finish = emit(tok)
                 if finish is not None:
                     return finish, None
             c, P, bonus = P, P + n + 1, target[n]
-            pend_tokens, pend_hidden = drafts[:n] + [bonus], new_hidden
+            pend_tokens = [bonus] if self.is_dfly else drafts[:n] + [bonus]
+            pend_hidden = new_hidden
         return None, (P, bonus)
 
     def prewarm(self, *, max_context, sample=True, filtered=True):
@@ -246,14 +285,23 @@ class SpeculativeGreedy:
             modes = (((False, False), (True, False)) + (((True, True),) if filtered else ())
                      if sample else ((False, False),))
             for mode, filt in modes:
-                for w in (x for x in ABSORB_WIDTHS if x <= k + 1):
-                    toks, hid = g.spec_inputs("draft", w)
-                    toks.zero_()
-                    hid.zero_()
+                if self.is_dfly:
+                    dbonus, dhid = g.dfly_inputs(k + 1)
+                    dbonus.zero_()
+                    dhid.zero_()
                     if mode:
-                        self._noise("draft", w)
-                    g.run_spec("draft", row=self.row, start=short - w, count=w,
-                               call_shape=self._shape(w), sample=mode, filtered=filt)
+                        self._noise("dfly_draft", k + 1)
+                    g.run_dfly_draft(row=self.row, start=short, count=k + 1,
+                                     call_shape=self._shape(k + 1), sample=mode, filtered=filt)
+                else:
+                    for w in (x for x in ABSORB_WIDTHS if x <= k + 1):
+                        toks, hid = g.spec_inputs("draft", w)
+                        toks.zero_()
+                        hid.zero_()
+                        if mode:
+                            self._noise("draft", w)
+                        g.run_spec("draft", row=self.row, start=short - w, count=w,
+                                   call_shape=self._shape(w), sample=mode, filtered=filt)
                 toks, _ = g.spec_inputs("verify", k + 1)
                 toks.zero_()
                 if mode:
@@ -269,26 +317,38 @@ class SpeculativeGreedy:
         # captures are unchanged.
         row_extent = self.graphs.cache.cap_of(self.row) * self.graphs.world \
             if self.graphs is not None else 0
+        dfly_cp_primed = False
         while start + k + 1 < min(int(max_context), row_extent):
             if not self.eligible(start, start - k - 1):
                 break
             modes = (((False, False), (True, False)) + (((True, True),) if filtered else ())
                      if sample else ((False, False),))
             for mode, filt in modes:
-                for w in (x for x in ABSORB_WIDTHS if x <= k + 1):
-                    toks, hid = g.spec_inputs("draft", w)
-                    toks.zero_()
-                    hid.zero_()
-                    if mode:
-                        self._noise("draft", w)
-                    g.run_spec("draft", row=self.row, start=start - w, count=w,
-                               call_shape=self._shape(w), sample=mode, filtered=filt)
+                if self.is_dfly:
+                    if not dfly_cp_primed:
+                        dbonus, dhid = g.dfly_inputs(k + 1)
+                        dbonus.zero_()
+                        dhid.zero_()
+                        if mode:
+                            self._noise("dfly_draft", k + 1)
+                        g.run_dfly_draft(row=self.row, start=start, count=k + 1,
+                                         call_shape=self._shape(k + 1), sample=mode, filtered=filt)
+                else:
+                    for w in (x for x in ABSORB_WIDTHS if x <= k + 1):
+                        toks, hid = g.spec_inputs("draft", w)
+                        toks.zero_()
+                        hid.zero_()
+                        if mode:
+                            self._noise("draft", w)
+                        g.run_spec("draft", row=self.row, start=start - w, count=w,
+                                   call_shape=self._shape(w), sample=mode, filtered=filt)
                 toks, _ = g.spec_inputs("verify", k + 1)
                 toks.zero_()
                 if mode:
                     self._noise("verify", k + 1)
                 g.run_spec("verify", row=self.row, start=start, count=k + 1,
                            call_shape=self._shape(k + 1), sample=mode, filtered=filt)
+            dfly_cp_primed = True
             start = g.index_width(start + k + 2) * g.world + k + 2
         torch.cuda.synchronize(g.device)
         return g.captures - before

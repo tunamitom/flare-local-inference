@@ -56,6 +56,10 @@ class Hy4Sharding:
         # Routed experts, the shared expert and the dense FFN shard intermediate width.
         self.shard.partition(self.config.text["moe_intermediate_size"], alignment=EXPERT_ALIGNMENT)
         self.shard.partition(self.config.text["intermediate_size"], alignment=EXPERT_ALIGNMENT)
+        if self.config.has_dfly:
+            self.shard.partition(self.config.dfly_intermediate_size, alignment=EXPERT_ALIGNMENT)
+            self.shard.partition(self.config.dfly_hidden_correction_intermediate_size,
+                                 alignment=EXPERT_ALIGNMENT)
         self.shard.partition(self.config.vocabulary)
 
     # --- head geometry -----------------------------------------------------
@@ -121,6 +125,17 @@ class Hy4Sharding:
         return self.shard.partition(self.config.text["intermediate_size"], alignment=EXPERT_ALIGNMENT)
 
     @property
+    def dfly_dense_range(self):
+        """(first, last) intermediate channels of each DFly2 dense FFN layer."""
+        return self.shard.partition(self.config.dfly_intermediate_size, alignment=EXPERT_ALIGNMENT)
+
+    @property
+    def dfly_correction_range(self):
+        """(first, last) intermediate channels of DFly2 hidden_correction."""
+        return self.shard.partition(self.config.dfly_hidden_correction_intermediate_size,
+                                    alignment=EXPERT_ALIGNMENT)
+
+    @property
     def vocabulary_range(self):
         """(first, last) vocabulary rows of the embedding and the head."""
         return self.shard.partition(self.config.vocabulary)
@@ -134,6 +149,9 @@ class Hy4Sharding:
             or name.endswith(".linear_gate.weight")
             or ".mlp.experts." in name or ".mlp.shared_experts." in name
             or name.endswith((".mlp.gate_proj.weight", ".mlp.up_proj.weight", ".mlp.down_proj.weight"))
+            or name.endswith((".hidden_correction.gate_proj.weight",
+                              ".hidden_correction.up_proj.weight",
+                              ".hidden_correction.down_proj.weight"))
             or name in ("lm_head.weight", "model.embed_tokens.weight")
         )
         return not shardable

@@ -42,13 +42,54 @@ def kept_fp32(name):
             or name == "lm_head.weight")
 
 
-def checkpoint_names(config, *, mtp=True, packed=False):
+def dfly_checkpoint_names(config, *, include_ignored=False):
+    """All `model.dfly_layers.*` tensor names for a DFly2-equipped checkpoint.
+
+    Active loaded tensors: `dfly_layers` dense attention + SwiGLU FFN layers
+    (14 tensors each: no indexer, no iHC) plus 10 wrapper tensors (`mtp_fusion`
+    4, `final_norm` 1, `hidden_correction` 5). With `include_ignored=True`,
+    adds the 2 unused `confidence_head.proj.{weight,bias}` tensors present in
+    the checkpoint shards so strict inventory checks account for every key.
+    """
+    if not config.has_dfly:
+        return frozenset()
+    names = {
+        "model.dfly_layers.final_norm.weight",
+        "model.dfly_layers.mtp_fusion.eh_proj.weight",
+        "model.dfly_layers.mtp_fusion.enorm.weight",
+        "model.dfly_layers.mtp_fusion.hnorm.weight",
+        "model.dfly_layers.mtp_fusion.gate",
+        "model.dfly_layers.hidden_correction.embed_norm.weight",
+        "model.dfly_layers.hidden_correction.hidden_norm.weight",
+        "model.dfly_layers.hidden_correction.gate_proj.weight",
+        "model.dfly_layers.hidden_correction.up_proj.weight",
+        "model.dfly_layers.hidden_correction.down_proj.weight",
+    }
+    if include_ignored:
+        names |= {
+            "model.dfly_layers.confidence_head.proj.weight",
+            "model.dfly_layers.confidence_head.proj.bias",
+        }
+    for index in range(config.dfly_layers):
+        prefix = f"model.dfly_layers.{index}"
+        names |= {f"{prefix}.input_layernorm.weight", f"{prefix}.post_attention_layernorm.weight"}
+        attention = f"{prefix}.self_attn"
+        names |= {f"{attention}.{name}" for name in (
+            "kv_a_layernorm.weight", "kv_a_proj_with_mqa.weight", "kv_b_proj.weight",
+            "learnable_sink_param", "linear_gate.weight", "o_proj.weight",
+            "q_a_layernorm.weight", "q_a_proj.weight", "q_b_proj.weight")}
+        names |= {f"{prefix}.mlp.{proj}.weight" for proj in ("down_proj", "gate_proj", "up_proj")}
+    return frozenset(names)
+
+
+def checkpoint_names(config, *, mtp=True, dfly=None, packed=False):
     """Every tensor name of the checkpoint, from `ref/idx.json`'s schema.
 
-    Verified against the real `model.safetensors.index.json` (2006 tensors) in
-    `tests/recipes/test_hy4_construction.py`. `packed` describes the W4A16_NVFP4
-    export instead: the two fused expert tensors of every MoE block become the
-    packed weight/scale/gain triples of `contract.packed_expert_tensor_names`.
+    Verified against the real `model.safetensors.index.json` (2006 preview
+    tensors; 2059 active text + DFly2 tensors on official `tencent/Hy4`).
+    `packed` describes the W4A16_NVFP4 export instead: the two fused expert
+    tensors of every MoE block become the packed weight/scale/gain triples of
+    `contract.packed_expert_tensor_names`.
     """
     names = {"lm_head.weight", "model.embed_tokens.weight", "model.norm.weight",
              "model.hc_head.hc_head_base", "model.hc_head.hc_head_fn", "model.hc_head.hc_head_scale"}
@@ -93,6 +134,9 @@ def checkpoint_names(config, *, mtp=True, packed=False):
             names |= moe_names(prefix)
             names |= {f"{prefix}.mlp.gate.{name}" for name in ("e_score_correction_bias", "weight")}
             names |= {f"{prefix}.mlp.shared_experts.{proj}.weight" for proj in ("down_proj", "gate_proj", "up_proj")}
+    include_dfly = mtp if dfly is None else dfly
+    if include_dfly and config.has_dfly:
+        names |= set(dfly_checkpoint_names(config, include_ignored=False))
     return frozenset(names)
 
 
@@ -279,10 +323,17 @@ class Hy4WeightLoader(DirectWeightLoader):
         if self._packed:
             verify_export_package(self.manifest.metadata_path, self.config)
         packed = self._packed
-        inventory = checkpoint_names(self.config, mtp=True, packed=packed)
-        expected = checkpoint_names(self.config, mtp=self.mtp, packed=packed)
+        inventory = set(checkpoint_names(self.config, mtp=True, dfly=True, packed=packed))
+        if self.config.has_dfly:
+            inventory |= set(dfly_checkpoint_names(self.config, include_ignored=True))
+        expected = checkpoint_names(self.config, mtp=self.mtp, dfly=self.mtp, packed=packed)
         available = set(self.manifest.tensors)
-        missing, unexpected = sorted(expected - available), sorted(available - inventory)
+        extra = available - inventory
+        if self.config.has_vision:
+            # Text-only serving preserves `vit.*` passthrough weights in the
+            # checkpoint package while leaving them unselected on load.
+            extra = {name for name in extra if not name.startswith("vit.")}
+        missing, unexpected = sorted(expected - available), sorted(extra)
         if missing or unexpected:
             raise ValueError(f"Hy4 checkpoint tensor names disagree with the recipe: "
                              f"missing={missing[:8]}, unexpected={unexpected[:8]}")

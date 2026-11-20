@@ -62,7 +62,7 @@ PACKED_SUFFIXES = ("weight", "weight_scale", "weight_scale_2")
 UNQUANTIZED_FAMILIES = (
     "embed_tokens", "lm_head", "hc_pre", "hc_head", "linear_gate", "learnable_sink_param",
     "mlp.gate", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj", "mlp.shared_experts",
-    "self_attn", "indexer", "layernorm", "norm",
+    "self_attn", "indexer", "layernorm", "norm", "dfly_layers",
 )
 
 

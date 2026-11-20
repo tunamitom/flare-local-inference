@@ -36,6 +36,95 @@ CSF_RESIDENT_SCALE_RATIOS = {"gate_up_proj": 0.557, "down_proj": 0.600}
 LATENT_RECORD_BYTES = 656
 INDEX_RECORD_BYTES = 132
 
+# Official `tencent/Hy4` (`hy_v4_vl`) DFly2 target layers and alignment.
+OFFICIAL_DFLY_LAYERS = (61, 65, 69, 73, 77)
+DFLY_TOPK_ALIGNMENT = 128
+
+
+def _normalize_hy4_config(config):
+    """Flatten nested `hy_v4_vl` `text_config` while checking duplicate fields.
+
+    Official `tencent/Hy4` wraps text geometry under `text_config` alongside
+    top-level text keys, `vision_config`, and `dfly_*` metadata. Flat preview
+    `hy_v4` dicts pass through untouched.
+    """
+    if config.get("model_type") != "hy_v4_vl" or not isinstance(config.get("text_config"), dict):
+        return dict(config)
+    text_cfg = config["text_config"]
+    merged = dict(text_cfg)
+    for key, value in config.items():
+        if key == "text_config":
+            continue
+        if key in text_cfg and key not in ("model_type", "architectures"):
+            if text_cfg[key] != value:
+                raise ValueError(
+                    f"Hy4 VL config disagrees between top-level and text_config on {key!r}: "
+                    f"{value!r} vs {text_cfg[key]!r}")
+        else:
+            merged[key] = value
+    merged["model_type"] = config["model_type"]
+    merged["architectures"] = config.get("architectures", text_cfg.get("architectures"))
+    merged["_text_model_type"] = text_cfg.get("model_type")
+    # Official `hy_v4_vl` omits `use_mla` / `use_dsa` (implicit from `layer_types`
+    # and `gated_mla`); preserve explicit False so validation rejects it.
+    merged.setdefault("use_mla", True)
+    merged.setdefault("use_dsa", True)
+    return merged
+
+
+def _validate_dfly_relations(config):
+    """Validate structural DFly2 config invariants when bundled."""
+    dfly_layers = config.get("dfly_num_hidden_layers")
+    if dfly_layers is None or dfly_layers == 0:
+        return
+    if type(dfly_layers) is not int or dfly_layers < 1:
+        raise ValueError(f"Hy4 DFly requires a positive integer dfly_num_hidden_layers, got {dfly_layers!r}")
+    for key, expected in (("dfly_enable_ihc", False), ("dfly_mlp_type", "dense"),
+                          ("dfly_attn_causal", True), ("dfly_mtp_fusion", "slot0"),
+                          ("dfly_enable_hidden_correction", True)):
+        value = config.get(key, expected)
+        if type(value) is not type(expected) or value != expected:
+            raise ValueError(f"Hy4 DFly requires {key}={expected!r}; checkpoint has {value!r}")
+    block_size = config.get("dfly_block_size")
+    if type(block_size) is not int or not 2 <= block_size <= 17:
+        raise ValueError(f"Hy4 DFly requires dfly_block_size in [2, 17], got {block_size!r}")
+    mask_id = config.get("dfly_mask_token_id")
+    if type(mask_id) is not int or not 0 <= mask_id < config["vocab_size"]:
+        raise ValueError(
+            f"Hy4 DFly requires dfly_mask_token_id in [0, {config['vocab_size']}), got {mask_id!r}")
+    target_topk = config.get("dfly_target_index_topk", config["index_topk"])
+    if type(target_topk) is not int or target_topk != config["index_topk"]:
+        raise ValueError(
+            f"Hy4 DFly requires dfly_target_index_topk == index_topk ({config['index_topk']}), "
+            f"got {target_topk!r}")
+    window = config.get("dfly_context_local_window")
+    if window is not None and (type(window) is not int or window < 0):
+        raise ValueError(f"Hy4 DFly requires dfly_context_local_window None or >= 0, got {window!r}")
+    layers = config["num_hidden_layers"]
+    indexer_types = config["indexer_types"]
+    for key in ("dfly_target_index_layer", "dfly_target_kv_layers"):
+        targets = config.get(key)
+        if key == "dfly_target_index_layer" and type(targets) is int:
+            targets = [targets] * dfly_layers
+        if (not isinstance(targets, (list, tuple)) or len(targets) != dfly_layers
+                or any(type(i) is not int or not 0 <= i < layers for i in targets)):
+            raise ValueError(
+                f"Hy4 DFly {key} must list {dfly_layers} valid target layer indices in [0, {layers}), "
+                f"got {targets!r}")
+        if key == "dfly_target_kv_layers" and len(set(targets)) != dfly_layers:
+            raise ValueError(f"Hy4 DFly dfly_target_kv_layers must be distinct, got {targets!r}")
+        if key == "dfly_target_index_layer":
+            shared = [i for i in targets if indexer_types[i] != "full"]
+            if shared:
+                raise ValueError(
+                    f"Hy4 DFly dfly_target_index_layer must name 'full' indexer layers; got shared {shared}")
+    for key, default in (("dfly_intermediate_size", config["intermediate_size"]),
+                         ("dfly_hidden_correction_intermediate_size", config["hidden_size"])):
+        size = config.get(key)
+        size = default if size is None else size
+        if type(size) is not int or size < 1:
+            raise ValueError(f"Hy4 DFly {key} must be a positive integer, got {size!r}")
+
 
 def _require(config, name, expected, *, pin=True):
     value = config.get(name)
@@ -53,10 +142,10 @@ def _smoke_relations(config):
     """Structural Hy4 invariants at any geometry (the tiny-parity path).
 
     `from_dict(config, pinned=False)` accepts reduced geometries (the reference
-    package's `tiny-hy4`) but never a structural drift: the iHC 4-stream form,
-    the gated-MLA geometry relations, the IndexCache full/shared pattern and the
-    dense-then-sparse MLP pattern are checked exactly as the pinned path checks
-    their production values.
+    package's `tiny-hy4` and official `hy_v4_vl` DFly2 tiny fixtures) but never
+    a structural drift: the iHC 4-stream form, the gated-MLA geometry relations,
+    the IndexCache full/shared pattern, the dense-then-sparse MLP pattern, and
+    any bundled DFly2 draft geometry are checked strictly.
     """
     for name in ("hidden_size", "num_hidden_layers", "vocab_size", "intermediate_size",
                  "q_lora_rank", "kv_lora_rank", "moe_intermediate_size", "n_routed_experts",
@@ -79,8 +168,10 @@ def _smoke_relations(config):
         raise ValueError("Hy4 iHC requires hc_mult=4 with positive eps and magnitude")
     if c.get("n_shared_experts") != 1 or c.get("swiglu_limit", 0) <= 0 or c.get("routed_scaling_factor", 0) <= 0:
         raise ValueError("Hy4 MoE requires one shared expert and positive clamp/scaling")
-    if type(c.get("num_nextn_predict_layers")) is not int or c["num_nextn_predict_layers"] < 1:
-        raise ValueError("Hy4 requires at least one MTP predictor layer")
+    if type(c.get("num_nextn_predict_layers")) is not int or c["num_nextn_predict_layers"] < 0:
+        raise ValueError("Hy4 requires a nonnegative integer num_nextn_predict_layers")
+    if c["num_nextn_predict_layers"] == 0 and not c.get("dfly_num_hidden_layers"):
+        raise ValueError("Hy4 requires at least one MTP predictor layer or bundled DFly2 draft layers")
     rope = c.get("rope_parameters")
     if not isinstance(rope, dict) or "rope_theta" not in rope or "rope_type" not in rope:
         raise ValueError("Hy4 requires rope_parameters with rope_theta and rope_type")
@@ -95,6 +186,7 @@ def _smoke_relations(config):
     if not (isinstance(c.get("layer_types"), list) and len(c["layer_types"]) == layers
             and set(c["layer_types"]) <= {"deepseek_sparse_attention", "indexed_attention"}):
         raise ValueError("Hy4 requires one uniform sparse-attention layer_types list")
+    _validate_dfly_relations(c)
 
 
 # Structural flags the checkpoint's `config.json` carries at full size but the
@@ -122,29 +214,43 @@ class ModelConfig:
     def from_dict(cls, config, *, pinned=True):
         """Validate a Hy4 `config.json`.
 
-        `pinned=True` (the serving path) demands the exact production geometry
-        of `tencent/Hy4-preview` at revision `705d81ee`. `pinned=False` is the
-        smoke/tiny path: it fills HF's structural defaults and validates the
-        same Hy4 structural invariants at reduced geometry (`_smoke_relations`)
-        — for the reference package's `tiny-hy4` rank-construction dry-run.
+        `pinned=True` (the serving path) demands either the exact production
+        geometry of `tencent/Hy4-preview` (`hy_v4`, revision `705d81ee`) or
+        official `tencent/Hy4` (`hy_v4_vl`, revision `bd0c8665bf93` with
+        5-layer DFly2). `pinned=False` is the smoke/tiny path: it fills HF's
+        structural defaults and validates the same Hy4 structural invariants
+        at reduced geometry (`_smoke_relations`).
         """
         if not isinstance(config, dict):
             raise ValueError("Hy4 preparation requires a JSON object config")
+        normalized = _normalize_hy4_config(config)
         if pinned:
-            cls._validate_pinned(config)
-            return cls(config)
-        effective = {name: value for name, value in SMOKE_DEFAULTS.items() if name not in config}
-        effective.update(config)
+            cls._validate_pinned(normalized)
+            return cls(normalized)
+        effective = {name: value for name, value in SMOKE_DEFAULTS.items() if name not in normalized}
+        effective.update(normalized)
+        if effective.get("dfly_num_hidden_layers") and "num_nextn_predict_layers" not in normalized:
+            effective["num_nextn_predict_layers"] = 0
         _smoke_relations(effective)
         return cls(effective)
 
     @classmethod
     def _validate_pinned(cls, config):
+        is_vl = config.get("model_type") == "hy_v4_vl"
         # Identity.
-        _require(config, "architectures", ["HYV4ForCausalLM"])
-        _require(config, "model_type", "hy_v4")
-        _require(config, "torch_dtype", "bfloat16")
-        _require(config, "dtype", "bfloat16")
+        if is_vl:
+            _require(config, "architectures", ["HYV4VLForConditionalGeneration"])
+            _require(config, "model_type", "hy_v4_vl")
+            _require(config, "_text_model_type", "hy_v4")
+            _require(config, "dtype", "bfloat16")
+            if "torch_dtype" in config:
+                _require(config, "torch_dtype", "bfloat16")
+            _require(config, "qk_norm", True)
+        else:
+            _require(config, "architectures", ["HYV4ForCausalLM"])
+            _require(config, "model_type", "hy_v4")
+            _require(config, "torch_dtype", "bfloat16")
+            _require(config, "dtype", "bfloat16")
         _require(config, "hidden_act", "silu")
         _require(config, "attention_bias", False)
         _require(config, "attention_dropout", 0.0)
@@ -207,18 +313,49 @@ class ModelConfig:
         _require(config, "norm_topk_prob", True)
         _require(config, "routed_scaling_factor", 2.827)
         _require(config, "swiglu_limit", 10.0)
-        # MTP: one single-stream GLM-style predictor with its own indexer, sink,
-        # gate and 256-expert MoE; the head is shared.
-        _require(config, "num_nextn_predict_layers", 1)
-        _require(config, "mtp_loss_factor", 0.1)
-        # Rotary and head.
-        _require(config, "rope_parameters", {"rope_theta": 10000000.0, "rope_type": "default"})
+        if is_vl:
+            # Official Hy4: 0 legacy MTP layers; 5-layer dense DFly2 drafter.
+            _require(config, "num_nextn_predict_layers", 0)
+            _require(config, "dfly_num_hidden_layers", 5)
+            _require(config, "dfly_mlp_type", "dense")
+            _require(config, "dfly_enable_ihc", False)
+            _require(config, "dfly_mtp_fusion", "slot0")
+            _require(config, "dfly_enable_hidden_correction", True)
+            _require(config, "dfly_target_index_layer", list(OFFICIAL_DFLY_LAYERS))
+            _require(config, "dfly_target_kv_layers", list(OFFICIAL_DFLY_LAYERS))
+            _require(config, "dfly_target_index_topk", 2048)
+            _require(config, "dfly_attn_causal", True)
+            _require(config, "dfly_block_size", 7)
+            _require(config, "dfly_mask_token_id", 120009)
+            _require(config, "dfly_context_local_window", None)
+            _validate_dfly_relations(config)
+            rope = config.get("rope_parameters")
+            expected_rope = {
+                "mrope_interleaved": True,
+                "mrope_section": [12, 10, 10],
+                "rope_theta": 10000000,
+                "rope_type": "default",
+            }
+            if (not isinstance(rope, dict)
+                    or rope.get("mrope_interleaved") is not expected_rope["mrope_interleaved"]
+                    or rope.get("mrope_section") != expected_rope["mrope_section"]
+                    or rope.get("rope_type") != expected_rope["rope_type"]
+                    or float(rope.get("rope_theta", -1)) != float(expected_rope["rope_theta"])
+                    or set(rope) != set(expected_rope)):
+                raise ValueError(
+                    f"Hy4 VL preparation requires rope_parameters={expected_rope!r}; checkpoint has {rope!r}")
+            _require_in(config, "transformers_version", ("5.24.0",))
+        else:
+            # Preview Hy4: one single-stream GLM-style MTP predictor.
+            _require(config, "num_nextn_predict_layers", 1)
+            _require(config, "mtp_loss_factor", 0.1)
+            _require(config, "rope_parameters", {"rope_theta": 10000000.0, "rope_type": "default"})
+            _require_in(config, "transformers_version", ("5.16.2",))
         _require(config, "enable_lm_head_fp32", True)
         # Special tokens.
         _require(config, "bos_token_id", 120000)
         _require(config, "eos_token_id", 120025)
         _require(config, "pad_token_id", 120002)
-        _require_in(config, "transformers_version", ("5.16.2",))
 
     @property
     def layers(self):
@@ -245,6 +382,78 @@ class ModelConfig:
         return self.text["num_nextn_predict_layers"]
 
     @property
+    def dfly_layers(self):
+        return int(self.text.get("dfly_num_hidden_layers") or 0)
+
+    @property
+    def has_dfly(self):
+        return self.dfly_layers > 0
+
+    @property
+    def has_vision(self):
+        return isinstance(self.text.get("vision_config"), dict)
+
+    @property
+    def dfly_target_index_layers(self):
+        if not self.has_dfly:
+            return ()
+        raw = self.text["dfly_target_index_layer"]
+        if type(raw) is int:
+            return (raw,) * self.dfly_layers
+        return tuple(int(i) for i in raw)
+
+    @property
+    def dfly_target_kv_layers(self):
+        if not self.has_dfly:
+            return ()
+        return tuple(int(i) for i in self.text["dfly_target_kv_layers"])
+
+    @property
+    def dfly_block_size(self):
+        return int(self.text["dfly_block_size"]) if self.has_dfly else 0
+
+    @property
+    def dfly_mask_token_id(self):
+        return int(self.text["dfly_mask_token_id"]) if self.has_dfly else -1
+
+    @property
+    def dfly_context_local_window(self):
+        if not self.has_dfly:
+            return 0
+        window = self.text.get("dfly_context_local_window")
+        return 0 if window is None else int(window)
+
+    @property
+    def dfly_intermediate_size(self):
+        if not self.has_dfly:
+            return 0
+        size = self.text.get("dfly_intermediate_size")
+        return int(self.text["intermediate_size"] if size is None else size)
+
+    @property
+    def dfly_hidden_correction_intermediate_size(self):
+        if not self.has_dfly:
+            return 0
+        size = self.text.get("dfly_hidden_correction_intermediate_size")
+        return int(self.hidden if size is None else size)
+
+    @property
+    def dfly_index_topk(self):
+        """Sparse attention column width for DFly2 layers (history + window + block).
+
+        Rounded up to 128-index blocks when `target_index_topk >= 128` (2,176
+        at production geometry) to satisfy sparse-MLA block alignment; kept
+        exact on small smoke configs whose `index_topk < 128`.
+        """
+        if not self.has_dfly:
+            return 0
+        target_topk = int(self.text.get("dfly_target_index_topk", self.text["index_topk"]))
+        width = target_topk + self.dfly_context_local_window + self.dfly_block_size
+        if target_topk >= DFLY_TOPK_ALIGNMENT:
+            return -(-width // DFLY_TOPK_ALIGNMENT) * DFLY_TOPK_ALIGNMENT
+        return width
+
+    @property
     def full_indexer_layers(self):
         """Layers that run the indexer and own the only index-key pages."""
         layers = tuple(i for i, kind in enumerate(self.text["indexer_types"]) if kind == "full")
@@ -262,9 +471,15 @@ class ModelConfig:
         return self.text["indexer_types"][layer] if layer < self.layers else "full"
 
     def token_record_bytes(self, *, draft=False):
-        """One rank's cache bytes per token across the layer stack."""
-        layers = self.layers + int(draft)
-        indexers = len(self.full_indexer_layers) + int(draft)
+        """One rank's cache bytes per token across the layer stack.
+
+        Legacy MTP (`draft_layers > 0`) adds one persistent latent and index
+        layer; DFly2 writes ephemeral block KV into target layers' verify slots
+        and adds zero persistent KV bytes.
+        """
+        persistent_draft = int(bool(draft) and self.draft_layers > 0)
+        layers = self.layers + persistent_draft
+        indexers = len(self.full_indexer_layers) + persistent_draft
         return layers * LATENT_RECORD_BYTES + indexers * INDEX_RECORD_BYTES
 
     def parameter_census(self):
@@ -281,7 +496,7 @@ class ModelConfig:
         blocks = self.layers + self.draft_layers
         moe_blocks = self.layers - 1 + self.draft_layers
         e, mi, dense = self.experts, c["moe_intermediate_size"], c["intermediate_size"]
-        return {
+        census = {
             "embed_tokens": v * h,
             "lm_head": v * h,
             "model_norm": h,
@@ -312,6 +527,26 @@ class ModelConfig:
             "mtp.eh_proj": self.draft_layers * 2 * h * h,
             "mtp.norms": self.draft_layers * 3 * h,
         }
+        if self.has_dfly:
+            dn = self.dfly_layers
+            di = self.dfly_intermediate_size
+            ci = self.dfly_hidden_correction_intermediate_size
+            census.update({
+                "dfly.q_a_proj": dn * ql * h,
+                "dfly.q_a_layernorm": dn * ql,
+                "dfly.q_b_proj": dn * heads * qk * ql,
+                "dfly.kv_a_proj_with_mqa": dn * (kv + rope) * h,
+                "dfly.kv_a_layernorm": dn * kv,
+                "dfly.kv_b_proj": dn * heads * (nope + vd) * kv,
+                "dfly.o_proj": dn * h * heads * vd,
+                "dfly.linear_gate": dn * heads * vd * h,
+                "dfly.sinks": dn * heads,
+                "dfly.norms": dn * 2 * h + h,  # input/post_attention + final_norm
+                "dfly.mlp.dense": dn * 3 * di * h,
+                "dfly.mtp_fusion": 2 * h * h + 3 * h,  # eh_proj + enorm/hnorm/gate
+                "dfly.hidden_correction": (2 * ci * (2 * h) + h * ci) + 2 * h,
+            })
+        return census
 
     def stored_parameter_counts(self):
         """(BF16, FP32) storage counts reproducing the checkpoint's published census.
@@ -372,9 +607,10 @@ class ModelConfig:
         stored_bf16, stored_fp32 = self.stored_parameter_counts()
 
         # Resident dtype upgrades over storage: `lm_head`, indexer
-        # `weights_proj`/`k_norm`, and the MTP block's correction bias and sink
-        # load FP32 from BF16 storage.
-        upgrades = (v * h + indexers * 32 * h + indexers * 2 * 128 + e + heads) * 2
+        # `weights_proj`/`k_norm`, and any BF16-stored draft correction bias /
+        # sinks load FP32 from BF16 storage.
+        upgrades = (v * h + indexers * 32 * h + indexers * 2 * 128
+                    + self.draft_layers * (e + heads) + self.dfly_layers * heads) * 2
         expert_params = census["mlp.experts"]
         packed_experts = expert_params * 4 // 8 + expert_params // 16 + moe_blocks * e * 2 * 4
         # `kv_b_proj` of the target layers is replicated (the `kv_b`
@@ -402,18 +638,35 @@ class ModelConfig:
             + (4 * (4 * h) + 4 + 1) * 4            # hc_head
             + self.draft_layers * 3 * h * 2)       # MTP enorm/hnorm/final_layernorm
 
-        draft_experts = e * (2 * mi * h + h * mi)
-        draft_bytes = (
-            draft_experts * 4 // 8 + draft_experts // 16 + e * 2 * 4  # packed experts
-            + (2 * mi * h + h * mi) * 2            # shared experts
-            + 2 * h * h * 2                        # eh_proj
-            + ql * h * 2 + heads * qk * ql * 2     # q_a_proj, q_b_proj
-            + (kv + rope) * h * 2 + heads * (nope + vd) * kv * 2
-            + h * heads * vd * 2 + heads * vd * h * 2  # o_proj, linear_gate
-            + ((32 * 128) * ql + 128 * h + 32 * h) * 2 + 2 * 128 * 2  # indexer
-            + e * h * 2                            # router gate
-            + (5 * h + ql + kv) * 2                # enorm/hnorm/final/input/post_attention norms
-            + (e + heads) * 2 + (32 * h + 2 * 128 + e + heads) * 2)  # bias/sink and FP32 upgrades
+        if self.has_dfly:
+            dn = self.dfly_layers
+            di = self.dfly_intermediate_size
+            ci = self.dfly_hidden_correction_intermediate_size
+            dfly_replicated = (
+                dn * (ql * h + (kv + rope) * h + heads * (nope + vd) * kv
+                      + ql + kv + 2 * h) * 2
+                + (2 * h * h + 3 * h + h + 2 * h) * 2  # mtp_fusion + final_norm + hc norms
+            )
+            dfly_sharded = (
+                dn * (heads * qk * ql + h * heads * vd + heads * vd * h + 3 * di * h) * 2
+                + (2 * ci * (2 * h) + h * ci) * 2
+                + dn * heads * 4  # sinks head-sharded FP32
+            )
+            replicated += dfly_replicated
+            draft_bytes = dfly_replicated + dfly_sharded
+        else:
+            draft_experts = e * (2 * mi * h + h * mi)
+            draft_bytes = (
+                draft_experts * 4 // 8 + draft_experts // 16 + e * 2 * 4  # packed experts
+                + (2 * mi * h + h * mi) * 2            # shared experts
+                + 2 * h * h * 2                        # eh_proj
+                + ql * h * 2 + heads * qk * ql * 2     # q_a_proj, q_b_proj
+                + (kv + rope) * h * 2 + heads * (nope + vd) * kv * 2
+                + h * heads * vd * 2 + heads * vd * h * 2  # o_proj, linear_gate
+                + ((32 * 128) * ql + 128 * h + 32 * h) * 2 + 2 * 128 * 2  # indexer
+                + e * h * 2                            # router gate
+                + (5 * h + ql + kv) * 2                # enorm/hnorm/final/input/post_attention norms
+                + (e + heads) * 2 + (32 * h + 2 * 128 + e + heads) * 2)  # bias/sink and FP32 upgrades
 
         gate_up_scales = moe_blocks * e * (2 * mi) * (h // 16)
         down_scales = moe_blocks * e * h * (mi // 16)

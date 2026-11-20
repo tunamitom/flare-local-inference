@@ -638,6 +638,23 @@ class Hy4Decoder:
         self.trace = []          # the wiring trace the W7 gates read
         self.plan_book = None    # the `KernelPlanBook` (bound by wire_operators)
         self._mla_scratch_pool = {}  # Patch C: shared sparse-MLA scratch per rank
+        self.has_dfly = getattr(weights, "dfly", None) is not None
+        self._dfly_producer_plane = (
+            {layer_id: plane for plane, layer_id in enumerate(weights.dfly.producer_layers)}
+            if self.has_dfly else {})
+        self._dfly_tap = None
+        self._dfly_lane_tap = {}
+        if self.has_dfly:
+            from .dfly import DflyState
+
+            self.dfly_state = DflyState(
+                num_producers=len(weights.dfly.producer_layers),
+                rows=cache.rows,
+                target_topk=int(weights.config.text["index_topk"]),
+                draft_topk=int(weights.config.dfly_index_topk),
+                device=weights.device)
+        else:
+            self.dfly_state = None
 
     # --- W7 wiring ---------------------------------------------------------
     def default_call_shape(self, shape):
@@ -673,6 +690,10 @@ class Hy4Decoder:
             # consult18 P4: the MTP draft's CP attention binds the same shapes
             # (decode steps, prefill-shaped prompt absorption).
             attentions.append(self.weights.draft.attention)
+        if getattr(self.weights, "dfly", None) is not None:
+            # DFly2 layers only execute decode-family block shapes; bind their
+            # `draft_index_topk`-wide sparse-MLA plans and sink folds here.
+            attentions.extend(layer.attention for layer in self.weights.dfly.layers)
         for attention in attentions:
             attention.bind_plan_book(book)
             attention.prepare_plans(shapes, sink_variants=sink_variants,
@@ -921,6 +942,212 @@ class Hy4Decoder:
         selected, _ = draft.attention.selection.buffers(rows=x.shape[0])
         return hidden, None, selected
 
+    # --- DFly2 (AngelSpec) block-parallel drafter --------------------------
+
+    def arm_dfly_capture(self, count):
+        """Capture all `count` verify query rows' target top-k selections."""
+        if self.has_dfly:
+            self._dfly_tap = ("capture_all", int(count))
+
+    def disarm_dfly_tap(self):
+        self._dfly_tap = None
+
+    def dfly_commit_capture(self, row, src_index):
+        """Commit captured verify row `src_index` into `dfly_state` for `row`."""
+        if self.has_dfly:
+            self.dfly_state.commit_capture_row(row, src_index)
+
+    def _dfly_record_selection(self, layer_index, token_rows, selected, counts, *,
+                               base, is_global):
+        if not getattr(self, "has_dfly", False):
+            return
+        plane = self._dfly_producer_plane.get(layer_index)
+        if plane is None:
+            return
+        from .lanes import lane
+
+        tap = self._dfly_lane_tap.get(lane())
+        if tap is None:
+            tap = self._dfly_tap
+        if tap is None:
+            return
+        world = int(getattr(self.collectives, "world_size", 1))
+        rank = int(getattr(self.collectives, "rank", 0))
+        caps = self.cache.caps_for(token_rows)
+        mode = tap[0]
+        if mode == "capture_all":
+            self.dfly_state.record_capture(
+                plane, selected, counts, base=base, caps=caps,
+                world=world, rank=rank, is_global=is_global)
+        elif mode == "commit_token":
+            _, batch_rows, width, tok_idx = tap
+            pick = (torch.arange(batch_rows, device=selected.device, dtype=torch.long) * width
+                    + int(tok_idx))
+            self.dfly_state.record_commit(
+                plane, token_rows[pick], selected[pick], counts[pick],
+                base=base[pick], caps=caps[pick],
+                world=world, rank=rank, is_global=is_global)
+
+    def _dfly_attention(self, layer, x, positions, token_rows, rows_t, anchors, *,
+                        query_width, call_shape, bypass_short=False, bypass_cp=False,
+                        pad_entries=0, write_positions=None):
+        """One DFly2 layer's attention over target KV + tapped top-k + causal block."""
+        attn = layer.attention
+        attn._active_call_shape = call_shape
+        kv_layer = layer.target_kv_layer
+        world = int(getattr(self.collectives, "world_size", 1))
+        rank = int(getattr(self.collectives, "rank", 0))
+        bundle = attn.project_packed(x, positions, absorb=True, with_index_keys=False)
+        q_local, latent = bundle.q, bundle.latent
+        write_pos = positions if write_positions is None else write_positions
+        self.cache.write_latent(kv_layer, token_rows, write_pos, latent)
+        use_short = bool(bypass_short and world > 1 and kv_layer in self.cache.short)
+        selected, counts = self.dfly_state.build_sparse_indices(
+            layer.producer_plane, rows_t, anchors,
+            cache=self.cache, query_width=query_width,
+            world=world, rank=rank,
+            bypass_short=use_short, bypass_cp=bool(bypass_cp and world > 1 and not use_short))
+        if pad_entries > 0:
+            pad_sel = torch.full((pad_entries, selected.shape[1]), -1,
+                                 dtype=selected.dtype, device=selected.device)
+            pad_cnt = torch.zeros((pad_entries,), dtype=counts.dtype, device=counts.device)
+            selected = torch.cat((selected, pad_sel), dim=0).contiguous()
+            counts = torch.cat((counts, pad_cnt), dim=0).contiguous()
+        if world == 1:
+            attended = attn.attend(q_local, self.cache.latents(kv_layer), selected, counts,
+                                   call_shape=call_shape)
+            return attn.gate_and_project(attended.output, x)
+        if use_short:
+            attended = attn.attend(q_local, self.cache.short_latents(kv_layer), selected, counts,
+                                   fold_sink=True, expand=False, call_shape=call_shape)
+            fused = attn.expand_gate_project(attended.output, x)
+            if fused is not None:
+                return fused
+            return attn.gate_and_project(attn.expand_output(attended.output).to(x.dtype), x)
+        q_all = self.collectives.all_gather_heads(q_local)
+        partial = attn.attend(q_all, self.cache.latents(kv_layer), selected, counts,
+                              fold_sink=False, expand=False, call_shape=call_shape)
+        out, lse = self.collectives.lse_reduce(
+            partial.output, partial.lse, partials_sink_folded=partial.provenance.sink_folded)
+        out, lse = attn.fold_sink(out, lse, call_shape=call_shape)
+        fused = attn.expand_gate_project(out, x)
+        if fused is not None:
+            return fused
+        return attn.gate_and_project(attn.expand_output(out).to(x.dtype), x)
+
+    def dfly_draft(self, bonus_tokens, target_hidden, *, request_rows=None, k=None,
+                   anchors=None, call_shape=None, static_slots=None,
+                   bypass_short=False, bypass_cp=False,
+                   sample=False, filtered=False, inv_temp=None, top_k=None, top_p=None,
+                   noise_q=None, q_out=None, greedy_mask=None,
+                   pad_rows=None, pad_positions=None, write_positions=None):
+        """Run one DFly2 block forward + `k` hidden-correction steps -> `(drafts [B, k], z [B, k+1, H])`.
+
+        `bonus_tokens` `[B]` is each request's newly sampled anchor token at
+        position `P_b`; `target_hidden` `[B, H]` is the target's post-`model.norm`
+        hidden at `P_b - 1`. Each DFly2 layer writes its block KV into its bound
+        target KV layer (`dfly_target_kv_layers`) at the verify slots `P_b .. P_b + k`
+        and attends over the tapped target top-k at `P_b - 1` union the causal block.
+        """
+        if not self.has_dfly:
+            raise ValueError("no DFly2 draft block is prepared")
+        dfly = self.weights.dfly
+        eps = float(self.config.text["rms_norm_eps"])
+        bonus = torch.as_tensor(bonus_tokens, device=self.device, dtype=torch.long).reshape(-1)
+        bs = int(bonus.shape[0])
+        k = int(min(3, self.config.dfly_block_size - 1) if k is None else k)
+        if not 1 <= k <= self.config.dfly_block_size - 1:
+            raise ValueError(
+                f"DFly2 draft depth k={k} must lie in [1, {self.config.dfly_block_size - 1}]")
+        W = k + 1
+        if request_rows is None:
+            rows_t = torch.arange(bs, device=self.device, dtype=torch.long)
+        elif isinstance(request_rows, torch.Tensor):
+            rows_t = request_rows.to(device=self.device, dtype=torch.long).reshape(bs)
+        else:
+            rows_t = torch.tensor(request_rows, device=self.device, dtype=torch.long).reshape(bs)
+        if anchors is None:
+            anchors_t = torch.tensor([self._row_lengths.get(int(r), 0) for r in rows_t.tolist()],
+                                     device=self.device, dtype=torch.long)
+        else:
+            anchors_t = torch.as_tensor(anchors, device=self.device, dtype=torch.long).reshape(bs)
+        pad_entries = int(pad_rows.shape[0]) if pad_rows is not None else 0
+        total_q = bs * W + pad_entries
+        if call_shape is None:
+            call_shape = verify_shape(total_q) if total_q > 1 else DECODE_ONE_ROW
+        mask_id = int(self.config.dfly_mask_token_id)
+        block_ids = torch.full((bs, W), mask_id, dtype=torch.long, device=self.device)
+        block_ids[:, 0] = bonus
+        flat_ids = block_ids.reshape(-1)
+        steps = torch.arange(W, device=self.device, dtype=torch.long)
+        positions = (anchors_t.unsqueeze(1) + steps.unsqueeze(0)).reshape(-1)
+        token_rows = rows_t.unsqueeze(1).expand(bs, W).reshape(-1)
+        if pad_entries > 0:
+            flat_ids = torch.cat((flat_ids, torch.full((pad_entries,), mask_id,
+                                                       dtype=torch.long, device=self.device)))
+            positions = torch.cat((positions, pad_positions.to(device=self.device, dtype=torch.long)))
+            token_rows = torch.cat((token_rows, pad_rows.to(device=self.device, dtype=torch.long)))
+        vr = self.weights.sharding.vocabulary_range
+        h = self.collectives.embed_lookup(
+            flat_ids, self.weights.embed, vocabulary_range=vr).to(self.compute_dtype)
+        live_h = h[:bs * W].view(bs, W, -1)
+        fused0 = dfly.mtp_fusion.forward(
+            live_h[:, 0], target_hidden.to(self.compute_dtype).reshape(bs, -1))
+        live_h = torch.cat((fused0.unsqueeze(1), live_h[:, 1:]), dim=1).reshape(bs * W, -1)
+        h = torch.cat((live_h, h[bs * W:]), dim=0) if pad_entries > 0 else live_h
+        write_pos = (positions if write_positions is None
+                     else write_positions.to(device=self.device, dtype=torch.long).reshape(total_q))
+        if static_slots is not None:
+            kept, slot, safe = static_slots
+            self.cache.begin_forward_static(
+                token_rows, write_pos, slot=slot, safe=safe, kept=kept,
+                kept_identity=(int(kept.numel()) == total_q and _diet2()))
+        else:
+            self.cache.begin_forward(token_rows, write_pos)
+        try:
+            for layer in dfly.layers:
+                x = rms_norm(h, layer.input_norm, eps)
+                attn_out = self._dfly_attention(
+                    layer, x, positions, token_rows, rows_t, anchors_t,
+                    query_width=W, call_shape=call_shape,
+                    bypass_short=bypass_short, bypass_cp=bypass_cp,
+                    pad_entries=pad_entries, write_positions=write_pos)
+                h = h + self.collectives.all_reduce(attn_out)
+                x = rms_norm(h, layer.post_attention_norm, eps)
+                mlp_out = layer.mlp.forward(x)
+                h = h + self.collectives.all_reduce(mlp_out)
+        finally:
+            self.cache._forward_memo.pop(id(token_rows), None)
+            self.cache._kept_identity.pop(id(token_rows), None)
+        z = rms_norm(h[:bs * W], dfly.final_norm, eps).view(bs, W, -1)
+        drafts = []
+        prev = bonus
+        for step in range(k):
+            prev_emb = self.collectives.embed_lookup(
+                prev, self.weights.embed, vocabulary_range=vr).to(self.compute_dtype)
+            corrected = dfly.hidden_correction.forward(
+                z[:, step + 1], prev_emb, collectives=self.collectives)
+            logits_shard = self.head_logits(corrected)
+            if sample:
+                from .spec_sample import filter_scores, sample_tokens
+
+                scale = inv_temp.reshape(-1, 1) if inv_temp.numel() > 1 else inv_temp
+                scores = logits_shard * scale
+                if filtered:
+                    scores, _ = filter_scores(
+                        self.collectives, scores, top_k, top_p, vocabulary_range=vr)
+                if q_out is not None:
+                    q_out[:, step].copy_(scores)
+                n_step = noise_q[:, step] if noise_q.ndim == 3 else noise_q[step:step + 1]
+                if greedy_mask is not None:
+                    n_step = torch.where(greedy_mask.reshape(-1, 1),
+                                         torch.full_like(n_step, 0.5), n_step)
+                prev = sample_tokens(self.collectives, scores, n_step, vocabulary_range=vr)
+            else:
+                prev = self.greedy_tokens(logits_shard)
+            drafts.append(prev.reshape(bs))
+        return torch.stack(drafts, dim=1), z
+
     def forward(self, token_ids, *, request_rows=None, state=None, return_hidden=False,
                 call_shape=None, logits_rows="all"):
         """The real body loop: iHC streams -> 78 gated sparse-MLA layers -> head.
@@ -1110,6 +1337,23 @@ class Hy4Decoder:
         # Vocabulary-sharded embedding (D5): masked lookup over this rank's
         # shard + all-reduce (identity at world 1).
         WATCH.begin_forward(call_shape.name, positions)   # consult17: no-op unless armed
+        auto_dfly_tap = (getattr(self, "has_dfly", False) and self._dfly_tap is None
+                         and logits_rows != "none")
+        if auto_dfly_tap:
+            width = int(token_ids.shape[1])
+            tok_idx = width - 1 if logits_rows in ("all", "last") else int(logits_rows)
+            self._dfly_tap = ("commit_token", int(token_ids.shape[0]), width, tok_idx)
+        try:
+            return self._layers_and_head_body(
+                token_ids, rows, positions, token_rows, visible, visible_max,
+                state=state, return_hidden=return_hidden, call_shape=call_shape,
+                logits_rows=logits_rows, gather=gather)
+        finally:
+            if auto_dfly_tap:
+                self._dfly_tap = None
+
+    def _layers_and_head_body(self, token_ids, rows, positions, token_rows, visible, visible_max, *,
+                              state, return_hidden, call_shape, logits_rows, gather=True):
         with TIMER.phase("embed"):
             embeds = self.collectives.embed_lookup(
                 token_ids.reshape(-1), self.weights.embed,
@@ -1422,6 +1666,10 @@ class Hy4Decoder:
             prepare()
         steps = [self._half_steps(*halves[index], half_shape, prevalidated=True)
                  for index in (0, 1)]
+        if getattr(self, "has_dfly", False) and logits_rows != "none":
+            tok_idx = 2 * half - 1 if logits_rows in ("all", "last") else int(logits_rows)
+            self._dfly_lane_tap[0] = ("commit_token", 1, half, tok_idx) if tok_idx < half else None
+            self._dfly_lane_tap[1] = ("commit_token", 1, half, tok_idx - half) if tok_idx >= half else None
         results = [None, None]
         layers = len(self.weights.layers)
         from .hangdump import lazy_preparation_trap
@@ -1598,12 +1846,18 @@ class Hy4Decoder:
             out = []
             for index in (0, 1):
                 self.cache.begin_forward(halves[index][2], halves[index][1])
+                tap = (self._dfly_lane_tap.get(index)
+                       if getattr(self, "has_dfly", False) else None)
+                prev_tap = self._dfly_tap
+                self._dfly_tap = tap
                 single = self._half_steps(*halves[index], half_shape, prevalidated=True)
                 try:
                     while True:
                         next(single)
                 except StopIteration as finished:
                     out.append(finished.value)
+                finally:
+                    self._dfly_tap = prev_tap
             return out
 
         from .runtime import SWITCHES as _switches
@@ -1664,6 +1918,7 @@ class Hy4Decoder:
             if all(p is not None for p in parts):
                 sink[id(token_ids)] = torch.cat(parts, dim=0)
         normed = torch.cat(results, dim=0)
+        self._dfly_lane_tap.clear()
         self.cache.end_forward()
         if logits_rows == "none":
             logits = None
@@ -1780,6 +2035,8 @@ class Hy4Decoder:
             with TIMER.phase("attn.index_score"):
                 selected, counts = attn.select(y, q_resid, positions, visible,
                                                self.cache.key_table(owner), slot_base)
+            self._dfly_record_selection(layer.index, token_rows, selected, counts,
+                                        base=slot_base, is_global=False)
             with TIMER.phase("attn.sparse_mla"):
                 attended = attn.attend(q_local, self.cache.latents(layer.index), selected, counts,
                                        call_shape=call_shape)
@@ -1819,6 +2076,8 @@ class Hy4Decoder:
                         # its own tensors (an owner buffer may be rewritten by another path)
                         sel, cnt = fill, counts[:n].clone()
                         self._short_sel = (visible, token_rows, sel, cnt)
+            self._dfly_record_selection(layer.index, token_rows, sel, cnt,
+                                        base=token_rows.reshape(-1).long() * S, is_global=True)
             with TIMER.phase("attn.sparse_mla"):
                 attended = attn.attend(q_local, self.cache.short_latents(layer.index), sel,
                                        cnt, fold_sink=True, expand=False, call_shape=call_shape)
@@ -1842,6 +2101,8 @@ class Hy4Decoder:
             with TIMER.phase("attn.index_score"):
                 selected, counts = attn.select(y, q_resid, positions, visible,
                                                self.cache.short_key_table(owner), base)
+            self._dfly_record_selection(layer.index, token_rows, selected, counts,
+                                        base=base, is_global=True)
             with TIMER.phase("attn.sparse_mla"):
                 attended = attn.attend(q_local, self.cache.short_latents(layer.index), selected,
                                        counts, fold_sink=True, expand=False, call_shape=call_shape)
@@ -1925,6 +2186,8 @@ class Hy4Decoder:
                                                 slot_map=None)
         with TIMER.phase("attn.handback"):
             selected, counts = attn.selection.buffers(rows=y.shape[0])
+        self._dfly_record_selection(layer.index, token_rows, selected, counts,
+                                    base=slot_base, is_global=False)
         PROBE.add("selected", layer.index, selected, counts)
         self.trace.append(("query_exchange", schedule.placement("query_exchange", family),
                            call_shape.query_wiring, int(q_local.shape[-1])))
@@ -2018,6 +2281,8 @@ class Hy4Decoder:
         for row in rows:
             self._row_lengths.pop(int(row), None)
             self._draft_positions.pop(int(row), None)
+        if getattr(self, "dfly_state", None) is not None:
+            self.dfly_state.reset_rows(rows)
 
 
 

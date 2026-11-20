@@ -272,6 +272,7 @@ class Hy4LayerAttention:
     sharding: Hy4Sharding
     selection: "SelectionCell | None"
     device: torch.device
+    max_width: int | None = None
     _mla: object = field(default=None, repr=False)
     _indexer_plan: object = field(default=None, repr=False)
     _mla_plans: dict = field(default_factory=dict, repr=False)
@@ -677,7 +678,7 @@ class Hy4LayerAttention:
             # `batch`); `max_q_rows` may cover a whole call-shape family —
             # `sparse_mla.bind` admits any call at or under the planned rows.
             max_q_rows=shape.rows * shape.tokens if max_q_rows is None else int(max_q_rows),
-            max_width=self.config.text["index_topk"],
+            max_width=int(self.max_width) if self.max_width is not None else self.config.text["index_topk"],
             softmax_scale=self.scaling,
             head_dim=self.kv_lora + self.qk_rope, v_head_dim=self.kv_lora,
             # The engine contract is the fused 656-byte FP8 record (uint8 byte

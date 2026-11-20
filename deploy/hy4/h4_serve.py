@@ -492,6 +492,29 @@ def parse_tool_calls(text, tools):
     return text[:at], calls
 
 
+MULTIMODAL_CONTENT_TYPES = frozenset({
+    "image", "image_url", "input_image", "video", "video_url", "input_video",
+})
+
+
+def reject_multimodal_messages(messages):
+    """Refuse OpenAI image/video content parts with ValueError (mapped to HTTP 400)."""
+    if not isinstance(messages, list):
+        return
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                kind = part.get("type")
+                if kind in MULTIMODAL_CONTENT_TYPES or "image_url" in part or "video_url" in part:
+                    raise ValueError(
+                        "vision/image/video inputs are not enabled on this text-only serve")
+
+
 def normalize_tool_history(messages):
     """The chat template iterates assistant `tool_calls[].function.arguments` as
     a mapping; OpenAI clients send it back as a JSON string. Decode it (and give
@@ -706,8 +729,10 @@ def run_generate_steps(ctx, cmd, *, row=0, admit_only=False, preempt=None, spec_
         # one overlapped pair — two CHUNK-row halves on two lanes. (Not for
         # the NLL probe: its all-row logits of a pair would be ~1 GB.)
         full = max(ctx.widths)
+        is_dfly = bool(getattr(decoder, "has_dfly", False))
+        need_absorb = use_spec and not is_dfly
         pending = None
-        decoder.embed_sink = {} if use_spec else None
+        decoder.embed_sink = {} if need_absorb else None
 
         def absorb_pending(first_next, final=False):
             """Absorb the previous step's rows; `first_next` [1, H] is the
@@ -744,6 +769,7 @@ def run_generate_steps(ctx, cmd, *, row=0, admit_only=False, preempt=None, spec_
             # sampler — no head and no vocabulary gather for the other chunks,
             # one row gathered for the last.
             last = index == len(steps) - 1
+            need_hidden = need_absorb or (use_spec and is_dfly and last)
             if params.get("nll"):
                 # consult18 stage 0b: every row's full-vocabulary logits (a probe,
                 # not a serving path), scored against the next prompt token.
@@ -776,7 +802,7 @@ def run_generate_steps(ctx, cmd, *, row=0, admit_only=False, preempt=None, spec_
                             t, half_shape=ctx.shapes[full],
                             logits_rows=real - 1 if last else "none", row=row)
                         torch.cuda.synchronize(dev)
-                elif use_spec:
+                elif need_hidden:
                     logits, post = decoder.forward_overlapped(
                         t, half_shape=ctx.shapes[full], logits_rows=real - 1 if last else "none",
                         return_hidden=True, row=row)
@@ -784,7 +810,7 @@ def run_generate_steps(ctx, cmd, *, row=0, admit_only=False, preempt=None, spec_
                     logits = decoder.forward_overlapped(
                         t, half_shape=ctx.shapes[full], logits_rows=real - 1 if last else "none",
                         row=row)
-            elif use_spec:
+            elif need_hidden:
                 logits, post, _ = decoder.forward(t, request_rows=[row], call_shape=ctx.shapes[w],
                                                   logits_rows=real - 1 if last else "none",
                                                   return_hidden=True)
@@ -792,7 +818,7 @@ def run_generate_steps(ctx, cmd, *, row=0, admit_only=False, preempt=None, spec_
                 logits = decoder.forward(t, request_rows=[row], call_shape=ctx.shapes[w],
                                          logits_rows=real - 1 if last else "none")
             decoder.append([row], real)
-            if use_spec:
+            if need_absorb:
                 # prompt absorption: draft rows pos .. pos+w-1 with the target's
                 # post-norm hidden and each row's next prompt token (the last
                 # prompt row's is a placeholder: round 1 re-absorbs it with the
@@ -805,6 +831,10 @@ def run_generate_steps(ctx, cmd, *, row=0, admit_only=False, preempt=None, spec_
                     absorb_pending(emb[:1] if emb is not None else None)
                 pending = (pos, w, post, emb, real)
                 last_hidden = post[0, real - 1].clone()
+            elif use_spec and is_dfly and last:
+                # DFly2 has no prompt absorption: tap only the final prompt hidden
+                # (the last real token's target top-k was already captured above).
+                last_hidden = post[0, real - 1].clone()
             pos += real
             if chunked and index < len(steps) - 1:
                 # c8 L17: pause between chunks; other forwards (the loop's rounds,
@@ -812,7 +842,7 @@ def run_generate_steps(ctx, cmd, *, row=0, admit_only=False, preempt=None, spec_
                 sink, decoder.embed_sink = decoder.embed_sink, None
                 yield pos
                 decoder.embed_sink = sink
-        if use_spec and pending is not None:
+        if need_absorb and pending is not None:
             last_emb = pending[3]
             absorb_pending(last_emb[-1:] if last_emb is not None else None, final=True)
         decoder.embed_sink = None
@@ -1216,6 +1246,7 @@ def serve_http(ctx):
                 tools = body.get("tools") or None
                 with ctx.tok_lock:              # one tokenizer, many request threads
                     if "messages" in body:
+                        reject_multimodal_messages(body["messages"])
                         text = ctx.tok.apply_chat_template(
                             normalize_tool_history(body["messages"]), tokenize=False,
                             add_generation_prompt=True, tools=tools)
@@ -2257,12 +2288,13 @@ class BatchLoop:
 
     def _bs_cached(self, B, K, end):
         g = self.ctx.decoder.decode_graphs
+        is_dfly = bool(getattr(self.ctx.decoder, "has_dfly", False))
         per, size, csize = self._bs_layout(B, K)
         shape, cshape = batch_shape_of(size), batch_shape_of(csize)
         return (g.bspec_cached("draft", size, end, call_shape=shape, per=per)
                 and g.bspec_cached("verify", size, end, call_shape=shape, per=per)
-                and all(g.bspec_cached("chain", csize, end, call_shape=cshape, step=j)
-                        for j in range(1, K)))
+                and (is_dfly or all(g.bspec_cached("chain", csize, end, call_shape=cshape, step=j)
+                                    for j in range(1, K))))
 
     def _adopt_solo(self, ys):
         """Every rank: a preempted solo speculation joins the batched rounds with its
@@ -2272,10 +2304,11 @@ class BatchLoop:
         import torch
 
         spec = self.ctx.spec
+        is_dfly = bool(getattr(self.ctx.decoder, "has_dfly", False))
         st = self.ctx.decoder.decode_graphs.bspec_state()
         P, bonus, c = int(ys["P"]), int(ys["bonus"]), int(ys["c"])
         tokens, hidden = ys["tokens"], ys["hidden"].reshape(len(ys["tokens"]), -1)
-        if len(tokens) > 1:
+        if len(tokens) > 1 and not is_dfly:
             spec._absorb(c, tokens[:-1], hidden[:-1], sample=False)
         st["pend_tok"][0].fill_(bonus)
         st["pend_hid"][0].copy_(hidden[-1].reshape(1, -1).expand(st["pend_hid"].shape[1], -1))
@@ -2328,8 +2361,9 @@ class BatchLoop:
         cpads = [False] * B + [True] * (csize - B)
         bonus = st["pend_tok"][rows_t, st["n"][rows_t]]   # the round's inputs (rollback)
         g.run_bspec("draft", erows, pads, end=end, call_shape=shape, per=per)
-        for step in range(1, K):
-            g.run_bspec("chain", crows, cpads, end=end, call_shape=cshape, step=step)
+        if not getattr(d, "has_dfly", False):
+            for step in range(1, K):
+                g.run_bspec("chain", crows, cpads, end=end, call_shape=cshape, step=step)
         g.run_bspec("verify", erows, pads, end=end, call_shape=shape, per=per)
         snap = self._bs_snap()
         dev = snap["dev"]
@@ -2805,12 +2839,14 @@ def main():
         # 512-wide latent. (The w14 c1 runner's 192 was a bench-only guess.)
         with open(os.path.join(args.snapshot, "config.json")) as fh:
             _cfg = json.load(fh)
-        unabsorbed = _cfg["qk_nope_head_dim"] + _cfg["qk_rope_head_dim"]   # 256
-        absorbed = _cfg["kv_lora_rank"] + _cfg["qk_rope_head_dim"]         # 576
-        values = _cfg["kv_lora_rank"]                                      # 512
-        cfg_topk = int(_cfg.get("index_topk", (_cfg.get("text_config") or {}).get("index_topk", 2048)))
-        reduce = _cfg["hidden_size"]                                       # 6144
-        expanded = _cfg["v_head_dim"] if args.partial_wire == "expanded" else None   # 256
+        _text_cfg = _cfg.get("text_config") if isinstance(_cfg.get("text_config"), dict) else _cfg
+        unabsorbed = _text_cfg["qk_nope_head_dim"] + _text_cfg["qk_rope_head_dim"]   # 256
+        absorbed = _text_cfg["kv_lora_rank"] + _text_cfg["qk_rope_head_dim"]         # 576
+        values = _text_cfg["kv_lora_rank"]                                           # 512
+        cfg_topk = int(_cfg.get("index_topk", _text_cfg.get("index_topk", 2048)))
+        reduce = _text_cfg["hidden_size"]                                            # 6144
+        expanded = _text_cfg["v_head_dim"] if args.partial_wire == "expanded" else None   # 256
+        _has_dfly = int(_cfg.get("dfly_num_hidden_layers") or _text_cfg.get("dfly_num_hidden_layers") or 0) > 0
         trace(rank, f"transport construction (gather widths {unabsorbed}/{absorbed}, "
                     f"values {values}, reduce {reduce})")
         score_offer = None
@@ -3022,7 +3058,12 @@ def main():
         # shape (decode 1 row + every prepared prefill width) — oneshot at 1
         # row, rsag above (c1-unit-costs.md §1's arm choice).
         # round 16: spec verify rows outside the prefill widths (k = 4 -> 5 rows)
-        EXTRA_ROWS = tuple(w for w in DECODE_ROWS if w not in PREFILL_WIDTHS)
+        # DFly2 hidden_correction also runs all_reduce on `slots = size // per`
+        # (including 5 and 6 for bspec buckets 12/16 at per=2/3).
+        _dfly_slot_rows = (tuple(sorted({b // per for b in BATCH_ROWS for per in (2, 3, 4) if b >= per}))
+                           if MTP and _has_dfly else ())
+        EXTRA_ROWS = tuple(sorted(set(w for w in (*DECODE_ROWS, *_dfly_slot_rows)
+                                      if w not in PREFILL_WIDTHS)))
         for w in (1, *PREFILL_WIDTHS, *EXTRA_ROWS):
             transport.prepare_all_reduce(dsession if w == 1 else session, w)
         if uses_dma and args.dma_replay:
@@ -3089,7 +3130,9 @@ def main():
         graph_reserve = int(float(os.environ.get("HY4_GRAPH_RESERVE_MB") or 2688) * 2**20)
         budget = free_a + cache_a - args.headroom - graph_reserve
         # cache bytes ~= rows * (capacity / world) * (78*656 + 21*256 real residency)
-        per_global = args.rows * ((78 + int(MTP)) * 656 + (21 + int(MTP)) * 256) / world
+        # Legacy MTP adds one persistent KV/index layer; DFly2 reuses target KV slots (0 extra).
+        _draft_kv = int(MTP and not _has_dfly)
+        per_global = args.rows * ((78 + _draft_kv) * 656 + (21 + _draft_kv) * 256) / world
         capacity = args.capacity if args.capacity > 0 else int(budget // per_global) & ~1023
         trace(rank, f"phase A: fixed(book+ctx+runtime)={fixed_bytes} B, torn-down free={free_post} B, "
                     f"headroom={args.headroom} B + graph reserve {graph_reserve} B -> capacity "
@@ -3317,13 +3360,14 @@ def main():
                                                      call_shape=shape, per=per)
                                     graphs.run_bspec("verify", rows_p, [False] * b, end=end,
                                                      call_shape=shape, per=per)
-                        for step in (1, 2):
-                            for b in (4, 2):
-                                shape = batch_shape(b)
-                                rows_p = [i % args.rows for i in range(b)]
-                                for _ in range(2):
-                                    graphs.run_bspec("chain", rows_p, [False] * b, end=end,
-                                                     call_shape=shape, step=step)
+                        if not getattr(ctx.decoder, "has_dfly", False):
+                            for step in (1, 2):
+                                for b in (4, 2):
+                                    shape = batch_shape(b)
+                                    rows_p = [i % args.rows for i in range(b)]
+                                    for _ in range(2):
+                                        graphs.run_bspec("chain", rows_p, [False] * b, end=end,
+                                                         call_shape=shape, step=step)
                 if 12 in BATCH_ROWS:
                     # c8 regress-fix: a lone long request decodes in K=3 rounds of one
                     # row; its context-parallel width buckets up to HY4_BSPEC_PREWARM
@@ -3339,9 +3383,10 @@ def main():
                         for _ in range(2):
                             graphs.run_bspec("draft", [0] * 4, [False] * 4, end=end,
                                              call_shape=batch_shape(4), per=4)
-                            for step in (1, 2):
-                                graphs.run_bspec("chain", [0, 0], [False, True], end=end,
-                                                 call_shape=batch_shape(2), step=step)
+                            if not getattr(ctx.decoder, "has_dfly", False):
+                                for step in (1, 2):
+                                    graphs.run_bspec("chain", [0, 0], [False, True], end=end,
+                                                     call_shape=batch_shape(2), step=step)
                             graphs.run_bspec("verify", [0] * 4, [False] * 4, end=end,
                                              call_shape=batch_shape(4), per=4)
                         w = graphs.index_width(w * world + 1)

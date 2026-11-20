@@ -86,6 +86,8 @@ class DecodeGraphs:
         if self.device.type == "cuda":
             self._tail_host = self._tail_host.pin_memory()
         self._tail_start = torch.zeros((1,), dtype=torch.long, device=self.device)
+        self._batch_ring = []
+        self._batch_ring_at = 0
         self.graphs = collections.OrderedDict()
         self.pool = None
         self.captures = self.replays = self.eager_steps = self.uncaptured = 0
@@ -237,6 +239,7 @@ class DecodeGraphs:
         width = int(token_ids.shape[1])
         return (token_ids.is_cuda and int(token_ids.shape[0]) == 1 and width > 1
                 and width % self.world == 0 and width <= self.TAIL_MAX
+                and not (getattr(self.decoder, "has_dfly", False) and return_hidden)
                 and state is None and call_shape.is_prefill_graph
                 and 0 <= row < int(self.decoder.cache.rows)
                 and (start + width - 1) // self.world < self.cache.cap_of(row))
@@ -506,9 +509,13 @@ class DecodeGraphs:
         if deferred is not None:
             deferred.clear()
         with use_lane(0, overlap=False, geometry=geometry, sync_free=True), w8_decode_scope():
-            logits, normed, _ = d._layers_and_head(
-                tokens, rows, positions, token_rows, visible, visible_max, state=None,
-                return_hidden=True, call_shape=call_shape, logits_rows="all", gather=False)
+            d.arm_dfly_capture(count)
+            try:
+                logits, normed, _ = d._layers_and_head(
+                    tokens, rows, positions, token_rows, visible, visible_max, state=None,
+                    return_hidden=True, call_shape=call_shape, logits_rows="all", gather=False)
+            finally:
+                d.disarm_dfly_tap()
             if sample:
                 from .spec_sample import filter_scores, verify_sample
 
@@ -613,6 +620,94 @@ class DecodeGraphs:
         self.replays += 1
         return outputs
 
+    # -- DFly2 single-row block-parallel draft graphs (no indexer buckets) --
+    def _dfly_state(self, count):
+        state = getattr(self, "_dfly", None)
+        if state is None:
+            state = self._dfly = {}
+        entry = state.get(int(count))
+        if entry is None:
+            d = self.decoder
+            hidden = int(d.config.hidden)
+            per = self.spec_per(count)
+            entry = state[int(count)] = {
+                "bonus": torch.zeros((1,), dtype=torch.long, device=self.device),
+                "hidden": torch.zeros((1, hidden), dtype=d.compute_dtype, device=self.device),
+                "args": torch.zeros((1 + 3 * per,), dtype=torch.long, device=self.device),
+                "per": per,
+                "out_drafts": torch.zeros((int(count) - 1,), dtype=torch.long, device=self.device),
+                "out_flag": torch.zeros((), dtype=torch.bool, device=self.device),
+            }
+        return entry
+
+    def dfly_inputs(self, count):
+        """Static `(bonus [1], target_hidden [1, H])` buffers for `run_dfly_draft`."""
+        entry = self._dfly_state(count)
+        return entry["bonus"], entry["hidden"]
+
+    def dfly_sample_state(self, count):
+        entry = self._dfly_state(count)
+        if "noise" not in entry:
+            vocab = int(self.decoder.weights.head.shape[0])
+            k = int(count) - 1
+            entry["noise"] = torch.zeros((k, vocab), dtype=torch.float32, device=self.device)
+            entry["out_q"] = torch.zeros((k, vocab), dtype=torch.float32, device=self.device)
+        return entry
+
+    def _body_dfly_draft(self, row, call_shape, count, sample=False, filtered=False, regime="cp"):
+        from .lanes import use_lane
+
+        d = self.decoder
+        entry = self._dfly_state(count)
+        k = int(count) - 1
+        anchor = entry["args"][0:1]
+        rows_1 = torch.full((1,), int(row), dtype=torch.long, device=self.device)
+        bypass_short = (regime == "bypass" and self.short_cap() > 0)
+        bypass_cp = (regime == "bypass" and not bypass_short)
+        top_k, top_p = self.spec_filter_params() if (sample and filtered) else (None, None)
+        with use_lane(0, overlap=False, geometry=None, sync_free=True):
+            drafts, _ = d.dfly_draft(
+                entry["bonus"], entry["hidden"],
+                request_rows=rows_1, k=k, anchors=anchor,
+                call_shape=call_shape, static_slots=self._spec_slots(entry),
+                bypass_short=bypass_short, bypass_cp=bypass_cp,
+                sample=sample, filtered=filtered,
+                inv_temp=self.spec_inv_temp() if sample else None,
+                top_k=top_k, top_p=top_p,
+                noise_q=entry["noise"] if sample else None,
+                q_out=entry["out_q"].unsqueeze(0) if sample else None)
+        entry["out_drafts"].copy_(drafts[0])
+        entry["out_flag"].zero_()
+        return entry["out_drafts"], entry["out_flag"]
+
+    def run_dfly_draft(self, *, row, start, count, call_shape, sample=False, filtered=False):
+        """Run one DFly2 block draft of `k = count - 1` tokens -> `(drafts [k], flag)`.
+
+        DFly2 never runs an indexer, so only two regimes exist across the entire
+        context range: `"bypass"` (`<= index_topk`) and `"cp"` (`> index_topk`).
+        """
+        regime, _ = self.spec_width(start, count, call_shape)
+        eff = "bypass" if regime == "bypass" else "cp"
+        filtered = bool(sample and filtered)
+        key = ("dfly_draft", int(row), int(count), eff, call_shape.name)
+        if sample:
+            key = key + (("sample", "filtered") if filtered else ("sample",))
+            self.dfly_sample_state(count)
+        entry = self._dfly_state(count)
+        self._stage_spec(entry, row, start, count)
+        cached = self.graphs.get(key)
+        if cached is None:
+            out = self._body_dfly_draft(row, call_shape, count, sample, filtered, eff)
+            self.eager_steps += 1
+            self._capture(key, lambda: self._body_dfly_draft(
+                row, call_shape, count, sample, filtered, eff))
+            return out
+        graph, drafts_out, flag = cached
+        self.graphs.move_to_end(key)
+        graph.replay()
+        self.replays += 1
+        return drafts_out, flag
+
     # -- batched decode: B request rows, one token each ----------------------
     # A step over B active request rows runs as the decode-family rows shape
     # of its bucket (1, 2, 4 or 8 query rows; `verify_shape(B)` past one row).
@@ -642,8 +737,6 @@ class DecodeGraphs:
         state = getattr(self, "_batch", None)
         if state is None:
             state = self._batch = {}
-            self._batch_ring = []
-            self._batch_ring_at = 0
         entry = state.get(size)
         if entry is None:
             # args: tokens | positions | rows | record slot (-1 off-owner) | safe slot
@@ -929,7 +1022,46 @@ class DecodeGraphs:
                            vocabulary_range=d.weights.sharding.vocabulary_range)
         st["drafts"][:slots, j].copy_(dj.reshape(-1))
 
+    def _body_bdraft_dfly(self, size, call_shape, rw, per):
+        """Batched DFly2 block draft: produces all `K = per - 1` drafts and `q` scores in one pass."""
+        from .lanes import use_lane
+
+        d = self.decoder
+        st, entry = self.bspec_state(), self._bspec_args(size, per)
+        # DFly2 writes into target KV at verify positions `P .. P + K` (pad rows clamped by row_cap_dev).
+        rows, _, positions, slot, safe = self._bspec_geometry("verify", size, per)
+        K = per - 1
+        slots = size // per
+        live = slots * per
+        rem = size - live
+        srow = rows[0:live:per]
+        anchors = st["P"][srow]
+        n_last = st["n"][srow]
+        bonus = st["pend_tok"][srow, n_last]
+        target_hidden = st["pend_hid"][srow, n_last]
+        greedy, scale = self._bspec_greedy(slots)
+        bypass_short = (rw[0] == "bypass" and self.short_cap() > 0)
+        bypass_cp = (rw[0] == "bypass" and not bypass_short)
+        with use_lane(0, overlap=False, geometry=None, sync_free=True):
+            drafts, _ = d.dfly_draft(
+                bonus, target_hidden,
+                request_rows=srow, k=K, anchors=anchors,
+                call_shape=call_shape, static_slots=(entry["kept"], slot, safe),
+                bypass_short=bypass_short, bypass_cp=bypass_cp,
+                sample=True, filtered=False, inv_temp=scale,
+                noise_q=st["noise_q"][:slots, :K],
+                q_out=st["q"][:slots, :K],
+                greedy_mask=greedy,
+                pad_rows=(rows[live:] if rem else None),
+                pad_positions=(positions[live:] if rem else None),
+                write_positions=positions)
+        st["drafts"][:slots, :K].copy_(drafts)
+        st["out_dflag"].zero_()
+        return st["drafts"], st["out_dflag"]
+
     def _body_bdraft(self, size, call_shape, rw, per):
+        if getattr(self.decoder, "has_dfly", False):
+            return self._body_bdraft_dfly(size, call_shape, rw, per)
         from .lanes import use_lane
 
         d = self.decoder
@@ -999,9 +1131,13 @@ class DecodeGraphs:
         geometry, visible_max = self._geo(*rw, rows=rows)
         with use_lane(0, overlap=False, geometry=geometry, sync_free=True), \
                 w8_decode_scope():
-            logits, normed, _ = d._layers_and_head(
-                tokens, rows, positions, token_rows, visible, visible_max, state=None,
-                return_hidden=True, call_shape=call_shape, logits_rows="all", gather=False)
+            d.arm_dfly_capture(size)
+            try:
+                logits, normed, _ = d._layers_and_head(
+                    tokens, rows, positions, token_rows, visible, visible_max, state=None,
+                    return_hidden=True, call_shape=call_shape, logits_rows="all", gather=False)
+            finally:
+                d.disarm_dfly_tap()
             live = slots * per
             greedy, scale = self._bspec_greedy(slots)
             scores = (logits[:live].reshape(slots, per, -1).float() * scale.reshape(-1, 1, 1))
@@ -1034,8 +1170,18 @@ class DecodeGraphs:
             st["P"].index_copy_(0, target, P_old + n_acc + 1)
             st["pend_tok"].narrow(1, 0, per).index_copy_(0, target, new_tok)
             st["pend_hid"].narrow(1, 0, per).index_copy_(0, target, new_hid)
+            if getattr(d, "has_dfly", False):
+                src_idx = torch.arange(slots, device=n_acc.device, dtype=torch.long) * per + n_acc
+                d.dfly_state.commit_capture(target, src_idx)
         st["out_vflag"].copy_(self._flag(deferred))
         return st["out_n"], st["out_vflag"]
+
+    def _bspec_regime(self, kind, end, call_shape):
+        rw = self.regime(int(end), call_shape)
+        if kind == "draft" and getattr(self.decoder, "has_dfly", False):
+            # DFly2 has no indexer width buckets: one bypass graph and one cp graph.
+            return ("bypass", 0) if rw[0] == "bypass" else ("cp", 0)
+        return rw
 
     def run_bspec(self, kind, rows, pads, *, end, call_shape, per=2, step=0):
         """One batched speculative forward: "draft" (the absorb, `per` = K+1 entries
@@ -1048,7 +1194,7 @@ class DecodeGraphs:
         size = len(rows)
         if size not in self.BATCH_BUCKETS:
             raise ValueError("a batched speculative forward runs in a bucket")
-        rw = self.regime(int(end), call_shape)
+        rw = self._bspec_regime(kind, end, call_shape)
         sub = step if kind == "chain" else per
         key = ("bspec", kind, size, sub, self.wkey(*rw), call_shape.name)
         entry = self._bspec_args(size, 1 if kind == "chain" else per)
@@ -1073,7 +1219,7 @@ class DecodeGraphs:
 
     def bspec_cached(self, kind, size, end, *, call_shape, per=2, step=0):
         sub = step if kind == "chain" else per
-        return ("bspec", kind, size, sub, self.wkey(*self.regime(int(end), call_shape)),
+        return ("bspec", kind, size, sub, self.wkey(*self._bspec_regime(kind, end, call_shape)),
                 call_shape.name) in self.graphs
 
     def bspec_set(self, row, *, P, c, n):

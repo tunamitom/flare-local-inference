@@ -227,7 +227,8 @@ class Hy4ModelWeights:
     head: torch.Tensor           # [vocab_local, hidden] FP32 (`enable_lm_head_fp32`)
     hc_head: IhcHead
     layers: tuple
-    draft: object | None = None  # `mtp.MtpBlock` when speculation is prepared
+    draft: object | None = None  # `mtp.MtpBlock` when legacy MTP is prepared
+    dfly: object | None = None   # `dfly.DflyBlock` when DFly2 is prepared
     used_names: frozenset = frozenset()
     _prepared: dict = field(default_factory=dict)  # GPU session wiring
 
@@ -267,7 +268,7 @@ class Hy4ModelWeights:
                 for sub in vars(item).values():
                     visit(sub)
 
-        visit((self.embed, self.norm, self.head, self.hc_head, self.layers, self.draft))
+        visit((self.embed, self.norm, self.head, self.hc_head, self.layers, self.draft, self.dfly))
         return total
 
 
@@ -377,7 +378,7 @@ def _load_ihc(builder, prefix, *, head=False):
     return loaded
 
 
-def _attention_state(builder, layer, prefix, selection):
+def _attention_state(builder, layer, prefix, selection, *, has_indexer=None, max_width=None):
     config, sharding, loader = builder.config, builder.sharding, builder.loader
     c = config.text
     hidden = config.hidden
@@ -407,7 +408,8 @@ def _attention_state(builder, layer, prefix, selection):
     sink = sink[sharding.head_range[0]:sharding.head_range[1]].contiguous()
 
     indexer = None
-    if config.indexer_type(layer) == "full":
+    use_indexer = (config.indexer_type(layer) == "full") if has_indexer is None else bool(has_indexer)
+    if use_indexer:
         ip = f"{attn}.indexer"
         indexer = IndexerWeights(
             wq_b=builder.linear(f"{ip}.wq_b", (c["index_n_heads"] * c["index_head_dim"], c["q_lora_rank"])),
@@ -437,7 +439,8 @@ def _attention_state(builder, layer, prefix, selection):
                  else replace(attention_weights.indexer, wk=packed.rows("indexer_wk"))))
     return Hy4LayerAttention(
         weights=attention_weights,
-        config=config, sharding=sharding, selection=selection, device=builder.loader.device)
+        config=config, sharding=sharding, selection=selection, device=builder.loader.device,
+        max_width=max_width)
 
 
 def _moe_state(builder, prefix, *, dense=False):
@@ -599,9 +602,15 @@ def build_model_state(loader, config, sharding, *, selections, mtp=True):
             input_norm=input_norm, post_attention_norm=post_norm, mlp=mlp))
 
     draft = None
-    if mtp:
+    dfly = None
+    if mtp and config.draft_layers:
         draft = MtpBlock.build(builder, selections[config.layers])
+    if mtp and config.has_dfly:
+        from .dfly import DflyBlock
+
+        dfly = DflyBlock.build(builder)
     builder.finish(set(loader._selected_names()))
     return Hy4ModelWeights(
         config=config, sharding=sharding, device=loader.device, embed=embed, norm=norm, head=head,
-        hc_head=hc_head, layers=tuple(layers), draft=draft, used_names=frozenset(builder.used))
+        hc_head=hc_head, layers=tuple(layers), draft=draft, dfly=dfly,
+        used_names=frozenset(builder.used))
