@@ -214,6 +214,11 @@ class DecodeGraphs:
                                      safe=self._args[2:3])
         regime = regime or ("bypass" if width == 0 else "cp")
         geometry, visible_max = self._geo(regime, width, row=row, count=1)
+        # Phase 4 (design 4.1 item 5): the captured step rotates at
+        # `P_rope = P_kv + rope_delta_dev[row]` — the `add`/`clamp` read one
+        # persistent device buffer inside the EXISTING graph buckets (zero new
+        # CUDA graphs; text rows (delta 0) run bit-identical angles).
+        rope_positions = (positions + d.rope_delta_dev[token_rows]).clamp_min(0)
         deferred = getattr(d.collectives, "deferred_checks", None)
         if deferred is not None:
             deferred.clear()
@@ -221,7 +226,7 @@ class DecodeGraphs:
             logits = d._layers_and_head(
                 self._token, rows, positions, token_rows, visible, visible_max, state=None,
                 return_hidden=False, call_shape=call_shape, logits_rows=logits_rows,
-                gather=False)
+                gather=False, rope_positions=rope_positions)
         flags = list(deferred) if deferred else []
         if deferred is not None:
             deferred.clear()
@@ -276,6 +281,7 @@ class DecodeGraphs:
         slots = self.cache.base_of(row) + torch.div(start + first, self.world,
                                                     rounding_mode="floor") + j
         d.cache.begin_forward_device(token_rows, positions, kept, slots)
+        rope_positions = (positions + d.rope_delta_dev[token_rows]).clamp_min(0)
         geometry = {"owned_max": max(width, 1), "base": self.cache.base_of(row)}
         deferred = getattr(d.collectives, "deferred_checks", None)
         if deferred is not None:
@@ -284,7 +290,8 @@ class DecodeGraphs:
             out = d._layers_and_head(
                 tokens, rows, positions, token_rows, visible, None, state=None,
                 return_hidden=need_hidden, call_shape=call_shape,
-                logits_rows="all" if need_logits else "none", gather=False)
+                logits_rows="all" if need_logits else "none", gather=False,
+                rope_positions=rope_positions)
         flags = list(deferred) if deferred else []
         if deferred is not None:
             deferred.clear()
@@ -503,6 +510,7 @@ class DecodeGraphs:
         visible = positions + 1
         kept, slot, safe = self._spec_slots(entry)
         d.cache.begin_forward_static(token_rows, positions, slot=slot, safe=safe, kept=kept)
+        rope_positions = (positions + d.rope_delta_dev[token_rows]).clamp_min(0)
         geometry, visible_max = self._geo(regime, width, row=row, count=count)
         visible_max = visible_max if call_shape.is_decode_graph else None
         deferred = getattr(d.collectives, "deferred_checks", None)
@@ -513,7 +521,8 @@ class DecodeGraphs:
             try:
                 logits, normed, _ = d._layers_and_head(
                     tokens, rows, positions, token_rows, visible, visible_max, state=None,
-                    return_hidden=True, call_shape=call_shape, logits_rows="all", gather=False)
+                    return_hidden=True, call_shape=call_shape, logits_rows="all", gather=False,
+                    rope_positions=rope_positions)
             finally:
                 d.disarm_dfly_tap()
             if sample:
@@ -809,6 +818,7 @@ class DecodeGraphs:
         visible = positions + 1
         d.cache.begin_forward_static(token_rows, positions, slot=slot, safe=safe,
                                      kept=entry["kept"], kept_identity=_kept_rows())
+        rope_positions = (positions + d.rope_delta_dev[token_rows]).clamp_min(0)
         geometry, visible_max = self._geo(*rw, rows=rows)
         deferred = getattr(d.collectives, "deferred_checks", None)
         if deferred is not None:
@@ -816,7 +826,8 @@ class DecodeGraphs:
         with use_lane(0, overlap=False, geometry=geometry, sync_free=True), w8_decode_scope():
             logits = d._layers_and_head(
                 tokens, rows, positions, token_rows, visible, visible_max, state=None,
-                return_hidden=False, call_shape=call_shape, logits_rows="all", gather=False)
+                return_hidden=False, call_shape=call_shape, logits_rows="all", gather=False,
+                rope_positions=rope_positions)
             if sample:
                 # exact sampling of softmax(logits / T) per row over the vocabulary
                 # shards (Gumbel-max + the offer exchange): the same ids on every
@@ -1125,6 +1136,7 @@ class DecodeGraphs:
         visible = positions + 1
         d.cache.begin_forward_static(token_rows, positions, slot=slot, safe=safe, kept=entry["kept"],
                                      kept_identity=_kept_rows())
+        rope_positions = (positions + d.rope_delta_dev[token_rows]).clamp_min(0)
         deferred = getattr(d.collectives, "deferred_checks", None)
         if deferred is not None:
             deferred.clear()
@@ -1135,7 +1147,8 @@ class DecodeGraphs:
             try:
                 logits, normed, _ = d._layers_and_head(
                     tokens, rows, positions, token_rows, visible, visible_max, state=None,
-                    return_hidden=True, call_shape=call_shape, logits_rows="all", gather=False)
+                    return_hidden=True, call_shape=call_shape, logits_rows="all", gather=False,
+                    rope_positions=rope_positions)
             finally:
                 d.disarm_dfly_tap()
             live = slots * per

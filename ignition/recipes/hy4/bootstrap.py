@@ -279,7 +279,7 @@ class PreparedHy4Rank:
 def construct_rank(snapshot, config: PreparationConfig, *, rank=0, device=None, pinned=True,
                    mtp=None, cache_rows=None, cache_capacity=None, index_pages_per_layer=1,
                    headers_only=False, manifest=None, world_size=None, collectives=None,
-                   fused_cache=False):
+                   fused_cache=False, vision=False):
     """Construct one Hy4 rank end to end (the CPU-shape/dtype dry run's core).
 
     Shard assignment, name-checked weight loading (the do-not-quantize floor
@@ -325,6 +325,7 @@ def construct_rank(snapshot, config: PreparationConfig, *, rank=0, device=None, 
         manifest = inspect_indexed_checkpoint(snapshot)
     loader_device = torch.device("meta") if headers_only else device
     loader = Hy4WeightLoader(manifest, loader_device, shard=shard, mtp=mtp, pinned=pinned,
+                             vision=vision,
                              expert_scale_compression=config.expert_scale_compression)
     if headers_only:
         sources = headers_dry_run(loader)
@@ -342,9 +343,20 @@ def construct_rank(snapshot, config: PreparationConfig, *, rank=0, device=None, 
                               fused_records=fused_cache)
     decoder = Hy4Decoder(weights, cache, collectives=collectives,
                          prefill_chunk_size=config.prefill_chunk_size)
+    if vision:
+        # Phase 4 (VISION-DESIGN section 4.1 item 5): attach the TP8 ViT tower
+        # (`HY4_VISION=tp8`) — its `weights.allocated_bytes` term is already
+        # captured in `weights_bytes` above, so the Phase-A KV budget deducts
+        # the 339.09 MiB/rank cleanly (design section 1.4 note).
+        from .vision import Hy4VisionTower
+
+        if weights.vision is None:
+            raise ValueError("vision=True selected no vit.* checkpoint tensors")
+        decoder.vision = Hy4VisionTower(weights.vision)
     report = {"rank": rank, "world_size": shard.world_size, "device": str(device),
               "weights_bytes": weights.allocated_bytes, "mtp": mtp,
               "dfly": weights.dfly is not None,
+              "vision": bool(vision),
               "full_indexer_layers": model_config.full_indexer_layers,
               "shared_indexer_layers": len(model_config.shared_indexer_layers),
               "prefill_head_gather": sharding.prefill_head_gather,

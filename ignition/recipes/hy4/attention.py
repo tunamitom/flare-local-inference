@@ -103,15 +103,78 @@ def rotate_half_interleaved(x):
     return torch.stack((-x2, x1), dim=-1).flatten(-2)
 
 
-def apply_interleaved_rope(x, positions, *, rope_dim, theta):
+def apply_interleaved_mrope(x, positions_3d, *, rope_dim, theta, mrope_section=(12, 10, 10)):
+    """Interleaved 3D mRoPE on the LAST `rope_dim` dims of `x` (multimodal prefill).
+
+    `positions_3d` is `[3, rows]` int64 (axis 0 = T, 1 = H, 2 = W). Exact
+    frequency recomposition across the `rope_dim // 2` rotary pairs, verified
+    against `transformers 5.24.0.dev0` `modeling_hy_v4_vl.py`
+    (`HYV4VLRotaryEmbedding.recomposition_frequencies`) and SGLang
+    `hunyuan_v4.py`: the three axis tables `freqs[a, n, p] = position[a, n] *
+    inv_freq[p]` interleave with the H pairs over `slice(1, section[1] * 3, 3)`
+    and the W pairs over `slice(2, section[2] * 3, 3)`; every other pair
+    (12 of 32 at production `mrope_section = (12, 10, 10)`) keeps T.
+
+    Computed and applied in full FP32 with ONE rounding to `x.dtype` — the
+    exact arithmetic of `apply_interleaved_rope`, so whenever the three axes
+    are equal (every text token) the result is BITWISE identical to 1D RoPE at
+    that position (design section 2.1 exact reduction invariant).
+    """
+    if rope_dim <= 0 or rope_dim % 2:
+        raise ValueError("rope_dim must be a positive even number")
+    if x.shape[-1] < rope_dim:
+        raise ValueError("rotary block exceeds the input width")
+    if not isinstance(positions_3d, torch.Tensor) or positions_3d.ndim != 2 or positions_3d.shape[0] != 3:
+        raise ValueError("3D mRoPE needs positions of shape [3, rows]")
+    if int(positions_3d.shape[1]) != int(x.shape[0]):
+        raise ValueError("3D mRoPE positions must cover every row of x")
+    pairs = rope_dim // 2
+    if sum(mrope_section) != pairs:
+        raise ValueError(f"mrope_section {tuple(mrope_section)} must sum to {pairs} rotary pairs")
+    inv_freq = 1.0 / (theta ** (torch.arange(0, rope_dim, 2, device=x.device, dtype=torch.float32) / rope_dim))
+    freqs = positions_3d.to(torch.float32)[:, :, None] * inv_freq.reshape(1, 1, -1)  # [3, rows, pairs]
+    freqs_out = freqs[0].clone()
+    for axis, offset in ((1, 1), (2, 2)):
+        length = mrope_section[axis] * 3
+        index = slice(offset, length, 3)
+        freqs_out[:, index] = freqs[axis][:, index]
+    angles = freqs_out.repeat_interleave(2, dim=-1)          # interleaved pairs
+    cos, sin = angles.cos(), angles.sin()
+    pe = x[..., x.shape[-1] - rope_dim:]
+    while cos.ndim < pe.ndim:
+        cos, sin = cos.unsqueeze(1), sin.unsqueeze(1)
+    rotated = pe.float() * cos + rotate_half_interleaved(pe.float()) * sin
+    out = x.clone()
+    out[..., x.shape[-1] - rope_dim:] = rotated.to(x.dtype)
+    return out
+
+
+def rope_positions_of(positions, rope_positions):
+    """The rotary-space positions of one call (design section 2.3).
+
+    `rope_positions=None` keeps the call on `positions` (`P_kv`); a `[3, N]`
+    tensor is the multimodal-prefill 3D form (dispatched to
+    `apply_interleaved_mrope`); a 1D tensor is the shifted text form
+    (`P_kv + mrope_delta`).
+    """
+    return positions if rope_positions is None else rope_positions
+
+
+def apply_interleaved_rope(x, positions, *, rope_dim, theta, mrope_section=None):
     """Interleaved rotary embedding on the LAST `rope_dim` dims of `x`.
 
     The checkpoint stores the rotary block last (`torch.split(x,
     [dim - rope_dim, rope_dim])` in the witness) with consecutive rotary
     pairs, so the rotation is the GPT-J adjacent-pair form. `positions` is
-    int/long per row. Matches `dsa_indexer.rope.apply_indexer_rope` at
-    width 128 (checked in `tests/recipes/test_hy4_decoder_body.py`).
+    int/long per row, or `[3, rows]` 3D mRoPE positions (multimodal prefill
+    chunks) which dispatch to `apply_interleaved_mrope`. Matches
+    `dsa_indexer.rope.apply_indexer_rope` at width 128 (checked in
+    `tests/recipes/test_hy4_decoder_body.py`).
     """
+    if isinstance(positions, torch.Tensor) and positions.ndim == 2:
+        return apply_interleaved_mrope(
+            x, positions, rope_dim=rope_dim, theta=theta,
+            mrope_section=(12, 10, 10) if mrope_section is None else tuple(mrope_section))
     if rope_dim <= 0 or rope_dim % 2:
         raise ValueError("rope_dim must be a positive even number")
     if x.shape[-1] < rope_dim:
@@ -292,6 +355,10 @@ class Hy4LayerAttention:
         self.kv_lora = c["kv_lora_rank"]
         self.v_head = c["v_head_dim"]
         self.rope_theta = c["rope_parameters"]["rope_theta"]
+        # Interleaved 3D mRoPE sections (design section 2.1): production
+        # (12, 10, 10) over the 32 rotary pairs — pinned by `config.py` on the
+        # official checkpoint.
+        self.mrope_section = tuple(c["rope_parameters"].get("mrope_section") or (12, 10, 10))
         self.scaling = c["qk_head_dim"] ** -0.5  # rope_type default: no mscale
         # `kv_b_proj` rows are PER HEAD, `[key qk_nope; value v]` (reference
         # `expand_kv`, modeling_hy_v4_patched.py:431-434: `kv_b_proj(x).view(B,
@@ -309,7 +376,7 @@ class Hy4LayerAttention:
 
     # --- projection --------------------------------------------------------
 
-    def project(self, x, positions, *, absorb=True):
+    def project(self, x, positions, *, absorb=True, rope_positions=None):
         """(q_resid, absorbed query [rows,heads,kv_lora+rope], latent [rows,kv_lora+rope]).
 
         The absorbed query is `q_nope @ W_UK` per head (512-wide at production
@@ -319,15 +386,24 @@ class Hy4LayerAttention:
         prefill graph wiring gathers unabsorbed queries and absorbs + expands
         LOCALLY (consult8 §5's `kv_b` two-wirings); decode graphs keep the
         owner-side absorb here and read no extra weights.
+
+        `rope_positions` (design section 2.3) is the rotary-space position:
+        `None` keeps `positions` (the bit-identical text path), 1D runs the
+        existing fused kernels, `[3, N]` dispatches to
+        `apply_interleaved_mrope` (multimodal prefill chunks only). The cache
+        writes keep `positions` (`P_kv`) — see `Hy4Cache.write_latent`.
         """
         w = self.weights
+        rop = rope_positions_of(positions, rope_positions)
         q_resid = rms_norm(x @ w.q_a_proj.T, w.q_a_norm, self.config.text["rms_norm_eps"])
         q = (q_resid @ w.q_b_proj.T).view(-1, self.heads, self.qk_nope + self.qk_rope)
-        q = apply_interleaved_rope(q, positions, rope_dim=self.qk_rope, theta=self.rope_theta)
+        q = apply_interleaved_rope(q, rop, rope_dim=self.qk_rope, theta=self.rope_theta,
+                                       mrope_section=self.mrope_section)
         compressed = x @ w.kv_a_proj.T
         kv_pass, k_rot = compressed[:, :self.kv_lora], compressed[:, self.kv_lora:]
         k_pass = rms_norm(kv_pass, w.kv_a_norm, self.config.text["rms_norm_eps"])
-        k_rot = apply_interleaved_rope(k_rot, positions, rope_dim=self.qk_rope, theta=self.rope_theta)
+        k_rot = apply_interleaved_rope(k_rot, rop, rope_dim=self.qk_rope, theta=self.rope_theta,
+                                      mrope_section=self.mrope_section)
         latent = torch.cat((k_pass, k_rot), dim=-1)  # [rows, kv_lora + rope] — the cache record
         if not absorb:
             return q_resid, q, latent
@@ -337,7 +413,8 @@ class Hy4LayerAttention:
         # weight reads stay this rank's `kv_b_proj` rows).
         return q_resid, self.absorb_queries(q), latent
 
-    def project_packed(self, x, positions, *, absorb=True, with_index_keys=False):
+    def project_packed(self, x, positions, *, absorb=True, with_index_keys=False,
+                       rope_positions=None):
         """All same-input projections of one layer call from ONE packed weight.
 
         Packed at load (`AttentionWeights.packed_input`): `q_a_proj` +
@@ -350,12 +427,19 @@ class Hy4LayerAttention:
         packing this falls back to the loose weights (identical math). The
         `gate_raw` output is stashed for `gate_and_project` (which keeps its
         two-argument contract) keyed on the input's storage.
+
+        `rope_positions` (design section 2.3): `None` keeps `positions`; a
+        `[3, N]` multimodal-prefill form bypasses every 1D-only fused kernel
+        (`rope_interleaved` / `latent_prep` / `absorb_pack_rope_fused`) and
+        runs the numerically identical eager chain through `project`.
         """
         w = self.weights
+        rop = rope_positions_of(positions, rope_positions)
         packed = w.packed_input
-        if packed is None:
-            q_resid, q, latent = self.project(x, positions, absorb=absorb)
-            index_keys = self.prepare_index_keys(x, positions) if with_index_keys else None
+        if packed is None or (isinstance(rop, torch.Tensor) and rop.ndim == 2):
+            q_resid, q, latent = self.project(x, positions, absorb=absorb, rope_positions=rope_positions)
+            index_keys = (self.prepare_index_keys(x, positions, rope_positions=rope_positions)
+                          if with_index_keys else None)
             gate_raw = x @ w.gate_proj.T.to(x.dtype)
             self._stash_gate(x, gate_raw)
             return LayerProjections(q_resid, q, latent, index_keys, gate_raw)
@@ -390,16 +474,17 @@ class Hy4LayerAttention:
         if absorb and x.is_cuda and diet("diet_absorb") and _fused_norm_rope():
             # round 15: W_UK straight into the absorbed query's latent columns,
             # the rope block rotated straight into its last columns (no cat)
-            q_out = self._absorb_into(q, positions)
+            q_out = self._absorb_into(q, rop)
         else:
-            q = apply_interleaved_rope(q, positions, rope_dim=self.qk_rope, theta=self.rope_theta)
+            q = apply_interleaved_rope(q, rop, rope_dim=self.qk_rope, theta=self.rope_theta,
+                                       mrope_section=self.mrope_section)
         kv_pass, k_rot = kv_raw[:, :self.kv_lora], kv_raw[:, self.kv_lora:]
         latent = None
         if glue and diet("diet3") and diet("rms_tree"):
             # round 15: the latent row (tree RMSNorm + rope) in one launch
             from .fused_ops import latent_prep
 
-            latent = latent_prep(kv_raw, w.kv_a_norm, self.config.text["rms_norm_eps"], positions,
+            latent = latent_prep(kv_raw, w.kv_a_norm, self.config.text["rms_norm_eps"], rop,
                                  lora=self.kv_lora, rope_dim=self.qk_rope, theta=self.rope_theta)
         if latent is not None:
             pass
@@ -411,12 +496,13 @@ class Hy4LayerAttention:
                                  dtype=kv_raw.dtype, device=kv_raw.device)
             fused_rms_norm(kv_pass, w.kv_a_norm, self.config.text["rms_norm_eps"],
                            out=latent[:, :self.kv_lora])
-            rope_interleaved(k_rot, positions, rope_dim=self.qk_rope, theta=self.rope_theta,
+            rope_interleaved(k_rot, rop, rope_dim=self.qk_rope, theta=self.rope_theta,
                              out=latent[:, self.kv_lora:])
         else:
             k_pass = rms_norm(kv_pass, w.kv_a_norm, self.config.text["rms_norm_eps"])
-            k_rot = apply_interleaved_rope(k_rot, positions, rope_dim=self.qk_rope,
-                                           theta=self.rope_theta)
+            k_rot = apply_interleaved_rope(k_rot, rop, rope_dim=self.qk_rope,
+                                           theta=self.rope_theta,
+                                           mrope_section=self.mrope_section)
             latent = torch.cat((k_pass, k_rot), dim=-1)
         if q_out is None:
             q_out = q if not absorb else self.absorb_queries(q)
@@ -424,7 +510,7 @@ class Hy4LayerAttention:
         if with_index_keys:
             # Through `prepare_index_keys` — the single key-prep entry point
             # (a wrong-rotation mutant wraps this method and must stay live).
-            index_keys = self.prepare_index_keys(x, positions)
+            index_keys = self.prepare_index_keys(x, positions, rope_positions=rope_positions)
         self._stash_gate(x, gate_raw)
         return LayerProjections(q_resid, q_out, latent, index_keys, gate_raw)
 
@@ -719,18 +805,20 @@ class Hy4LayerAttention:
 
     # --- selection ---------------------------------------------------------
 
-    def prepare_index_keys(self, x, positions):
+    def prepare_index_keys(self, x, positions, *, rope_positions=None):
         """Project and prepare this layer's index keys.
 
         The `k_norm` runs before the nope/pe split and the interleaved RoPE
         applies at write time (`dsa_indexer.rope.prepare_indexer_keys`): the
         key cache stores post-rope keys and the scorer never rotates. The
         epsilon is `rms_norm_eps` (the decided convention), never b12x's 1e-6
-        default.
+        default. `rope_positions` as in `project` (3D mRoPE prefill chunks
+        bypass the 1D-only fused `index_key_prep`).
         """
         iw = self.weights.indexer
         if iw is None:
             raise ValueError("shared layers prepare no index keys")
+        rop = rope_positions_of(positions, rope_positions)
         # The packed same-input weight supplies `wk` when present (same rows,
         # bitwise the same GEMM); the loose tensor otherwise.
         stash = getattr(self, "_wk_raw", None)
@@ -742,23 +830,24 @@ class Hy4LayerAttention:
             packed = self.weights.packed_input
             wk = iw.wk if packed is None else packed.rows("indexer_wk")
             k_raw = x @ wk.T
-        if k_raw.is_cuda and diet("diet3") and _fused_norm_rope():
+        if k_raw.is_cuda and diet("diet3") and _fused_norm_rope() and rop.ndim == 1:
             # round 15: .float(), the LayerNorm (ATen's own mean / Welford trees)
             # and the rope in one launch for the decode family's few rows
             from .fused_ops import index_key_prep
 
             keys = index_key_prep(k_raw, iw.k_norm_weight, iw.k_norm_bias,
-                                  self.config.text["rms_norm_eps"], positions,
+                                  self.config.text["rms_norm_eps"], rop,
                                   rope_dim=self.config.text["qk_rope_head_dim"],
                                   theta=self.rope_theta)
             if keys is not None:
                 return keys
         k = k_raw.float()
         k = layer_norm(k, iw.k_norm_weight, iw.k_norm_bias, self.config.text["rms_norm_eps"])
-        return apply_interleaved_rope(k, positions, rope_dim=self.config.text["qk_rope_head_dim"],
-                                     theta=self.rope_theta)
+        return apply_interleaved_rope(k, rop, rope_dim=self.config.text["qk_rope_head_dim"],
+                                     theta=self.rope_theta,
+                                     mrope_section=self.mrope_section)
 
-    def select(self, x, q_resid, positions, visible, key_table, slot_base):
+    def select(self, x, q_resid, positions, visible, key_table, slot_base, *, rope_positions=None):
         """Write this layer's top-k selection into its IndexCache cell.
 
         `full` layers score with the indexer (dsa_indexer on CUDA, the same
@@ -779,13 +868,15 @@ class Hy4LayerAttention:
             return cell.buffers(rows=x.shape[0])
         if self.weights.indexer is None:
             raise ValueError("full layer lacks indexer weights")
-        scores = self.index_scores(x, q_resid, positions, visible, key_table, slot_base)
+        scores = self.index_scores(x, q_resid, positions, visible, key_table, slot_base,
+                                   rope_positions=rope_positions)
         topk = min(self.config.text["index_topk"], scores.shape[-1])
         indices = scores.topk(topk, dim=-1).indices.to(torch.int32)
         cell.write_selection(indices, visible, slot_base)
         return cell.buffers(rows=x.shape[0])
 
-    def local_candidates(self, x, q_resid, positions, visible, key_table, slot_base, *, world, rank):
+    def local_candidates(self, x, q_resid, positions, visible, key_table, slot_base, *, world, rank,
+                         rope_positions=None):
         """This rank's local top-k candidates over its OWN key table (D3).
 
         Returns `(candidate_scores [rows, topk] FP32, candidate_positions
@@ -821,12 +912,14 @@ class Hy4LayerAttention:
             parts = [self.local_candidates(
                 x[start:start + block], q_resid[start:start + block],
                 positions[start:start + block], visible[start:start + block], key_table,
-                slot_base[start:start + block], world=world, rank=rank)
+                slot_base[start:start + block], world=world, rank=rank,
+                rope_positions=(None if rope_positions is None
+                                else rope_positions[..., start:start + block]))
                 for start in range(0, count, block)]
             return (torch.cat([values for values, _ in parts]),
                     torch.cat([picked for _, picked in parts]))
         scores = self.index_scores(x, q_resid, positions, visible, key_table, slot_base,
-                                  world=world, rank=rank)
+                                   world=world, rank=rank, rope_positions=rope_positions)
         rows, width = scores.shape
         if width < topk:
             scores = torch.cat((scores, scores.new_full((rows, topk - width), float("-inf"))), dim=-1)
@@ -857,7 +950,8 @@ class Hy4LayerAttention:
     INDEX_SCORE_BLOCK_BYTES = 256 << 20
     INDEX_CANDIDATE_BLOCK_BYTES = 256 << 20
 
-    def index_scores(self, x, q_resid, positions, visible, key_table, slot_base, *, world=1, rank=0):
+    def index_scores(self, x, q_resid, positions, visible, key_table, slot_base, *, world=1, rank=0,
+                     rope_positions=None):
         """Dense causal indexer logits [rows, width] over the key cache.
 
         The reference contract (`HYV4Indexer.forward`, `dsa_indexer`'s
@@ -875,20 +969,27 @@ class Hy4LayerAttention:
         position `j * world + rank`. The indexer is replicated and rank
         invariant (never head-sharded — §2), so the local scores equal the
         single-rank scores of the same positions.
+
+        `rope_positions` as in `project`: 3D mRoPE prefill chunks rotate the
+        query through `apply_interleaved_mrope` (the 1D-only fused
+        `rope_interleaved` never sees a `[3, N]` tensor).
         """
         iw = self.weights.indexer
         c = self.config.text
+        rop = rope_positions_of(positions, rope_positions)
         n_heads, head_dim = iw.heads, iw.head_dim
         q = (q_resid @ iw.wq_b.T).view(-1, n_heads, head_dim)
-        if q.is_cuda and q.dtype == torch.bfloat16 and diet("diet2") and _fused_norm_rope():
+        if (q.is_cuda and q.dtype == torch.bfloat16 and diet("diet2") and _fused_norm_rope()
+                and rop.ndim == 1):
             # round 15: the rope stores its BF16-rounded result as FP32 (= rope, then .float())
             from .fused_ops import rope_interleaved
 
-            q = rope_interleaved(q, positions, rope_dim=c["qk_rope_head_dim"], theta=self.rope_theta,
+            q = rope_interleaved(q, rop, rope_dim=c["qk_rope_head_dim"], theta=self.rope_theta,
                                  out=torch.empty(q.shape, dtype=torch.float32, device=q.device))
         else:
-            q = apply_interleaved_rope(q, positions, rope_dim=c["qk_rope_head_dim"],
-                                       theta=self.rope_theta)
+            q = apply_interleaved_rope(q, rop, rope_dim=c["qk_rope_head_dim"],
+                                       theta=self.rope_theta,
+                                       mrope_section=self.mrope_section)
         # Owned live keys per query token (world 1: every position is owned).
         def owned_of():
             return torch.div((visible.long() - rank).clamp_min(0) + world - 1, world,

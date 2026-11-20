@@ -229,6 +229,7 @@ class Hy4ModelWeights:
     layers: tuple
     draft: object | None = None  # `mtp.MtpBlock` when legacy MTP is prepared
     dfly: object | None = None   # `dfly.DflyBlock` when DFly2 is prepared
+    vision: object | None = None  # `vision.Hy4VisionWeights` (Phase 4, `vit.*`)
     used_names: frozenset = frozenset()
     _prepared: dict = field(default_factory=dict)  # GPU session wiring
 
@@ -268,7 +269,8 @@ class Hy4ModelWeights:
                 for sub in vars(item).values():
                     visit(sub)
 
-        visit((self.embed, self.norm, self.head, self.hc_head, self.layers, self.draft, self.dfly))
+        visit((self.embed, self.norm, self.head, self.hc_head, self.layers, self.draft, self.dfly,
+               self.vision))
         return total
 
 
@@ -609,8 +611,16 @@ def build_model_state(loader, config, sharding, *, selections, mtp=True):
         from .dfly import DflyBlock
 
         dfly = DflyBlock.build(builder)
+    vision = None
+    if any(name.startswith("vit.") for name in loader._selected_names()):
+        # Phase 4 (VISION-DESIGN section 4.1 item 3): consume exactly the 649
+        # `vit.*` tensors through this builder (fail-closed on leftovers) when
+        # `Hy4WeightLoader(..., vision=True)` selected the family.
+        from .vision import Hy4VisionWeights
+
+        vision = Hy4VisionWeights.build(builder)
     builder.finish(set(loader._selected_names()))
     return Hy4ModelWeights(
         config=config, sharding=sharding, device=loader.device, embed=embed, norm=norm, head=head,
-        hc_head=hc_head, layers=tuple(layers), draft=draft, dfly=dfly,
+        hc_head=hc_head, layers=tuple(layers), draft=draft, dfly=dfly, vision=vision,
         used_names=frozenset(builder.used))

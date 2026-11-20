@@ -63,6 +63,10 @@ UNQUANTIZED_FAMILIES = (
     "embed_tokens", "lm_head", "hc_pre", "hc_head", "linear_gate", "learnable_sink_param",
     "mlp.gate", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj", "mlp.shared_experts",
     "self_attn", "indexer", "layernorm", "norm", "dfly_layers",
+    # Phase 4 (VISION-DESIGN section 4.1 item 2): the `vit.*` vision tower is
+    # strictly BF16 unquantized (649 tensors) — contract validation refuses a
+    # quantized vision weight fail-closed.
+    "vit",
 )
 
 

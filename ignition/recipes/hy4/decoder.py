@@ -45,6 +45,25 @@ from .state import Hy4ModelWeights
 from .wiring import DECODE_ONE_ROW, SCHEDULE, chunk_plan, prefill_shape, verify_shape
 
 
+def _slice_embeds(inputs_embeds, rows, width, start, stop):
+    """One prefill chunk's embedding rows out of the full `[rows, width, hidden]`
+    (or flat) tensor — row-major layout, matching `_positions`."""
+    if inputs_embeds is None:
+        return None
+    hidden = int(inputs_embeds.shape[-1])
+    return inputs_embeds.reshape(rows, width, hidden)[:, start:stop].reshape(-1, hidden)
+
+
+def _slice_rope(rope_positions, rows, width, start, stop):
+    """One prefill chunk's rotary positions (`[3, rows*width]`, `[rows*width]`
+    or None) out of the full prompt tensor."""
+    if rope_positions is None:
+        return None
+    if rope_positions.ndim == 2:
+        return rope_positions.reshape(3, rows, width)[:, :, start:stop].reshape(3, -1)
+    return rope_positions.reshape(rows, width)[:, start:stop].reshape(-1)
+
+
 def _diet2():
     from .runtime import SWITCHES
 
@@ -639,6 +658,15 @@ class Hy4Decoder:
         self.plan_book = None    # the `KernelPlanBook` (bound by wire_operators)
         self._mla_scratch_pool = {}  # Patch C: shared sparse-MLA scratch per rank
         self.has_dfly = getattr(weights, "dfly", None) is not None
+        # Phase 4 (VISION-DESIGN section 2.3): one persistent per-row mRoPE
+        # delta (`P_rope = P_kv + delta`), 0 for text rows — the trailing pad
+        # entry `cache.rows` is PERMANENTLY 0 so a padded decode-graph row
+        # executes the bit-identical text rotary path. Zero extra CUDA graphs;
+        # the captured bodies read this buffer inside their existing buckets.
+        self.rope_delta_dev = torch.zeros(cache.rows + 1, dtype=torch.long, device=self.device)
+        # `vision.Hy4VisionTower`, attached by `bootstrap.construct_rank` when
+        # `HY4_VISION=tp8` selects the `vit.*` family (None otherwise).
+        self.vision = None
         self._dfly_producer_plane = (
             {layer_id: plane for plane, layer_id in enumerate(weights.dfly.producer_layers)}
             if self.has_dfly else {})
@@ -704,7 +732,8 @@ class Hy4Decoder:
 
     # --- entry points ------------------------------------------------------
 
-    def prefill(self, token_ids, *, request_rows=None, state=None, call_shape=None):
+    def prefill(self, token_ids, *, request_rows=None, state=None, call_shape=None,
+                inputs_embeds=None, rope_positions=None):
         """Chunked prefill: `token_ids` [rows, tokens] continues the rows' prompts.
 
         Chunks are at most `prefill_chunk_size` tokens per row, cut by
@@ -722,7 +751,8 @@ class Hy4Decoder:
         chunk = self.prefill_chunk_size
         if not chunk or width <= chunk:
             return self.forward(token_ids, request_rows=request_rows, state=state,
-                                call_shape=call_shape)
+                                call_shape=call_shape, inputs_embeds=inputs_embeds,
+                                rope_positions=rope_positions)
         spans = sorted({(start, stop) for _, start, stop in chunk_plan([width] * rows, chunk)})
         row_ids = self._rows(token_ids, request_rows).tolist()
         saved = {row: self._row_lengths.get(row, 0) for row in row_ids}
@@ -733,7 +763,9 @@ class Hy4Decoder:
             self.trace.append(("chunk", start, stop))
             parts.append(self.forward(token_ids[:, start:stop], request_rows=request_rows,
                                       state=state,
-                                      call_shape=self.default_call_shape((rows, stop - start))))
+                                      call_shape=self.default_call_shape((rows, stop - start)),
+                                      inputs_embeds=_slice_embeds(inputs_embeds, rows, width, start, stop),
+                                      rope_positions=_slice_rope(rope_positions, rows, width, start, stop)))
         for row, base in saved.items():
             self._row_lengths[row] = base
         return torch.cat(parts, dim=1)
@@ -924,13 +956,17 @@ class Hy4Decoder:
         h = draft.embed_merge(embeds, prev_hidden.to(self.compute_dtype).reshape(-1, embeds.shape[-1]))
         x = rms_norm(h, draft.input_norm, eps)
         layer = SimpleNamespace(attention=draft.attention, index=self.config.layers)
+        # Phase 4: the MTP draft is also a post-prefill step — its queries
+        # rotate at `P_kv + mrope_delta` while the writes stay in `P_kv`.
+        rope_positions = (positions + self.rope_delta_dev[token_rows]).clamp_min(0)
         if static_slots is not None:
             # consult18 P4 draft graphs: predicated owned writes (device slots).
             kept, slot, safe = static_slots
             cache.begin_forward_static(token_rows, positions, slot=slot, safe=safe, kept=kept)
         try:
             attn_out = self._attention(layer, x, positions, token_rows, visible,
-                                       call_shape=call_shape, visible_max=visible_max)
+                                       call_shape=call_shape, visible_max=visible_max,
+                                       rope_positions=rope_positions)
         finally:
             if static_slots is not None:
                 cache._forward_memo.pop(id(token_rows), None)
@@ -990,14 +1026,21 @@ class Hy4Decoder:
 
     def _dfly_attention(self, layer, x, positions, token_rows, rows_t, anchors, *,
                         query_width, call_shape, bypass_short=False, bypass_cp=False,
-                        pad_entries=0, write_positions=None):
-        """One DFly2 layer's attention over target KV + tapped top-k + causal block."""
+                        pad_entries=0, write_positions=None, rope_positions=None):
+        """One DFly2 layer's attention over target KV + tapped top-k + causal block.
+
+        Phase 4 (design section 2.4): `write_positions` / `positions` stay in
+        `P_kv` space (cache writes, `row_cap_dev` clamping, `DflyState` slot
+        maps) while `rope_positions` shifts the rotary angles by the request's
+        `mrope_delta` — the SGLang `dfly_mrope_positions` contract.
+        """
         attn = layer.attention
         attn._active_call_shape = call_shape
         kv_layer = layer.target_kv_layer
         world = int(getattr(self.collectives, "world_size", 1))
         rank = int(getattr(self.collectives, "rank", 0))
-        bundle = attn.project_packed(x, positions, absorb=True, with_index_keys=False)
+        bundle = attn.project_packed(x, positions, absorb=True, with_index_keys=False,
+                                     rope_positions=rope_positions)
         q_local, latent = bundle.q, bundle.latent
         write_pos = positions if write_positions is None else write_positions
         self.cache.write_latent(kv_layer, token_rows, write_pos, latent)
@@ -1104,6 +1147,13 @@ class Hy4Decoder:
                 kept_identity=(int(kept.numel()) == total_q and _diet2()))
         else:
             self.cache.begin_forward(token_rows, write_pos)
+        # Phase 4 (design section 2.4): every block token is a 1D text token
+        # (`T = H = W = P_kv + mrope_delta`) — matching SGLang's
+        # `dfly_mrope_positions(positions, active, deltas)`; because all three
+        # axes equal, 1D interleaved FP32 RoPE is bit-exact without a
+        # `[3, B*W]` tensor. `positions` (P_kv) stay unchanged for the cache
+        # writes, `row_cap_dev` clamping and `DflyState` slot maps.
+        rope_positions = (positions + self.rope_delta_dev[token_rows]).clamp_min(0)
         try:
             for layer in dfly.layers:
                 x = rms_norm(h, layer.input_norm, eps)
@@ -1111,7 +1161,8 @@ class Hy4Decoder:
                     layer, x, positions, token_rows, rows_t, anchors_t,
                     query_width=W, call_shape=call_shape,
                     bypass_short=bypass_short, bypass_cp=bypass_cp,
-                    pad_entries=pad_entries, write_positions=write_pos)
+                    pad_entries=pad_entries, write_positions=write_pos,
+                    rope_positions=rope_positions)
                 h = h + self.collectives.all_reduce(attn_out)
                 x = rms_norm(h, layer.post_attention_norm, eps)
                 mlp_out = layer.mlp.forward(x)
@@ -1149,7 +1200,7 @@ class Hy4Decoder:
         return torch.stack(drafts, dim=1), z
 
     def forward(self, token_ids, *, request_rows=None, state=None, return_hidden=False,
-                call_shape=None, logits_rows="all"):
+                call_shape=None, logits_rows="all", inputs_embeds=None, rope_positions=None):
         """The real body loop: iHC streams -> 78 gated sparse-MLA layers -> head.
 
         Returns FP32 logits over this rank's vocabulary shard. `request_rows`
@@ -1169,6 +1220,15 @@ class Hy4Decoder:
         form and only that row is gathered across the vocabulary shards;
         `"none"` skips the head and the gather and returns `None` (a prefill
         chunk that is not the prompt's last).
+
+        Phase 4 (VISION-DESIGN section 4.1 item 5): `inputs_embeds`
+        (`[rows, tokens, hidden]` or flat `[rows*tokens, hidden]`) replaces the
+        embedding lookup — a multimodal prefill chunk with `vit.perceive` rows
+        scattered in — and `rope_positions` supplies the rotary-space
+        positions (`[3, rows*tokens]` 3D mRoPE for image-bearing chunks, 1D
+        `P_kv + mrope_delta` for text after an image). Both default `None`:
+        the text path stays bit-identical (the lookup runs; the RoPE shift
+        reads `rope_delta_dev` = 0).
         """
         if token_ids.ndim != 2:
             raise ValueError("token_ids must be [rows, tokens]")
@@ -1196,18 +1256,28 @@ class Hy4Decoder:
             try:
                 return self._forward_body(token_ids, request_rows=request_rows, state=state,
                                           return_hidden=return_hidden, call_shape=call_shape,
-                                          logits_rows=logits_rows)
+                                          logits_rows=logits_rows, inputs_embeds=inputs_embeds,
+                                          rope_positions=rope_positions)
             finally:
                 torch.cuda.set_sync_debug_mode(previous)
                 _sync_site_reporter.uninstall()
         return self._forward_body(token_ids, request_rows=request_rows, state=state,
                                   return_hidden=return_hidden, call_shape=call_shape,
-                                  logits_rows=logits_rows)
+                                  logits_rows=logits_rows, inputs_embeds=inputs_embeds,
+                                  rope_positions=rope_positions)
 
     def _forward_body(self, token_ids, *, request_rows, state, return_hidden, call_shape,
-                      logits_rows):
+                      logits_rows, inputs_embeds=None, rope_positions=None):
         TIMER.forward_begin(call_shape.name)   # W29: no-op unless --profile-steps armed
         rows = self._rows(token_ids, request_rows)
+        # Phase 4: a multimodal chunk (supplied embeddings or 3D mRoPE positions)
+        # runs the eager body only — the captured sync-free / tail / decode
+        # graphs are text-only machinery and stay byte-identical for text.
+        multimodal = inputs_embeds is not None or (
+            isinstance(rope_positions, torch.Tensor) and rope_positions.ndim == 2)
+        if inputs_embeds is not None and tuple(inputs_embeds.shape) != tuple(token_ids.shape) + (self.config.hidden,):
+            if inputs_embeds.ndim != 2 or tuple(inputs_embeds.shape) != (token_ids.shape[0] * token_ids.shape[1], self.config.hidden):
+                raise ValueError("inputs_embeds must be [rows, tokens, hidden] or flat [rows*tokens, hidden]")
         # consult18 P1/P2: a single-row forward can run sync-free — positions,
         # bounds, ownership and the indexer geometry from host-known row
         # lengths; the selection checks deferred to one read at the end.
@@ -1216,7 +1286,7 @@ class Hy4Decoder:
         on_device = token_ids.is_cuda or getattr(self, "_sync_free_on_cpu", False)  # CPU: tests
         mode = SWITCHES.get("sync_free")
         graphs = getattr(self, "decode_graphs", None)
-        one_row = (getattr(self, "_sync_free_allowed", True) and on_device
+        one_row = (not multimodal and getattr(self, "_sync_free_allowed", True) and on_device
                    and int(token_ids.shape[0]) == 1
                    and (request_rows is None or len(request_rows) == 1)
                    and not (token_ids.is_cuda and torch.cuda.is_current_stream_capturing()))
@@ -1299,7 +1369,8 @@ class Hy4Decoder:
                     result = self._layers_and_head(
                         token_ids, rows, positions, token_rows, visible, visible_max, state=state,
                         return_hidden=return_hidden, call_shape=call_shape,
-                        logits_rows=logits_rows)
+                        logits_rows=logits_rows, inputs_embeds=inputs_embeds,
+                        rope_positions=rope_positions)
                 flags = list(deferred) if deferred else []
                 if deferred is not None:
                     deferred.clear()
@@ -1330,10 +1401,12 @@ class Hy4Decoder:
                        and call_shape.is_decode_graph else None)
         return self._layers_and_head(token_ids, rows, positions, token_rows, visible, visible_max,
                                      state=state, return_hidden=return_hidden,
-                                     call_shape=call_shape, logits_rows=logits_rows)
+                                     call_shape=call_shape, logits_rows=logits_rows,
+                                     inputs_embeds=inputs_embeds, rope_positions=rope_positions)
 
     def _layers_and_head(self, token_ids, rows, positions, token_rows, visible, visible_max, *,
-                         state, return_hidden, call_shape, logits_rows, gather=True):
+                         state, return_hidden, call_shape, logits_rows, gather=True,
+                         inputs_embeds=None, rope_positions=None):
         # Vocabulary-sharded embedding (D5): masked lookup over this rank's
         # shard + all-reduce (identity at world 1).
         WATCH.begin_forward(call_shape.name, positions)   # consult17: no-op unless armed
@@ -1347,19 +1420,30 @@ class Hy4Decoder:
             return self._layers_and_head_body(
                 token_ids, rows, positions, token_rows, visible, visible_max,
                 state=state, return_hidden=return_hidden, call_shape=call_shape,
-                logits_rows=logits_rows, gather=gather)
+                logits_rows=logits_rows, gather=gather, inputs_embeds=inputs_embeds,
+                rope_positions=rope_positions)
         finally:
             if auto_dfly_tap:
                 self._dfly_tap = None
 
     def _layers_and_head_body(self, token_ids, rows, positions, token_rows, visible, visible_max, *,
-                              state, return_hidden, call_shape, logits_rows, gather=True):
+                              state, return_hidden, call_shape, logits_rows, gather=True,
+                              inputs_embeds=None, rope_positions=None):
         with TIMER.phase("embed"):
-            embeds = self.collectives.embed_lookup(
-                token_ids.reshape(-1), self.weights.embed,
-                vocabulary_range=self.weights.sharding.vocabulary_range).to(self.compute_dtype)
+            if inputs_embeds is not None:
+                embeds = inputs_embeds.to(self.compute_dtype).reshape(-1, self.config.hidden)
+            else:
+                embeds = self.collectives.embed_lookup(
+                    token_ids.reshape(-1), self.weights.embed,
+                    vocabulary_range=self.weights.sharding.vocabulary_range).to(self.compute_dtype)
         self._publish_embeds(token_ids, embeds)
         WATCH.check("embed", -1, embeds=embeds)
+        if rope_positions is None:
+            # Phase 4 (design section 2.3): every post-prefill step rotates at
+            # `P_rope = P_kv + rope_delta_dev[row]` — integer identity for text
+            # rows (delta 0), so the text numerics are bit-identical. The cache
+            # writes below keep `positions` (`P_kv`) unchanged.
+            rope_positions = (positions + self.rope_delta_dev[token_rows]).clamp_min(0)
         streams = StreamState.begin(embeds)
         if state is not None:
             state.streams[:streams.streams.shape[0]] = streams.streams
@@ -1377,7 +1461,8 @@ class Hy4Decoder:
                         norm_weight=layer.input_norm)
             WATCH.check("ihc", index, y=y, streams=streams.streams)
             attn_out = self._attention(layer, y, positions, token_rows, visible,
-                                       call_shape=call_shape, visible_max=visible_max)
+                                       call_shape=call_shape, visible_max=visible_max,
+                                       rope_positions=rope_positions)
             WATCH.check("attn.fold_expand_gate", index, attn_out=attn_out)
             with TIMER.phase("comm.all_reduce.attn"):
                 attn_out = self.collectives.all_reduce(attn_out)  # D4 (o_proj shard)
@@ -1477,18 +1562,26 @@ class Hy4Decoder:
         self.lanes = 2
         return self
 
-    def _half_steps(self, token_ids, positions, token_rows, call_shape, *, prevalidated=False):
+    def _half_steps(self, token_ids, positions, token_rows, call_shape, *, prevalidated=False,
+                    inputs_embeds=None, rope_positions=None):
         """One half of an overlapped chunk: the body loop, yielding after each
         layer; returns the half's post-norm hidden. `prevalidated`: the caller
         ran `cache.begin_forward` for these exact tensors before the loop (its
-        bounds checks read the device)."""
+        bounds checks read the device). `inputs_embeds` / `rope_positions` as
+        in `forward` (Phase 4 multimodal chunks)."""
         visible = positions + 1
         if not prevalidated:
             self.cache.begin_forward(token_rows, positions)
         with TIMER.phase("embed"):
-            embeds = self.collectives.embed_lookup(
-                token_ids.reshape(-1), self.weights.embed,
-                vocabulary_range=self.weights.sharding.vocabulary_range).to(self.compute_dtype)
+            if inputs_embeds is not None:
+                embeds = inputs_embeds.to(self.compute_dtype).reshape(-1, self.config.hidden)
+            else:
+                embeds = self.collectives.embed_lookup(
+                    token_ids.reshape(-1), self.weights.embed,
+                    vocabulary_range=self.weights.sharding.vocabulary_range).to(self.compute_dtype)
+        if rope_positions is None:
+            # Phase 4: the text-row shift is integer identity (delta 0).
+            rope_positions = (positions + self.rope_delta_dev[token_rows]).clamp_min(0)
         self._publish_embeds(token_ids, embeds)
         PROBE.add("embed", -1, embeds)
         streams = StreamState.begin(embeds)
@@ -1509,7 +1602,8 @@ class Hy4Decoder:
                         norm_weight=layer.input_norm)
             PROBE.add("y_attn_in", index, y)
             attn_out = yield from self._attention_gen(layer, y, positions, token_rows, visible,
-                                                      call_shape=call_shape, visible_max=None)
+                                                      call_shape=call_shape, visible_max=None,
+                                                      rope_positions=rope_positions)
             PROBE.add("attn_out", index, attn_out)
             with TIMER.phase("comm.all_reduce.attn"):
                 attn_out = self.collectives.all_reduce(attn_out)
@@ -1593,7 +1687,7 @@ class Hy4Decoder:
         return len(graphs)
 
     def forward_overlapped(self, token_ids, *, half_shape, logits_rows="none", return_hidden=False,
-                           row=0):
+                           row=0, inputs_embeds=None, rope_positions=None):
         """consult18 stage D: one prefill chunk as two halves on two lanes.
 
         Half A (the first `half_shape.tokens` positions) runs on lane 0's
@@ -1626,6 +1720,20 @@ class Hy4Decoder:
         token_rows = self._token_rows(token_ids.shape, rows)
         halves = ((token_ids[:, :half], positions[:half], token_rows[:half]),
                   (token_ids[:, half:], positions[half:], token_rows[half:]))
+
+        def half_inputs(index):
+            """The half's `(inputs_embeds, rope_positions)` views (Phase 4)."""
+            start, stop = (0, half) if index == 0 else (half, 2 * half)
+            embeds_half = (None if inputs_embeds is None else
+                           inputs_embeds.reshape(1, 2 * half, -1)[:, start:stop]
+                           .reshape(-1, int(inputs_embeds.shape[-1])))
+            if rope_positions is None:
+                rope_half = None
+            elif rope_positions.ndim == 2:
+                rope_half = rope_positions.reshape(3, 2 * half)[:, start:stop]
+            else:
+                rope_half = rope_positions.reshape(2 * half)[start:stop]
+            return embeds_half, rope_half
         cuda = self.device.type == "cuda"
         streams = (None, None)
         if cuda:
@@ -1664,7 +1772,9 @@ class Hy4Decoder:
         prepare = getattr(getattr(self.collectives, "transport", None), "prepare_lane_audit", None)
         if prepare is not None:
             prepare()
-        steps = [self._half_steps(*halves[index], half_shape, prevalidated=True)
+        steps = [self._half_steps(*halves[index], half_shape, prevalidated=True,
+                                  inputs_embeds=half_inputs(index)[0],
+                                  rope_positions=half_inputs(index)[1])
                  for index in (0, 1)]
         if getattr(self, "has_dfly", False) and logits_rows != "none":
             tok_idx = 2 * half - 1 if logits_rows in ("all", "last") else int(logits_rows)
@@ -1969,10 +2079,11 @@ class Hy4Decoder:
         return rows.reshape(-1, 1).expand(shape[0], shape[1]).reshape(-1)
 
     def _attention(self, layer, y, positions, token_rows, visible, *, call_shape,
-                   visible_max=None):
+                   visible_max=None, rope_positions=None):
         """One layer's attention (`_attention_gen` run to completion)."""
         steps = self._attention_gen(layer, y, positions, token_rows, visible,
-                                    call_shape=call_shape, visible_max=visible_max)
+                                    call_shape=call_shape, visible_max=visible_max,
+                                    rope_positions=rope_positions)
         try:
             while True:
                 next(steps)
@@ -1980,7 +2091,7 @@ class Hy4Decoder:
             return finished.value
 
     def _attention_gen(self, layer, y, positions, token_rows, visible, *, call_shape,
-                       visible_max=None):
+                       visible_max=None, rope_positions=None):
         """One layer's attention: world 1 today's path, world > 1 the CP shape (D2/D3).
 
         A generator (consult18 D, fine-grained overlap): it yields ("kv", layer)
@@ -2018,7 +2129,8 @@ class Hy4Decoder:
         local_absorb_after_gather = world > 1 and call_shape.query_wiring == "unabsorbed-local-absorb"
         with TIMER.phase("attn.project"):
             bundle = attn.project_packed(y, positions, absorb=not local_absorb_after_gather,
-                                         with_index_keys=attn.weights.indexer is not None)
+                                         with_index_keys=attn.weights.indexer is not None,
+                                         rope_positions=rope_positions)
         q_resid, q_local, latent = bundle.q_resid, bundle.q, bundle.latent
         PROBE.add("project", layer.index, q_local, latent,
                   bundle.index_keys if attn.weights.indexer is not None else None)
@@ -2034,7 +2146,8 @@ class Hy4Decoder:
         if world == 1:
             with TIMER.phase("attn.index_score"):
                 selected, counts = attn.select(y, q_resid, positions, visible,
-                                               self.cache.key_table(owner), slot_base)
+                                               self.cache.key_table(owner), slot_base,
+                                               rope_positions=rope_positions)
             self._dfly_record_selection(layer.index, token_rows, selected, counts,
                                         base=slot_base, is_global=False)
             with TIMER.phase("attn.sparse_mla"):
@@ -2100,7 +2213,8 @@ class Hy4Decoder:
             base = token_rows.reshape(-1).long() * S
             with TIMER.phase("attn.index_score"):
                 selected, counts = attn.select(y, q_resid, positions, visible,
-                                               self.cache.short_key_table(owner), base)
+                                               self.cache.short_key_table(owner), base,
+                                               rope_positions=rope_positions)
             self._dfly_record_selection(layer.index, token_rows, selected, counts,
                                         base=base, is_global=True)
             with TIMER.phase("attn.sparse_mla"):
@@ -2125,7 +2239,7 @@ class Hy4Decoder:
                 with TIMER.phase("attn.index_score"):
                     scores, candidates = attn.local_candidates(
                         y, q_resid, positions, visible, self.cache.key_table(owner), slot_base,
-                        world=world, rank=rank)
+                        world=world, rank=rank, rope_positions=rope_positions)
                 PROBE.add("candidates", layer.index, scores, candidates)
                 from .lanes import sync_free
                 from .runtime import SWITCHES
@@ -2281,6 +2395,10 @@ class Hy4Decoder:
         for row in rows:
             self._row_lengths.pop(int(row), None)
             self._draft_positions.pop(int(row), None)
+            # Phase 4: a released row restarts text-only — its mRoPE delta is
+            # zero again, so the next request on this row is bit-identical to a
+            # fresh row (Gate V4's post-release reuse check).
+            self.rope_delta_dev[int(row)] = 0
         if getattr(self, "dfly_state", None) is not None:
             self.dfly_state.reset_rows(rows)
 

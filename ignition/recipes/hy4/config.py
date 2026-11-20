@@ -138,6 +138,36 @@ def _require_in(config, name, choices, *, pin=True):
         raise ValueError(f"Hy4 preparation requires {name} in {choices!r}; checkpoint has {value!r}")
 
 
+def _validate_vision_config(config):
+    """Pin the official `hy_v4_vl` `vision_config` (VISION-DESIGN section 4.1 item 1).
+
+    Only `hy_v4_vl` checkpoints carry `vision_config`; the pinned values are
+    the exact `tencent/Hy4` (`bd0c8665bf93`) vision geometry. `use_2d_rope` is
+    ABSENT from the checkpoint config (defaults False) and `rope_2d_theta` /
+    `rope_2d_percent` are inert — an explicit `use_2d_rope: true` is a
+    structural drift and fails closed.
+    """
+    vision = config.get("vision_config")
+    if not isinstance(vision, dict):
+        raise ValueError("Hy4 VL preparation requires a vision_config object")
+    for name, expected in (("num_hidden_layers", 40), ("hidden_size", 1536),
+                           ("intermediate_size", 6144), ("num_attention_heads", 16),
+                           ("patch_size", 16), ("spatial_merge_size", 2),
+                           ("max_image_size", 2048),
+                           ("projector_type", "rmsnorm_mlp_adapter")):
+        value = vision.get(name)
+        if value != expected:
+            raise ValueError(
+                f"Hy4 VL preparation requires vision_config.{name}={expected!r}; "
+                f"checkpoint has {value!r}")
+    if vision.get("use_2d_rope", False):
+        raise ValueError("Hy4 VL vision carries no 2D ViT RoPE (use_2d_rope must be unset)")
+    # Special tokens live at top level (merged config) — pinned by numeric id.
+    for name, expected in (("image_token_id", 120120), ("image_start_token_id", 120118),
+                           ("image_end_token_id", 120119)):
+        _require(config, name, expected)
+
+
 def _smoke_relations(config):
     """Structural Hy4 invariants at any geometry (the tiny-parity path).
 
@@ -347,6 +377,7 @@ class ModelConfig:
                     or set(rope) != set(expected_rope)):
                 raise ValueError(
                     f"Hy4 VL preparation requires rope_parameters={expected_rope!r}; checkpoint has {rope!r}")
+            _validate_vision_config(config)
             _require_in(config, "transformers_version", ("5.24.0",))
         else:
             # Preview Hy4: one single-stream GLM-style MTP predictor.
@@ -568,7 +599,7 @@ class ModelConfig:
         fp32 += self.layers * self.heads          # target-layer sinks
         return sum(census.values()) - fp32, fp32
 
-    def packed_byte_arithmetic(self):
+    def packed_byte_arithmetic(self, *, vision=False):
         """Exact resident byte arithmetic of the W4A16-packed checkpoint.
 
         Every figure is documented derivation from `parameter_census`, not a
@@ -595,6 +626,11 @@ class ModelConfig:
         - `scale_scratch_bytes`: one rank's shared CSF expansion scratch at TP8
           (two scale layouts: an expansion writes one while the next layer's
           compressed bytes stage in the other), about 0.15 GiB per rank.
+        - `vision=True` (Phase 4, VISION-DESIGN section 1.1): adds the TP8-A1
+          sharded `vit.*` footprint — `vision_bytes` (all 649 tensors once, BF16)
+          and `vision_sharded_bytes` (the exact per-rank 355,560,960 B = 339.09
+          MiB: replicated embeddings 52,697,088 + col/row-sharded layers
+          40 x 7,099,008 + TP8 `perceive` 18,903,552).
         """
         import math
 
@@ -679,7 +715,7 @@ class ModelConfig:
         # Two expansion layouts of one rank's block scales at TP8 (256 experts,
         # 256 local intermediate channels).
         scale_scratch = 2 * (e * (2 * mi // 8) * (h // 16) + e * h * ((mi // 8) // 16))
-        return {
+        result = {
             "packed_resident_bytes": packed_resident,
             "replicated_bytes": replicated,
             "draft_bytes": draft_bytes,
@@ -687,3 +723,35 @@ class ModelConfig:
             "csf_scale_bytes": csf_scales,
             "scale_scratch_bytes": scale_scratch,
         }
+        if vision and self.has_vision:
+            # Phase 4 (VISION-DESIGN section 1.1): `vit.*` at TP8-A1 — every
+            # tensor BF16 (2 B/element), `q/k/v` + `dense_h_to_4h` +
+            # `perceive.proj.0` column-shard (dim 0 / 8) and `o_proj` +
+            # `dense_4h_to_h` + `perceive.proj.2` row-shard (dim 1 / 8); the
+            # embeddings, every norm, `image_newline` and the post-all-reduce
+            # biases replicate. (If the world is not 8, `Hy4VisionWeights`
+            # shards the same way and `allocated_bytes` measures the result.)
+            v = self.text["vision_config"]
+            vh, vl = int(v["hidden_size"]), int(v["num_hidden_layers"])
+            vi = int(v["intermediate_size"])
+            vo = int(v.get("out_hidden_size", self.hidden))
+            vp = int(v.get("patch_size", 16))
+            vedge = int(v.get("max_image_size", 2048)) // vp
+            vpos = vedge * vedge + 1
+            embed_elements = vh * 3 * vp * vp + vh + vpos * vh
+            layer_elements = (3 * (vh * vh + vh) + (vh * vh + vh)      # q/k/v + o
+                              + vi * vh + vi + vh * vi + vh             # fc1 + fc2
+                              + 4 * vh)                                 # 2 x LayerNorm(w+b)
+            # Per-rank: q/k/v (+biases), `o_proj` weight, `dense_h_to_4h`
+            # (+bias) and `dense_4h_to_h` weight shard / 8; `o_proj` /
+            # `dense_4h_to_h` biases and the two LayerNorms replicate.
+            layer_rank = ((3 * (vh * vh + vh) + vh * vh + vi * vh + vi + vh * vi) // 8
+                          + 2 * vh + 4 * vh)
+            perceive_elements = vh + vi * vh * 4 + vi + vo * vi + vo + vo
+            perceive_rank = ((vi * vh * 4 + vi + vo * vi) // 8 + vh + vo + vo)
+            result["vision_bytes"] = (embed_elements + vl * layer_elements
+                                      + perceive_elements) * 2
+            result["vision_sharded_bytes"] = (embed_elements * 2
+                                              + vl * layer_rank * 2
+                                              + perceive_rank * 2)
+        return result
