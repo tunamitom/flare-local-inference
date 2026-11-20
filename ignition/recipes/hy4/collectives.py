@@ -1188,17 +1188,20 @@ class CeExchange:
         half0 = self._memory[first0:first0 + self.world * self.lse_slot].view(torch.int8)
         half1 = self._memory[first1:first1 + self.world * self.lse_slot].view(torch.int8)
         self._await_all("lse", self.local)
-        mine4 = torch.empty((hpr, rows, width), dtype=torch.float32, device=self.device)
-        mine4_lse = torch.empty((hpr, rows), dtype=torch.float32, device=self.device)
-        q4 = torch.empty((n, width), dtype=torch.int8, device=self.device)
-        s4 = torch.empty((n,), dtype=torch.float32, device=self.device)
-        out4_lse = torch.empty((hpr, rows), dtype=torch.float32, device=self.device)
+        mine = torch.empty((hpr, rows, width), dtype=torch.float32, device=self.device)
+        mine_lse = torch.empty((hpr, rows), dtype=torch.float32, device=self.device)
+        q = torch.empty((n, width), dtype=torch.int8, device=self.device)
+        s = torch.empty((n,), dtype=torch.float32, device=self.device)
+        out_lse = torch.empty((hpr, rows), dtype=torch.float32, device=self.device)
+        # N = len(switch_ranks) = the switch group's rank count, derived here
+        # from the process-group layout (world=2 / 1-rank groups -> N=1;
+        # world=8 / 4-rank groups -> N=4) — the kernel unrolls N statically
         lse_switch_merge_int8(p, lse_major, half0, half1,
                               rows=rows, hpr=hpr, width=width, soff=soff,
                               lse_part=self.lse_part, slot_stride=self.lse_slot,
                               switch_ranks=tuple(sorted((me, *self.local))),
-                              me=me, partner=partner, mine4=mine4, mine4_lse=mine4_lse,
-                              q4=q4, s4=s4, out4_lse=out4_lse)
+                              me=me, partner=partner, mine=mine, mine_lse=mine_lse,
+                              q=q, s=s, out_lse=out_lse)
         # Phase 2, across the link: the merged block for the partner's heads, INT8.
         main = torch.cuda.current_stream()
         merged = self._event("lse-merged")
@@ -1206,18 +1209,18 @@ class CeExchange:
         self._cross_stream.wait_event(merged)
         base = self._lse_offset(bank, 0, me)
         self._send_block(self._cross_stream, partner,
-                         ((base, q4.data_ptr(), n * width), (base + soff, s4.data_ptr(), n * 4),
-                          (base + self.lse_part, out4_lse.data_ptr(), lse_bytes)),
+                         ((base, q.data_ptr(), n * width), (base + soff, s.data_ptr(), n * 4),
+                          (base + self.lse_part, out_lse.data_ptr(), lse_bytes)),
                          (me,), "lse", ("lse2", partner))
         self._await("lse", partner)
         out = torch.empty((rows, hpr, width), dtype=partials.dtype, device=self.device)
-        out_lse = torch.empty((rows, hpr), dtype=torch.float32, device=self.device)
-        lse_final_merge_int8(mine4, mine4_lse, half0,
+        out_lse_rows = torch.empty((rows, hpr), dtype=torch.float32, device=self.device)
+        lse_final_merge_int8(mine, mine_lse, half0,
                              rows=rows, hpr=hpr, width=width, soff=soff,
                              lse_part=self.lse_part, slot_stride=self.lse_slot,
-                             partner=partner, out=out, out_lse=out_lse)
+                             partner=partner, out=out, out_lse=out_lse_rows)
         self._drain()
-        return out, out_lse
+        return out, out_lse_rows
 
     def lse_reduce_scatter(self, partials, lses, *, relay=False):
         """`[rows, heads, width]` partials + `[rows, heads]` base-2 LSE over

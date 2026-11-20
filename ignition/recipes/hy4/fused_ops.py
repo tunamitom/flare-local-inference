@@ -1353,32 +1353,6 @@ def dequant_slots_int8(slots, sources, soff, n, width, out, dests=None,
 # --------------------------------------------------------------------------
 
 @triton.jit
-def _lse_merge4_fp32(lv0, lv1, lv2, lv3, pv0, pv1, pv2, pv3, BLOCK_W: tl.constexpr):
-    peak = tl.maximum(tl.maximum(lv0, lv1), tl.maximum(lv2, lv3))
-    finite = (peak == peak) & (peak != float("inf")) & (peak != float("-inf"))
-    peak = tl.where(finite, peak, 0.0)
-    total = 0.0
-    acc = tl.zeros((BLOCK_W,), dtype=tl.float32)
-    w = libdevice.exp2(libdevice.sub_rn(lv0, peak))
-    total = libdevice.add_rn(total, w)
-    acc = libdevice.add_rn(acc, libdevice.mul_rn(pv0, w))
-    w = libdevice.exp2(libdevice.sub_rn(lv1, peak))
-    total = libdevice.add_rn(total, w)
-    acc = libdevice.add_rn(acc, libdevice.mul_rn(pv1, w))
-    w = libdevice.exp2(libdevice.sub_rn(lv2, peak))
-    total = libdevice.add_rn(total, w)
-    acc = libdevice.add_rn(acc, libdevice.mul_rn(pv2, w))
-    w = libdevice.exp2(libdevice.sub_rn(lv3, peak))
-    total = libdevice.add_rn(total, w)
-    acc = libdevice.add_rn(acc, libdevice.mul_rn(pv3, w))
-    seen = total > 0
-    safe = tl.maximum(total, 1e-30)
-    out = tl.where(seen, libdevice.div_rn(acc, safe), 0.0)
-    lse = tl.where(seen, libdevice.add_rn(peak, libdevice.log2(safe)), float("-inf"))
-    return out, lse
-
-
-@triton.jit
 def _lse_merge2_fp32(lv0, lv1, pv0, pv1, BLOCK_W: tl.constexpr):
     peak = tl.maximum(lv0, lv1)
     finite = (peak == peak) & (peak != float("inf")) & (peak != float("-inf"))
@@ -1426,18 +1400,72 @@ def _lse_quant_owners_kernel(x_ptr, x_row_stride, x_head_stride, owners_ptr,
 
 
 @triton.jit
+def _lse_src_lv(base, SLOT, SOFF, LOFF, src, owner,
+                lse_ptr, h, row, hr,
+                HPR: tl.constexpr, ROWS: tl.constexpr, SELF: tl.constexpr):
+    """N4a phase-1 source lookup (LSE part): source `src`'s FP32 base-2 LSE
+    for this program's (head h, row row) — `owner`'s exact LSE row for the ME
+    source (the chain keeps its own partials exact), the wire slot's FP32
+    LSE part otherwise.  `SELF` is the calling rank (the `src == SELF`
+    branch test); `owner` is which head block to read (ME or PARTNER) —
+    do not swap them.  `src` / `owner` / `SELF` are compile-time, so each
+    call site folds to a single load + one branch-free address path."""
+    if src == SELF:
+        head = owner * HPR + h
+        lv = tl.load(lse_ptr + head * ROWS + row)
+    else:
+        slot_l = (base + src * SLOT + LOFF).to(tl.pointer_type(tl.float32))
+        lv = tl.load(slot_l + hr)
+    return lv
+
+
+@triton.jit
+def _lse_src_pv(base, SLOT, SOFF, src, owner,
+                p_ptr, p_row_stride, p_head_stride,
+                h, row, hr, c, W,
+                HPR: tl.constexpr, SELF: tl.constexpr, BLOCK_W: tl.constexpr):
+    """N4a phase-1 source lookup (partials): `owner`'s exact BF16 partial row
+    widened to FP32 for the ME source, the wire slot's `dequant_slots_int8`
+    value (`(q * s)` FP32 -> one BF16 round -> FP32) otherwise — the eager
+    chain's in-switch dequant arithmetic, unchanged.  `SELF` is the calling
+    rank (the `src == SELF` branch test); `owner` is the head block to read."""
+    if src == SELF:
+        head = owner * HPR + h
+        pv = tl.load(p_ptr + row * p_row_stride + head * p_head_stride + c,
+                     mask=c < W, other=0.0).to(tl.float32)
+    else:
+        slot_q = (base + src * SLOT).to(tl.pointer_type(tl.int8))
+        slot_s = (base + src * SLOT + SOFF).to(tl.pointer_type(tl.float32))
+        qv = tl.load(slot_q + hr * W + c, mask=c < W, other=0).to(tl.float32)
+        sc = tl.load(slot_s + hr)
+        pv = tl.cast(qv * sc, tl.bfloat16).to(tl.float32)
+    return pv
+
+
+@triton.jit
 def _lse_switch_merge_kernel(p_ptr, p_row_stride, p_head_stride, lse_ptr,
                              half0, half1, SLOT, SOFF, LOFF,
-                             mine4_ptr, mine4_lse_ptr, q4_ptr, s4_ptr, out4_lse_ptr,
+                             mine_ptr, mine_lse_ptr, q_ptr, s_ptr, out_lse_ptr,
                              N, ROWS, W,
                              HPR: tl.constexpr, ME: tl.constexpr, PARTNER: tl.constexpr,
-                             SWITCH: tl.constexpr, BLOCK_W: tl.constexpr):
-    """N4a phase 1: the in-switch 4-source merge for this rank's own heads
-    (FP32 `mine4`) and for the partner's heads, requantized straight to the
-    INT8 wire (`q4` / `s4`) with its merged LSE.  One program per (head, row);
+                             SWITCH: tl.constexpr, NS: tl.constexpr, BLOCK_W: tl.constexpr):
+    """N4a phase 1: the in-switch N-source merge for this rank's own heads
+    (FP32 `mine`) and for the partner's heads, requantized straight to the
+    INT8 wire (`q` / `s`) with its merged LSE.  One program per (head, row);
     sources load in `SWITCH` order (sorted(me, *local) = the eager chain's
     `torch.stack` source order) — exact BF16 for `ME`, INT8 wire slots
-    otherwise."""
+    otherwise.
+
+    N = len(SWITCH) = the switch group's rank count — any N >= 1, derived by
+    the wrapper from the process-group layout (world=2 / 1-rank groups ->
+    N=1; world=8 / 4-rank groups -> N=4).  The merge is `_merge_head_major`'s
+    expression ladder over N sources (0-start `add_rn` / `mul_rn` source
+    accumulation in source order, `exp2` / `log2` from libdevice, the
+    `seen` / `-inf` guards).  `NS` / `SWITCH` are constexpr and the source
+    loop is `tl.static_range` (unrolled at trace time), so every `SWITCH[s]`
+    index and `src == ME` test is a compile-time constant — a plain `range`
+    loop would leave `s` a runtime loop var and break constexpr indexing
+    (the wave-B compile defect)."""
     hr = tl.program_id(0)
     h = hr // ROWS
     row = hr % ROWS
@@ -1445,57 +1473,66 @@ def _lse_switch_merge_kernel(p_ptr, p_row_stride, p_head_stride, lse_ptr,
     mask = c < W
     block_off = (hr * W + c).to(tl.int64)
 
-    mine_l, mine_p, theirs_l, theirs_p = [], [], [], []
-    for s in range(4):
-        src = SWITCH[s]
-        if src == ME:
-            head = ME * HPR + h
-            lv = tl.load(lse_ptr + head * ROWS + row)
-            pv = tl.load(p_ptr + row * p_row_stride + head * p_head_stride + c,
-                         mask=mask, other=0.0).to(tl.float32)
-        else:
-            slot_q = (half0 + src * SLOT).to(tl.pointer_type(tl.int8))
-            slot_s = (half0 + src * SLOT + SOFF).to(tl.pointer_type(tl.float32))
-            slot_l = (half0 + src * SLOT + LOFF).to(tl.pointer_type(tl.float32))
-            lv = tl.load(slot_l + hr)
-            qv = tl.load(slot_q + hr * W + c, mask=mask, other=0).to(tl.float32)
-            sc = tl.load(slot_s + hr)
-            pv = tl.cast(qv * sc, tl.bfloat16).to(tl.float32)
-        mine_l.append(lv)
-        mine_p.append(pv)
-        if src == ME:
-            head = PARTNER * HPR + h
-            lv = tl.load(lse_ptr + head * ROWS + row)
-            pv = tl.load(p_ptr + row * p_row_stride + head * p_head_stride + c,
-                         mask=mask, other=0.0).to(tl.float32)
-        else:
-            slot_q = (half1 + src * SLOT).to(tl.pointer_type(tl.int8))
-            slot_s = (half1 + src * SLOT + SOFF).to(tl.pointer_type(tl.float32))
-            slot_l = (half1 + src * SLOT + LOFF).to(tl.pointer_type(tl.float32))
-            lv = tl.load(slot_l + hr)
-            qv = tl.load(slot_q + hr * W + c, mask=mask, other=0).to(tl.float32)
-            sc = tl.load(slot_s + hr)
-            pv = tl.cast(qv * sc, tl.bfloat16).to(tl.float32)
-        theirs_l.append(lv)
-        theirs_p.append(pv)
+    # -- this rank's own heads: N-source merge in SWITCH source order -------
+    peak = _lse_src_lv(half0, SLOT, SOFF, LOFF, SWITCH[0], ME,
+                       lse_ptr, h, row, hr, HPR, ROWS, ME)
+    for s in tl.static_range(1, NS):
+        lv = _lse_src_lv(half0, SLOT, SOFF, LOFF, SWITCH[s], ME,
+                         lse_ptr, h, row, hr, HPR, ROWS, ME)
+        peak = tl.maximum(peak, lv)
+    finite = (peak == peak) & (peak != float("inf")) & (peak != float("-inf"))
+    peak = tl.where(finite, peak, 0.0)
+    total = 0.0
+    acc = tl.zeros((BLOCK_W,), dtype=tl.float32)
+    for s in tl.static_range(NS):
+        lv = _lse_src_lv(half0, SLOT, SOFF, LOFF, SWITCH[s], ME,
+                         lse_ptr, h, row, hr, HPR, ROWS, ME)
+        pv = _lse_src_pv(half0, SLOT, SOFF, SWITCH[s], ME,
+                         p_ptr, p_row_stride, p_head_stride,
+                         h, row, hr, c, W, HPR, ME, BLOCK_W)
+        w = libdevice.exp2(libdevice.sub_rn(lv, peak))
+        total = libdevice.add_rn(total, w)
+        acc = libdevice.add_rn(acc, libdevice.mul_rn(pv, w))
+    seen = total > 0
+    safe = tl.maximum(total, 1e-30)
+    mine_out = tl.where(seen, libdevice.div_rn(acc, safe), 0.0)
+    mine_lse = tl.where(seen, libdevice.add_rn(peak, libdevice.log2(safe)), float("-inf"))
+    tl.store(mine_ptr + block_off, mine_out, mask=mask)
+    tl.store(mine_lse_ptr + hr, mine_lse)
 
-    mine_out, mine_lse = _lse_merge4_fp32(mine_l[0], mine_l[1], mine_l[2], mine_l[3],
-                                         mine_p[0], mine_p[1], mine_p[2], mine_p[3],
-                                         BLOCK_W)
-    tl.store(mine4_ptr + block_off, mine_out, mask=mask)
-    tl.store(mine4_lse_ptr + hr, mine_lse)
-    theirs_out, theirs_lse = _lse_merge4_fp32(theirs_l[0], theirs_l[1], theirs_l[2],
-                                              theirs_l[3], theirs_p[0], theirs_p[1],
-                                              theirs_p[2], theirs_p[3], BLOCK_W)
-    tl.store(out4_lse_ptr + hr, theirs_lse)
+    # -- the partner's heads: the same ladder over the same source order ----
+    peak = _lse_src_lv(half1, SLOT, SOFF, LOFF, SWITCH[0], PARTNER,
+                       lse_ptr, h, row, hr, HPR, ROWS, ME)
+    for s in tl.static_range(1, NS):
+        lv = _lse_src_lv(half1, SLOT, SOFF, LOFF, SWITCH[s], PARTNER,
+                         lse_ptr, h, row, hr, HPR, ROWS, ME)
+        peak = tl.maximum(peak, lv)
+    finite = (peak == peak) & (peak != float("inf")) & (peak != float("-inf"))
+    peak = tl.where(finite, peak, 0.0)
+    total = 0.0
+    acc = tl.zeros((BLOCK_W,), dtype=tl.float32)
+    for s in tl.static_range(NS):
+        lv = _lse_src_lv(half1, SLOT, SOFF, LOFF, SWITCH[s], PARTNER,
+                         lse_ptr, h, row, hr, HPR, ROWS, ME)
+        pv = _lse_src_pv(half1, SLOT, SOFF, SWITCH[s], PARTNER,
+                         p_ptr, p_row_stride, p_head_stride,
+                         h, row, hr, c, W, HPR, ME, BLOCK_W)
+        w = libdevice.exp2(libdevice.sub_rn(lv, peak))
+        total = libdevice.add_rn(total, w)
+        acc = libdevice.add_rn(acc, libdevice.mul_rn(pv, w))
+    seen = total > 0
+    safe = tl.maximum(total, 1e-30)
+    theirs_out = tl.where(seen, libdevice.div_rn(acc, safe), 0.0)
+    theirs_lse = tl.where(seen, libdevice.add_rn(peak, libdevice.log2(safe)), float("-inf"))
+    tl.store(out_lse_ptr + hr, theirs_lse)
     # the eager chain's `quant_rows_int8(out4.to(torch.bfloat16)...)` math
     x = tl.cast(theirs_out, tl.bfloat16).to(tl.float32)
     amax = tl.max(tl.abs(x), axis=0)
     scale = tl.where(amax > 0, amax / 127.0, 1.0)
     q = libdevice.rint(x / scale)
     q = tl.minimum(tl.maximum(q, -127.0), 127.0)
-    tl.store(q4_ptr + block_off, q.to(tl.int8), mask=mask)
-    tl.store(s4_ptr + hr, scale)
+    tl.store(q_ptr + block_off, q.to(tl.int8), mask=mask)
+    tl.store(s_ptr + hr, scale)
 
 
 @triton.jit
@@ -1536,6 +1573,11 @@ def quant_owner_blocks_int8(x, owners, q_all, s_all, *, rows, hpr, width):
     n = int(hpr) * int(rows)
     if x.stride(2) != 1:
         x = x.contiguous()
+    if int(owners.numel()) > 0:
+        lo, hi = int(owners.min()), int(owners.max())
+        if lo < 0 or (hi + 1) * int(hpr) > int(x.shape[1]):
+            raise ValueError(f"owner blocks [{lo}..{hi}] outside the "
+                             f"{int(x.shape[1]) // int(hpr)} head blocks of x")
     rows_per = max(1, 4096 // triton.next_power_of_2(width))
     _lse_quant_owners_kernel[(triton.cdiv(n, rows_per), int(owners.numel()))](
         x, x.stride(0), x.stride(1), owners, q_all, s_all, n, int(rows), int(hpr), int(width),
@@ -1544,11 +1586,23 @@ def quant_owner_blocks_int8(x, owners, q_all, s_all, *, rows, hpr, width):
 
 def lse_switch_merge_int8(partials, lse_major, half0, half1, *, rows, hpr, width,
                           soff, lse_part, slot_stride, switch_ranks, me, partner,
-                          mine4, mine4_lse, q4, s4, out4_lse):
+                          mine, mine_lse, q, s, out_lse):
     """N4a fused phase 1 (`_lse_relay_int8`'s step 2 + `out4.to(bf16)` +
     requant in one launch).  `half0` / `half1` are the int8 wire-slot views
     `[world, lse_slot]` of the two relay halves; `switch_ranks` is the eager
-    chain's `sorted((me, *local))` source order (its `torch.stack` axis)."""
+    chain's `sorted((me, *local))` source order (its `torch.stack` axis) —
+    the switch-group layout DERIVED FROM THE PROCESS GROUP by the CeExchange
+    caller, not a fabric constant.  N = len(switch_ranks) sources merge here
+    (N=1 for a world=2 / 1-rank-group run, N=4 for world=8 / 4-rank groups,
+    any N >= 1 in between)."""
+    switch = tuple(int(v) for v in switch_ranks)
+    ns = len(switch)
+    if ns < 1:
+        raise ValueError("lse_switch_merge_int8 needs at least one switch source")
+    if int(me) not in switch:
+        raise ValueError(f"switch_ranks {switch} must contain me={int(me)}")
+    if len(set(switch)) != ns:
+        raise ValueError(f"switch_ranks {switch} has duplicate sources")
     n = int(hpr) * int(rows)
     if partials.stride(2) != 1:
         partials = partials.contiguous()
@@ -1556,10 +1610,10 @@ def lse_switch_merge_int8(partials, lse_major, half0, half1, *, rows, hpr, width
     _lse_switch_merge_kernel[(n,)](
         partials, partials.stride(0), partials.stride(1), lse_major,
         half0, half1, int(slot_stride), int(soff), int(lse_part),
-        mine4, mine4_lse, q4, s4, out4_lse,
+        mine, mine_lse, q, s, out_lse,
         n, int(rows), int(width),
         HPR=int(hpr), ME=int(me), PARTNER=int(partner),
-        SWITCH=tuple(int(v) for v in switch_ranks), BLOCK_W=block)
+        SWITCH=switch, NS=ns, BLOCK_W=block)
 
 
 def lse_final_merge_int8(mine4, mine4_lse, base0, *, rows, hpr, width,
