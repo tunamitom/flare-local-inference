@@ -299,7 +299,7 @@ class DecodeGraphs:
         `need_hidden`: `(logits, post-norm hidden [1, T, H], pre-norm hidden,
         flag)` (graph-pool tensors: read them before the next replay)."""
         count = int(token_ids.shape[1])
-        width = self.index_width(start + count)
+        width = min(self.index_width(start + count), self.cache.cap_of(row))
         # c8 L6b: the tail graphs bake the row's base (> 64 query rows: no per-row
         # base indexer) — a relocated row captures its tails anew
         key = ("tail", int(row), count, width, call_shape.name, bool(need_logits),

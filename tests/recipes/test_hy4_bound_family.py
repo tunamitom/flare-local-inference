@@ -260,15 +260,17 @@ def test_site2_fused_handback_lcap_is_the_row_extent():
     cache = contract_cache()
     merged = torch.zeros((2, 4), dtype=torch.int64)          # unused on the fused path
     captured = drive_attention(cache, fused=True, merged=merged, token_rows=[7, 3])
-    lcap = int(captured["handback"]["local_capacity"])
-    # the rebind: cap_of(row) = 44,672 (uniform rows), not max_cap() = 131,072
-    assert lcap == ROW_CAP == cache.cap_of(7) == cache.cap_of(3)
-    assert lcap < cache.max_cap()
-    # the kernel guard is `local < LCAP` (fused_ops.py:987): tail-row local
+    lcap = captured["handback"]["local_capacity"]
+    # Per-row device capacity tensor: every row carries its own real extent
+    # (`cap_of(row)` = 44,672 on uniform rows, never `max_cap()` = 131,072).
+    assert isinstance(lcap, torch.Tensor)
+    assert lcap.tolist() == [ROW_CAP, ROW_CAP]
+    assert int(lcap.max()) < cache.max_cap()
+    # The kernel guard is `local < row_cap` (fused_ops.py): tail-row local
     # 44,672 is flat slot 357,376 — refused; 44,671 (flat slot 357,375)
-    # accepted byte-identically (the old guard accepted it too)
-    assert not (ROW_CAP < lcap)
-    assert (ROW_CAP - 1) < lcap
+    # accepted byte-identically (the old guard accepted it too).
+    assert not (ROW_CAP < int(lcap[0]))
+    assert (ROW_CAP - 1) < int(lcap[0])
     assert 7 * ROW_CAP + ROW_CAP == FLAT_SLOTS               # slot 357,376 never handed back
     assert 7 * ROW_CAP + (ROW_CAP - 1) == FLAT_SLOTS - 1     # the last in-extent slot
     # in-extent hand-back slots equal the old formula's (only the guard changed)
@@ -284,10 +286,54 @@ def test_site2_fused_lcap_never_passes_any_row_extent():
     cache = ragged_cache()          # caps [12, 8, 8, 4]
     merged = torch.zeros((2, 4), dtype=torch.int64)
     captured = drive_attention(cache, fused=True, merged=merged, token_rows=[0, 3])
-    lcap = int(captured["handback"]["local_capacity"])
-    assert lcap == 4 == min(cache.cap_of(r) for r in range(4))
-    for row in range(4):
-        assert lcap <= cache.cap_of(row)      # never admits a slot past ANY row
+    lcap = captured["handback"]["local_capacity"]
+    # Each row carries its OWN extent (`[12, 4]`) — never exceeds that row's
+    # extent and never collapses wider active rows to a narrower row's cap.
+    assert isinstance(lcap, torch.Tensor)
+    assert lcap.tolist() == [cache.cap_of(0), cache.cap_of(3)] == [12, 4]
+
+
+def test_site2_fused_handback_dynamic_idle_zero_preserves_active_row():
+    """Regression: under dynamic extents (`HY4_DYN_EXTENTS=on`), idle rows have
+    `cap_of(row) == 0`. Passing a scalar `min(cap_of(r))` handed `LCAP = 0` to
+    `_scores_only_select_kernel` and dropped every selected key on active rows.
+    Per-row `caps_for(token_rows)` must preserve the active row's extent."""
+    cache = contract_cache()
+    cache.set_extents([0, 10_240, 0, 0, 0, 0, 0, 0], bases=[0] * ROWS)
+    merged = torch.zeros((4, 4), dtype=torch.int64)
+    captured = drive_attention(cache, fused=True, merged=merged, token_rows=[1, 1, 1, 1])
+    lcap = captured["handback"]["local_capacity"]
+    assert isinstance(lcap, torch.Tensor)
+    assert lcap.tolist() == [10_240, 10_240, 10_240, 10_240]
+    # Live growth updates `row_cap_dev` in place; subsequent calls follow it.
+    cache.set_extents([0, 20_480, 0, 0, 0, 0, 0, 0], bases=[0] * ROWS)
+    captured2 = drive_attention(cache, fused=True, merged=merged, token_rows=[1, 1, 1, 1])
+    assert captured2["handback"]["local_capacity"].tolist() == [20_480, 20_480, 20_480, 20_480]
+
+
+def test_site1_need_local_aligns_to_geometric_index_width_grid():
+    """Dynamic extent grants past `GEOM_FROM` (8,192) align to `DecodeGraphs`'s
+    geometric width grid so `index_width` stays on boot-primed buckets."""
+    import importlib.util
+    from pathlib import Path
+
+    spec = importlib.util.spec_from_file_location(
+        "h4_serve_mod",
+        Path(__file__).resolve().parents[2] / "deploy" / "hy4" / "h4_serve.py",
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    cache = contract_cache()
+    loop = mod.BatchLoop.__new__(mod.BatchLoop)
+    loop.ctx = SimpleNamespace(decoder=SimpleNamespace(cache=cache))
+    g = graphs_for(cache)
+    for tokens in (85, 10_240, 64_358, 65_540, 81_044, 128_555, 250_000):
+        cap = loop._need_local(tokens)
+        assert cap <= cache.cap_limit
+        assert cap >= -(-(tokens + 8192) // WORLD)
+        if cap < cache.cap_limit:
+            # Every granted extent is itself a geometric `index_width` grid point.
+            assert old_index_width(cap * WORLD, g.granule, g.GEOM_FROM, cache.cap_limit) == cap
 
 
 def test_site3_handback_bounds_are_per_row():

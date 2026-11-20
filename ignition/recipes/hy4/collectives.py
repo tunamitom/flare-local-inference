@@ -2889,10 +2889,12 @@ class PcieDcpCollectives:
         offer = width if not self.local_offer else min(int(self.local_offer), width)
         plan = self._plan("selection_exchange", None)
         offers = self.transport.exchange_scores(candidate_scores[:, :offer].contiguous(), plan=plan)
+        lcap = (local_capacity.reshape(-1).to(torch.int64).contiguous()
+                if isinstance(local_capacity, torch.Tensor) else int(local_capacity))
         _, _, flag = scores_only_select(
             offers, candidate_scores, candidate_positions, topk=topk, world=self.world_size,
             rank=self.rank, handback=(selected, counts, base.reshape(-1).to(torch.int64).contiguous(),
-                                      int(local_capacity)))
+                                      lcap))
         self.deferred_checks.append(flag)
 
     def merge_topk(self, candidate_scores, candidate_positions, *, topk):

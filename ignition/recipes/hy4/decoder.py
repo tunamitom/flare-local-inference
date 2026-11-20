@@ -285,6 +285,16 @@ class Hy4Cache:
                                     lambda: self.row_base_dev[row_of.long()])
         return self.row_base_dev.to(row_of.device)[row_of.long()]
 
+    def caps_for(self, row_of):
+        """Each token's row slot capacity (`row_of` maps token -> request row)."""
+        if row_of.is_cuda:
+            from .attention import diet, forward_memo
+
+            if diet("diet_index"):
+                return forward_memo(row_of, ("caps_for", id(self.row_cap_dev)),
+                                    lambda: self.row_cap_dev[row_of.long()])
+        return self.row_cap_dev.to(row_of.device)[row_of.long()]
+
     def allocate_short(self, rows, capacity):
         """The replicated short-context record tables (fused records only)."""
         from .config import LATENT_RECORD_BYTES
@@ -1871,21 +1881,13 @@ class Hy4Decoder:
                             scores, candidates, topk=self.config.text["index_topk"],
                             selected=selected_buf, counts=counts_buf,
                             base=self.cache.slots_for(token_rows),
-                            # CSF bound-fix: the fused hand-back's `local < LCAP`
-                            # guard (fused_ops.py:987 `local < LCAP`) is this
-                            # path's only out-of-extent guard, and `max_cap()`
-                            # (131,072 — the dynamic-extents cap) admitted local
-                            # slots past every row's real `cap_of` (44,672 at
-                            # the gate boots; tail-row local 44,672 is flat slot
-                            # 357,376, one past the flat table). Bind to the
-                            # row extents: the NARROWEST `cap_of` — a scalar
-                            # kernel argument must be safe for every row of the
-                            # forward, and under the contract's uniform extents
-                            # it IS `cap_of(row)` exactly (in-extent hand-back
-                            # byte-identical); ragged extents conservatively
-                            # derate the fused path, never past any row.
-                            local_capacity=min(self.cache.cap_of(r)
-                                               for r in range(self.cache.rows)))
+                            # Per-row device capacity (matching the non-fused
+                            # hand-back guard below): each query row bounds its
+                            # own local slots by live `row_cap_dev[row]`, so
+                            # idle rows at extent 0 under dynamic extents never
+                            # zero active rows' selections and captured graphs
+                            # track extent updates in place.
+                            local_capacity=self.cache.caps_for(token_rows))
                     yield ("comm", "scores")
                     merged = None
                 else:

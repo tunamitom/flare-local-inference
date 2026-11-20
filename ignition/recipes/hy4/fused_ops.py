@@ -351,12 +351,13 @@ def _index_scores_kernel(q_ptr, wt_ptr, key_ptr, owned_ptr, out_ptr, width, out_
     if PER_ROW_BASE:
         # batched decode: query row r scores its own request row's key segment
         key_ptr += tl.load(base_ptr + r) * D
-    keys = tl.load(key_ptr + w[:, None].to(tl.int64) * D + d[None, :], mask=w[:, None] < width,
+    owned = tl.load(owned_ptr + r)
+    live = (w < width) & (w < owned)
+    keys = tl.load(key_ptr + w[:, None].to(tl.int64) * D + d[None, :], mask=live[:, None],
                    other=0.0)
     prod = tl.maximum(tl.dot(q, tl.trans(keys)), 0.0)
     wt = tl.load(wt_ptr + r * H + h)
     logit = tl.sum(wt[:, None] * prod, axis=0)
-    owned = tl.load(owned_ptr + r)
     logit = tl.where(w < owned, logit, float("-inf"))
     tl.store(out_ptr + r * out_stride + w, logit, mask=w < width)
 
@@ -935,9 +936,10 @@ def ihc_post_pre_split(x, residual, prev_post, fn, hc_scale, hc_base, *, magnitu
 # --------------------------------------------------------------------------
 @triton.jit
 def _scores_only_select_kernel(offers_ptr, cand_ptr, pos_ptr, out_val_ptr, out_pos_ptr, flag_ptr,
-                               sel_ptr, cnt_ptr, base_ptr, LCAP,
+                               sel_ptr, cnt_ptr, base_ptr, cap_ptr, LCAP,
                                WIDTH, TOPK, KIDX, RANK, OFFER: tl.constexpr, WORLD: tl.constexpr,
-                               NOFF: tl.constexpr, NCAND: tl.constexpr, HANDBACK: tl.constexpr):
+                               NOFF: tl.constexpr, NCAND: tl.constexpr, HANDBACK: tl.constexpr,
+                               PER_ROW_CAP: tl.constexpr):
     r = tl.program_id(0).to(tl.int64)
     j = tl.arange(0, NOFF)
     stacked = tl.load(offers_ptr + r * (WORLD * OFFER) + j, mask=j < WORLD * OFFER,
@@ -984,7 +986,8 @@ def _scores_only_select_kernel(offers_ptr, cand_ptr, pos_ptr, out_val_ptr, out_p
         # stably to the front, -1 padding, live count.
         pp = merged.to(tl.int64)
         local = tl.where(pp >= 0, pp, 0) // WORLD
-        live = out_mask & (pp >= 0) & (local < LCAP) & ((pp % WORLD) == RANK)
+        row_cap = tl.load(cap_ptr + r).to(tl.int64) if PER_ROW_CAP else LCAP
+        live = out_mask & (pp >= 0) & (local < row_cap) & ((pp % WORLD) == RANK)
         dest = tl.cumsum(live.to(tl.int32), axis=0) - 1
         count = tl.sum(live.to(tl.int32))
         base = tl.load(base_ptr + r)
@@ -1018,7 +1021,9 @@ def scores_only_select(offers, candidate_scores, candidate_positions, *, topk, w
     `offers`: the `world` per-rank `[rows, offer]` FP32 offers in rank order.
     `handback=(selected [rows, topk] int32, counts [rows] int32, row_base [rows]
     int64, local_capacity)`: write this rank's compacted local slots + counts
-    (the decoder map + selection hand-back) instead; values/positions are None."""
+    (the decoder map + selection hand-back) instead; values/positions are None.
+    `local_capacity` is either a per-row `[rows]` int64 device tensor (live
+    under dynamic extents and CUDA graphs) or a uniform scalar int."""
     rows, width = (int(v) for v in candidate_scores.shape)
     offer = int(offers[0].shape[1])
     stacked = _stacked_offers(offers, world)
@@ -1028,19 +1033,29 @@ def scores_only_select(offers, candidate_scores, candidate_positions, *, topk, w
     if handback is None:
         out_val = torch.empty((rows, topk), dtype=torch.float32, device=scores.device)
         out_pos = torch.empty((rows, topk), dtype=torch.int32, device=scores.device)
-        sel, cnt, base, lcap = out_pos, flags, flags, 0
+        sel, cnt, base, cap_ptr, lcap, per_row_cap = out_pos, flags, flags, flags, 0, False
     else:
-        sel, cnt, base, lcap = handback
+        sel, cnt, base, lcap_arg = handback
         out_val = out_pos = None
+        if isinstance(lcap_arg, torch.Tensor):
+            cap_ptr = lcap_arg.reshape(-1).to(torch.int64).contiguous()
+            if int(cap_ptr.numel()) != rows:
+                raise ValueError(
+                    f"scores_only_select: per-row local_capacity has {int(cap_ptr.numel())} "
+                    f"entries for {rows} rows")
+            lcap, per_row_cap = 0, True
+        else:
+            cap_ptr, lcap, per_row_cap = base, int(lcap_arg), False
     noff = triton.next_power_of_2(world * offer)
     ncand = triton.next_power_of_2(max(width, topk))
     _scores_only_select_kernel[(rows,)](stacked, scores, positions,
                                         flags if out_val is None else out_val,
                                         sel if out_pos is None else out_pos, flags,
-                                        sel, cnt, base, int(lcap),
+                                        sel, cnt, base, cap_ptr, lcap,
                                         width, topk, min(topk, world * offer) - 1, rank,
                                         OFFER=offer, WORLD=world, NOFF=noff, NCAND=ncand,
-                                        HANDBACK=handback is not None, num_warps=8)
+                                        HANDBACK=handback is not None,
+                                        PER_ROW_CAP=per_row_cap, num_warps=8)
     flag = flags[0] if rows == 1 else flags.any()
     return out_val, out_pos, flag
 

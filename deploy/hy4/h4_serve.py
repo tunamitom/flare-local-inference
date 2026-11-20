@@ -1669,10 +1669,18 @@ class BatchLoop:
         return bool(getattr(self.ctx, "dyn_extents", False))
 
     def _need_local(self, tokens):
-        """Local slots for `tokens` positions plus 8k of room, in 1,024-slot units."""
+        """Local slots for `tokens` positions plus 8k of room, aligned to the
+        indexer's geometric width buckets (1,024-slot units up to 8,192, then
+        four per octave) so `DecodeGraphs.index_width` stays on boot-primed
+        buckets instead of clamping to off-grid widths mid-request."""
         c = self.ctx.decoder.cache
         n = -(-(int(tokens) + 8192) // c.world)
-        return min(-(-n // 1024) * 1024, int(c.cap_limit))
+        w = -(-n // 1024) * 1024
+        if w > 8192:
+            octave = 1 << (w.bit_length() - 1)
+            step = octave // 4
+            w = -(-w // step) * step
+        return min(w, int(c.cap_limit))
 
     def _used_local(self, row):
         """Local slots a row has written (its length, in-flight rounds and pads included)."""
