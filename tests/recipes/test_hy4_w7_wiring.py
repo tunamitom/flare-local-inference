@@ -140,6 +140,58 @@ def test_prepared_plans_are_per_call_shape_and_refuse_jit(worlds):
         attn._sink_folds.update(saved[2])
 
 
+@pytest.mark.parametrize("world", (2, 8))
+def test_selection_exchange_candidates_is_the_exact_rollback(world):
+    """`--selection-exchange candidates` (the rollback handle): the exact
+    full-candidate merge stays wired over the transport surfaces and selects
+    the same global top-k as the scores-only exchange (smooth scores: no ties
+    at the cut)."""
+    from ignition.recipes.hy4.collectives import (
+        PcieDcpCollectives, SimulatedDcpTransport, SimulatedGroup,
+    )
+
+    torch.manual_seed(17)
+    topk, rows, n = 8, 3, 40
+    scores = torch.randn(rows, n)
+    per_rank = [_owned_candidates(scores, world, rank, topk) for rank in range(world)]
+    group = SimulatedGroup(world)
+    transport = SimulatedDcpTransport(group)
+
+    def body(rank):
+        def run(mode):
+            col = PcieDcpCollectives(rank=rank, world_size=world, transport=transport,
+                                     exchange_mode=mode)
+            return col.merge_topk(per_rank[rank][0], per_rank[rank][1], topk=topk)
+        return run("candidates"), run("scores-only")
+
+    results = group.run([lambda _col, rank=rank: body(rank) for rank in range(world)])
+    want = scores.topk(topk, dim=1).values.sort(dim=1).values
+    # The exact (candidates) merge returns the global top-k on every rank.
+    exact_positions = None
+    union_values = [[] for _ in range(rows)]
+    union_positions = [[] for _ in range(rows)]
+    for rank_results in results:
+        (cv, cp), (sv, sp) = rank_results
+        assert torch.equal(cv.sort(dim=1).values, want), "candidates: not a global top-k"
+        for row in range(rows):
+            assert torch.equal(scores[row, cp[row].long()], cv[row]), (
+                "a selected key must carry its own score")
+        exact_positions = cp
+        # scores-only: each rank returns its OWN keys; the union is the top-k.
+        for row in range(rows):
+            keep = sp[row] >= 0
+            union_values[row] += sv[row][keep].tolist()
+            union_positions[row] += sp[row][keep].tolist()
+            assert torch.equal(scores[row, sp[row][keep].long()], sv[row][keep]), (
+                "a selected key must carry its own score")
+    for row in range(rows):
+        assert len(union_positions[row]) == len(set(union_positions[row])) == topk
+        assert torch.equal(torch.tensor(sorted(union_values[row])), want[row]), (
+            "the scores-only union is not the global top-k")
+        assert set(union_positions[row]) == set(exact_positions[row].tolist()), (
+            "rollback and scores-only selected different keys")
+
+
 def test_pcie_dcp_wiring_calls_the_transport_surfaces():
     """The TODO hooks wired: `all_gather_heads` / `lse_reduce_scatter` on the
     b12x surfaces with prepared plans, base-2 LSE, declared partial provenance,
@@ -169,6 +221,10 @@ def test_pcie_dcp_wiring_calls_the_transport_surfaces():
             self.calls.append(("exchange_scores", tuple(offers.shape), plan))
             return [offers, offers]
 
+        def stage_candidates(self, local_indices, local_scores, local_counts=None, *, plan):
+            self.calls.append(("stage_candidates", tuple(local_scores.shape), plan))
+            return [(local_scores, local_indices)] * 2
+
         def all_reduce(self, value):
             return value
 
@@ -190,9 +246,10 @@ def test_pcie_dcp_wiring_calls_the_transport_surfaces():
     assert surface[2] is False, "partials_sink_folded must be declared into the merge"
     assert surface[3] is False, "the sink must NOT enter the merge (one post-merge fold)"
     # The scores-only exchange moves SCORES only (offer width), never keys.
-    col.merge_topk(torch.tensor([[3.0, 2.0, 1.0]]), torch.tensor([[5, 3, 1]]), topk=2)
+    # Candidate packs are `[rows, topk]` (merge_candidate_topk's contract).
+    col.merge_topk(torch.tensor([[3.0, 2.0]]), torch.tensor([[5, 3]]), topk=2)
     scores_call = transport.calls[2]
-    assert scores_call[0] == "exchange_scores" and scores_call[1] == (1, 3)
+    assert scores_call[0] == "exchange_scores" and scores_call[1] == (1, 2)
 
 
 def test_wired_two_rank_paths_equal_world_1(worlds):

@@ -84,6 +84,13 @@ def test_begin_forward_host_matches_the_device_path():
         _slots = Hy4Cache._slots
         _owned_slots = Hy4Cache._owned_slots
         begin_forward_host = Hy4Cache.begin_forward_host
+        _extents = Hy4Cache._extents
+        base_of = Hy4Cache.base_of
+        cap_of = Hy4Cache.cap_of
+        row_base_dev = Hy4Cache.row_base_dev
+        row_cap_dev = Hy4Cache.row_cap_dev
+        row_base = None
+        row_cap = None
 
         def __init__(self, rank, world=8, capacity=4096, rows=2):
             self.rank, self.world, self.capacity, self.rows = rank, world, capacity, rows

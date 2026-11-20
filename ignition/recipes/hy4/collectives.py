@@ -625,6 +625,14 @@ class SimulatedDcpTransport:
         gathered = torch.cat(taken, dim=1)
         return gathered if out is None else out.copy_(gathered)
 
+    def gather_head_major(self, rows, width):
+        """`PcieDcpCollectives.gather_head_major`'s transport surface (Option 1,
+        PERF-PLAN.md Step 3). The CPU twin's gather is the BF16 wire's row-major
+        `[rows, heads, width]` (see `all_gather_heads` above), so it never
+        reports the INT8 wire's head-major layout and the absorb path stays on
+        the row-major contract every consumer assumes."""
+        return False
+
     def lse_reduce_scatter(self, partial_output, partial_lse, out=None, *, plan, lse_base,
                            partials_sink_folded=None, return_lse=False):
         from b12x.comm.pcie import lse_reduce_scatter_reference

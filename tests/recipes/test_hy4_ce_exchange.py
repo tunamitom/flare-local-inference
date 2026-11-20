@@ -34,6 +34,8 @@ def test_merge_matches_the_b12x_reference_merge():
 
 
 class _FakeCe:
+    gather_head_major = False       # the BF16 wire's gather is row-major
+
     def __init__(self, gather=None, merge=None):
         self.gather, self.merge, self.calls = gather, merge, []
 
