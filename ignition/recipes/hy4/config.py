@@ -170,8 +170,11 @@ def _smoke_relations(config):
         raise ValueError("Hy4 MoE requires one shared expert and positive clamp/scaling")
     if type(c.get("num_nextn_predict_layers")) is not int or c["num_nextn_predict_layers"] < 0:
         raise ValueError("Hy4 requires a nonnegative integer num_nextn_predict_layers")
-    if c["num_nextn_predict_layers"] == 0 and not c.get("dfly_num_hidden_layers"):
-        raise ValueError("Hy4 requires at least one MTP predictor layer or bundled DFly2 draft layers")
+    # `draft_layers == 0` is legal (plan 4.1): official `hy_v4_vl` carries no
+    # MTP predictor layer at all, so the smoke path must accept zero draft
+    # layers whether or not a DFly2 drafter is bundled. Zero draft layers
+    # means zero draft KV bytes (`token_record_bytes`) and 77 packed MoE
+    # prefixes (59,136 matrices) in the export.
     rope = c.get("rope_parameters")
     if not isinstance(rope, dict) or "rope_theta" not in rope or "rope_type" not in rope:
         raise ValueError("Hy4 requires rope_parameters with rope_theta and rope_type")

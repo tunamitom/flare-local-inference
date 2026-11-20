@@ -82,14 +82,58 @@ def dfly_checkpoint_names(config, *, include_ignored=False):
     return frozenset(names)
 
 
-def checkpoint_names(config, *, mtp=True, dfly=None, packed=False):
+def vision_checkpoint_names(config):
+    """All `vit.*` tensor names of a `hy_v4_vl` checkpoint's vision tower.
+
+    The vision tower of the official `tencent/Hy4` checkpoint carries exactly
+    649 tensors: 3 embedding tensors, 16 tensors per
+    `vision_config.num_hidden_layers` ViT layer, and 6 `vit.perceive` adapter
+    tensors. Text-only serving (the plan's V-A staging) preserves these
+    passthrough weights in the package but leaves them unselected; the family
+    is enumerated so strict key coverage accepts exactly these keys and fails
+    closed on anything else under `vit.`.
+    """
+    vision = config.text.get("vision_config")
+    if not isinstance(vision, dict):
+        return frozenset()
+    layers = vision.get("num_hidden_layers")
+    if type(layers) is not int or layers < 1:
+        raise ValueError(
+            f"Hy4 vision requires a positive integer vision_config.num_hidden_layers, got {layers!r}")
+    names = {
+        "vit.embeddings.patch_embedding.weight", "vit.embeddings.patch_embedding.bias",
+        "vit.embeddings.position_embedding.weight",
+        "vit.perceive.norm.weight", "vit.perceive.image_newline",
+    }
+    names |= {f"vit.perceive.proj.{index}.{suffix}"
+              for index in (0, 2) for suffix in ("weight", "bias")}
+    for layer in range(layers):
+        prefix = f"vit.layers.{layer}"
+        names |= {f"{prefix}.{norm}.{suffix}"
+                  for norm in ("input_layernorm", "post_attention_layernorm")
+                  for suffix in ("weight", "bias")}
+        names |= {f"{prefix}.self_attn.{proj}.{suffix}"
+                  for proj in ("q_proj", "k_proj", "v_proj", "o_proj")
+                  for suffix in ("weight", "bias")}
+        names |= {f"{prefix}.mlp.{proj}.{suffix}"
+                  for proj in ("dense_h_to_4h", "dense_4h_to_h")
+                  for suffix in ("weight", "bias")}
+    return frozenset(names)
+
+
+def checkpoint_names(config, *, mtp=True, dfly=None, vision=False, packed=False):
     """Every tensor name of the checkpoint, from `ref/idx.json`'s schema.
 
     Verified against the real `model.safetensors.index.json` (2006 preview
-    tensors; 2059 active text + DFly2 tensors on official `tencent/Hy4`).
-    `packed` describes the W4A16_NVFP4 export instead: the two fused expert
-    tensors of every MoE block become the packed weight/scale/gain triples of
-    `contract.packed_expert_tensor_names`.
+    tensors; 2059 active text + DFly2 tensors and 649 `vit.*` tensors on
+    official `tencent/Hy4`). `dfly` selects the 80 active `model.dfly_layers.*`
+    tensors (default: follow `mtp`), `vision` the `vit.*` family (default off —
+    text-only serving deliberately leaves it unselected); unselected families
+    are still enumerated by the strict-coverage gate via
+    `dfly_checkpoint_names(include_ignored=True)` / `vision_checkpoint_names`
+    so any unknown key fails closed. `packed` describes the W4A16_NVFP4 export
+    instead: the two fused expert tensors of every MoE block become the packed
+    weight/scale/gain triples of `contract.packed_expert_tensor_names`.
     """
     names = {"lm_head.weight", "model.embed_tokens.weight", "model.norm.weight",
              "model.hc_head.hc_head_base", "model.hc_head.hc_head_fn", "model.hc_head.hc_head_scale"}
@@ -137,6 +181,8 @@ def checkpoint_names(config, *, mtp=True, dfly=None, packed=False):
     include_dfly = mtp if dfly is None else dfly
     if include_dfly and config.has_dfly:
         names |= set(dfly_checkpoint_names(config, include_ignored=False))
+    if vision and config.has_vision:
+        names |= set(vision_checkpoint_names(config))
     return frozenset(names)
 
 
@@ -283,12 +329,16 @@ class Hy4WeightLoader(DirectWeightLoader):
     (256 ranks-wide channels at TP8, 128 at TP16); omit it for a full-width
     load. `mtp` includes the checkpoint's MTP block in the selection; with
     `mtp=False` the block may be present or absent (drafts load only for
-    learned speculation). `expert_scale_compression` optionally stores the
-    routed experts' block scales in the lossless `csf` encoding at load.
+    learned speculation). `dfly` (default: follow `mtp`) selects the bundled
+    DFly2 drafter family and `vision` the `vit.*` tower (default off —
+    text-only serving preserves the passthrough weights unselected); either
+    way every family present in the checkpoint is name-checked strictly.
+    `expert_scale_compression` optionally stores the routed experts' block
+    scales in the lossless `csf` encoding at load.
     """
 
     def __init__(self, manifest, device, *, shard=None, progress=None, prefixes=None, mtp=True,
-                 expert_scale_compression=None, pinned=True):
+                 dfly=None, vision=False, expert_scale_compression=None, pinned=True):
         super().__init__(manifest, device, prefixes=prefixes, progress=progress)
         from .config import ModelConfig
 
@@ -296,6 +346,8 @@ class Hy4WeightLoader(DirectWeightLoader):
             raise ValueError("Hy4 expert scale compression must be None or 'csf'")
         self.config = ModelConfig.load(manifest.snapshot, pinned=pinned)
         self.shard, self.mtp = shard, mtp
+        self.dfly = self.mtp if dfly is None else dfly
+        self.vision = vision
         self.expert_scale_compression = expert_scale_compression
 
     @cached_property
@@ -323,17 +375,18 @@ class Hy4WeightLoader(DirectWeightLoader):
         if self._packed:
             verify_export_package(self.manifest.metadata_path, self.config)
         packed = self._packed
-        inventory = set(checkpoint_names(self.config, mtp=True, dfly=True, packed=packed))
+        # Every family the checkpoint may carry is enumerated (the 2 ignored
+        # `confidence_head` tensors and the `vit.*` passthrough tower included),
+        # so strict coverage accepts exactly those keys when present and fails
+        # closed on any unknown name, while unselected families stay
+        # deliberately unselected.
+        inventory = set(checkpoint_names(self.config, mtp=True, dfly=True, vision=True, packed=packed))
         if self.config.has_dfly:
             inventory |= set(dfly_checkpoint_names(self.config, include_ignored=True))
-        expected = checkpoint_names(self.config, mtp=self.mtp, dfly=self.mtp, packed=packed)
+        expected = checkpoint_names(self.config, mtp=self.mtp, dfly=self.dfly,
+                                    vision=self.vision, packed=packed)
         available = set(self.manifest.tensors)
-        extra = available - inventory
-        if self.config.has_vision:
-            # Text-only serving preserves `vit.*` passthrough weights in the
-            # checkpoint package while leaving them unselected on load.
-            extra = {name for name in extra if not name.startswith("vit.")}
-        missing, unexpected = sorted(expected - available), sorted(extra)
+        missing, unexpected = sorted(expected - available), sorted(available - inventory)
         if missing or unexpected:
             raise ValueError(f"Hy4 checkpoint tensor names disagree with the recipe: "
                              f"missing={missing[:8]}, unexpected={unexpected[:8]}")

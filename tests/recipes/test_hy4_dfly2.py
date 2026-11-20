@@ -237,9 +237,31 @@ def _make_tiny_official_snapshot(root: Path, *, packed: bool = False, seed: int 
         tensors[f"{lp}.mlp.up_proj.weight"] = rand((inter, h))
         tensors[f"{lp}.mlp.down_proj.weight"] = rand((h, inter))
 
-    # Vision passthrough tensors (skipped by the text-only loader).
-    tensors["vit.embeddings.patch_embedding.weight"] = rand((32, 3, 4, 4))
-    tensors["vit.adapter.proj.weight"] = rand((h, 32))
+    # Vision passthrough tensors — schema-accurate `vit.*` family (3 embeddings
+    # + 16 per ViT layer + 6 `vit.perceive`), deliberately unselected by the
+    # text-only loader but name-checked strictly (plan 4.1).
+    vh = 32
+    tensors["vit.embeddings.patch_embedding.weight"] = rand((vh, 3, 4, 4))
+    tensors["vit.embeddings.patch_embedding.bias"] = rand((vh,))
+    tensors["vit.embeddings.position_embedding.weight"] = rand((8, vh))
+    for vlayer in range(cfg["vision_config"]["num_hidden_layers"]):
+        vp = f"vit.layers.{vlayer}"
+        for sub in ("input_layernorm", "post_attention_layernorm"):
+            tensors[f"{vp}.{sub}.weight"] = ones((vh,))
+            tensors[f"{vp}.{sub}.bias"] = rand((vh,), scale=0.02)
+        for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
+            tensors[f"{vp}.self_attn.{proj}.weight"] = rand((vh, vh))
+            tensors[f"{vp}.self_attn.{proj}.bias"] = rand((vh,), scale=0.02)
+        tensors[f"{vp}.mlp.dense_h_to_4h.weight"] = rand((2 * vh, vh))
+        tensors[f"{vp}.mlp.dense_h_to_4h.bias"] = rand((2 * vh,), scale=0.02)
+        tensors[f"{vp}.mlp.dense_4h_to_h.weight"] = rand((vh, 2 * vh))
+        tensors[f"{vp}.mlp.dense_4h_to_h.bias"] = rand((vh,), scale=0.02)
+    tensors["vit.perceive.norm.weight"] = ones((vh,))
+    tensors["vit.perceive.image_newline"] = rand((2 * vh,), scale=0.02)
+    tensors["vit.perceive.proj.0.weight"] = rand((2 * vh, vh, 2, 2))
+    tensors["vit.perceive.proj.0.bias"] = rand((2 * vh,), scale=0.02)
+    tensors["vit.perceive.proj.2.weight"] = rand((2 * vh, 2 * vh, 1, 1))
+    tensors["vit.perceive.proj.2.bias"] = rand((2 * vh,), scale=0.02)
 
     if packed:
         cfg = dict(cfg)
