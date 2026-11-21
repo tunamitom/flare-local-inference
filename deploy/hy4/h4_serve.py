@@ -1506,11 +1506,12 @@ class BatchLoop:
         self.bs_la = True           # c8 L5b: enqueue bspec round k+1 before consuming round k
         self.bspec_k2 = True        # c8 L13: two chained drafts per row at <= 4 rows
         self.bspec_k3 = True        # c8 L13b: three chained drafts per row at <= 3 rows
-        self.solo_bspec = False     # c8 L13b: a lone request on the batched rounds (A/B: no gain at c1)
+        self.bspec_multi_cap = int(os.environ.get("HY4_BSPEC_MULTI_CAP") or 12)
+        self.solo_bspec = os.environ.get("HY4_SOLO_BSPEC", "0") == "1"
         self.prefilling = {}        # c8 L17: row -> a long admission's paused prefill (every rank)
         self.chunked_admit = True   # c8 L17: long prompts prefill between decode rounds
         self.prefill_long = 8192    # ... from this many prompt tokens
-        self.prefill_every = 24     # ... one chunk per this many decode iterations (rank 0)
+        self.prefill_every = int(os.environ.get("HY4_PREFILL_EVERY") or 24)
         self._since_chunk = 0
         self._bs_inv = None         # the staged per-slot 1/T (re-staged when it changes)
         self._bs_rows_t = (None, None)
@@ -2042,8 +2043,9 @@ class BatchLoop:
             self._inv_key = {}
         if self._inv_key.get(size) != key:
             # pinned staging: a pageable H2D would wait for the in-flight step
-            if not hasattr(self, "_inv_host"):
-                self._inv_host = [torch.zeros((8,), dtype=torch.float32).pin_memory()
+            cap = max(8, int(self.rows), int(size))
+            if not hasattr(self, "_inv_host") or int(self._inv_host[0].shape[0]) < cap:
+                self._inv_host = [torch.zeros((cap,), dtype=torch.float32).pin_memory()
                                   for _ in range(4)]
                 self._inv_at = 0
             buf = self._inv_host[self._inv_at]
@@ -2203,9 +2205,15 @@ class BatchLoop:
         graphs = getattr(getattr(self.ctx, "decoder", None), "decode_graphs", None)
         kmax = int(getattr(graphs, "bspec_kmax", spec_k)) if graphs is not None else spec_k
         top_k = min(spec_k, kmax)
+        cap = int(getattr(self, "bspec_multi_cap", 12) or 12)
         for K in range(top_k, 1, -1):
             need = (K + 1) * B
-            if (need <= 12 and any(need <= b <= 12 for b in rows)) or (K == top_k and need in rows):
+            cands = [b for b in rows if need <= b <= cap]
+            if cands:
+                b = min(cands)
+                if b <= 12 or b - need <= max(2, B // 2):
+                    return K
+            if K == top_k and need in rows:
                 return K
         return 1
 
@@ -2551,18 +2559,22 @@ class BatchLoop:
         if pending is not None:
             self._consume(pending, None)
 
-    def _snap(self):
+    def _snap(self, *, needed=0):
         import torch
 
-        if self._snaps is None:
+        buckets = tuple(getattr(self.ctx, "batch_rows", ()) or ())
+        cap = max(8, int(self.rows), max((1, *buckets)), int(needed))
+        if self._snaps is None or int(self._snaps[0]["cap"]) < cap:
             dev = self.ctx.device
-            self._snaps = [{"out": torch.zeros((8,), dtype=torch.long, device=dev),
-                            "inp": torch.zeros((8,), dtype=torch.long, device=dev),
+            self._snaps = [{"cap": cap,
+                            "out": torch.zeros((cap,), dtype=torch.long, device=dev),
+                            "inp": torch.zeros((cap,), dtype=torch.long, device=dev),
                             "flag": torch.zeros((1,), dtype=torch.long, device=dev),
-                            "src": torch.zeros((8,), dtype=torch.long, device=dev),
-                            "host": torch.zeros((9,), dtype=torch.long).pin_memory(),
-                            "src_host": torch.zeros((8,), dtype=torch.long).pin_memory(),
+                            "src": torch.zeros((cap,), dtype=torch.long, device=dev),
+                            "host": torch.zeros((cap + 1,), dtype=torch.long).pin_memory(),
+                            "src_host": torch.zeros((cap,), dtype=torch.long).pin_memory(),
                             "event": torch.cuda.Event()} for _ in range(4)]
+            self._snap_at = 0
         snap = self._snaps[self._snap_at]
         self._snap_at = (self._snap_at + 1) % len(self._snaps)
         return snap
@@ -2577,7 +2589,10 @@ class BatchLoop:
         d = ctx.decoder
         graphs = d.decode_graphs
         starts = [int(d._row_lengths.get(row, 0)) for row in rows]
-        size = graphs.batch_bucket(len(rows))
+        allowed = (tuple(b for b in graphs.BATCH_BUCKETS
+                         if b == 1 or b in getattr(ctx, "batch_rows", ()))
+                   if getattr(ctx, "batch_rows", None) else None)
+        size = graphs.batch_bucket(len(rows), allowed=allowed)
         shape = ctx.decode_shape if size == 1 else batch_shape(size)
         pad = None
         if size > len(rows):
@@ -2588,7 +2603,8 @@ class BatchLoop:
         if self._pending is not None and not graphs.batch_cached(rows, starts, call_shape=shape,
                                                                  pad=pad, sample=sampled):
             self._drain()                      # the eager first call must not overlap a replay
-        snap = self._snap()
+        snap = self._snap(needed=size)
+        cap = int(snap["cap"])
         pre = None
         if any(i >= 0 for i in src):
             prev_out = prev["snap"]["out"]
@@ -2609,7 +2625,7 @@ class BatchLoop:
             snap["out"][:size].copy_(out_tokens[:size])
             snap["flag"].copy_(flag.reshape(1).long())
             snap["host"][:size].copy_(snap["out"][:size], non_blocking=True)
-            snap["host"][8:9].copy_(snap["flag"], non_blocking=True)
+            snap["host"][cap:cap + 1].copy_(snap["flag"], non_blocking=True)
         else:
             vr = d.weights.sharding.vocabulary_range
             root = {"root_host": True} if _rt.SWITCHES.get("root_logits") == "on" else {}
@@ -2639,7 +2655,7 @@ class BatchLoop:
         rows, size = step["rows"], step["size"]
         if step["sampled"]:
             step["snap"]["event"].synchronize()
-            flagged = bool(int(step["snap"]["host"][8]))
+            flagged = bool(int(step["snap"]["host"][int(step["snap"]["cap"])]))
         else:
             flagged = step["flag"]
         force = getattr(self, "force_rollback_every", 0)   # dev: exercise the rollback
@@ -2895,10 +2911,11 @@ def main():
         # the replicated window: records (and indexer keys past top-k) of every
         # position below it, per serving row
         SHORT_POSITIONS = max(int(os.environ.get("HY4_SHORT_KV_POSITIONS") or 0), int(cfg_topk))
-        BATCH_ROWS = tuple(b for b in (2, 4, 8) if b <= args.batch_rows)
-        # dev probes only: wider batch shapes (16 / 32 query rows) for micro-benches
-        BATCH_ROWS += tuple(int(x) for x in (os.environ.get("HY4_BATCH_EXTRA") or "").split(",")
-                            if x.strip() and int(x) not in BATCH_ROWS)
+        BATCH_ROWS = tuple(b for b in (2, 4, 8, 16) if b <= args.batch_rows)
+        # extra batch buckets (e.g. 6, 12, 24, 32 for bspec verify widths)
+        BATCH_ROWS = tuple(sorted(set(BATCH_ROWS) | {
+            int(x) for x in (os.environ.get("HY4_BATCH_EXTRA") or "").split(",") if x.strip()
+        }))
         DECODE_ROWS = tuple(sorted(set(SPEC_ROWS) | set(BATCH_ROWS)))
         from ignition.recipes.hy4.collectives import parse_all_reduce_arms
 
@@ -2939,7 +2956,7 @@ def main():
                 int(os.environ.get("HY4_SPEC_K") or 0) + 1
                 if os.environ.get("HY4_MTP") == "1" and os.environ.get("HY4_SPEC_DECODE_ROWS") == "1"
                 and int(os.environ.get("HY4_SPEC_K") or 0) > 0 else 1,
-                max((b for b in (1, 2, 4, 8) if b <= args.batch_rows), default=1),
+                max((b for b in (1, 2, 4, 8, 16) if b <= args.batch_rows), default=1),
                 *(int(x) for x in (os.environ.get("HY4_BATCH_EXTRA") or "").split(",") if x.strip())),
             dma=uses_dma, kernel_rows=args.all_reduce_kernel_rows or None,
             lanes=2 if args.overlap else 1, lane_rows=CHUNK,
@@ -2995,6 +3012,9 @@ def main():
                                for layer in built.weights.layers)
                 if getattr(built.weights, "draft", None) is not None:
                     released += quantize_attention(built.weights.draft.attention, keep_bf16=keep)
+                if getattr(built.weights, "dfly", None) is not None:
+                    released += sum(quantize_attention(layer.attention, keep_bf16=keep)
+                                    for layer in built.weights.dfly.layers)
                 if os.environ.get("HY4_HEAD_BF16") == "1":
                     # consult18 P7: decode-family head reads a BF16 copy (the
                     # checkpoint's values; the FP32 head is their upcast)
@@ -3312,7 +3332,8 @@ def main():
             # replay fails the boot, not a request); longer contexts capture
             # their bucket on first use.
             from ignition.recipes.hy4.decode_graph import DecodeGraphs
-            ctx.decoder.decode_graphs = DecodeGraphs(ctx.decoder)
+            _keep = int(os.environ.get("HY4_GRAPH_KEEP") or DecodeGraphs.KEEP)
+            ctx.decoder.decode_graphs = DecodeGraphs(ctx.decoder, keep=_keep)
             upto = int(os.environ.get("HY4_DECODE_GRAPH_PREWARM") or 65536)
             if upto > 0:
                 t_cap = time.monotonic()
@@ -3360,8 +3381,10 @@ def main():
             # the local regime (replicated short KV past top-k): its one bucket
             bases = (0, int(cfg_topk) + 8, past) if SHORT_KV and SHORT_POSITIONS > int(cfg_topk) \
                 else (0, past)
+            _plain_buckets = [b for b in sorted(BATCH_ROWS, reverse=True)
+                              if b in (2, 4, 8, 16, max(BATCH_ROWS))] + [1]
             for base in bases:
-                for b in sorted(BATCH_ROWS, reverse=True) + [1]:
+                for b in _plain_buckets:
                     shape = ctx.decode_shape if b == 1 else batch_shape(b)
                     # wider than the cache rows: wrap the rows, each wrapped entry
                     # at its own position
@@ -3370,8 +3393,34 @@ def main():
                     for _ in range(2):            # eager + capture, then one replay
                         graphs.run_batch([0] * b, rows_p, starts_p, call_shape=shape)
             if MTP and getattr(ctx, "spec", None) is not None:
-                # batched speculation: the MTP draft attention's batch plan group is
+                # batched speculation: the draft attention's batch plan group is
                 # primed by its first call too — widest first, draft and verify
+                _has_dfly_dec = bool(getattr(ctx.decoder, "has_dfly", False))
+                _spec_k_live = int(getattr(ctx.spec, "k", 3) or 3)
+                _prewarm_pers = (tuple(range(3, max(4, _spec_k_live + 1) + 1))
+                                 if _has_dfly_dec else (3, 4))
+                _dfly_multi_pairs = set()
+                if _has_dfly_dec:
+                    _multi_cap = max(12, int(os.environ.get("HY4_BSPEC_MULTI_CAP") or 24))
+                    _top_k = min(_spec_k_live, int(getattr(graphs, "bspec_kmax", _spec_k_live)))
+                    for _cap_i in sorted({12, _multi_cap}):
+                        for _B in range(1, args.rows + 1):
+                            _chosen = 1
+                            for _K in range(_top_k, 1, -1):
+                                _need = (_K + 1) * _B
+                                _cands = [b for b in BATCH_ROWS if _need <= b <= _cap_i]
+                                if _cands:
+                                    _b = min(_cands)
+                                    if _b <= 12 or _b - _need <= max(2, _B // 2):
+                                        _chosen = _K
+                                        break
+                                if _K == _top_k and _need in BATCH_ROWS:
+                                    _chosen = _K
+                                    break
+                            if _chosen > 1:
+                                _p = _chosen + 1
+                                _sz = graphs.batch_bucket(_p * _B, allowed=BATCH_ROWS)
+                                _dfly_multi_pairs.add((_sz, _p))
                 for base in bases:
                     for b in sorted((x for x in BATCH_ROWS if x >= 2), reverse=True):
                         shape = batch_shape(b)
@@ -3382,17 +3431,16 @@ def main():
                         for _ in range(2):
                             graphs.run_bspec("draft", rows_p, [False] * b, end=end, call_shape=shape)
                             graphs.run_bspec("verify", rows_p, [False] * b, end=end, call_shape=shape)
-                    _has_dfly_dec = bool(getattr(ctx.decoder, "has_dfly", False))
-                    _spec_k_live = int(getattr(ctx.spec, "k", 3) or 3)
-                    _prewarm_pers = (tuple(range(3, max(4, _spec_k_live + 1) + 1))
-                                     if _has_dfly_dec else (3, 4))
                     if 12 in BATCH_ROWS or (_has_dfly_dec and any(b >= _spec_k_live + 1 for b in BATCH_ROWS)):
                         # c8 L13: multi-draft bspec rounds (per = K + 1 entries/row).
                         end = base + 2 * args.rows + max(_prewarm_pers) + 2
                         for per in _prewarm_pers:
-                            _bs_buckets = [b for b in sorted(BATCH_ROWS, reverse=True)
-                                           if b >= per and (b in (12, 8, 6, 4)
-                                                            or (per == _spec_k_live + 1 and b % per == 0))]
+                            if _has_dfly_dec:
+                                _bs_buckets = [b for b in sorted(BATCH_ROWS, reverse=True)
+                                               if (b, per) in _dfly_multi_pairs]
+                            else:
+                                _bs_buckets = [b for b in sorted(BATCH_ROWS, reverse=True)
+                                               if b >= per and b in (12, 8, 4)]
                             for b in _bs_buckets:
                                 shape = batch_shape(b)
                                 live = (b // per) * per

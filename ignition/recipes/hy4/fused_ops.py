@@ -295,7 +295,7 @@ def expand_gate(out, wuv, gate_raw, *, block_v=32):
     rows, heads, D = (int(v) for v in out.shape)
     V = int(wuv.shape[1])
     if (int(wuv.shape[0]) != heads or int(wuv.shape[2]) != D or wuv.stride(2) != 1
-            or out.stride(2) != 1 or D & (D - 1) or rows < 1 or rows > 16):
+            or out.stride(2) != 1 or D & (D - 1) or rows < 1 or rows > 32):
         return None
     g = gate_raw.reshape(rows, -1)
     if int(g.shape[1]) != heads * V or g.stride(-1) != 1 or g.dtype != torch.bfloat16:
