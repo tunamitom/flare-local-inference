@@ -1113,3 +1113,87 @@ def test_bspec_k5_policy_and_snapshot_width():
     # Snapshot capacity covers B=8 at K=5 (105 longs > legacy 81).
     assert 8 * (2 * 5 + 3) + 1 == 105
     assert max(81, loop.rows * (2 * fake_g.bspec_kmax + 3) + 1) == 121
+
+
+def test_bspec_dfly_draft_wkey_distinguishes_bypass_and_cp():
+    """Regression: DFly2 bspec draft bypass (end <= topk) and cp (end > topk) must not collide."""
+    from ignition.recipes.hy4.decode_graph import DecodeGraphs
+    from ignition.recipes.hy4.wiring import batch_shape
+
+    # Direct wkey contract: ("bypass", 0), ("local", S), ("cp", 0), ("cp", W) are all distinct.
+    keys = {
+        DecodeGraphs.wkey("bypass", 0),
+        DecodeGraphs.wkey("local", 4096),
+        DecodeGraphs.wkey("cp", 0),
+        DecodeGraphs.wkey("cp", 1024),
+    }
+    assert len(keys) == 4
+    assert DecodeGraphs.wkey("bypass", 0) != DecodeGraphs.wkey("cp", 0)
+
+    # Full DecodeGraphs._bspec_regime + bspec_cached separation for a DFly2 decoder.
+    fake_dec = SimpleNamespace(
+        has_dfly=True,
+        device=CPU,
+        collectives=SimpleNamespace(world_size=8, rank=0),
+        config=SimpleNamespace(text={"index_topk": 2048}, dfly_block_size=7),
+        cache=SimpleNamespace(rows=16, short_capacity=4096, cap_of=lambda r: 32768),
+    )
+    g = DecodeGraphs(fake_dec, granule=1024)
+    shape = batch_shape(6)
+    rw_short = g._bspec_regime("draft", 128, shape)
+    rw_long = g._bspec_regime("draft", 65536, shape)
+    assert rw_short == ("bypass", 0)
+    assert rw_long == ("cp", 0)
+    k_short = ("bspec", "draft", 6, 6, g.wkey(*rw_short), shape.name)
+    k_long = ("bspec", "draft", 6, 6, g.wkey(*rw_long), shape.name)
+    assert k_short != k_long
+    g.graphs[k_short] = (None, None, None)
+    assert g.bspec_cached("draft", 6, 128, call_shape=shape, per=6)
+    assert not g.bspec_cached("draft", 6, 65536, call_shape=shape, per=6)
+
+
+def test_batch_loop_c16_scaling_and_a2a_caps():
+    """Verify BatchLoop scales cleanly to c16 (size 32) without 8-row buffer limits."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "h4_serve_c16_mod", Path(__file__).resolve().parents[2] / "deploy" / "hy4" / "h4_serve.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    from ignition.recipes.hy4.collectives import a2a_pool_row_caps
+    from ignition.recipes.hy4.decode_graph import DecodeGraphs
+
+    assert 24 in DecodeGraphs.BATCH_BUCKETS and 32 in DecodeGraphs.BATCH_BUCKETS
+    fake_g = SimpleNamespace(
+        bspec_kmax=6,
+        BSPEC_KMAX=3,
+        BATCH_BUCKETS=DecodeGraphs.BATCH_BUCKETS,
+        batch_bucket=lambda count, *, allowed=None: DecodeGraphs.batch_bucket(
+            SimpleNamespace(BATCH_BUCKETS=DecodeGraphs.BATCH_BUCKETS), count, allowed=allowed),
+    )
+    loop = mod.BatchLoop.__new__(mod.BatchLoop)
+    loop.rows = 16
+    loop.bspec_k3 = True
+    loop.bspec_k2 = True
+    loop.bspec_multi_cap = 24
+    loop.ctx = SimpleNamespace(
+        batch_rows=(2, 4, 6, 8, 12, 16, 24, 32),
+        spec=SimpleNamespace(k=5),
+        decoder=SimpleNamespace(decode_graphs=fake_g),
+    )
+    # B=1->K=5(6), B=2->K=5(12), B=3->K=4(16), B=4->K=5(24), B=5->K=2(16), B=6->K=3(24),
+    # B=7->K=2(24), B=8->K=2(24), B=9..16->K=1(24/32).
+    ks = [loop._bs_k(B) for B in range(1, 17)]
+    assert ks[:8] == [5, 5, 4, 5, 2, 3, 2, 2]
+    assert ks[8:] == [1] * 8
+    assert loop._bs_layout(16, 1) == (2, 32, 16)
+    assert loop._bs_layout(8, 2) == (3, 24, 8)
+    assert loop._bs_layout(4, 5) == (6, 24, 4)
+
+    # Dead-A2A caps expand the absorbed gather pool to 32 rows for c16 bspec.
+    caps = a2a_pool_row_caps(
+        absorbed_width=576, unabsorbed_width=256, expanded_width=256,
+        decode_rows=(2, 4, 6, 8, 12, 16, 24, 32), prefill_widths=(16, 32, 64, 128, 256, 512, 1024, 2048),
+        ce_rows=1024, audit=False, force_caps=False)
+    assert caps["caps"][(576, "gather")] == 32

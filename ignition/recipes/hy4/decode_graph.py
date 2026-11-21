@@ -61,7 +61,7 @@ class DecodeGraphs:
     # cuGraphLaunch replaying another graph of the shared pool; boots that
     # never destroyed one replayed thousands of steps cleanly. Past KEEP
     # graphs a new key runs eagerly (uncaptured) instead of evicting.
-    KEEP = 256
+    KEEP = 384
 
     def __init__(self, decoder, *, granule=None, keep=None, bspec_kmax=None):
         self.decoder = decoder
@@ -179,7 +179,11 @@ class DecodeGraphs:
 
     @staticmethod
     def wkey(regime, width):
-        return ("L", width) if regime == "local" else width
+        if regime == "local":
+            return ("L", width)
+        if regime == "cp" and width == 0:
+            return ("cp", 0)
+        return width
 
     def _geo(self, regime, width, *, rows=None, row=None, count=1):
         """The captured step's host-known geometry and `visible_max` in its regime
@@ -674,7 +678,7 @@ class DecodeGraphs:
         bypass_short = (regime == "bypass" and self.short_cap() > 0)
         bypass_cp = (regime == "bypass" and not bypass_short)
         top_k, top_p = self.spec_filter_params() if (sample and filtered) else (None, None)
-        with use_lane(0, overlap=False, geometry=None, sync_free=True):
+        with use_lane(0, overlap=False, geometry=None, sync_free=True), w8_decode_scope():
             drafts, _ = d.dfly_draft(
                 entry["bonus"], entry["hidden"],
                 request_rows=rows_1, k=k, anchors=anchor,
@@ -728,7 +732,7 @@ class DecodeGraphs:
     # step writes there — never visible to that token's query, and overwritten
     # by the row's next step before any read. Identical pad entries write
     # identical bytes.
-    BATCH_BUCKETS = (1, 2, 4, 8, 12, 16, 32)
+    BATCH_BUCKETS = (1, 2, 4, 8, 12, 16, 24, 32)
 
     def batch_bucket(self, count, *, allowed=None):
         buckets = tuple(sorted(allowed)) if allowed else self.BATCH_BUCKETS
@@ -846,7 +850,12 @@ class DecodeGraphs:
     def _batch_prep(self, tokens, rows, starts, call_shape, pad_rows, pad, sample):
         """The padded step's (size, tokens, rows, starts, width, graph key)."""
         count = len(rows)
-        size = self.batch_bucket(count)
+        if (call_shape is not None and call_shape.name == "batch"
+                and int(call_shape.rows) in self.BATCH_BUCKETS
+                and int(call_shape.rows) >= count):
+            size = int(call_shape.rows)
+        else:
+            size = self.batch_bucket(count)
         # Attempt2 (CSF UAF, memcheck-named OOB span): a REAL entry's slot must
         # land inside its row's extent — `_stage_batch` stages
         # `base_of(row) + start // world` and the static cache path is unchecked
@@ -1063,7 +1072,7 @@ class DecodeGraphs:
         greedy, scale = self._bspec_greedy(slots)
         bypass_short = (rw[0] == "bypass" and self.short_cap() > 0)
         bypass_cp = (rw[0] == "bypass" and not bypass_short)
-        with use_lane(0, overlap=False, geometry=None, sync_free=True):
+        with use_lane(0, overlap=False, geometry=None, sync_free=True), w8_decode_scope():
             drafts, _ = d.dfly_draft(
                 bonus, target_hidden,
                 request_rows=srow, k=K, anchors=anchors,
