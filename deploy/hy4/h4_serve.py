@@ -2213,7 +2213,7 @@ class BatchLoop:
                 b = min(cands)
                 if b <= 12 or b - need <= max(2, B // 2):
                     return K
-            if K == top_k and need in rows:
+            if K == top_k and need <= cap and need in rows:
                 return K
         return 1
 
@@ -3403,7 +3403,7 @@ def main():
                 if _has_dfly_dec:
                     _multi_cap = max(12, int(os.environ.get("HY4_BSPEC_MULTI_CAP") or 24))
                     _top_k = min(_spec_k_live, int(getattr(graphs, "bspec_kmax", _spec_k_live)))
-                    for _cap_i in sorted({12, _multi_cap}):
+                    for _cap_i in sorted({12, 16, _multi_cap}):
                         for _B in range(1, args.rows + 1):
                             _chosen = 1
                             for _K in range(_top_k, 1, -1):
@@ -3414,7 +3414,7 @@ def main():
                                     if _b <= 12 or _b - _need <= max(2, _B // 2):
                                         _chosen = _K
                                         break
-                                if _K == _top_k and _need in BATCH_ROWS:
+                                if _K == _top_k and _need <= _cap_i and _need in BATCH_ROWS:
                                     _chosen = _K
                                     break
                             if _chosen > 1:

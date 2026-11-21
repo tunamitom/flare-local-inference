@@ -21,6 +21,9 @@ import torch
 
 GROUP = 128
 GEMV_ROWS = 16
+# On SM120, wide packed_input [8256, 6144] is faster in BF16 cuBLAS from 8 rows
+# up while INT8 GEMV wins at <= 6 rows; o_proj [6144, 4096] wins up to 16 rows.
+PACK_GEMV_ROWS = 6
 # INT8 reads are scoped to the decode-family bodies (decode step, verify rows,
 # draft forwards — DecodeGraphs) when the BF16 original is kept: every prefill
 # call, short tails included, stays the original BF16 op.
@@ -36,12 +39,12 @@ def decode_scope():
         _DECODE_SCOPE.reset(token)
 
 
-def in_decode_scope(x):
-    """A decode-family call that may read the INT8 copies: CUDA, <= GEMV_ROWS rows,
+def in_decode_scope(x, *, max_rows=GEMV_ROWS):
+    """A decode-family call that may read the INT8 copies: CUDA, <= max_rows rows,
     inside `decode_scope()`. `x` is the matmul's input as it multiplies the
     weight (rows = every dimension but the last)."""
     return (_DECODE_SCOPE.get() and x.is_cuda
-            and int(x.numel() // max(int(x.shape[-1]), 1)) <= GEMV_ROWS)
+            and int(x.numel() // max(int(x.shape[-1]), 1)) <= int(max_rows))
 
 
 def int8_rows_ok(weight, x2):

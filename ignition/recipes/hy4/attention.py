@@ -359,9 +359,10 @@ class Hy4LayerAttention:
             gate_raw = x @ w.gate_proj.T.to(x.dtype)
             self._stash_gate(x, gate_raw)
             return LayerProjections(q_resid, q, latent, index_keys, gate_raw)
-        from .w8 import Int8Weight, in_decode_scope
+        from .w8 import PACK_GEMV_ROWS, Int8Weight, in_decode_scope
 
-        w8 = w.w8_pack if (w.w8_pack is not None and in_decode_scope(x)) else None
+        w8 = (w.w8_pack if (w.w8_pack is not None and in_decode_scope(x, max_rows=PACK_GEMV_ROWS))
+              else None)
         if w8 is None and isinstance(packed.packed, Int8Weight):
             w8 = packed.packed
         if w8 is not None:
