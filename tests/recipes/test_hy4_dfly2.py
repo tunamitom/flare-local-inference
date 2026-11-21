@@ -1191,6 +1191,14 @@ def test_batch_loop_c16_scaling_and_a2a_caps():
     assert loop._bs_layout(8, 2) == (3, 24, 8)
     assert loop._bs_layout(4, 5) == (6, 24, 4)
 
+    # With cap=16, B=4 stays within bucket 16 (K=3) rather than spilling into bucket 24.
+    loop.bspec_multi_cap = 16
+    assert [loop._bs_k(B) for B in range(1, 9)] == [5, 5, 4, 3, 2, 1, 1, 1]
+    assert loop._bs_layout(4, 3) == (4, 16, 4)
+    # With cap=32, B=8 reaches K=3 in exact bucket 32.
+    loop.bspec_multi_cap = 32
+    assert loop._bs_k(8) == 3 and loop._bs_layout(8, 3) == (4, 32, 8)
+
     # Dead-A2A caps expand the absorbed gather pool to 32 rows for c16 bspec.
     caps = a2a_pool_row_caps(
         absorbed_width=576, unabsorbed_width=256, expanded_width=256,

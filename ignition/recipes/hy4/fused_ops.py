@@ -507,9 +507,9 @@ def _index_key_prep_kernel(k_ptr, w_ptr, b_ptr, pos_ptr, inv_ptr, out_ptr, k_str
 
 def index_key_prep(k_raw, weight, bias, eps, positions, *, rope_dim, theta):
     """`rope_interleaved(layer_norm(k_raw.float(), weight, bias, eps), positions)`
-    for <= 8 rows of 128-wide keys (FP32 out), or None when not that shape."""
+    for <= 32 rows of 128-wide keys (FP32 out), or None when not that shape."""
     rows = int(k_raw.shape[0]) if k_raw.dim() == 2 else -1
-    if (rows < 1 or rows > 8 or int(k_raw.shape[1]) != 128 or k_raw.stride(-1) != 1
+    if (rows < 1 or rows > 32 or int(k_raw.shape[1]) != 128 or k_raw.stride(-1) != 1
             or int(rope_dim) != 64 or weight.dtype != torch.float32 or bias.dtype != torch.float32
             or int(positions.numel()) != rows):
         return None
