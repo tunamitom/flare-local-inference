@@ -1217,6 +1217,12 @@ def test_batch_loop_c16_scaling_and_a2a_caps():
     loop.bspec_multi_cap = 16
     assert [loop._bs_k(B) for B in range(1, 9)] == [5, 5, 4, 3, 2, 1, 1, 1]
     assert loop._bs_layout(4, 3) == (4, 16, 4)
+    # With multi_kmax=3, B=1 keeps K=5 (bucket 6) while B=2 stays in bucket 8 (K=3).
+    loop.bspec_multi_kmax = 3
+    assert [loop._bs_k(B) for B in range(1, 9)] == [5, 3, 3, 3, 2, 1, 1, 1]
+    assert loop._bs_layout(1, 5) == (6, 6, 2)
+    assert loop._bs_layout(2, 3) == (4, 8, 2)
+    loop.bspec_multi_kmax = 0
     # With cap=32, B=8 reaches K=3 in exact bucket 32.
     loop.bspec_multi_cap = 32
     assert loop._bs_k(8) == 3 and loop._bs_layout(8, 3) == (4, 32, 8)

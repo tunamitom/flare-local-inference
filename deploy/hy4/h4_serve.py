@@ -1507,6 +1507,7 @@ class BatchLoop:
         self.bspec_k2 = True        # c8 L13: two chained drafts per row at <= 4 rows
         self.bspec_k3 = True        # c8 L13b: three chained drafts per row at <= 3 rows
         self.bspec_multi_cap = int(os.environ.get("HY4_BSPEC_MULTI_CAP") or 12)
+        self.bspec_multi_kmax = int(os.environ.get("HY4_BSPEC_MULTI_KMAX") or 0)
         self.solo_bspec = os.environ.get("HY4_SOLO_BSPEC", "0") == "1"
         self.prefilling = {}        # c8 L17: row -> a long admission's paused prefill (every rank)
         self.chunked_admit = True   # c8 L17: long prompts prefill between decode rounds
@@ -2205,6 +2206,9 @@ class BatchLoop:
         graphs = getattr(getattr(self.ctx, "decoder", None), "decode_graphs", None)
         kmax = int(getattr(graphs, "bspec_kmax", spec_k)) if graphs is not None else spec_k
         top_k = min(spec_k, kmax)
+        multi_kmax = int(getattr(self, "bspec_multi_kmax", 0) or 0)
+        if B >= 2 and multi_kmax > 0:
+            top_k = min(top_k, multi_kmax)
         cap = int(getattr(self, "bspec_multi_cap", 12) or 12)
         for K in range(top_k, 1, -1):
             need = (K + 1) * B
@@ -3402,9 +3406,12 @@ def main():
                 _dfly_multi_pairs = set()
                 if _has_dfly_dec:
                     _multi_cap = max(12, int(os.environ.get("HY4_BSPEC_MULTI_CAP") or 24))
-                    _top_k = min(_spec_k_live, int(getattr(graphs, "bspec_kmax", _spec_k_live)))
+                    _multi_kmax = int(os.environ.get("HY4_BSPEC_MULTI_KMAX") or 0)
+                    _top_k_base = min(_spec_k_live, int(getattr(graphs, "bspec_kmax", _spec_k_live)))
                     for _cap_i in sorted({12, 16, _multi_cap}):
                         for _B in range(1, args.rows + 1):
+                            _top_k = (min(_top_k_base, _multi_kmax)
+                                      if _B >= 2 and _multi_kmax > 0 else _top_k_base)
                             _chosen = 1
                             for _K in range(_top_k, 1, -1):
                                 _need = (_K + 1) * _B
